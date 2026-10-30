@@ -705,8 +705,8 @@ int svc_thread(int num, uint64_t *regs) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_PREEMPT"); on = e ? atoi(e) != 0 : DM_GAME_CORE_PREEMPT; }
     // Not only "whom did this SVC wake": when a higher-priority thread of the same core is already running (busy, not waiting, at the time of the signal), on hardware the calling thread does not get the CPU at all.
     // Metroid Dread: with the dispatcher thread busy, the main thread's "unlink the holders" request woke nobody, the object was freed right away, and the dispatcher later walked the freed holders in WaitAny and crashed
-    if (me && me->yield_pending && core_serial_on()) dm_core_handoff();   // core_serial hands the core to the woken thread instead of the wait below
-    else if (me && core_serial_on()) core_yield_to_better(me);
+    // core_serial hands the core to the woken thread instead of the wait below; a thread without a token (allowed on several cores, as Dread's main thread) still waits below
+    if (me && core_serial_on() && me->core_held >= 0) { if (me->yield_pending) dm_core_handoff(); else core_yield_to_better(me); }
     else if (me && on) {
         uint64_t t0 = now_ns(); int w = dm_yield_to_core_peers(5000);
         if (w) { if (w < 0) g_preempt_cap++; g_preempt_n++; g_preempt_ns += now_ns() - t0; }
