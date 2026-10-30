@@ -6963,8 +6963,10 @@ static const char *cctx_snap(void) {
 }
 // When the game itself asks for 30 fps (pacing by the game's present interval, interval 2, hle_nvn.c) the display link runs at 30 Hz too: games whose logic counts frames, such as Engage, are not pulled up to 60 fps by the display link on iOS
 __attribute__((weak)) int nvn_game_fps(void) { return 60; }   // hle_nvn.c provides the strong definition
-int mtl_fps_target(void) { static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; else MLOG("DM_FPS=%d: frame rate pinned by the test switch", env); }
-    return env > 0 ? env : nvn_game_fps() == 30 ? 30 : 60; }
+static _Atomic int g_fps_pin = -2;   // DM_FPS at startup; the Mac front end's frame-rate menu changes it at run time (link_sync follows on the next frame)
+int mtl_fps_target(void) { int pin = g_fps_pin; if (pin == -2) { const char *e = getenv("DM_FPS"); pin = e ? atoi(e) : -1; if (pin != 30 && pin != 60) pin = -1; else MLOG("DM_FPS=%d: frame rate pinned", pin); g_fps_pin = pin; }
+    return pin > 0 ? pin : nvn_game_fps() == 30 ? 30 : 60; }
+void mtl_set_fps_pin(int fps) { g_fps_pin = fps == 30 || fps == 60 ? fps : -1; MLOG("frame rate pinned to %s by the front end", fps == 30 || fps == 60 ? (fps == 30 ? "30" : "60") : "the game's own"); }
 // Hand a submission to the GPU in segments (DM_NVN_CUT=draw count, 0 = off; default 64): when the game holds back the next frame's submit until this frame's GPU work is done (The Legend of Zelda: Breath of the Wild: the main thread's nvnSyncWait on the fence of the frame just submitted),
 // the GPU sits idle for the milliseconds the host spends translating inside the submit (in the shrine each frame is GPU 13 ms + translation 7 ms back to back). Each time this many draws have accumulated, the command buffer encoded so far is committed between two passes: the GPU runs the earlier passes while the CPU translates the later ones.
 // Cut only when no encoder is open and no pass is deferred / merged / hoisted; commit this batch's uploads first (later draws use them). The fence signal and completion work stay on the last segment only: the queue executes in commit order and every encoder starts with a queue barrier

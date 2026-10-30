@@ -2,6 +2,7 @@
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <unistd.h>
 #include <unistd.h>
@@ -27,6 +28,40 @@ static uint8_t *g_stack; static size_t g_stack_cap;
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < RESERVE; }
 
 static void *alias_windows_thread(void *arg);
+// Diagnostic DM_MEMDUMP=<seconds>:<dir>: at that time, every readable region of the guest block and the main module is written to <dir>/<hex address>.bin
+// (finding the game's own data structures, e.g. building cheats for a build no cheat database covers)
+#include <TargetConditionals.h>
+#if !TARGET_OS_IPHONE
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+static void memdump_once(const char *dir);
+static void *memdump_thread(void *arg) {   // DM_MEMDUMP=<seconds>:<dir>[;<seconds>:<dir>...], times counted from start, in increasing order
+    char spec[2048]; strlcpy(spec, arg, sizeof spec); double done = 0;
+    for (char *tok = strtok(spec, ";"); tok; tok = strtok(NULL, ";")) {
+        double secs = atof(tok); char *dir = strchr(tok, ':'); if (!dir) continue; dir++;
+        if (secs > done) usleep((useconds_t)((secs - done) * 1e6)); done = secs > done ? secs : done;
+        mkdir(dir, 0755); memdump_once(dir);
+    }
+    return NULL;
+}
+static void memdump_once(const char *dir) {
+    uint64_t ranges[2][2] = {{(uint64_t)(uintptr_t)g_as, (uint64_t)(uintptr_t)g_as + RESERVE}, {(uint64_t)(uintptr_t)g_mod[0].base, (uint64_t)(uintptr_t)g_mod[0].base + g_mod[0].size}};
+    size_t total = 0; int files = 0;
+    for (int r = 0; r < 2; r++) {
+        mach_vm_address_t a = ranges[r][0];
+        while (a < ranges[r][1]) {
+            mach_vm_size_t sz = 0; vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
+            if (mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS || a >= ranges[r][1]) break;
+            if (info.protection & VM_PROT_READ) {
+                char path[1024]; snprintf(path, sizeof path, "%s/%llx.bin", dir, (unsigned long long)a);
+                FILE *f = fopen(path, "wb"); if (f) { fwrite((void *)(uintptr_t)a, 1, sz, f); fclose(f); total += sz; files++; }
+            }
+            a += sz;
+        }
+    }
+    LOG("DM_MEMDUMP: %d regions, %.1f MB written to %s (main base %p, heap %p, alias %p)", files, total / 1048576.0, dir, g_mod[0].base, g_heap, g_alias);
+}
+#endif
 static void mem_init(void) {
     if (g_as) return;
     g_as = mmap(NULL, RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -44,6 +79,20 @@ static void mem_init(void) {
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)RESERVE, g_heap, g_alias, g_stack);
     const char *aw = getenv("DM_ALIAS_WINDOWS");
     if (aw && atoi(aw) > 0) { pthread_t th; if (!pthread_create(&th, NULL, alias_windows_thread, (void *)(uintptr_t)atoi(aw))) pthread_detach(th); }
+#if !TARGET_OS_IPHONE
+    const char *md = getenv("DM_MEMDUMP");
+    if (md) { pthread_t th; if (!pthread_create(&th, NULL, memdump_thread, (void *)md)) pthread_detach(th); }
+#endif
+}
+
+// Region bases as Atmosphère's cheat VM names them (MemoryAccessType: 0 main NSO, 1 heap, 2 alias, 3 ASLR) -- guest pointers are host pointers here
+uint64_t dm_cheat_region_base(int region) {
+    switch (region) {
+    case 0: return (uint64_t)(uintptr_t)g_mod[0].base;
+    case 1: return (uint64_t)(uintptr_t)g_heap;
+    case 2: return (uint64_t)(uintptr_t)g_alias;
+    default: return (uint64_t)(uintptr_t)g_as;
+    }
 }
 
 // Application memory pool = the 3285 MB the Switch (4 GB model) gives applications. At startup (main+0x1b66160) the game sets the whole total reported by QueryMemoryInfo as the heap, retrying with 2 MB less on failure,
@@ -63,7 +112,7 @@ void svc_guest_range(uint8_t **base, size_t *size) { *base = g_as; *size = RESER
 enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=4, I_HeapSize=5,
        I_TotalMem=6, I_UsedMem=7, I_DebuggerAttached=8, I_ResourceLimit=9, I_IdleTick=10, I_RandomEntropy=11,
        I_AslrAddr=12, I_AslrSize=13, I_StackAddr=14, I_StackSize=15, I_SysResTotal=16, I_SysResUsed=17,
-       I_ProgramId=18, I_InitProcIdRange=19, I_UserExcAddr=20, I_TotalNonSys=21, I_UsedNonSys=22, I_IsApplication=23 };
+       I_ProgramId=18, I_InitProcIdRange=19, I_UserExcAddr=20, I_TotalNonSys=21, I_UsedNonSys=22, I_IsApplication=23, I_FreeThreadCount=24 };
 
 static uint8_t g_seen[256];
 
@@ -295,6 +344,9 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         case I_RandomEntropy: { uint64_t dm_entropy64(void); v = dm_entropy64(); break; }   // a deterministic stream when DM_DETCLOCK is on (hle_os.c)
         case I_ProgramId: { static uint64_t pid; if (!pid) { const char *e = getenv("DM_PROGRAM_ID"); pid = e ? strtoull(e, NULL, 16) : DM_GAME_PROGRAM_ID; } v = pid; break; }   // default from the game profile's program_id; DM_PROGRAM_ID=hex overrides
         case I_IsApplication: v = 1; break;
+        // threads the process may still create; 0 (the default answer) made Hollow Knight's Unity 6 player create none of its worker threads and wait for them forever.
+        // The host has no thread resource limit, so report a typical application's headroom
+        case I_FreeThreadCount: v = 64; break;
         case I_UserExcAddr: { static _Alignas(0x1000) uint8_t ctx[0x1000]; v = (uint64_t)ctx; break; }   // user exception context area: newer SDKs' SetDyingMessageRegion writes to +0x1c0 (0 would write through a null pointer)
         default: v = 0; break;
         }

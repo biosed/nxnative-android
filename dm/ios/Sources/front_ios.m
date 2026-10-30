@@ -122,7 +122,8 @@ static UILabel *front_ios_fps_label(void) {
 }
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
-void front_run(void (*guest)(void)) { guest(); }   // Already on main.m's big-stack thread
+void dm_cheats_start(void);
+void front_run(void (*guest)(void)) { dm_cheats_start(); guest(); }   // Already on main.m's big-stack thread
 
 // Software keyboard: show a UIAlertController on the main thread, the calling thread waits for the result
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {

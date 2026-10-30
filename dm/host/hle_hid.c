@@ -50,6 +50,7 @@ void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry
     shake_note();
 }
 uint64_t dm_input_samples(void) { return (uint64_t)atomic_load(&g_sampling); }
+uint64_t dm_input_buttons(void) { return (atomic_load(&g_btn) | atomic_load(&g_pad_btn)) & 0xffff; }   // buttons held now, keyboard and controllers (the cheat VM's key conditions)
 // DM_KEYS scripted input (for tests): "seconds:key[+key][~hold seconds][*count/interval seconds],...", e.g. "8:A,12:A,15:Down~0.5,16:A+B,40:A*80/2" (A every 2 s from 40 s on, 80 times). Key names A B X Y LS RS L R ZL ZR (plus the sticks LLeft LUp LRight LDown and RLeft RUp RRight RDown) Plus Minus Left Up Right Down, left stick LLeft LUp LRight LDown,
 //   T<x>x<y> = a touch at normalized picture coordinates (origin top left) for the hold time, and Shake = the controller shaken for the hold time (at least one whole shake);
 //   held 0.15 s by default, at most 1024 steps (counted after repeats are expanded). Goes through the controller path (dm_pad_set), ORed with keyboard / touch, neither overrides the other. Times are counted from host start.
@@ -298,6 +299,18 @@ HLE_FORCE("_ZN2nn3hid26IsSevenSixAxisSensorAtRestEv", "console six-axis sensor a
 // The development debug pad (Super Mario Odyssey initializes and polls it): never connected, all zero
 HLE_FORCE("_ZN2nn3hid18InitializeDebugPadEv", "debug pad; the host has none", void, h_hid_DbgPadInit, void) {}
 HLE_FORCE("_ZN2nn3hid16GetDebugPadStateEPNS0_13DebugPadStateE", "debug pad state: not connected (all 0)", void, h_hid_DbgPadState, void *st) { memset(st, 0, 32); }   // sampling number, attributes, buttons, two sticks
+HLE_FORCE("_ZN2nn3hid17GetDebugPadStatesEPNS0_13DebugPadStateEi", "debug pad states: one entry, not connected (SDK 20: the sdk's own version initializes the digitizer and aborts)", int, h_hid_DbgPadStates, void *st, int n) {
+    if (n < 1) return 0; memset(st, 0, 32); return 1;
+}
+// SDK 20 (Hollow Knight 1.5): the digitizer and the handle-based mouse calls, all reaching hid services the host does not have
+HLE_FORCE("_ZN2nn3hid19InitializeDigitizerEv", "digitizer; the host has none", void, h_hid_DigitizerInit, void) {}
+HLE_FORCE("_ZN2nn3hid14GetMouseHandleEv", "mouse handle: a fixed one (no mouse is ever connected)", uint64_t, h_hid_MouseHandle, void) { return 0; }
+HLE_FORCE("_ZN2nn3hid19GetDebugMouseHandleEv", "debug mouse handle: a fixed one (never connected)", uint64_t, h_hid_DbgMouseHandle, void) { return 0; }
+HLE_FORCE("_ZN2nn3hid15InitializeMouseERKNS0_11MouseHandleE", "mouse (handle form); not provided by the host", void, h_hid_InitMouseH, const void *h) { (void)h; }
+HLE_FORCE("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEiRKNS0_11MouseHandleE", "mouse states (handle form): 0 entries", int, h_hid_MouseStatesH, void *out, int n, const void *h) { (void)out; (void)n; (void)h; return 0; }
+HLE_FORCE("_ZN2nn3hid13GetMouseStateEPNS0_10MouseStateERKNS0_11MouseHandleE", "mouse state (handle form): not connected (MouseState 0x28 bytes zeroed)", void, h_hid_MouseStateH, void *st, const void *h) {
+    (void)h; memset(st, 0, 0x28); ((int64_t *)st)[0] = atomic_fetch_add(&g_sampling, 1) + 1;
+}
 HLE_FORCE("_ZN2nn3hid25EnableSixAxisSensorFusionERKNS0_19SixAxisSensorHandleEb", "six-axis sensor fusion; ignored by the host", void, h_hid_SixFusionOn, const uint32_t *h, uint32_t on) { (void)h; (void)on; }
 HLE_FORCE("_ZN2nn3hid28IsSixAxisSensorFusionEnabledERKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion: off", unsigned, h_hid_SixFusionQ, const uint32_t *h) { (void)h; return 0; }
 HLE_FORCE("_ZN2nn3hid25GetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleE", "gyroscope zero-drift mode: standard", int, h_hid_GyroGet, const uint32_t *h) { (void)h; return 1; }

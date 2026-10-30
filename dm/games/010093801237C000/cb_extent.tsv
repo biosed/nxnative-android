@@ -1,4 +1,4 @@
-# chain b-1a9b40cf13d7 2026-10-21T23:23:23+08:00
+# chain b-454c6fc86195 2026-10-21T14:53:00-06:00
 # shader key, then reg:bytes for each uniform slot whose reads stay inside its first bytes, and s<reg> for each storage slot it never writes (cb_extent.py)
 003b38fe9b3627ba	0:192 2:64
 00500b94cf88443d	0:1168
