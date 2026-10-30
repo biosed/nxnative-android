@@ -70,14 +70,18 @@ def deploy(a):
     ext = f'/sdcard/Android/data/{package(a.id)}/files'
     if a.from_device:   # copied on the device: much faster than over USB
         run('adb', 'shell', f'mkdir -p {ext} && for d in romfs dm vk font; do rm -rf {ext}/$d; cp -r {a.from_device}/$d {ext}/$d; done')
-    else:
-        b = a.build; vk = glob.glob(os.path.join(b, 'shader', 'vk'))[0]
-        run('adb', 'shell', f'mkdir -p {ext}/dm {ext}/vk')
-        for f in glob.glob(os.path.join(b, 'patched_android', '*.patched.bin')) + glob.glob(os.path.join(b, 'patched_android', '*.tsv')): run('adb', 'push', f, f'{ext}/dm/', stdout=subprocess.DEVNULL)
-        st = tempfile.mkdtemp(); [shutil.copy(f, st) for f in glob.glob(os.path.join(vk, '*.spv')) + glob.glob(os.path.join(vk, '*.vk.txt'))]
-        run('adb', 'push', st + '/.', f'{ext}/vk/', stdout=subprocess.DEVNULL); shutil.rmtree(st)
-        run('adb', 'push', os.path.join(b, 'font'), f'{ext}/font', stdout=subprocess.DEVNULL)
-        run('adb', 'push', glob.glob(os.path.join(b, 'extract', '*', 'RomFS'))[-1], f'{ext}/romfs', stdout=subprocess.DEVNULL)
+    else:   # adb cannot make folders inside Android/data (Android 13: secure_mkdirs is refused): pushed to /data/local/tmp, then copied on the device
+        b = a.build; vk = glob.glob(os.path.join(b, 'shader', 'vk'))[0]; tmp = '/data/local/tmp/nx_deploy'
+        st = tempfile.mkdtemp()
+        for d in ('dm', 'vk'): os.makedirs(os.path.join(st, d))
+        for f in glob.glob(os.path.join(b, 'patched_android', '*.patched.bin')) + glob.glob(os.path.join(b, 'patched_android', '*.tsv')): os.symlink(f, os.path.join(st, 'dm', os.path.basename(f)))
+        for f in glob.glob(os.path.join(vk, '*.spv')) + glob.glob(os.path.join(vk, '*.vk.txt')): os.symlink(f, os.path.join(st, 'vk', os.path.basename(f)))
+        os.symlink(os.path.join(b, 'font'), os.path.join(st, 'font')); os.symlink(glob.glob(os.path.join(b, 'extract', '*', 'RomFS'))[-1], os.path.join(st, 'romfs'))
+        run('adb', 'shell', f'rm -rf {tmp}; mkdir -p {tmp} {ext}')
+        for d in ('dm', 'vk', 'font', 'romfs'):
+            run('adb', 'push', os.path.realpath(os.path.join(st, d)) if d in ('font', 'romfs') else os.path.join(st, d), f'{tmp}/{d}', stdout=subprocess.DEVNULL)
+            run('adb', 'shell', f'rm -rf {ext}/{d} && cp -r {tmp}/{d} {ext}/{d} && rm -rf {tmp}/{d}')
+        run('adb', 'shell', f'rm -rf {tmp}'); shutil.rmtree(st)
     print(f'game files in {ext}')
 
 ap = argparse.ArgumentParser()
