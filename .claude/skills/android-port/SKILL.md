@@ -23,7 +23,7 @@ user gets follows the standard below; do not ship one that lacks any of it.
 - **One APK** with the game inside (`make_apk.py --bundle`, under 4 GB; it stores every repeated piece once, which brought
   Metroid Dread's 4.7 GB deflated down to 3.4 GB; a game that still does not fit, such as Super Mario Odyssey, gets the
   APK plus `<APK name>-datos.zip`, which the menu asks for once: Android and its tools read no ZIP64), the player's latest save bundled when they have
-  one, on the user's USB (`/Volumes/JOAQUIN2026/<Game> (Android)/` with a Spanish `LEEME.txt`), replacing older versions.
+  one, on the user's USB drive (`/Volumes/<drive>/<Game> (Android)/` with a Spanish `LEEME.txt`), replacing older versions.
 
 ## Procedure
 
