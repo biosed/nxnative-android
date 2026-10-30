@@ -13,13 +13,25 @@ plays it in handheld mode at about 59 fps (GPU 16 ms a frame in Dirtmouth), with
   for the other platform (`TP_SLOT` in `<module>.fixups.tsv`).
 - **Apple APIs.** `compat/` supplies the Mach, libdispatch, QoS, malloc-zone, CommonCrypto, clonefile and xattr calls
   the shared code makes (see `compat/README.md`).
-- **Platform parts.** Audio output is an AAudio stream (`hle_audio.c`). H.264 and AAC movie decoding are not there
-  yet (`hle_movie_avc.c`, `hle_movie.c` log `[RED]` and go on without pictures / with silence).
+- **Platform parts.** Audio output is an AAudio stream (`hle_audio.c`). H.264 is decoded by the NDK's MediaCodec
+  (`hle_movie_avc.c`, Annex B access units, pictures converted to NV12 / RGBA); AAC is not there yet (`hle_movie.c` logs
+  `[RED]` and goes on with silence). The system's Roboto stands in when a game asks for the shared font and none is there.
+- **Scheduling.** Horizon runs one thread at a time per core; a phone with eight big cores runs a Switch core's threads
+  truly in parallel, which raced Super Mario Odyssey's core-0 threads into heap corruption at boot. On Android each guest
+  thread pinned to one core holds that core's token while it runs (`hle_thread.c` `core_serial`, `DM_CORE_SERIAL=0` turns
+  it off): it gives it up while it waits (SVC waits, sleeps, yields, GPU waits in `hle_nvn.c`), hands it to a
+  higher-priority thread at its next SVC, and takes the token of its new core when its mask changes, also when another
+  thread changed it. A line every 5 s names the thread that waited longest and the one that held the core against it.
 - **Graphics.** `src_vk/nvn_vk.c` replays the NVN layer's command lists into Vulkan (its file header has the design:
   ring-buffer copies of what draws read, images in `GENERAL` layout, fragment resources in set 1). Shaders are the
   Metal chain's own SPIR-V, exported by `tools/spv_android.py` (below). BC formats are decoded on upload (BC4-7 by `third_party/bcdec`, MIT / Unlicense), and every
-  submission waits on GPU for the one before through a timeline semaphore. Not there yet: compute dispatches, indirect
-  draws, storage buffer write-back, buffer textures.
+  submission waits on GPU for the one before through a timeline semaphore. Compute dispatches run, and buffers they write
+  are tracked until the submission ends (`gw_*`), so draws that read them wait for it. Cube, 3D and array textures used
+  as attachments get 2D views (a cube view as an attachment loses the Mali device). Images come from 64 MB blocks with a
+  free list; pipelines go through a pipeline cache saved beside the game files. Not there yet: indirect draws, buffer
+  textures, geometry / tessellation stages. Diagnostics (`env.txt`): `DM_VK_PASSLOG=<frame>[+]` logs a frame's passes,
+  draws, copies and dispatches, `DM_VK_RTDUMP=<frame>` writes its render targets, `DM_VK_SKIP=<mask>` drops kinds of work
+  (1 buffer→texture, 2 texture→texture, 4 texture→buffer, 8 clears, 16 uploads, 32 draws / dispatches).
   `BACKEND=null` builds the null backend (`null/nvn_null.c`) instead.
 
 ## Shaders
@@ -72,7 +84,9 @@ python3 dm/android/tools/make_apk.py --deploy <id> <NSP folder>/<id>_build   # g
 ```
 
 `--bundle` puts the game files inside the APK instead (deflated: Hollow Knight's 3.6 GB make a 1.06 GB APK; Android takes
-APKs below 4 GB): one file to install without a computer, which the menu unpacks on its first start. `--test` makes a
+APKs below 4 GB): one file to install without a computer, which the menu unpacks on its first start. Repeated pieces of
+archives are stored once. Past 3.8 GB, whole files go to `<APK name>-datos.zip` (no ZIP64, which Android does not read);
+the menu asks for it once through the system file picker and checks it belongs to this APK. `--test` makes a
 `<package>.prueba` copy that installs beside the real app.
 
 The log is `/sdcard/Android/data/<package>/files/log.txt`; an `env.txt` beside it (KEY=VALUE lines) sets diagnostic switches.
@@ -80,4 +94,4 @@ The log is `/sdcard/Android/data/<package>/files/log.txt`; an `env.txt` beside i
 ## Next
 
 The missing backend features above; GPU time (images stay in `GENERAL` layout, which keeps Mali from compressing them);
-a user-facing script in `scripts/` that goes from NSP to installed app; H.264 / AAC through MediaCodec.
+a user-facing script in `scripts/` that goes from NSP to installed app; AAC through MediaCodec.

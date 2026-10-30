@@ -4,7 +4,9 @@
 #   make_apk.py <id> <NSP build folder> <out.apk> [--save <folder>] [--cheats <file>] [--label <name>] [--bundle]
 #     --bundle: the game files go inside the APK too (assets/game/, deflated, listed in assets/game/files.txt) and the menu unpacks them on the first start: one file, no
 #     computer needed. Every file is stored as pieces, each piece once (assets/game/p/<hash>): archives of (hash, start, end) entries, such as Metroid Dread's .pkg files, are cut at
-#     their entries, which repeat across archives (Dread's 4.7 GB deflated becomes 3.7 GB), and whole files that repeat are stored once. --test: package <package>.prueba, label "(prueba)": installs beside the real app without touching it. Android takes APKs below 4 GB only; past 2 GB the ZIP stays without ZIP64 records (apksigner and the installer read it as a plain ZIP)
+#     their entries, which repeat across archives (Dread's 4.7 GB deflated becomes 3.7 GB), and whole files that repeat are stored once. A game that still does not fit
+#     (Super Mario Odyssey: 5.3 GB of already compressed archives) fills the APK to 3.8 GB and puts the rest, whole files, into <out>-datos.zip beside it (marked =d in
+#     files.txt; assets/game/datos.txt names it): the menu asks the player to pick that file once, on the first start. --test: package <package>.prueba, label "(prueba)": installs beside the real app without touching it. Android takes APKs below 4 GB only; past 2 GB the ZIP stays without ZIP64 records (apksigner and the installer read it as a plain ZIP)
 #   make_apk.py --deploy <id> <NSP build folder> [--from-device <folder on the device that already has romfs/dm/vk/font>]
 # Tools: Homebrew's android-commandlinetools (build-tools 34, platform 33) and openjdk@21; the key is <NSP folder>/../android-debug.keystore (made once, kept so updates install over)
 import argparse, glob, hashlib, os, re, shutil, struct, subprocess, sys, tempfile, zipfile
@@ -12,6 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__)); ANDROID = os.path.dirname(HER
 SDK = os.environ.get('ANDROID_SDK', '/opt/homebrew/share/android-commandlinetools')
 BT = os.path.join(SDK, 'build-tools', '34.0.0'); JAR = os.path.join(SDK, 'platforms', 'android-33', 'android.jar')
 JAVA = os.environ.get('JAVA_HOME', '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home')
+APK_GAME_LIMIT = int(os.environ.get('APK_GAME_LIMIT', 3_800_000_000))   # bytes of game in the APK before the rest goes to the data file (Android and its tools read no ZIP64: an APK stays below 4 GB)
 ENV = dict(os.environ, JAVA_HOME=JAVA, PATH=os.path.join(JAVA, 'bin') + os.pathsep + os.environ['PATH'])
 def run(*a, **k): subprocess.run([str(x) for x in a], check=True, env=ENV, **k)
 def package(gid, test=False): return 'com.nxnative.t' + gid.lower() + ('.prueba' if test else '')   # test: installs beside the real app, its own data
@@ -60,8 +63,13 @@ def build(a):
                 for f in sorted(fs):
                     if not f.startswith('.'): p = os.path.join(root, f); z.write(p, 'assets/save/' + os.path.relpath(p, a.save))
         if a.bundle:
-            listing = []; stored = set(); raw = 0
+            listing = []; stored = set(); raw = 0; dz = None; dname = os.path.splitext(os.path.basename(a.out))[0] + '-datos.zip'; dn = dbytes = 0
             for rel, src in game_files(a.build):
+                if dz is None and z.fp.tell() > APK_GAME_LIMIT:   # the APK is full: the rest goes whole into the data file the menu asks for (see the header)
+                    dz = zipfile.ZipFile(os.path.join(os.path.dirname(os.path.abspath(a.out)), dname), 'w', zipfile.ZIP_DEFLATED, allowZip64=False)
+                    dz.writestr('nxdatos.txt', f'{package(a.id, a.test)}\t{vc}\n')
+                if dz is not None:
+                    dz.write(src, rel); listing.append(f'{rel}\t{os.path.getsize(src)}\t=d'); dn += 1; dbytes += os.path.getsize(src); continue
                 d = open(src, 'rb').read(); names = []
                 for off, n in pieces(d):
                     k = hashlib.sha1(d[off:off + n]).hexdigest()[:24]; names.append(k)
@@ -69,6 +77,9 @@ def build(a):
                 listing.append(f'{rel}\t{len(d)}\t' + ' '.join(names))
             z.writestr('assets/game/files.txt', '\n'.join(listing) + '\n')
             print(f'game: {len(listing)} files, {len(stored)} pieces, {raw / 1e9:.2f} GB stored once')
+            if dz is not None:
+                dz.close(); z.writestr('assets/game/datos.txt', f'{dname}\t{dn}\t{dbytes}\n')
+                print(f'data file {dname}: {dn} files, {dbytes / 1e9:.2f} GB, {os.path.getsize(os.path.join(os.path.dirname(os.path.abspath(a.out)), dname)) / 1e9:.2f} GB compressed')
     if os.path.getsize(base) >= 0xFFFFFFFF: sys.exit(f'[RED] the APK would be {os.path.getsize(base) / 1e9:.1f} GB: Android installs APKs below 4 GB only')
     aligned = os.path.join(w, 'aligned.apk')
     run(os.path.join(BT, 'zipalign'), '-f', '-p', '4', base, aligned)
@@ -111,17 +122,13 @@ def deploy(a):
     if a.from_device:   # copied on the device: much faster than over USB
         run('adb', 'shell', f'mkdir -p {ext} && for d in romfs dm vk font; do rm -rf {ext}/$d; cp -r {a.from_device}/$d {ext}/$d; done')
     else:   # adb cannot make folders inside Android/data (Android 13: secure_mkdirs is refused): pushed to /data/local/tmp, then copied on the device
-        b = a.build; vk = glob.glob(os.path.join(b, 'shader', 'vk'))[0]; tmp = '/data/local/tmp/nx_deploy'
-        st = tempfile.mkdtemp()
-        for d in ('dm', 'vk'): os.makedirs(os.path.join(st, d))
-        for f in glob.glob(os.path.join(b, 'patched_android', '*.patched.bin')) + glob.glob(os.path.join(b, 'patched_android', '*.tsv')): os.symlink(f, os.path.join(st, 'dm', os.path.basename(f)))
-        for f in glob.glob(os.path.join(vk, '*.spv')) + glob.glob(os.path.join(vk, '*.vk.txt')): os.symlink(f, os.path.join(st, 'vk', os.path.basename(f)))
-        os.symlink(os.path.join(b, 'font'), os.path.join(st, 'font')); os.symlink(glob.glob(os.path.join(b, 'extract', '*', 'RomFS'))[-1], os.path.join(st, 'romfs'))
+        b = a.build; tmp = '/data/local/tmp/nx_deploy'   # the folders themselves: adb push copies symbolic links as links, which the device refuses
+        src = {'dm': os.path.join(b, 'patched_android'), 'vk': glob.glob(os.path.join(b, 'shader', 'vk'))[0], 'font': os.path.join(b, 'font'), 'romfs': glob.glob(os.path.join(b, 'extract', '*', 'RomFS'))[-1]}
         run('adb', 'shell', f'rm -rf {tmp}; mkdir -p {tmp} {ext}')
         for d in ('dm', 'vk', 'font', 'romfs'):
-            run('adb', 'push', os.path.realpath(os.path.join(st, d)) if d in ('font', 'romfs') else os.path.join(st, d), f'{tmp}/{d}', stdout=subprocess.DEVNULL)
+            run('adb', 'push', src[d], f'{tmp}/{d}', stdout=subprocess.DEVNULL)
             run('adb', 'shell', f'rm -rf {ext}/{d} && cp -r {tmp}/{d} {ext}/{d} && rm -rf {tmp}/{d}')
-        run('adb', 'shell', f'rm -rf {tmp}'); shutil.rmtree(st)
+        run('adb', 'shell', f'rm -rf {tmp}')
     print(f'game files in {ext}')
 
 ap = argparse.ArgumentParser()

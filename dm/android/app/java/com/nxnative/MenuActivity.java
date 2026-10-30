@@ -53,7 +53,7 @@ public class MenuActivity extends Activity {
         prefs = getSharedPreferences("menu", MODE_PRIVATE);
         seedFiles();
         buildUi();
-        if (needsUnpack()) { unpack(); return; }
+        if (needsUnpack()) { if (pendingData() != null) askData(null); else unpack(); return; }
         boolean forced = new File(getFilesDir(), "show_menu").delete();
         if (prefs.getBoolean("skip", false) && !forced && b == null && gameFilesPresent()) play();
     }
@@ -103,14 +103,15 @@ public class MenuActivity extends Activity {
         new Thread(() -> {
             String err = null;
             try {
-                List<String[]> files = new ArrayList<>(); long total = 0;
+                List<String[]> files = new ArrayList<>(), later = new ArrayList<>(); long total = 0;
                 try (BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open("game/files.txt"), StandardCharsets.UTF_8))) {
-                    String l; while ((l = r.readLine()) != null) { String[] f = l.split("\t"); if (f.length >= 2) { files.add(f); total += Long.parseLong(f[1]); } }
+                    String l; while ((l = r.readLine()) != null) { String[] f = l.split("\t"); if (f.length >= 2) { (f.length > 2 && f[2].equals("=d") ? later : files).add(f); total += Long.parseLong(f[1]); } }
                 }
                 File ext = getExternalFilesDir(null);
                 if (ext.getUsableSpace() < total + (200L << 20)) throw new Exception(String.format(Locale.ROOT, "No hay espacio: se necesitan %.1f GB libres.", total / 1e9));
-                new File(ext, ".unpacked").delete();
+                new File(ext, ".unpacked").delete(); new File(ext, ".pending_data").delete();
                 long done = 0; byte[] buf = new byte[1 << 20]; int lastPct = -1;
+                for (String[] f : later) total -= Long.parseLong(f[1]);
                 for (String[] f : files) {
                     File to = new File(ext, f[0]); to.getParentFile().mkdirs();
                     // the file is its pieces in order (game/p/<hash>, each stored once in the APK); a line without pieces is the file itself at game/<path>
@@ -124,13 +125,90 @@ public class MenuActivity extends Activity {
                         }
                     }
                 }
-                try (OutputStream o = new FileOutputStream(new File(ext, ".unpacked"))) { o.write((versionCode() + "\n").getBytes(StandardCharsets.UTF_8)); }
+                if (!later.isEmpty()) {   // the rest is in the data file beside the APK: listed for the import, which asks for that file
+                    StringBuilder sb = new StringBuilder(versionCode() + "\n"); for (String[] f : later) sb.append(f[0]).append('\t').append(f[1]).append('\n');
+                    try (OutputStream o = new FileOutputStream(new File(ext, ".pending_data"))) { o.write(sb.toString().getBytes(StandardCharsets.UTF_8)); }
+                } else try (OutputStream o = new FileOutputStream(new File(ext, ".unpacked"))) { o.write((versionCode() + "\n").getBytes(StandardCharsets.UTF_8)); }
             } catch (Exception e) { err = e.getMessage() != null ? e.getMessage() : e.toString(); }
             final String fe = err;
             runOnUiThread(() -> {
                 unpacking = false;
                 if (fe != null) { status.setText("No se pudo preparar el juego: " + fe); status.setTextColor(Color.rgb(255, 120, 120)); return; }
+                if (pendingData() != null) { askData(null); return; }
                 status.setText("Juego listo."); bar.setVisibility(View.GONE); playButton.setEnabled(true); playButton.requestFocus();
+            });
+        }).start();
+    }
+    // ---- The data file (a game too big for one APK, make_apk.py): <name>-datos.zip, chosen once by the player, its files written beside the APK's ----
+    private Button dataButton;
+    private String dataName() {
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open("game/datos.txt"), StandardCharsets.UTF_8))) { return r.readLine().split("\t")[0]; }
+        catch (Exception e) { return "datos.zip"; }
+    }
+    private List<String[]> pendingData() {   // the files still to come from the data file, when the APK part is done for this version
+        File p = new File(getExternalFilesDir(null), ".pending_data"); List<String[]> out = new ArrayList<>();
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(new java.io.FileInputStream(p), StandardCharsets.UTF_8))) {
+            if (!String.valueOf(versionCode()).equals(r.readLine())) return null;
+            String l; while ((l = r.readLine()) != null) { String[] f = l.split("\t"); if (f.length == 2) out.add(f); }
+        } catch (Exception e) { return null; }
+        return out.isEmpty() ? null : out;
+    }
+    private void askData(String problem) {
+        playButton.setEnabled(false); status.setVisibility(View.VISIBLE); bar.setVisibility(View.GONE);
+        status.setTextColor(problem != null ? Color.rgb(255, 120, 120) : Color.WHITE);
+        status.setText((problem != null ? problem + "\n" : "") + "Falta un paso: el juego no cabe en un solo APK. Toca \"Elegir archivo de datos\" y elige " + dataName()
+                       + " (lo copiaste junto al APK). Solo se hace una vez; después puedes borrar ese archivo.");
+        dataButton.setVisibility(View.VISIBLE); dataButton.requestFocus();
+    }
+    private void pickData() {
+        android.content.Intent i = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(android.content.Intent.CATEGORY_OPENABLE); i.setType("*/*");
+        try { startActivityForResult(i, 7); } catch (Exception e) { askData("Este Android no tiene selector de archivos."); }
+    }
+    @Override protected void onActivityResult(int req, int res, android.content.Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req == 7 && res == RESULT_OK && data != null && data.getData() != null) importData(data.getData());
+    }
+    private void importData(android.net.Uri uri) {
+        List<String[]> want = pendingData(); if (want == null) return;
+        java.util.Map<String, Long> left = new java.util.HashMap<>(); long total = 0; for (String[] f : want) { left.put(f[0], Long.parseLong(f[1])); total += Long.parseLong(f[1]); }
+        final long tot = total;
+        unpacking = true; dataButton.setVisibility(View.GONE); bar.setVisibility(View.VISIBLE); status.setTextColor(Color.WHITE);
+        status.setText("Copiando los datos del juego...");
+        new Thread(() -> {
+            String err = null; File ext = getExternalFilesDir(null);
+            try (java.util.zip.ZipInputStream zin = new java.util.zip.ZipInputStream(new java.io.BufferedInputStream(getContentResolver().openInputStream(uri), 1 << 20))) {
+                java.util.zip.ZipEntry e; long done = 0; byte[] buf = new byte[1 << 20]; int lastPct = -1; boolean checked = false;
+                while ((e = zin.getNextEntry()) != null) {
+                    String name = e.getName();
+                    if (name.equals("nxdatos.txt")) {   // this package and this build: a data file from another version would not match the APK's files
+                        java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream(); int k; while ((k = zin.read(buf)) > 0) bo.write(buf, 0, k);   // InputStream.readAllBytes is API 33
+                        String[] id = new String(bo.toByteArray(), StandardCharsets.UTF_8).trim().split("\t");
+                        if (id.length < 2 || !id[0].equals(getPackageName()) || !id[1].equals(String.valueOf(versionCode()))) throw new Exception("ese archivo de datos es de otra versión del juego.");
+                        checked = true; continue;
+                    }
+                    if (!checked) throw new Exception("ese archivo no es el archivo de datos de este juego.");
+                    if (!left.containsKey(name) || name.contains("..")) continue;
+                    File to = new File(ext, name); to.getParentFile().mkdirs();
+                    try (OutputStream out = new FileOutputStream(to)) {
+                        int n; while ((n = zin.read(buf)) > 0) { out.write(buf, 0, n); done += n;
+                            int pct = (int) (done * 100 / Math.max(1, tot));
+                            if (pct != lastPct) { lastPct = pct; final int p = pct; final long d = done; runOnUiThread(() -> { bar.setProgress(p);
+                                status.setText(String.format(Locale.ROOT, "Copiando los datos del juego: %d%% (%.1f de %.1f GB)", p, d / 1e9, tot / 1e9)); }); } }
+                    }
+                    if (to.length() != left.get(name)) throw new Exception("el archivo " + name + " llegó incompleto.");
+                    left.remove(name);
+                }
+                if (!checked) throw new Exception("ese archivo no es el archivo de datos de este juego.");
+                if (!left.isEmpty()) throw new Exception("faltan " + left.size() + " archivos en el archivo de datos.");
+                new File(ext, ".pending_data").delete();
+                try (OutputStream o = new FileOutputStream(new File(ext, ".unpacked"))) { o.write((versionCode() + "\n").getBytes(StandardCharsets.UTF_8)); }
+            } catch (Exception ex) { err = ex.getMessage() != null ? ex.getMessage() : ex.toString(); }
+            final String fe = err;
+            runOnUiThread(() -> {
+                unpacking = false;
+                if (fe != null) { askData("No se pudieron copiar los datos: " + fe); return; }
+                status.setText("Juego listo. Ya puedes borrar " + dataName() + "."); bar.setVisibility(View.GONE); playButton.setEnabled(true); playButton.requestFocus();
             });
         }).start();
     }
@@ -180,6 +258,8 @@ public class MenuActivity extends Activity {
         col.addView(text("Elige cómo quieres jugar. Durante el juego, mantén − y + dos segundos para volver aquí.", 14, false));
         status = text("", 15, true); status.setVisibility(View.GONE); col.addView(status);
         bar = new android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal); bar.setMax(100); bar.setVisibility(View.GONE); col.addView(bar);
+        dataButton = new Button(this); dataButton.setText("Elegir archivo de datos"); dataButton.setTextSize(18); dataButton.setVisibility(View.GONE);
+        dataButton.setOnClickListener(v -> pickData()); col.addView(dataButton);
         if (!gameFilesPresent() && !bundled()) {
             TextView w = text("Faltan los archivos del juego en " + getExternalFilesDir(null) + " (romfs, dm, vk). Cópialos desde la computadora y vuelve a abrir la app.", 15, true);
             w.setTextColor(Color.rgb(255, 120, 120)); col.addView(w);

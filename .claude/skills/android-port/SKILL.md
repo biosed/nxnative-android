@@ -21,7 +21,8 @@ user gets follows the standard below; do not ship one that lacks any of it.
   and Exynos (Mali / Xclipse / PowerVR), Tensor, Unisoc. Any GPU feature is checked at run time and has a fallback
   (render passes without dynamic rendering, CPU decode of formats the GPU cannot sample, optional uint8 indices).
 - **One APK** with the game inside (`make_apk.py --bundle`, under 4 GB; it stores every repeated piece once, which brought
-  Metroid Dread's 4.7 GB deflated down to 3.4 GB), the player's latest save bundled when they have
+  Metroid Dread's 4.7 GB deflated down to 3.4 GB; a game that still does not fit, such as Super Mario Odyssey, gets the
+  APK plus `<APK name>-datos.zip`, which the menu asks for once: Android and its tools read no ZIP64), the player's latest save bundled when they have
   one, on the user's USB (`/Volumes/JOAQUIN2026/<Game> (Android)/` with a Spanish `LEEME.txt`), replacing older versions.
 
 ## Procedure
@@ -70,12 +71,25 @@ synchronization problem. Take several `screencap`s in a row: a single one hides 
 - `adb push` cannot create folders inside `Android/data` (Android 13+): stage in `/data/local/tmp`, then `cp` on the device.
 - Input injected by adb comes from device ID −1 and lasts no time; the front end holds every press at least 50 ms.
 
+## When the picture or the timing is wrong
+
+- Black / missing parts: `DM_VK_PASSLOG=<frame>` in `env.txt` lists the frame's passes, draws, copies and dispatches;
+  `DM_VK_RTDUMP=<frame>` dumps its render targets (`rt_*.raw`); `DM_VK_SKIP=<mask>` drops kinds of work to bisect.
+- Device lost on Mali: look for attachments that are not plain 2D views, copies between unequal sizes or formats the
+  GPU cannot blit (`[RED] vk:` lines), and point size in shaders.
+- Grain or wrong colours in signed formats: `char` is unsigned on Android's arm64 (vendored C code that casts to `char`
+  for signed values breaks; build with `-funsigned-char` on the Mac to reproduce).
+- Crashes at boot that move around (heap corruption): threads of one Switch core running in parallel; `core_serial`
+  must be on (default on Android). Slow frames with it: the `core_serial: most waiting` line names the thread that holds
+  the core.
+
 ## Not done yet (check before promising)
 
-H.264 / AAC movies (MediaCodec), compute dispatches, indirect draws, storage-buffer write-back, buffer textures,
-geometry / tessellation stages. (Done, from Metroid Dread: NVN's GL depth convention, `spv_gl_depth`; textures the CPU
+AAC movies, indirect draws, buffer textures, geometry / tessellation stages. (Done: H.264 movies through MediaCodec;
+compute dispatches with write-back of the buffers they write; NVN's GL depth convention, `spv_gl_depth`; textures the CPU
 rewrites, re-uploaded at next use; initial content of textures in GPU-only pools, `init_fill`; BC4-7 decoded on upload
 by `third_party/bcdec`; submissions chained by a timeline semaphore, as the Mali-G57 did not order a present's blit
-after the frame by barriers alone.) A game
-that needs one of these needs it implemented in `src_vk/nvn_vk.c` (once, for every game). Only the RG Slide's Mali-G57 has
-been tested: on another GPU, read the player's `log.txt` and fix in general code, not per device.
+after the frame by barriers alone; cube / 3D / array render targets as 2D views; a pipeline cache on disk; one Switch
+core's threads run one at a time, `core_serial`.) A game that needs one of these needs it implemented in
+`src_vk/nvn_vk.c` (once, for every game). Only the RG Slide's Mali-G57 has been tested: on another GPU, read the
+player's `log.txt` and fix in general code, not per device.

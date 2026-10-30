@@ -9,6 +9,7 @@
 //   Events     0x45 CreateEvent 0x11 SignalEvent 0x12 ClearEvent 0x17 ResetSignal 0x18 WaitSynchronization 0x16 CloseHandle
 // Semantics follow the public Horizon kernel behavior (KConditionVariable / KAddressArbiter / KSynchronization of Atmosphère mesosphère).
 // All waits hang on one global lock G, with one condition variable per thread; correctness first, performance to be measured later.
+#include <limits.h>
 #include "dm.h"
 #include "dm_uc.h"
 #include <errno.h>
@@ -60,6 +61,10 @@ typedef struct thr {
     int yield_pending;         // this SVC woke a higher-priority thread pinned to this core: let it run before the SVC returns (svc_thread)
     _Atomic int *host_work;    // points at the thread's dm_host_work (registered when the thread starts)
     int host_owned;            // a guest thread the host created itself (dm_guest_thread_spawn): it waits in host code and is not one of the game's threads
+    int core_held, core_want;  // core_serial: the core whose token this thread holds / waits for (-1: none)
+    int core_away, core_back;  // dm_core_leave depth, and whether the token was given up there (taken back by dm_core_return)
+    uint64_t core_wait_ns, core_blame_ns;   // time it waited for its core / others waited while it held theirs (the thread line every 300 frames)
+    uint64_t core_since;       // when it started waiting for it (equal priorities in arrival order)
     uint64_t wseq;             // Sequence number of wait registration: at equal priority first come, first woken (same order as the Horizon kernel's KThread wait tree)
     struct thr *next;          // Wait chain
     struct thr *all;           // All-threads chain (for the state dump)
@@ -167,8 +172,102 @@ static void wake(thr_t *t, int64_t res) {
     thr_t *self = pthread_getspecific(g_keythr);   // the woken thread is pinned to this core with a higher priority: on Horizon it preempts at once (see dm_yield_to_core_peers)
     if (self && self != t && !t->host_owned && t->prio < self->prio && t->mask == 1ull << (self->core & 63)) self->yield_pending = 1;
 }
+// ---------- One thread per core at a time (core_serial) ----------
+// Horizon runs one thread at a time on each core, the highest-priority ready one, until it blocks, sleeps or yields (or a higher-priority one becomes ready); games whose
+// threads share a core rely on that for exclusion: Super Mario Odyssey's main thread, file loading, scene deletion and scene initialization threads all sit on core 0 and use
+// one sead heap without locking, which on the host, where they run in parallel on many cores, corrupted it in one boot out of two or three on Android (an abort on a failed
+// allocation at main+0x951f54, crashes in the heap code at main+0x954fb8; seen once on the Mac too). With core_serial on, a thread pinned to one core holds that core's token
+// while it runs guest code and gives it up when it blocks, sleeps, yields or exits; the token then goes to the highest-priority thread of that core waiting for it, and an SVC
+// that woke such a thread hands it over at once (preemption at SVC boundaries). Host-created threads and threads allowed on several cores take no token. A thread that waits
+// more than CORE_WAIT_MS runs anyway (a holder spinning without an SVC cannot hang the game; counted in g_core_overrun). DM_CORE_SERIAL=0 / 1 overrides the default
+enum { CORE_WAIT_MS = 20, CORE_PREEMPT_MS = 2, NCORE = 4 };
+static thr_t *g_core_owner[NCORE]; static pthread_cond_t g_core_cv = PTHREAD_COND_INITIALIZER; static uint64_t g_core_overrun, g_core_handoff;
+static _Atomic int g_core_wantprio[NCORE];   // the best priority now waiting for each core (INT_MAX: none), read without G by the holder at its SVCs
+#ifdef __ANDROID__
+#define CORE_SERIAL_DEFAULT 1   // many big cores run the threads of one Switch core truly in parallel (an RG Slide has 8); the Mac keeps its timing as it was
+#else
+#define CORE_SERIAL_DEFAULT 0
+#endif
+static const char *thr_name(thr_t *t, char *buf, size_t n);
+static int core_serial_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_CORE_SERIAL"); for (int c = 0; c < NCORE; c++) atomic_store(&g_core_wantprio[c], INT_MAX); on = e ? atoi(e) != 0 : CORE_SERIAL_DEFAULT; }
+    return on;
+}
+static int core_of(const thr_t *t) { return t->host_owned || !t->mask || (t->mask & (t->mask - 1)) || __builtin_ctzll(t->mask) >= NCORE ? -1 : __builtin_ctzll(t->mask); }
+static void core_release(thr_t *t) {   // holding G
+    int c = t->core_held; if (c < 0) return;
+    t->core_held = -1;
+    if (g_core_owner[c] == t) { g_core_owner[c] = NULL; pthread_cond_broadcast(&g_core_cv); }
+}
+static int core_best(int c, const thr_t *self) {   // holding G: whether self is the thread that should get core c now
+    for (thr_t *o = g_all; o; o = o->all)
+        if (o != self && o->core_want == c && !o->exited && (o->prio < self->prio || (o->prio == self->prio && o->core_since < self->core_since))) return 0;
+    return 1;
+}
+static void core_wantprio(int c) {   // holding G: refresh the best waiting priority of core c
+    int best = INT_MAX; for (thr_t *o = g_all; o; o = o->all) if (o->core_want == c && !o->exited && o->prio < best) best = o->prio;
+    atomic_store(&g_core_wantprio[c], best);
+}
+static void core_acquire(thr_t *t) {   // holding G
+    if (!core_serial_on() || !t) return;
+    int c = core_of(t);
+    if (c != t->core_held) core_release(t);
+    if (c < 0 || t->core_held == c) return;
+    t->core_want = c; t->core_since = now_ns(); core_wantprio(c);
+    // a thread of higher priority than the holder would preempt it on Horizon: it waits only for the holder's next SVC (core_yield_to_better), at most CORE_PREEMPT_MS
+    int ms = g_core_owner[c] && g_core_owner[c]->prio > t->prio ? CORE_PREEMPT_MS : CORE_WAIT_MS;
+    struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += ms * 1000000L; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+    uint64_t w0 = now_ns(); thr_t *holder = g_core_owner[c];
+    for (;;) {
+        if (!g_core_owner[c] && core_best(c, t)) { g_core_owner[c] = t; t->core_held = c; break; }
+        if (pthread_cond_timedwait(&g_core_cv, &G, &dl) == ETIMEDOUT) { g_core_overrun++; break; }
+    }
+    uint64_t dw = now_ns() - w0; t->core_wait_ns += dw; if (holder && holder != t) holder->core_blame_ns += dw;
+    t->core_want = -1; core_wantprio(c);
+    static uint64_t last; uint64_t now = now_ns();
+    if (!last) last = now;
+    else if (now - last > 5000000000ull) {   // every 5 s: who waited for a core longest, and who held it against others
+        double secs = (now - last) / 1e9; last = now; thr_t *w = NULL, *b = NULL; char n1[32], n2[32];
+        for (thr_t *o = g_all; o; o = o->all) { if (!w || o->core_wait_ns > w->core_wait_ns) w = o; if (!b || o->core_blame_ns > b->core_blame_ns) b = o; }
+        if (w && w->core_wait_ns) LOG("core_serial: most waiting %#x '%s' (priority %d, core %d) %.0f ms/s, most held against others %#x '%s' (priority %d, mask %#llx, holds core %d) %.0f ms/s",
+                                      w->handle, thr_name(w, n1, sizeof n1), w->prio, core_of(w), w->core_wait_ns / 1e6 / secs,
+                                      b->handle, thr_name(b, n2, sizeof n2), b->prio, (unsigned long long)b->mask, b->core_held, b->core_blame_ns / 1e6 / secs);
+        for (thr_t *o = g_all; o; o = o->all) o->core_wait_ns = o->core_blame_ns = 0;
+    }
+}
+// At every SVC: a thread holding its core gives it to a higher-priority thread waiting for it (Horizon would have switched to that thread as soon as it became ready)
+static void core_yield_to_better(thr_t *me) {
+    int c = me->core_held; if (c < 0) return;
+    if (core_of(me) != c) { pthread_mutex_lock(&G); core_acquire(me); pthread_mutex_unlock(&G); return; }   // another thread changed its core mask: the token follows at its next SVC
+    if (atomic_load(&g_core_wantprio[c]) >= me->prio) return;
+    pthread_mutex_lock(&G); core_release(me); core_acquire(me); g_core_handoff++; pthread_mutex_unlock(&G);
+}
+// A thread leaving for host work that waits (GPU submissions, presents, GPU fences: hle_nvn.c gfx_enter / SyncWait) gives its core up meanwhile; nested calls count (core_away)
+void dm_core_leave(void) {
+    thr_t *me = pthread_getspecific(g_keythr); if (!me || !core_serial_on()) return;
+    if (me->core_away++ || me->core_held < 0) return;
+    pthread_mutex_lock(&G); core_release(me); me->core_back = 1; pthread_mutex_unlock(&G);
+}
+void dm_core_return(void) {
+    thr_t *me = pthread_getspecific(g_keythr); if (!me || !core_serial_on() || !me->core_away) return;
+    if (--me->core_away || !me->core_back) return;
+    pthread_mutex_lock(&G); me->core_back = 0; core_acquire(me); pthread_mutex_unlock(&G);
+}
+void dm_core_handoff(void) {   // after an SVC that woke a higher-priority thread of this core: let it run first (svc_thread)
+    thr_t *me = pthread_getspecific(g_keythr); if (!me || !core_serial_on() || me->core_held < 0) return;
+    pthread_mutex_lock(&G); core_release(me); core_acquire(me); g_core_handoff++; pthread_mutex_unlock(&G);
+}
+
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
-static int64_t block(thr_t *t, int kind, int64_t ns) {
+static int64_t block_(thr_t *t, int kind, int64_t ns);
+static int64_t block(thr_t *t, int kind, int64_t ns) {   // the core's token is given up while waiting (core_serial)
+    core_release(t);
+    int64_t r = block_(t, kind, ns);
+    core_acquire(t);
+    return r;
+}
+static int64_t block_(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     struct timespec dl;
@@ -249,7 +348,7 @@ static void *thread_main(void *p) {
     t->mport = pthread_mach_thread_np(pthread_self()); t->host_work = &dm_host_work;
     crash_thread_init();
     guest_thread_init();
-    pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_acquire(t); pthread_mutex_unlock(&G);
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
     die("guest thread entry returned");
 }
@@ -257,13 +356,13 @@ static void thr_free(thr_t *t) {   // Holding G; unlink from the all-threads cha
     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
     pthread_cond_destroy(&t->cv); pthread_cond_destroy(&t->pcv); free(t);
 }
-static const char *thr_name(thr_t *t, char *buf, size_t n);
 static void wake_sync_waiters(const void *obj);
 static void thread_exit(thr_t *t) {
     t->exit_ns = now_ns(); t->exit_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
     // No logging here: the exit happens on the guest thread's own stack (some are only a dozen or so KiB), and a printf with floating point would blow the stack (real-device smoke test: SIGBUS when LibcurlResolver exits, backtrace fprintf → __dtoa). Only the time is recorded, and it is printed later in the state dump
     pthread_mutex_lock(&G);
     t->exited = 1;
+    core_release(t);
     wake_sync_waiters(t);   // Synchronization waiters on this thread re-check
     pthread_setspecific(g_keythr, NULL);
     if (t->closed) thr_free(t);
@@ -345,7 +444,7 @@ uint32_t svc_thread_main_init(void) {
     pause_install();
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL); pthread_cond_init(&t->pcv, NULL);
-    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt); t->host_work = &dm_host_work;
+    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->core_held = t->core_want = -1; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt); t->host_work = &dm_host_work;
     pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
@@ -480,6 +579,7 @@ void svc_thread_dump(void) {
     int nh = 0; for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
     fprintf(stderr, "[dm] handle table use %d / %d, threads created so far %llu\n", nh, MAX_H, g_next_id - 0x51);
     fprintf(stderr, "[dm] same-core preemption yields %llu, total %.1f ms, hit the cap %llu times\n", (unsigned long long)g_preempt_n, g_preempt_ns / 1e6, (unsigned long long)g_preempt_cap);
+    if (core_serial_on()) fprintf(stderr, "[dm] core_serial: %llu hand-overs after a wake, %llu waits past %d ms\n", (unsigned long long)g_core_handoff, (unsigned long long)g_core_overrun, CORE_WAIT_MS);
     for (thr_t *t = g_all; t; t = t->all) {
         module_t *m = module_of((void *)t->last_lr);
         // Thread name: SDK ThreadType+0x1a0 is the name pointer (ThreadManager::SetInitialThreadNameUnsafe 0x34a2a4); x2 of CreateThread = ThreadType*
@@ -497,9 +597,9 @@ void svc_thread_dump(void) {
         int have_raw = (t->wkind == 1 || t->wkind == 2 || t->wkind == 3) && t->waddr && !vm_read_overwrite(mach_task_self(), t->waddr & ~0xfull, 64, (vm_address_t)raw, &g3) && g3 == 64;
         char life[96]; uint64_t nowns = now_ns();
         if (t->exited) snprintf(life, sizeof life, " created at tick %u, exited at tick %u (%.1f s ago)", t->born_tick, t->exit_tick, (nowns - t->exit_ns) / 1e9); else if (!t->born_ns) snprintf(life, sizeof life, " present since process start"); else snprintf(life, sizeof life, " created at tick %u (%.1f s ago)", t->born_tick, (nowns - t->born_ns) / 1e9);
-        fprintf(stderr, "[dm] thread %#x '%s' priority %d core %d mask %#llx CPU %.2fs svc %llu %s%s%s waits:%s addr=%#llx%s last svc %#x lr=%s+%#llx\n", t->handle, nm, t->prio, t->core, (unsigned long long)t->mask,
+        fprintf(stderr, "[dm] thread %#x '%s' priority %d core %d mask %#llx CPU %.2fs svc %llu %s%s%s waits:%s addr=%#llx%s last svc %#x lr=%s+%#llx stack top %#llx\n", t->handle, nm, t->prio, t->core, (unsigned long long)t->mask,
                 cpu, t->nsvc, t->exited ? "exited" : "", t->started ? "" : "not started", life, kinds[t->wkind & 7], t->waddr, own, t->last_svc,
-                m ? m->name : "?", m ? t->last_lr - (uint64_t)m->base : t->last_lr);
+                m ? m->name : "?", m ? t->last_lr - (uint64_t)m->base : t->last_lr, (unsigned long long)t->stack_top);
         if (have_raw) { char hx[200]; int q = 0; for (int i = 0; i < 64; i += 4) q += snprintf(hx + q, sizeof hx - q, "%08x ", *(uint32_t *)(raw + i));
                         fprintf(stderr, "[dm]   %#x waited-for object, 64 bytes from %#llx: %s\n", t->handle, t->waddr & ~0xfull, hx); }
         thr_bt(t);
@@ -605,7 +705,9 @@ int svc_thread(int num, uint64_t *regs) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_PREEMPT"); on = e ? atoi(e) != 0 : DM_GAME_CORE_PREEMPT; }
     // Not only "whom did this SVC wake": when a higher-priority thread of the same core is already running (busy, not waiting, at the time of the signal), on hardware the calling thread does not get the CPU at all.
     // Metroid Dread: with the dispatcher thread busy, the main thread's "unlink the holders" request woke nobody, the object was freed right away, and the dispatcher later walked the freed holders in WaitAny and crashed
-    if (me && on) {
+    if (me && me->yield_pending && core_serial_on()) dm_core_handoff();   // core_serial hands the core to the woken thread instead of the wait below
+    else if (me && core_serial_on()) core_yield_to_better(me);
+    else if (me && on) {
         uint64_t t0 = now_ns(); int w = dm_yield_to_core_peers(5000);
         if (w) { if (w < 0) g_preempt_cap++; g_preempt_n++; g_preempt_ns += now_ns() - t0; }
     }
@@ -622,7 +724,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;
         // Core -2 (IdealCoreUseProcessValue) = the process's default ideal core (0 for this game), with an affinity mask of just that core - as in the Horizon kernel. It used to be recorded as -2 and GetCurrentProcessorNumber answered -2;
         //   SMBW's font engine picks its per-core engine slot by the current core number and crashed indexing with -2 (main +0x107dbc0, SequenceBackgroundWorker thread)
-        t->prio = (int)regs[4]; t->core = (int)regs[5] >= 0 ? (int)regs[5] : 0; t->mask = 1ull << t->core;
+        t->prio = (int)regs[4]; t->core = (int)regs[5] >= 0 ? (int)regs[5] : 0; t->mask = 1ull << t->core; t->core_held = t->core_want = -1;
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
         pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 1 << 20);
@@ -642,6 +744,8 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x0A: thread_exit(cur()); return 1;
     case 0x0B: {  // SleepThread(x0 ns); 0/-1/-2 = the various kinds of yield
         int64_t ns = (int64_t)regs[0];
+        thr_t *sme = pthread_getspecific(g_keythr);
+        if (sme && core_serial_on()) { pthread_mutex_lock(&G); core_release(sme); pthread_mutex_unlock(&G); }   // a sleep or a yield gives the core away
         if (ns > 0 && dm_detclock_enabled()) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
             while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
@@ -658,6 +762,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             else sched_yield();
             if (me && me->handle == 0x1001) { g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }
         }
+        if (sme && core_serial_on()) { pthread_mutex_lock(&G); core_acquire(sme); pthread_mutex_unlock(&G); }
         return 1;
     }
     case 0x0C: { thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; return 1; }
@@ -672,6 +777,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             // The ideal core is not in the new mask (-2/-3 keep the ideal core but pin the thread to other cores): as in Horizon, move the ideal core to the lowest core in the mask.
             // Otherwise GetCurrentProcessorNumber reports core 0 even for threads pinned to cores 1 / 2, and a job system with per-core queues (SMBW's BaseProcExecutor) takes core 0's work while nobody drains the queues of cores 1 / 2
             if (t->mask && (t->core < 0 || !(t->mask >> t->core & 1))) t->core = __builtin_ctzll(t->mask); }
+        if (t && t == pthread_getspecific(g_keythr)) { pthread_mutex_lock(&G); core_acquire(t); pthread_mutex_unlock(&G); }   // core_serial: the token of its new core
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }
     case 0x10: { thr_t *t = cur(); int c = t->core;   // The current core number is always 0..2 (never negative); a thread with no ideal core reports the lowest core its mask allows, not core 0 outside it
