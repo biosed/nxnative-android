@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+# The Android app of one game: the menu (app/java), the host library (make -C dm/android GAME=<id>), the game's icon, and optionally a save to start from and a cheat file,
+# signed with a development key. The game files are not in the APK (several GB): the deploy step copies them into the app's external folder over adb.
+#   make_apk.py <id> <NSP build folder> <out.apk> [--save <folder>] [--cheats <file>] [--label <name>]
+#   make_apk.py --deploy <id> <NSP build folder> [--from-device <folder on the device that already has romfs/dm/vk/font>]
+# Tools: Homebrew's android-commandlinetools (build-tools 34, platform 33) and openjdk@21; the key is <NSP folder>/../android-debug.keystore (made once, kept so updates install over)
+import argparse, glob, os, re, shutil, subprocess, sys, tempfile, zipfile
+HERE = os.path.dirname(os.path.abspath(__file__)); ANDROID = os.path.dirname(HERE)
+SDK = os.environ.get('ANDROID_SDK', '/opt/homebrew/share/android-commandlinetools')
+BT = os.path.join(SDK, 'build-tools', '34.0.0'); JAR = os.path.join(SDK, 'platforms', 'android-33', 'android.jar')
+JAVA = os.environ.get('JAVA_HOME', '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home')
+ENV = dict(os.environ, JAVA_HOME=JAVA, PATH=os.path.join(JAVA, 'bin') + os.pathsep + os.environ['PATH'])
+def run(*a, **k): subprocess.run([str(x) for x in a], check=True, env=ENV, **k)
+def package(gid): return 'com.nxnative.t' + gid.lower()
+
+MANIFEST = '''<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{pkg}" android:versionCode="{vc}" android:versionName="{vn}">
+  <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="33"/>
+  <uses-feature android:name="android.hardware.vulkan.version" android:version="0x403000" android:required="true"/>
+  <application android:label="{label}" android:icon="@mipmap/icon" android:hasCode="true" android:extractNativeLibs="true" android:isGame="true"
+               android:appCategory="game" android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+    <activity android:name="com.nxnative.MenuActivity" android:exported="true" android:screenOrientation="sensorLandscape"
+              android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode|screenLayout|smallestScreenSize">
+      <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+    </activity>
+    <activity android:name="android.app.NativeActivity" android:process=":game" android:exported="false" android:screenOrientation="sensorLandscape"
+              android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode|screenLayout|smallestScreenSize|density">
+      <meta-data android:name="android.app.lib_name" android:value="dmhost"/>
+    </activity>
+  </application>
+</manifest>
+'''
+
+def build(a):
+    lib = os.path.join(ANDROID, 'gen', a.id, 'libdmhost.so')
+    if not os.path.exists(lib): sys.exit(f'[RED] {lib} missing: make -C dm/android GAME={a.id} first')
+    w = tempfile.mkdtemp(prefix='apk_', dir=os.environ.get('WORK'))
+    label = a.label or a.id
+    vc = int(subprocess.run(['date', '+%y%m%d%H'], capture_output=True, text=True).stdout.strip())   # each build installs over the last
+    open(os.path.join(w, 'AndroidManifest.xml'), 'w').write(MANIFEST.format(pkg=package(a.id), vc=vc, vn='0.1.' + str(vc), label=label.replace('&', '&amp;')))
+    res = os.path.join(w, 'res', 'mipmap'); os.makedirs(res)
+    icon = (glob.glob(os.path.join(a.build, 'extract', '*', 'icon.jpg')) or [None])[0]
+    if icon: run('sips', '-s', 'format', 'png', '-Z', '192', icon, '--out', os.path.join(res, 'icon.png'), stdout=subprocess.DEVNULL)
+    else: sys.exit('[RED] no icon.jpg under the build folder\'s extract/')
+    run(os.path.join(BT, 'aapt2'), 'compile', '--dir', os.path.join(w, 'res'), '-o', os.path.join(w, 'res.zip'))
+    base = os.path.join(w, 'base.apk')
+    run(os.path.join(BT, 'aapt2'), 'link', '-o', base, '-I', JAR, '--manifest', os.path.join(w, 'AndroidManifest.xml'), os.path.join(w, 'res.zip'))
+    cls = os.path.join(w, 'classes'); os.makedirs(cls)
+    run(os.path.join(JAVA, 'bin', 'javac'), '--release', '11', '-cp', JAR, '-d', cls, *glob.glob(os.path.join(ANDROID, 'app', 'java', '**', '*.java'), recursive=True))
+    run(os.path.join(BT, 'd8'), '--release', '--min-api', '33', '--lib', JAR, '--output', w, *glob.glob(os.path.join(cls, '**', '*.class'), recursive=True))
+    with zipfile.ZipFile(base, 'a', zipfile.ZIP_DEFLATED) as z:
+        z.write(os.path.join(w, 'classes.dex'), 'classes.dex')
+        z.write(lib, 'lib/arm64-v8a/libdmhost.so')
+        if a.cheats: z.write(a.cheats, 'assets/cheats.txt')
+        if a.save:
+            for f in sorted(os.listdir(a.save)):
+                p = os.path.join(a.save, f)
+                if os.path.isfile(p): z.write(p, 'assets/save/' + f)
+    aligned = os.path.join(w, 'aligned.apk')
+    run(os.path.join(BT, 'zipalign'), '-f', '-p', '4', base, aligned)
+    ks = os.path.join(os.path.dirname(os.path.abspath(a.build)), '..', 'android-debug.keystore'); ks = os.path.abspath(ks)
+    if not os.path.exists(ks):
+        run(os.path.join(JAVA, 'bin', 'keytool'), '-genkeypair', '-keystore', ks, '-storepass', 'android', '-keypass', 'android', '-alias', 'nxnative', '-keyalg', 'RSA', '-keysize', '2048',
+            '-validity', '10000', '-dname', 'CN=nxnative development', stdout=subprocess.DEVNULL)
+    run(os.path.join(BT, 'apksigner'), 'sign', '--ks', ks, '--ks-pass', 'pass:android', '--key-pass', 'pass:android', '--ks-key-alias', 'nxnative', '--out', a.out, aligned)
+    shutil.rmtree(w, ignore_errors=True)
+    print(f'{a.out}: {package(a.id)} "{label}", {os.path.getsize(a.out) / 1e6:.1f} MB' + (f', save from {a.save}' if a.save else '') + (f', cheats {os.path.basename(a.cheats)}' if a.cheats else ''))
+
+def deploy(a):
+    ext = f'/sdcard/Android/data/{package(a.id)}/files'
+    if a.from_device:   # copied on the device: much faster than over USB
+        run('adb', 'shell', f'mkdir -p {ext} && for d in romfs dm vk font; do rm -rf {ext}/$d; cp -r {a.from_device}/$d {ext}/$d; done')
+    else:
+        b = a.build; vk = glob.glob(os.path.join(b, 'shader', 'vk'))[0]
+        run('adb', 'shell', f'mkdir -p {ext}/dm {ext}/vk')
+        for f in glob.glob(os.path.join(b, 'patched_android', '*.patched.bin')) + glob.glob(os.path.join(b, 'patched_android', '*.tsv')): run('adb', 'push', f, f'{ext}/dm/', stdout=subprocess.DEVNULL)
+        st = tempfile.mkdtemp(); [shutil.copy(f, st) for f in glob.glob(os.path.join(vk, '*.spv')) + glob.glob(os.path.join(vk, '*.vk.txt'))]
+        run('adb', 'push', st + '/.', f'{ext}/vk/', stdout=subprocess.DEVNULL); shutil.rmtree(st)
+        run('adb', 'push', os.path.join(b, 'font'), f'{ext}/font', stdout=subprocess.DEVNULL)
+        run('adb', 'push', glob.glob(os.path.join(b, 'extract', '*', 'RomFS'))[-1], f'{ext}/romfs', stdout=subprocess.DEVNULL)
+    print(f'game files in {ext}')
+
+ap = argparse.ArgumentParser()
+if len(sys.argv) > 1 and sys.argv[1] == '--deploy':
+    ap.add_argument('--deploy', action='store_true'); ap.add_argument('id'); ap.add_argument('build'); ap.add_argument('--from-device')
+    deploy(ap.parse_args())
+else:
+    ap.add_argument('id'); ap.add_argument('build'); ap.add_argument('out'); ap.add_argument('--save'); ap.add_argument('--cheats'); ap.add_argument('--label')
+    build(ap.parse_args())

@@ -31,7 +31,7 @@ static void *alias_windows_thread(void *arg);
 // Diagnostic DM_MEMDUMP=<seconds>:<dir>: at that time, every readable region of the guest block and the main module is written to <dir>/<hex address>.bin
 // (finding the game's own data structures, e.g. building cheats for a build no cheat database covers)
 #include <TargetConditionals.h>
-#if !TARGET_OS_IPHONE
+#if TARGET_OS_OSX
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 static void memdump_once(const char *dir);
@@ -79,7 +79,7 @@ static void mem_init(void) {
     LOG("guest AS %p +%#llx  heap %p alias %p stack %p", g_as, (unsigned long long)RESERVE, g_heap, g_alias, g_stack);
     const char *aw = getenv("DM_ALIAS_WINDOWS");
     if (aw && atoi(aw) > 0) { pthread_t th; if (!pthread_create(&th, NULL, alias_windows_thread, (void *)(uintptr_t)atoi(aw))) pthread_detach(th); }
-#if !TARGET_OS_IPHONE
+#if TARGET_OS_OSX
     const char *md = getenv("DM_MEMDUMP");
     if (md) { pthread_t th; if (!pthread_create(&th, NULL, memdump_thread, (void *)md)) pthread_detach(th); }
 #endif

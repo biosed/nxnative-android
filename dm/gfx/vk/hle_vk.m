@@ -39,16 +39,16 @@ static int g_log;
 #define VK(name, ret, ...)                                                                       \
     static ret h_##name(__VA_ARGS__);                                                            \
     static const PFN_##name chk_##name __attribute__((unused)) = h_##name;                       \
-    __attribute__((used, section("__DATA,swhle"))) static const hle_ent e_##name = {#name, (void *)h_##name}; \
+    __attribute__((used, DM_SECTION(swhle))) static const hle_ent e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 // VKB: the same, run on the thread's big host stack (hle_bigstack.c; register arguments only): for the functions that call into Metal on game threads, whose stacks can be small
 #define VKB(name, ret, ...)                                                                      \
     static ret h_##name(__VA_ARGS__) __attribute__((used));                                      \
     static const PFN_##name chk_##name __attribute__((unused)) = h_##name;                       \
     extern const char h_##name##_bs[];                                                           \
-    __asm__(".text\n.p2align 2\n.globl _h_" #name "_bs\n.private_extern _h_" #name "_bs\n_h_" #name "_bs:\n" \
-            "    adrp x16, _h_" #name "@PAGE\n    add x16, x16, _h_" #name "@PAGEOFF\n    b _dm_bigstack_enter\n"); \
-    __attribute__((used, section("__DATA,swhle"))) static const hle_ent e_##name = {#name, (void *)h_##name##_bs}; \
+    __asm__(".text\n.p2align 2\n.globl " DM_ASM_SYM(h_##name##_bs) "\n" DM_ASM_HIDDEN " " DM_ASM_SYM(h_##name##_bs) "\n" DM_ASM_SYM(h_##name##_bs) ":\n" \
+            DM_ASM_ADDR("x16", h_##name) "    b " DM_ASM_SYM(dm_bigstack_enter) "\n"); \
+    __attribute__((used, DM_SECTION(swhle))) static const hle_ent e_##name = {#name, (void *)h_##name##_bs}; \
     static ret h_##name(__VA_ARGS__)
 
 static uint32_t umin(uint32_t a, uint32_t b) { return a < b ? a : b; }
@@ -1529,7 +1529,7 @@ VKB(vkQueuePresentKHR, VkResult, VkQueue q, const VkPresentInfoKHR *pi) {
 static void *vk_lookup(const char *name) {
     static const hle_ent *sec; static unsigned long sz;
     if (!name || strncmp(name, "vk", 2)) return NULL;
-    if (!sec) sec = (const hle_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swhle", &sz);
+    if (!sec) sec = (const hle_ent *)DM_SECTION_DATA(swhle, &sz);
     void *fn = NULL; size_t n = strlen(name);
     for (int pass = 0; pass < 2 && !fn; pass++) {
         size_t len = pass ? n - 3 : n;

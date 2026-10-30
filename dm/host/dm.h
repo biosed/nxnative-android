@@ -34,6 +34,7 @@ typedef struct {
     uint64_t image_size, file_image_len, patch_len;   // only with the patch area before the base: whole image (with bss and key page), length of the image part of the file, patch area length
     char build_id[33];         // First 16 bytes of the NSO build ID (hex); empty for older build outputs
     unsigned key_idx[4];       // key page index of each thread slot (K18, KTLS, KTLR, KGATE)
+    unsigned tp_slot;          // fixups TP_SLOT: 0 = slots in the pthread TSD at tpidrro_el0 (Apple), 2 = behind bionic's TLS_SLOT_APP (Android)
     const Elf64_Dyn *dyn;
     const Elf64_Sym *symtab;
     const char *strtab;
@@ -48,6 +49,14 @@ extern int g_nmod;
 static inline const char *dm_main_build(void) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) return g_mod[i].build_id; return ""; }
 // Four thread-local slots: K18 = the Switch's x18, KTLS = tpidr_el0, KTLR = tpidrro_el0 (ThreadLocalRegion), KGATE = host gate entry; the actual key numbers are written into the key page by the loader
 extern pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
+#ifdef __ANDROID__
+// Android (patch_nso.py DM_PATCH_TP=android): the slots are a host block per thread whose address sits in bionic's TLS_SLOT_APP (tpidr_el0 + 16); the "keys" are block indices 1..4 (loader.c)
+void dm_slot_set(pthread_key_t k, const void *v);
+static inline void *dm_slot_get(pthread_key_t k) { void **tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp)); void **b = tp[2]; return b ? b[k] : NULL; }
+#else
+#define dm_slot_set pthread_setspecific
+#define dm_slot_get pthread_getspecific
+#endif
 
 void load_modules(const char *dir, const char **names, int n);
 void run_module_inits(void);

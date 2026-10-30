@@ -4,6 +4,24 @@
 // VideoToolbox wants a format description built from SPS / PPS and NAL units with 4-byte length prefixes. Decoding is synchronous and yields pictures in decode order; MediaCodec yields them
 // in presentation order, so pictures wait in a queue sorted by presentation time and leave it once more than `depth` are queued (4 when the profile has B-frames, 0 for Baseline), or all at the end of the stream
 #include "hle.h"
+#ifndef __APPLE__
+// Android: no H.264 decoder yet (MediaCodec is the counterpart of VideoToolbox here); decoding fails, so the movie decoder reports the error and the game goes on without the pictures
+#include "hle_movie_avc.h"
+struct mavc { int red; };
+mavc *mavc_new(void) { mavc *a = calloc(1, sizeof *a); if (!a) die("movie: AVC decoder allocation failed"); return a; }
+void mavc_free(mavc *a) { free(a); }
+void mavc_param_sets(mavc *a, const uint8_t *p, size_t n) { (void)a; (void)p; (void)n; }
+void mavc_avcc(mavc *a, const uint8_t *p, size_t n) { (void)a; (void)p; (void)n; }
+int mavc_decode(mavc *a, const uint8_t *p, int n, int64_t pts_us) {
+    (void)p; (void)n; (void)pts_us;
+    if (!a->red++) LOG("[RED] movie: H.264 is not decoded on Android yet");
+    return -1;
+}
+int mavc_take(mavc *a, int flush, uint8_t *nv12, int w, int h, int64_t *pts_us) { (void)a; (void)flush; (void)nv12; (void)w; (void)h; (void)pts_us; return 0; }
+int mavc_queued(const mavc *a) { (void)a; return 0; }
+void mavc_set_rgba(mavc *a) { (void)a; }
+void mavc_drop(mavc *a) { (void)a; }
+#else
 #include <VideoToolbox/VideoToolbox.h>
 #include <arm_neon.h>
 #include "hle_movie_avc.h"
@@ -141,3 +159,4 @@ int mavc_take(mavc *a, int flush, uint8_t *dst, int w, int h, int64_t *pts_us) {
     CVPixelBufferRelease(pb);
     return 1;
 }
+#endif

@@ -4,11 +4,18 @@
 #include "hle.h"
 #include <arm_neon.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <unistd.h>
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
 #include "hle_movie_avc.h"   // H.264 on VideoToolbox
+#ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>   // AAC
+#else
+// Android: no AAC decoder yet (MediaCodec is the counterpart of AudioToolbox's converter here); AAC tracks play as silence
+typedef void *AudioConverterRef; typedef uint32_t UInt32; typedef struct { int64_t mStartOffset; uint32_t mVariableFramesInPacket, mDataByteSize; } AudioStreamPacketDescription;
+static void AudioConverterDispose(AudioConverterRef c) { (void)c; }
+#endif
 // Vorbis (movie audio tracks, Link's Awakening): stb_vorbis, built into this file (dm/third_party/stb_vorbis); only its push-data API, floats out
 #define STB_VORBIS_NO_STDIO
 #define STB_VORBIS_NO_PULLDATA_API
@@ -305,6 +312,7 @@ static int md_vorbis(mdec_t *d, const uint8_t *p, int n, int slot) {
     return 1;
 }
 // ---------- AAC ----------
+#ifdef __APPLE__
 // The demuxer hands over raw AAC frames (1024 samples each) and the AudioSpecificConfig in csd-0. AudioToolbox takes the configuration as an MPEG-4 ES descriptor (the magic cookie built
 // here as FFmpeg's AudioToolbox decoder builds it); without csd-0 an AAC-LC configuration is made from the sample rate and channel count
 static uint8_t *esds_descr(uint8_t *p, int tag, unsigned n) { *p++ = (uint8_t)tag; for (int i = 3; i > 0; i--) *p++ = (uint8_t)(n >> (7 * i) | 0x80); *p++ = (uint8_t)(n & 0x7f); return p; }
@@ -353,6 +361,13 @@ static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
     d->out[slot].bytes = (size_t)frames * 2 * d->ch;
     return frames > 0;
 }
+#else
+static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
+    (void)p; (void)n; (void)slot;
+    if (!d->red_vb++) LOG("[RED] movie: AAC is not decoded on Android yet, outputting silence");
+    return 0;
+}
+#endif
 // The H.264 decoder, made by Configure (when the stream's parameter sets come with it) or by the first packet; RGBA pictures in the native texture mode either way.
 // Absolum's movies bring csd-0 / csd-1 to Configure, and a decoder made there used to stay NV12: the frames' bytes went into the RGBA texture as they were
 static void md_avc_open(mdec_t *d) { if (!d->avc) { d->avc = mavc_new(); if (d->fmt == MD_FMT_ABGR) mavc_set_rgba(d->avc); } }

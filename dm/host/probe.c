@@ -7,7 +7,7 @@
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
-#if !TARGET_OS_IPHONE
+#if TARGET_OS_OSX
 #include <mach/mach_vm.h>   // the write watch (DM_PROBE_WATCH): iOS's SDK has no mach_vm.h
 #endif
 #include <pthread.h>
@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 void crash_set_trap_hook(int (*fn)(ucontext_t *uc));
-#if !TARGET_OS_IPHONE
+#if TARGET_OS_OSX
 // Syntax module:offset[@x0 offset]. Put a brk at the guest address; on hit print x0..x3 (and the readable strings they point to) and a backtrace, then execute the original instruction from a trampoline slot and jump back.
 // The trampoline borrows x16: place probes only at function entries or at points where x16 is dead; the original instruction must not be PC-relative (adr/adrp/b/bl/ldr literal/cbz...).
 #define MAX_PROBE 16
@@ -286,7 +286,7 @@ static void watch_install(void) {
 #endif
 
 void probe_install(void) {
-#if !TARGET_OS_IPHONE
+#if TARGET_OS_OSX
     crash_set_trap_hook(probe_hit);
     const char *e = getenv("DM_PROBE");
     if (e) {

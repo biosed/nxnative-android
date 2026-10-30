@@ -1,11 +1,8 @@
 // Import resolution (implemented ones go to the host, the rest go to named stubs) and host gate dispatch.
-#include "dm.h"
-#include <mach-o/getsect.h>
-#include <mach-o/ldsyms.h>
+#include "hle.h"
 #include <dlfcn.h>
 #include <time.h>
 
-typedef struct { const char *name; void *fn; } hle_ent;
 
 // ---------- Unimplemented imports: named stubs (the statically assembled stub table in entry.S, the k-th = movz x9,#k; b unimpl_entry) ----------
 #define MAX_STUB 4096                 // Matches the .rept count in entry.S
@@ -27,7 +24,7 @@ static uint64_t g_cache[MAX_MOD][8192];
 
 uint64_t resolve_import(module_t *m, const char *name) {
     static const hle_ent *sec; static unsigned long secsz;
-    if (!sec) sec = (const hle_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swhle", &secsz);
+    if (!sec) sec = (const hle_ent *)DM_SECTION_DATA(swhle, &secsz);
     for (unsigned i = 0; i < secsz / sizeof(hle_ent); i++)
         if (!strcmp(sec[i].name, name)) {
             if (g_flag.imports) { Dl_info di; dladdr(sec[i].fn, &di); LOG("import %s -> %s", name, di.dli_sname); }
@@ -46,7 +43,7 @@ uint64_t resolve_import(module_t *m, const char *name) {
 
 // The host implements this import (the swhle table), without allocating a stub for it
 int hle_implements(const char *name) {
-    unsigned long secsz; const hle_ent *sec = (const hle_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swhle", &secsz);
+    unsigned long secsz; const hle_ent *sec = (const hle_ent *)DM_SECTION_DATA(swhle, &secsz);
     for (unsigned i = 0; sec && i < secsz / sizeof(hle_ent); i++) if (!strcmp(sec[i].name, name)) return 1;
     return 0;
 }

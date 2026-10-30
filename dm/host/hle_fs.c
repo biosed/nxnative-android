@@ -288,7 +288,7 @@ static int set_guest_name(const char *hp, const char *path) {
     memcpy(guest, start, k); guest[k] = 0;
     const char *physical = strrchr(hp, '/') + 1;
     if (strcmp(physical, guest)) return setxattr(hp, FS_GUEST_NAME, guest, strlen(guest), 0, XATTR_NOFOLLOW);
-    if (!removexattr(hp, FS_GUEST_NAME, XATTR_NOFOLLOW) || errno == ENOATTR) return 0;
+    if (!removexattr(hp, FS_GUEST_NAME, XATTR_NOFOLLOW) || errno == ENOATTR || errno == ENOTSUP || errno == EOPNOTSUPP) return 0;   // a file system without xattrs (Android's /data for a shell) holds no stale name either
     return -1;
 }
 static Result err_res(const char *op, const char *path) {

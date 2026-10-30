@@ -4,9 +4,26 @@
 #pragma once
 #include "dm.h"
 typedef struct { const char *name; void *fn; } hle_ent;
+// Registration tables are linker sections: Mach-O "__DATA,<name>" (read with getsectiondata), ELF "<name>" (Android: read between __start_<name> and __stop_<name>)
+#ifdef __APPLE__
+#define DM_SECTION(name) section("__DATA," #name)
+#define DM_ASM_SYM(name) "_" #name
+#define DM_ASM_ADDR(reg, name) "    adrp " reg ", _" #name "@PAGE\n    add " reg ", " reg ", _" #name "@PAGEOFF\n"
+#define DM_ASM_HIDDEN ".private_extern"
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
+#define DM_SECTION_DATA(name, szp) ((const void *)getsectiondata(&_mh_execute_header, "__DATA", #name, (szp)))
+#else
+#define DM_SECTION(name) section(#name), retain
+#define DM_ASM_SYM(name) #name
+#define DM_ASM_ADDR(reg, name) "    adrp " reg ", " #name "\n    add " reg ", " reg ", :lo12:" #name "\n"
+#define DM_ASM_HIDDEN ".hidden"
+#define DM_SECTION_DATA(name, szp) ({ extern const char __start_##name[] __attribute__((weak, visibility("hidden"))), __stop_##name[] __attribute__((weak, visibility("hidden"))); \
+                                      *(szp) = (unsigned long)(__stop_##name - __start_##name); (const void *)__start_##name; })
+#endif
 #define HLE(mangled, ret, cname, ...)                                                             \
     static ret cname(__VA_ARGS__);                                                                \
-    __attribute__((used, section("__DATA,swhle"))) static const hle_ent hle_ent_##cname = {mangled, (void *)cname}; \
+    __attribute__((used, DM_SECTION(swhle))) static const hle_ent hle_ent_##cname = {mangled, (void *)cname}; \
     static ret cname(__VA_ARGS__)
 
 typedef uint32_t Result;   // nn::Result: w0, 0 = success
@@ -34,16 +51,16 @@ void guest_clock_read_wait(void);     // A guest read of the system counter: wai
 typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
 #define HLE_FORCE(mangled, why, ret, cname, ...)                                                   \
     static ret cname(__VA_ARGS__);                                                                \
-    __attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (void *)cname, why}; \
+    __attribute__((used, DM_SECTION(swforce))) static const hle_force_ent hle_force_##cname = {mangled, (void *)cname, why}; \
     static ret cname(__VA_ARGS__)
 // Same as above, but the implementation runs on this thread's big host stack (hle_bigstack.c): what is registered is a stub generated at compile time (the implementation's address goes into x16, then a jump to dm_bigstack_enter).
 // For take-overs with large stack use (the file system sizes its buffers by PATH_MAX): a game thread's stack can be as small as 8 KB. Only register arguments are carried over (<= 8 integer, <= 8 floating point); not for variadic functions
 #define HLE_FORCE_BIG(mangled, why, ret, cname, ...)                                               \
     static ret cname(__VA_ARGS__) __attribute__((used));                                          \
     extern const char cname##_bs[];                                                               \
-    __asm__(".text\n.p2align 2\n.globl _" #cname "_bs\n.private_extern _" #cname "_bs\n_" #cname "_bs:\n" \
-            "    adrp x16, _" #cname "@PAGE\n    add x16, x16, _" #cname "@PAGEOFF\n    b _dm_bigstack_enter\n"); \
-    __attribute__((used, section("__DATA,swforce"))) static const hle_force_ent hle_force_##cname = {mangled, (const void *)cname##_bs, why}; \
+    __asm__(".text\n.p2align 2\n.globl " DM_ASM_SYM(cname##_bs) "\n" DM_ASM_HIDDEN " " DM_ASM_SYM(cname##_bs) "\n" DM_ASM_SYM(cname##_bs) ":\n" \
+            DM_ASM_ADDR("x16", cname) "    b " DM_ASM_SYM(dm_bigstack_enter) "\n"); \
+    __attribute__((used, DM_SECTION(swforce))) static const hle_force_ent hle_force_##cname = {mangled, (const void *)cname##_bs, why}; \
     static ret cname(__VA_ARGS__)
 
 // Operation mode (0 handheld / 1 docked): owned by hle_oe.c, and the hid controller style follows it; the front end can switch it at runtime
