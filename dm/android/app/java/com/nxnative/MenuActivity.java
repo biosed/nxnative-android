@@ -2,6 +2,8 @@
 // cheats of the game's build (each one chosen by the player, none on by default) and "no volver a mostrar". The choices go to <files>/settings.env, which the game's
 // native activity (app/front_android.c, process ":game") reads at boot. The menu stays under the game: when the game ends (− and + held two seconds) it shows again.
 // On first start the bundled save (assets/save, the player's progress from another device) seeds the app's save folder; the cheat file is refreshed from assets/cheats.txt.
+// An APK with the game inside (make_apk.py --bundle: assets/game/ and its list files.txt) unpacks it into the external folder on its first start, and again after an update,
+// with a progress bar; Jugar waits for it.
 // The menu works with the touch screen and with a controller (A confirms, B goes back, START plays). The screen stays on while it is open, as in the game.
 package com.nxnative;
 
@@ -43,6 +45,7 @@ public class MenuActivity extends Activity {
     private boolean launched;
     private Button playButton;
     private boolean playKeyDown;
+    private TextView status; private android.widget.ProgressBar bar; private volatile boolean unpacking;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -50,6 +53,7 @@ public class MenuActivity extends Activity {
         prefs = getSharedPreferences("menu", MODE_PRIVATE);
         seedFiles();
         buildUi();
+        if (needsUnpack()) { unpack(); return; }
         boolean forced = new File(getFilesDir(), "show_menu").delete();
         if (prefs.getBoolean("skip", false) && !forced && b == null && gameFilesPresent()) play();
     }
@@ -81,6 +85,49 @@ public class MenuActivity extends Activity {
             byte[] buf = new byte[65536]; int n;
             while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
         } catch (Exception e) { /* not bundled */ }
+    }
+    // ---- The game inside the APK ----
+    private long versionCode() { try { return getPackageManager().getPackageInfo(getPackageName(), 0).getLongVersionCode(); } catch (Exception e) { return 0; } }
+    private boolean bundled() { try (InputStream in = getAssets().open("game/files.txt")) { return true; } catch (Exception e) { return false; } }
+    private boolean needsUnpack() {
+        if (!bundled()) return false;
+        File mark = new File(getExternalFilesDir(null), ".unpacked");
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(new java.io.FileInputStream(mark), StandardCharsets.UTF_8))) { return !String.valueOf(versionCode()).equals(r.readLine()); }
+        catch (Exception e) { return true; }
+    }
+    private void unpack() {
+        unpacking = true; playButton.setEnabled(false);
+        status.setVisibility(View.VISIBLE); bar.setVisibility(View.VISIBLE);
+        status.setText("Preparando el juego por primera vez (solo esta vez, unos minutos)...");
+        new Thread(() -> {
+            String err = null;
+            try {
+                List<String[]> files = new ArrayList<>(); long total = 0;
+                try (BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open("game/files.txt"), StandardCharsets.UTF_8))) {
+                    String l; while ((l = r.readLine()) != null) { String[] f = l.split("\t"); if (f.length == 2) { files.add(f); total += Long.parseLong(f[1]); } }
+                }
+                File ext = getExternalFilesDir(null);
+                if (ext.getUsableSpace() < total + (200L << 20)) throw new Exception(String.format(Locale.ROOT, "No hay espacio: se necesitan %.1f GB libres.", total / 1e9));
+                new File(ext, ".unpacked").delete();
+                long done = 0; byte[] buf = new byte[1 << 20]; int lastPct = -1;
+                for (String[] f : files) {
+                    File to = new File(ext, f[0]); to.getParentFile().mkdirs();
+                    try (InputStream in = getAssets().open("game/" + f[0], AssetManager.ACCESS_STREAMING); OutputStream out = new FileOutputStream(to)) {
+                        int n; while ((n = in.read(buf)) > 0) { out.write(buf, 0, n); done += n;
+                            int pct = (int) (done * 100 / Math.max(1, total));
+                            if (pct != lastPct) { lastPct = pct; final int p = pct; final long d = done, t = total; runOnUiThread(() -> { bar.setProgress(p);
+                                status.setText(String.format(Locale.ROOT, "Preparando el juego por primera vez: %d%% (%.1f de %.1f GB)", p, d / 1e9, t / 1e9)); }); } }
+                    }
+                }
+                try (OutputStream o = new FileOutputStream(new File(ext, ".unpacked"))) { o.write((versionCode() + "\n").getBytes(StandardCharsets.UTF_8)); }
+            } catch (Exception e) { err = e.getMessage() != null ? e.getMessage() : e.toString(); }
+            final String fe = err;
+            runOnUiThread(() -> {
+                unpacking = false;
+                if (fe != null) { status.setText("No se pudo preparar el juego: " + fe); status.setTextColor(Color.rgb(255, 120, 120)); return; }
+                status.setText("Juego listo."); bar.setVisibility(View.GONE); playButton.setEnabled(true); playButton.requestFocus();
+            });
+        }).start();
     }
     private boolean gameFilesPresent() {
         File ext = getExternalFilesDir(null);
@@ -126,7 +173,9 @@ public class MenuActivity extends Activity {
         sv.addView(col, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         col.addView(text(getApplicationInfo().loadLabel(getPackageManager()) + " — Configuración", 24, true));
         col.addView(text("Elige cómo quieres jugar. Durante el juego, mantén − y + dos segundos para volver aquí.", 14, false));
-        if (!gameFilesPresent()) {
+        status = text("", 15, true); status.setVisibility(View.GONE); col.addView(status);
+        bar = new android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal); bar.setMax(100); bar.setVisibility(View.GONE); col.addView(bar);
+        if (!gameFilesPresent() && !bundled()) {
             TextView w = text("Faltan los archivos del juego en " + getExternalFilesDir(null) + " (romfs, dm, vk). Cópialos desde la computadora y vuelve a abrir la app.", 15, true);
             w.setTextColor(Color.rgb(255, 120, 120)); col.addView(w);
         }
@@ -180,6 +229,7 @@ public class MenuActivity extends Activity {
         try (OutputStream o = new FileOutputStream(new File(getFilesDir(), "settings.env"))) { o.write(env.getBytes(StandardCharsets.UTF_8)); } catch (Exception e) { /* the defaults apply */ }
     }
     private void play() {
+        if (unpacking) return;
         if (!new File(getFilesDir(), "settings.env").exists()) save();
         launched = true;
         Intent i = new Intent(); i.setClassName(this, "android.app.NativeActivity");

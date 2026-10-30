@@ -2,7 +2,8 @@
 // (MenuActivity.java, in the app's main process) writes the player's choices to <files>/settings.env and starts this activity; here the environment is set from it, the
 // host runs on a big-stack thread, the window goes to the Vulkan backend (front_native_window), and controllers -- the console's own and any other, an Xbox one over
 // USB or Bluetooth -- reach the game through dm_pad_set, by position as on the Mac and iOS (bottom B, right A, top X, left Y).
-// Holding − and + together for two seconds goes back to the menu: the game process ends (progress the game has saved is kept) and the menu opens with the options shown.
+// Phones without a controller get on-screen controls (front_overlay, drawn by the Vulkan backend over the picture): they show at the first touch and hide again
+// when a controller is used. Holding − and + together for two seconds goes back to the menu: the game process ends (progress the game has saved is kept) and the menu opens with the options shown.
 // Game files live in the app's external folder (<external>/romfs, dm, vk, font), the saves in its internal one (<files>/save); the log goes to <external>/log.txt.
 #include "dm.h"
 #include "dm_input.h"
@@ -61,6 +62,7 @@ static uint64_t key_bit(int32_t k) {
     return 0;
 }
 static uint64_t g_combo_since;
+static int g_touch_slot = -1;   // the device slot of the on-screen controls
 static void back_to_menu(void);
 // A press is held at least 50 ms (three frames; latch_thread lets it go, and times the − + hold): the game reads the controller many times a frame (about 40 for Hollow Knight) and acts on one
 // of those reads, so a shorter tap could fall between them
@@ -102,10 +104,69 @@ static void pads_push_(void) {
     else if (!g_combo_since) g_combo_since = now_ns();
     else if (now_ns() - g_combo_since > 2000000000ull) back_to_menu();
 }
+// ---------- On-screen controls ----------
+// Laid out from the window's height h: the D-pad bottom left, A B X Y bottom right (by position, as on the Switch), L / ZL and R / ZR in the top corners, − and + top centre
+typedef struct { float x, y, w, h; int on; char label[3]; } dm_ovl;
+enum { NVB = 15 };
+static struct { const char *label; uint64_t bit; float cx, cy; } g_vb[NVB];
+static _Atomic int g_ovl_show; static _Atomic uint64_t g_ovl_on; static float g_vw, g_vh, g_vr, g_dx, g_dy;
+static void vb_layout(void) {
+    ANativeWindow *w = front_native_window(NULL); if (!w) return;
+    float W_ = (float)ANativeWindow_getWidth(w), H = (float)ANativeWindow_getHeight(w);
+    if (W_ == g_vw && H == g_vh) return;
+    g_vw = W_; g_vh = H; g_vr = 0.065f * H; float o = 0.12f * H, fx = W_ - 0.24f * H, fy = H - 0.25f * H;
+    g_dx = 0.24f * H; g_dy = H - 0.25f * H;
+    int i = 0;
+    #define VB(l, b, x, y) g_vb[i++] = (typeof(g_vb[0])){l, b, x, y}
+    VB("A", DM_BTN_A, fx + o, fy); VB("B", DM_BTN_B, fx, fy + o); VB("X", DM_BTN_X, fx, fy - o); VB("Y", DM_BTN_Y, fx - o, fy);
+    VB("L", DM_BTN_L, 0.11f * H, 0.11f * H); VB("ZL", DM_BTN_ZL, 0.11f * H, 0.28f * H); VB("R", DM_BTN_R, W_ - 0.11f * H, 0.11f * H); VB("ZR", DM_BTN_ZR, W_ - 0.11f * H, 0.28f * H);
+    VB("-", DM_BTN_MINUS, W_ / 2 - 0.1f * H, 0.08f * H); VB("+", DM_BTN_PLUS, W_ / 2 + 0.1f * H, 0.08f * H);
+    VB("", DM_BTN_UP, g_dx, g_dy - o); VB("", DM_BTN_DOWN, g_dx, g_dy + o); VB("", DM_BTN_LEFT, g_dx - o, g_dy); VB("", DM_BTN_RIGHT, g_dx + o, g_dy);
+    VB("", 0, g_dx, g_dy);
+    #undef VB
+}
+// What the backend draws over the picture: one box per control, in window pixels (0 = hidden)
+int front_overlay(dm_ovl *out, int max) {
+    if (!atomic_load(&g_ovl_show)) return 0;
+    vb_layout(); uint64_t on = atomic_load(&g_ovl_on); int n = 0;
+    for (int i = 0; i < NVB && n < max; i++) {
+        dm_ovl *b = &out[n++]; float r = g_vb[i].bit ? g_vr : g_vr * 0.6f;
+        *b = (dm_ovl){g_vb[i].cx - r, g_vb[i].cy - r, 2 * r, 2 * r, g_vb[i].bit && (on & g_vb[i].bit) != 0, ""};
+        snprintf(b->label, sizeof b->label, "%s", g_vb[i].label);
+    }
+    return n;
+}
+// Every finger on the screen: the buttons under it; on the D-pad its direction (eight ways) and the left stick, from the finger's offset to the pad's centre
+static void touch_event(AInputEvent *e) {
+    vb_layout();
+    int32_t act = AMotionEvent_getAction(e), kind = act & AMOTION_EVENT_ACTION_MASK, up_idx = -1;
+    if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_CANCEL) up_idx = -2;
+    else if (kind == AMOTION_EVENT_ACTION_POINTER_UP) up_idx = (act & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+    uint64_t btn = 0; float sx = 0, sy = 0;
+    if (up_idx != -2) for (size_t p = 0; p < AMotionEvent_getPointerCount(e); p++) {
+        if ((int32_t)p == up_idx) continue;
+        float x = AMotionEvent_getX(e, p), y = AMotionEvent_getY(e, p), ddx = x - g_dx, ddy = y - g_dy;
+        if (fabsf(ddx) < 0.24f * g_vh && fabsf(ddy) < 0.24f * g_vh) {
+            float m = hypotf(ddx, ddy), dz = 0.03f * g_vh;
+            if (m > dz) { if (ddx < -0.4f * m) btn |= DM_BTN_LEFT; if (ddx > 0.4f * m) btn |= DM_BTN_RIGHT; if (ddy < -0.4f * m) btn |= DM_BTN_UP; if (ddy > 0.4f * m) btn |= DM_BTN_DOWN;
+                          float k = fminf(1.f, m / (0.12f * g_vh)); sx = ddx / m * k; sy = ddy / m * k; }
+            continue;
+        }
+        for (int i = 0; i < 10; i++) if (fabsf(x - g_vb[i].cx) < 1.3f * g_vr && fabsf(y - g_vb[i].cy) < 1.3f * g_vr) btn |= g_vb[i].bit;
+    }
+    if (g_touch_slot < 0) g_touch_slot = dev_slot(-1000000);
+    g_dev[g_touch_slot].btn = btn & ~(uint64_t)(DM_BTN_LEFT | DM_BTN_RIGHT | DM_BTN_UP | DM_BTN_DOWN) ;
+    g_dev[g_touch_slot].btn |= btn & (DM_BTN_LEFT | DM_BTN_RIGHT | DM_BTN_UP | DM_BTN_DOWN);
+    g_dev[g_touch_slot].ax[AX_LX] = sx; g_dev[g_touch_slot].ax[AX_LY] = sy;
+    atomic_store(&g_ovl_on, btn); atomic_store(&g_ovl_show, 1);
+    pads_push();
+}
 static int on_input(AInputEvent *e) {
     int32_t type = AInputEvent_getType(e), src = AInputEvent_getSource(e);
     static int seen; if (!seen++) LOG("front end: first input event (type %d, source %#x)", type, src);
     int s = dev_slot(AInputEvent_getDeviceId(e));
+    if (type == AINPUT_EVENT_TYPE_MOTION && (src & AINPUT_SOURCE_TOUCHSCREEN) == AINPUT_SOURCE_TOUCHSCREEN) { touch_event(e); return 1; }
+    if (src & (AINPUT_SOURCE_GAMEPAD | AINPUT_SOURCE_JOYSTICK | AINPUT_SOURCE_DPAD)) atomic_store(&g_ovl_show, 0);   // a controller in use: the on-screen controls go
     if (type == AINPUT_EVENT_TYPE_KEY) {
         uint64_t b = key_bit(AKeyEvent_getKeyCode(e)); if (!b) return AKeyEvent_getKeyCode(e) == AKEYCODE_BACK;
         if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN) g_dev[s].btn |= b; else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP) g_dev[s].btn &= ~b;

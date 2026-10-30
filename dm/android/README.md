@@ -1,6 +1,6 @@
 # Android host (bring-up)
 
-The host in `dm/host` and `dm/gfx` built for Android (arm64, API 33) with the NDK. Status: the game's code runs
+The host in `dm/host` and `dm/gfx` built for Android (arm64, API 30 = Android 11 and newer, Vulkan 1.1 and newer) with the NDK. Status: the game's code runs
 natively, with sound (AAudio), saves and a Vulkan graphics backend (`src_vk/nvn_vk.c`), as an app (`app/`, `tools/make_apk.py`)
 or an adb program. Checked with Hollow Knight 1.5.12620 on an ANBERNIC RG Slide (Unisoc T820, Mali-G57, Android 13): the app
 plays it in handheld mode at about 59 fps (GPU 16 ms a frame in Dirtmouth), with controllers, the start-up menu and cheats.
@@ -55,8 +55,11 @@ The log goes to stderr, as on the Mac. `tests/t_tls_slot.c` checks a device for 
 
 ## The app
 
-`app/front_android.c` is the NativeActivity (process `:game`): window → Vulkan swapchain, controllers by position (the
-console's own and any other, e.g. an Xbox pad), − and + held two seconds → back to the menu. `app/java/com/nxnative/MenuActivity.java`
+`app/front_android.c` is the NativeActivity (process `:game`): window → Vulkan swapchain (Android rotates it on phones whose
+screen is portrait by nature), controllers by position (the console's own and any other, e.g. an Xbox pad), on-screen
+controls drawn over the picture at the first touch (hidden again when a controller is used), − and + held two seconds →
+back to the menu. Without dynamic rendering (Vulkan 1.1 / 1.2 GPUs without `VK_KHR_dynamic_rendering`) the backend uses
+render passes made per pass; `DM_VK_NO_DYNREND=1` forces that path for testing. `app/java/com/nxnative/MenuActivity.java`
 is the Spanish start-up menu (mode, frame rate, screen fit, language, frame-rate counter, the build's cheats, "no volver a
 mostrar"); it writes `<files>/settings.env`, seeds `<files>/save` from `assets/save` on first start and copies `assets/cheats.txt`.
 
@@ -66,6 +69,10 @@ python3 dm/android/tools/make_apk.py <id> <NSP folder>/<id>_build <out>.apk --la
 adb install -r <out>.apk
 python3 dm/android/tools/make_apk.py --deploy <id> <NSP folder>/<id>_build   # game files into /sdcard/Android/data/<package>/files
 ```
+
+`--bundle` puts the game files inside the APK instead (deflated: Hollow Knight's 3.6 GB make a 1.06 GB APK; Android takes
+APKs below 4 GB): one file to install without a computer, which the menu unpacks on its first start. `--test` makes a
+`<package>.prueba` copy that installs beside the real app.
 
 The log is `/sdcard/Android/data/<package>/files/log.txt`; an `env.txt` beside it (KEY=VALUE lines) sets diagnostic switches.
 

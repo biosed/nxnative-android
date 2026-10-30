@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # The Android app of one game: the menu (app/java), the host library (make -C dm/android GAME=<id>), the game's icon, and optionally a save to start from and a cheat file,
 # signed with a development key. The game files are not in the APK (several GB): the deploy step copies them into the app's external folder over adb.
-#   make_apk.py <id> <NSP build folder> <out.apk> [--save <folder>] [--cheats <file>] [--label <name>]
+#   make_apk.py <id> <NSP build folder> <out.apk> [--save <folder>] [--cheats <file>] [--label <name>] [--bundle]
+#     --bundle: the game files go inside the APK too (assets/game/, deflated, listed in assets/game/files.txt) and the menu unpacks them on the first start: one file, no
+#     computer needed. --test: package <package>.prueba, label "(prueba)": installs beside the real app without touching it. Android takes APKs below 4 GB only; past 2 GB the ZIP stays without ZIP64 records (apksigner and the installer read it as a plain ZIP)
 #   make_apk.py --deploy <id> <NSP build folder> [--from-device <folder on the device that already has romfs/dm/vk/font>]
 # Tools: Homebrew's android-commandlinetools (build-tools 34, platform 33) and openjdk@21; the key is <NSP folder>/../android-debug.keystore (made once, kept so updates install over)
 import argparse, glob, os, re, shutil, subprocess, sys, tempfile, zipfile
@@ -11,12 +13,12 @@ BT = os.path.join(SDK, 'build-tools', '34.0.0'); JAR = os.path.join(SDK, 'platfo
 JAVA = os.environ.get('JAVA_HOME', '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home')
 ENV = dict(os.environ, JAVA_HOME=JAVA, PATH=os.path.join(JAVA, 'bin') + os.pathsep + os.environ['PATH'])
 def run(*a, **k): subprocess.run([str(x) for x in a], check=True, env=ENV, **k)
-def package(gid): return 'com.nxnative.t' + gid.lower()
+def package(gid, test=False): return 'com.nxnative.t' + gid.lower() + ('.prueba' if test else '')   # test: installs beside the real app, its own data
 
 MANIFEST = '''<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{pkg}" android:versionCode="{vc}" android:versionName="{vn}">
-  <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="33"/>
-  <uses-feature android:name="android.hardware.vulkan.version" android:version="0x403000" android:required="true"/>
+  <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="33"/>
+  <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true"/>
   <application android:label="{label}" android:icon="@mipmap/icon" android:hasCode="true" android:extractNativeLibs="true" android:isGame="true"
                android:appCategory="game" android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
     <activity android:name="com.nxnative.MenuActivity" android:exported="true" android:screenOrientation="sensorLandscape"
@@ -35,9 +37,9 @@ def build(a):
     lib = os.path.join(ANDROID, 'gen', a.id, 'libdmhost.so')
     if not os.path.exists(lib): sys.exit(f'[RED] {lib} missing: make -C dm/android GAME={a.id} first')
     w = tempfile.mkdtemp(prefix='apk_', dir=os.environ.get('WORK'))
-    label = a.label or a.id
+    label = (a.label or a.id) + (' (prueba)' if a.test else '')
     vc = int(subprocess.run(['date', '+%y%m%d%H'], capture_output=True, text=True).stdout.strip())   # each build installs over the last
-    open(os.path.join(w, 'AndroidManifest.xml'), 'w').write(MANIFEST.format(pkg=package(a.id), vc=vc, vn='0.1.' + str(vc), label=label.replace('&', '&amp;')))
+    open(os.path.join(w, 'AndroidManifest.xml'), 'w').write(MANIFEST.format(pkg=package(a.id, a.test), vc=vc, vn='0.1.' + str(vc), label=label.replace('&', '&amp;')))
     res = os.path.join(w, 'res', 'mipmap'); os.makedirs(res)
     icon = (glob.glob(os.path.join(a.build, 'extract', '*', 'icon.jpg')) or [None])[0]
     if icon: run('sips', '-s', 'format', 'png', '-Z', '192', icon, '--out', os.path.join(res, 'icon.png'), stdout=subprocess.DEVNULL)
@@ -56,6 +58,12 @@ def build(a):
             for f in sorted(os.listdir(a.save)):
                 p = os.path.join(a.save, f)
                 if os.path.isfile(p): z.write(p, 'assets/save/' + f)
+        if a.bundle:
+            listing = []
+            for rel, src in game_files(a.build):
+                z.write(src, 'assets/game/' + rel); listing.append(f'{rel}\t{os.path.getsize(src)}')
+            z.writestr('assets/game/files.txt', '\n'.join(listing) + '\n')
+    if os.path.getsize(base) >= 0xFFFFFFFF: sys.exit(f'[RED] the APK would be {os.path.getsize(base) / 1e9:.1f} GB: Android installs APKs below 4 GB only')
     aligned = os.path.join(w, 'aligned.apk')
     run(os.path.join(BT, 'zipalign'), '-f', '-p', '4', base, aligned)
     ks = os.path.join(os.path.dirname(os.path.abspath(a.build)), '..', 'android-debug.keystore'); ks = os.path.abspath(ks)
@@ -64,7 +72,17 @@ def build(a):
             '-validity', '10000', '-dname', 'CN=nxnative development', stdout=subprocess.DEVNULL)
     run(os.path.join(BT, 'apksigner'), 'sign', '--ks', ks, '--ks-pass', 'pass:android', '--key-pass', 'pass:android', '--ks-key-alias', 'nxnative', '--out', a.out, aligned)
     shutil.rmtree(w, ignore_errors=True)
-    print(f'{a.out}: {package(a.id)} "{label}", {os.path.getsize(a.out) / 1e6:.1f} MB' + (f', save from {a.save}' if a.save else '') + (f', cheats {os.path.basename(a.cheats)}' if a.cheats else ''))
+    print(f'{a.out}: {package(a.id, a.test)} "{label}", {os.path.getsize(a.out) / 1e6:.1f} MB' + (f', save from {a.save}' if a.save else '') + (f', cheats {os.path.basename(a.cheats)}' if a.cheats else ''))
+
+def game_files(b):   # (path in the app's external folder, source) for every game file
+    vk = glob.glob(os.path.join(b, 'shader', 'vk'))[0]; out = []
+    for f in sorted(glob.glob(os.path.join(b, 'patched_android', '*.patched.bin')) + glob.glob(os.path.join(b, 'patched_android', '*.tsv'))): out.append(('dm/' + os.path.basename(f), f))
+    for f in sorted(glob.glob(os.path.join(vk, '*.spv')) + glob.glob(os.path.join(vk, '*.vk.txt'))): out.append(('vk/' + os.path.basename(f), f))
+    for f in sorted(glob.glob(os.path.join(b, 'font', '*'))): out.append(('font/' + os.path.basename(f), f))
+    romfs = glob.glob(os.path.join(b, 'extract', '*', 'RomFS'))[-1]
+    for root, _, fs in os.walk(romfs):
+        for f in sorted(fs): p = os.path.join(root, f); out.append(('romfs/' + os.path.relpath(p, romfs), p))
+    return out
 
 def deploy(a):
     ext = f'/sdcard/Android/data/{package(a.id)}/files'
@@ -89,5 +107,6 @@ if len(sys.argv) > 1 and sys.argv[1] == '--deploy':
     ap.add_argument('--deploy', action='store_true'); ap.add_argument('id'); ap.add_argument('build'); ap.add_argument('--from-device')
     deploy(ap.parse_args())
 else:
-    ap.add_argument('id'); ap.add_argument('build'); ap.add_argument('out'); ap.add_argument('--save'); ap.add_argument('--cheats'); ap.add_argument('--label')
+    ap.add_argument('id'); ap.add_argument('build'); ap.add_argument('out'); ap.add_argument('--save'); ap.add_argument('--cheats'); ap.add_argument('--label'); ap.add_argument('--bundle', action='store_true'); ap.add_argument('--test', action='store_true')
+    zipfile.ZIP64_LIMIT = 0xFFFFFFFE   # Python writes ZIP64 records from 2 GB on; a plain ZIP holds offsets and sizes up to 4 GB
     build(ap.parse_args())

@@ -1,8 +1,8 @@
 # Android host: the shared host sources (dm/host, dm/gfx) built with the NDK into libdmhost.so, the native library of the Android app (make GAME=<base game title ID>, as dm/host).
 # Apple APIs come from compat/ (README there); Android's own parts (front end, graphics backend) are the sources in this folder.
-# NDK: NDK=<path>, default Homebrew's android-ndk cask. API level 33 (Android 13, the oldest the host is checked on)
+# NDK: NDK=<path>, default Homebrew's android-ndk cask. API level 30 (Android 11: bionic leaves TLS_SLOT_APP to apps from Android 10, renameat2 and sem_clockwait arrive in 11)
 NDK ?= /opt/homebrew/share/android-ndk
-API ?= 33
+API ?= 30
 TC := $(NDK)/toolchains/llvm/prebuilt/darwin-x86_64/bin
 CC := $(TC)/aarch64-linux-android$(API)-clang
 AR := $(TC)/llvm-ar
