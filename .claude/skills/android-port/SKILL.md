@@ -20,7 +20,8 @@ user gets follows the standard below; do not ship one that lacks any of it.
 - **Every Android device, not only the RG Slide**: arm64, Android 11+ (API 30), Vulkan 1.1+. Snapdragon (Adreno), MediaTek
   and Exynos (Mali / Xclipse / PowerVR), Tensor, Unisoc. Any GPU feature is checked at run time and has a fallback
   (render passes without dynamic rendering, CPU decode of formats the GPU cannot sample, optional uint8 indices).
-- **One APK** with the game inside (`make_apk.py --bundle`, under 4 GB), the player's latest save bundled when they have
+- **One APK** with the game inside (`make_apk.py --bundle`, under 4 GB; it stores every repeated piece once, which brought
+  Metroid Dread's 4.7 GB deflated down to 3.4 GB), the player's latest save bundled when they have
   one, on the user's USB (`/Volumes/JOAQUIN2026/<Game> (Android)/` with a Spanish `LEEME.txt`), replacing older versions.
 
 ## Procedure
@@ -39,7 +40,8 @@ Paths: `<B>` = `<NSP folder>/<id>_build` (made by `scripts/build_ipa_from_nsp.py
 3. **Build the host library**: `DM_GAMES_DIR=<B>/profile make -C dm/android GAME=<id>`.
 4. **Cheats**: `~/MacNativeGames/Cheats/titles/<id>/cheats/<build>.txt`, or ones made for the build by memory search (as for
    Hollow Knight). **Save**: the player's newest one (Mac app saves are in `~/Library/Application Support/<Game>/save`);
-   copy it to `<NSP folder>/Partida para Android/` first.
+   copy it to `<NSP folder>/Partida para Android/` first (folders inside it, such as Dread's `profile0/`, are kept). The
+   player needs the unpacked game's size free on the device on top of the APK.
 5. **Test copy on the RG Slide** (adb over USB; installs beside the user's app and never touches it):
    ```bash
    python3 dm/android/tools/make_apk.py <id> <B> <B>/vkwork/prueba.apk --bundle --test --label "<Game>" --save ... --cheats ...
@@ -53,6 +55,14 @@ Paths: `<B>` = `<NSP folder>/<id>_build` (made by `scripts/build_ipa_from_nsp.py
 6. **Final APK** without `--test`, onto the USB with the LEEME (requirements, install without a computer, controls, save,
    cheats warning, what is not working yet). Commit the repository changes when the user asks.
 
+## When the picture is wrong
+
+`env.txt` switches in the app's external folder: `DM_VK_PASSLOG=<frame>` logs that frame's passes and draws (targets,
+clears, shaders, depth / stencil / blend), `DM_VK_RTDUMP=<frame>` writes every render target as raw files
+(`DM_VK_SHOT_DIR`; `DM_VK_RTDUMP_DEC=1` adds the BC6H-decoded textures), `DM_VK_SHOTS=<frames>` the presented image.
+Compare with the Mac's run of the same scene; a black lit surface was a texture never uploaded, a black whole frame a
+synchronization problem. Take several `screencap`s in a row: a single one hides flicker.
+
 ## Device notes
 
 - The console has a secure lock screen and its own screen timeout: when the screen is off or locked, ask the user to
@@ -63,6 +73,9 @@ Paths: `<B>` = `<NSP folder>/<id>_build` (made by `scripts/build_ipa_from_nsp.py
 ## Not done yet (check before promising)
 
 H.264 / AAC movies (MediaCodec), compute dispatches, indirect draws, storage-buffer write-back, buffer textures,
-re-uploads of textures the CPU rewrites, NVN's GL depth convention (`near = -w`), geometry / tessellation stages. A game
+geometry / tessellation stages. (Done, from Metroid Dread: NVN's GL depth convention, `spv_gl_depth`; textures the CPU
+rewrites, re-uploaded at next use; initial content of textures in GPU-only pools, `init_fill`; BC4-7 decoded on upload
+by `third_party/bcdec`; submissions chained by a timeline semaphore, as the Mali-G57 did not order a present's blit
+after the frame by barriers alone.) A game
 that needs one of these needs it implemented in `src_vk/nvn_vk.c` (once, for every game). Only the RG Slide's Mali-G57 has
 been tested: on another GPU, read the player's `log.txt` and fix in general code, not per device.

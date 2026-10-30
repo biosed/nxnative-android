@@ -2,7 +2,7 @@
 // cheats of the game's build (each one chosen by the player, none on by default) and "no volver a mostrar". The choices go to <files>/settings.env, which the game's
 // native activity (app/front_android.c, process ":game") reads at boot. The menu stays under the game: when the game ends (− and + held two seconds) it shows again.
 // On first start the bundled save (assets/save, the player's progress from another device) seeds the app's save folder; the cheat file is refreshed from assets/cheats.txt.
-// An APK with the game inside (make_apk.py --bundle: assets/game/ and its list files.txt) unpacks it into the external folder on its first start, and again after an update,
+// An APK with the game inside (make_apk.py --bundle: assets/game/ and its list files.txt, each file as its pieces in assets/game/p/) unpacks it into the external folder on its first start, and again after an update,
 // with a progress bar; Jugar waits for it.
 // The menu works with the touch screen and with a controller (A confirms, B goes back, START plays). The screen stays on while it is open, as in the game.
 package com.nxnative;
@@ -77,7 +77,8 @@ public class MenuActivity extends Activity {
             String[] names = getAssets().list(dir);
             if (names == null || names.length == 0) return;
             to.mkdirs();
-            for (String n : names) copyAsset(dir + "/" + n, new File(to, n));
+            for (String n : names) { String[] sub = getAssets().list(dir + "/" + n);   // folders inside the save (profile0/, userdata/) have entries, files none
+                if (sub != null && sub.length > 0) copyAssetDir(dir + "/" + n, new File(to, n)); else copyAsset(dir + "/" + n, new File(to, n)); }
         } catch (Exception e) { /* no bundled save */ }
     }
     private void copyAsset(String name, File to) {
@@ -104,7 +105,7 @@ public class MenuActivity extends Activity {
             try {
                 List<String[]> files = new ArrayList<>(); long total = 0;
                 try (BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open("game/files.txt"), StandardCharsets.UTF_8))) {
-                    String l; while ((l = r.readLine()) != null) { String[] f = l.split("\t"); if (f.length == 2) { files.add(f); total += Long.parseLong(f[1]); } }
+                    String l; while ((l = r.readLine()) != null) { String[] f = l.split("\t"); if (f.length >= 2) { files.add(f); total += Long.parseLong(f[1]); } }
                 }
                 File ext = getExternalFilesDir(null);
                 if (ext.getUsableSpace() < total + (200L << 20)) throw new Exception(String.format(Locale.ROOT, "No hay espacio: se necesitan %.1f GB libres.", total / 1e9));
@@ -112,11 +113,15 @@ public class MenuActivity extends Activity {
                 long done = 0; byte[] buf = new byte[1 << 20]; int lastPct = -1;
                 for (String[] f : files) {
                     File to = new File(ext, f[0]); to.getParentFile().mkdirs();
-                    try (InputStream in = getAssets().open("game/" + f[0], AssetManager.ACCESS_STREAMING); OutputStream out = new FileOutputStream(to)) {
-                        int n; while ((n = in.read(buf)) > 0) { out.write(buf, 0, n); done += n;
-                            int pct = (int) (done * 100 / Math.max(1, total));
-                            if (pct != lastPct) { lastPct = pct; final int p = pct; final long d = done, t = total; runOnUiThread(() -> { bar.setProgress(p);
-                                status.setText(String.format(Locale.ROOT, "Preparando el juego por primera vez: %d%% (%.1f de %.1f GB)", p, d / 1e9, t / 1e9)); }); } }
+                    // the file is its pieces in order (game/p/<hash>, each stored once in the APK); a line without pieces is the file itself at game/<path>
+                    String[] parts = f.length > 2 ? f[2].split(" ") : new String[] { null };
+                    try (OutputStream out = new FileOutputStream(to)) {
+                        for (String part : parts) try (InputStream in = getAssets().open(part != null ? "game/p/" + part : "game/" + f[0], AssetManager.ACCESS_STREAMING)) {
+                            int n; while ((n = in.read(buf)) > 0) { out.write(buf, 0, n); done += n;
+                                int pct = (int) (done * 100 / Math.max(1, total));
+                                if (pct != lastPct) { lastPct = pct; final int p = pct; final long d = done, t = total; runOnUiThread(() -> { bar.setProgress(p);
+                                    status.setText(String.format(Locale.ROOT, "Preparando el juego por primera vez: %d%% (%.1f de %.1f GB)", p, d / 1e9, t / 1e9)); }); } }
+                        }
                     }
                 }
                 try (OutputStream o = new FileOutputStream(new File(ext, ".unpacked"))) { o.write((versionCode() + "\n").getBytes(StandardCharsets.UTF_8)); }

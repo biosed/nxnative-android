@@ -17,8 +17,9 @@ plays it in handheld mode at about 59 fps (GPU 16 ms a frame in Dirtmouth), with
   yet (`hle_movie_avc.c`, `hle_movie.c` log `[RED]` and go on without pictures / with silence).
 - **Graphics.** `src_vk/nvn_vk.c` replays the NVN layer's command lists into Vulkan (its file header has the design:
   ring-buffer copies of what draws read, images in `GENERAL` layout, fragment resources in set 1). Shaders are the
-  Metal chain's own SPIR-V, exported by `tools/spv_android.py` (below). Not there yet: compute dispatches, indirect
-  draws, storage buffer write-back, buffer textures, re-uploads of textures the CPU rewrites, GL depth convention.
+  Metal chain's own SPIR-V, exported by `tools/spv_android.py` (below). BC formats are decoded on upload (BC4-7 by `third_party/bcdec`, MIT / Unlicense), and every
+  submission waits on GPU for the one before through a timeline semaphore. Not there yet: compute dispatches, indirect
+  draws, storage buffer write-back, buffer textures.
   `BACKEND=null` builds the null backend (`null/nvn_null.c`) instead.
 
 ## Shaders

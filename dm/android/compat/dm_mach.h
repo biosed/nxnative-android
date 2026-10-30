@@ -39,7 +39,7 @@ kern_return_t vm_protect(mach_port_t task, vm_address_t addr, vm_size_t size, bo
 kern_return_t vm_allocate(mach_port_t task, vm_address_t *addr, vm_size_t size, int flags);
 kern_return_t vm_deallocate(mach_port_t task, vm_address_t addr, vm_size_t size);
 kern_return_t vm_remap(mach_port_t task, vm_address_t *to, vm_size_t size, vm_address_t mask, int flags, mach_port_t src_task, vm_address_t from, boolean_t copy, vm_prot_t *cur, vm_prot_t *max, int inherit);
-// thread / task introspection (diagnostics): unavailable
+// thread / task introspection: thread_info THREAD_BASIC_INFO from /proc (state, CPU time), the rest unavailable
 typedef struct { struct { int seconds, microseconds; } user_time, system_time; int cpu_usage, policy, run_state, flags, suspend_count, sleep_time; } thread_basic_info_data_t;
 typedef struct { uint64_t pth_user_time, pth_system_time; int pth_cpu_usage, pth_policy, pth_run_state, pth_flags, pth_sleep_time, pth_curpri, pth_priority, pth_maxpriority; char pth_name[64]; } thread_extended_info_data_t;
 #define THREAD_BASIC_INFO 3

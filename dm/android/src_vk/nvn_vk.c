@@ -154,6 +154,10 @@ static VkSampler g_dummy_samp; static VkImage g_dummy_img; static VkImageView g_
 static void dummies(void);
 static int g_has_surface;
 // Render passes: dynamic rendering where the GPU has it (Vulkan 1.3, or 1.2 / 1.1 with VK_KHR_dynamic_rendering), else classic render passes and framebuffers made per pass
+// Every submission, the game's and the presents, waits on GPU for the one before and signals the next value of one timeline semaphore (g_tlv, under g_qmu). Submission order alone with a
+// barrier at each start should do; the Mali-G57 (Unisoc T820) did not keep it for a present's blit, whose batch also waits on the swapchain acquire: two thirds of Metroid Dread's menu
+// frames showed black. GPUs without timeline semaphores (Vulkan 1.1 without 1.2) wait for the GPU on the CPU before each present instead
+static VkSemaphore g_tl; static uint64_t g_tlv;
 static int g_dynrend; static PFN_vkCmdBeginRenderingKHR p_begin_rendering; static PFN_vkCmdEndRenderingKHR p_end_rendering;
 static void vk_init_(void) {
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "nxnative", 1, "dmhost", 1, VK_API_VERSION_1_3};
@@ -206,6 +210,11 @@ static void vk_init_(void) {
     VkDeviceCreateInfo di = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qi, 0, NULL, next, ext, NULL};
     VKCHECK(vkCreateDevice(g_pd, &di, NULL, &g_dev));
     vkGetDeviceQueue(g_dev, g_qf, 0, &g_q);
+    if (dv >= VK_API_VERSION_1_2 && f12.timelineSemaphore && !getenv("DM_VK_NO_TIMELINE")) {
+        VkSemaphoreTypeCreateInfo ti = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, NULL, VK_SEMAPHORE_TYPE_TIMELINE, 0};
+        VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti, 0};
+        if (vkCreateSemaphore(g_dev, &si, NULL, &g_tl) != VK_SUCCESS) g_tl = VK_NULL_HANDLE;
+    }
     if (g_dynrend) {
         p_begin_rendering = (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(g_dev, dv >= VK_API_VERSION_1_3 ? "vkCmdBeginRendering" : "vkCmdBeginRenderingKHR");
         p_end_rendering = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(g_dev, dv >= VK_API_VERSION_1_3 ? "vkCmdEndRendering" : "vkCmdEndRenderingKHR");
@@ -229,8 +238,9 @@ static void vk_init_(void) {
     }
     dummies();
     pthread_t th; if (pthread_create(&th, NULL, completion_thread, NULL)) die("Vulkan: cannot start the completion thread"); pthread_detach(th);
-    LOG("vk: %s, Vulkan %u.%u.%u, driver %#x; uint8 indices %s, %s", g_props.deviceName, VK_API_VERSION_MAJOR(g_props.apiVersion), VK_API_VERSION_MINOR(g_props.apiVersion),
-        VK_API_VERSION_PATCH(g_props.apiVersion), g_props.driverVersion, g_has_u8 ? "yes" : "no", g_dynrend ? "dynamic rendering" : "render passes (no dynamic rendering)");
+    LOG("vk: %s, Vulkan %u.%u.%u, driver %#x; uint8 indices %s, %s, %s", g_props.deviceName, VK_API_VERSION_MAJOR(g_props.apiVersion), VK_API_VERSION_MINOR(g_props.apiVersion),
+        VK_API_VERSION_PATCH(g_props.apiVersion), g_props.driverVersion, g_has_u8 ? "yes" : "no", g_dynrend ? "dynamic rendering" : "render passes (no dynamic rendering)",
+        g_tl ? "submissions chained by a timeline semaphore" : "no timeline semaphore (presents wait for the GPU)");
 }
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static void vk_init(void) { pthread_once(&g_once, vk_init_); }
@@ -282,7 +292,10 @@ static void dummies(void) {
 }
 
 // ---------- Formats ----------
-enum { DEC_NONE, DEC_BC1, DEC_BC2, DEC_BC3 };   // compressed formats Mali cannot sample, decoded to RGBA8 on upload
+// Compressed formats Mali cannot sample, decoded on upload: BC1-5 and BC7 to RGBA8 (BC4 / BC5 as R / RG with blue 0 and alpha 1, signed ones to RGBA8 SNORM), BC6H to RGBA16F.
+// BC4-7 by bcdec (third_party/bcdec, MIT / Unlicense)
+enum { DEC_NONE, DEC_BC1, DEC_BC2, DEC_BC3, DEC_BC4, DEC_BC4S, DEC_BC5, DEC_BC5S, DEC_BC7, DEC_BC6H, DEC_BC6HS };
+static int dec_bpp(int dec) { return dec == DEC_BC6H || dec == DEC_BC6HS ? 8 : 4; }   // bytes per decoded pixel
 typedef struct { VkFormat f; uint8_t noalpha, dec, depth, stencil; } fmt_t;
 static fmt_t fmt_of(int nvn) {
     fmt_t r = {VK_FORMAT_UNDEFINED, 0, 0, 0, 0};
@@ -327,6 +340,10 @@ static fmt_t fmt_of(int nvn) {
         case 0x45: r.noalpha = 1; /* fall through */ case 0x46: r.f = VK_FORMAT_R8G8B8A8_SRGB; r.dec = DEC_BC1; break;
         case 0x47: r.f = VK_FORMAT_R8G8B8A8_SRGB; r.dec = DEC_BC2; break;
         case 0x48: r.f = VK_FORMAT_R8G8B8A8_SRGB; r.dec = DEC_BC3; break;
+        case 0x49: r.f = VK_FORMAT_R8G8B8A8_UNORM; r.dec = DEC_BC4; break; case 0x4A: r.f = VK_FORMAT_R8G8B8A8_SNORM; r.dec = DEC_BC4S; break;
+        case 0x4B: r.f = VK_FORMAT_R8G8B8A8_UNORM; r.dec = DEC_BC5; break; case 0x4C: r.f = VK_FORMAT_R8G8B8A8_SNORM; r.dec = DEC_BC5S; break;
+        case 0x4D: r.f = VK_FORMAT_R8G8B8A8_UNORM; r.dec = DEC_BC7; break; case 0x4E: r.f = VK_FORMAT_R8G8B8A8_SRGB; r.dec = DEC_BC7; break;
+        case 0x4F: r.f = VK_FORMAT_R16G16B16A16_SFLOAT; r.dec = DEC_BC6HS; break; case 0x50: r.f = VK_FORMAT_R16G16B16A16_SFLOAT; r.dec = DEC_BC6H; break;
         case 0x99: r.noalpha = 1; /* fall through */ case 0x9A: r.f = VK_FORMAT_B8G8R8A8_UNORM; break;
         case 0x9B: r.noalpha = 1; /* fall through */ case 0x9C: r.f = VK_FORMAT_B8G8R8A8_SRGB; break;
         case 0x95: r.f = VK_FORMAT_B5G6R5_UNORM_PACK16; break;
@@ -355,7 +372,11 @@ static VkFormat vfmt(int f) {
     return f > 0 && f < 0x6D ? T[f] : VK_FORMAT_UNDEFINED;
 }
 
-// BC1 / BC2 / BC3 → RGBA8 (Mali has no BC sampling)
+// BC1 / BC2 / BC3 → RGBA8 (Mali has no BC sampling); BC4-7 by bcdec
+#define BCDEC_IMPLEMENTATION
+#define BCDEC_BC4BC5_PRECISE
+#define BCDECDEF static
+#include "../third_party/bcdec/bcdec.h"
 static void bc_color(const uint8_t *b, uint8_t out[16][4], int alpha1) {
     uint16_t c0 = (uint16_t)(b[0] | b[1] << 8), c1 = (uint16_t)(b[2] | b[3] << 8); uint8_t p[4][4];
     for (int i = 0; i < 2; i++) { uint16_t c = i ? c1 : c0; p[i][0] = (uint8_t)((c >> 11) * 255 / 31); p[i][1] = (uint8_t)((c >> 5 & 63) * 255 / 63); p[i][2] = (uint8_t)((c & 31) * 255 / 31); p[i][3] = 255; }
@@ -365,13 +386,22 @@ static void bc_color(const uint8_t *b, uint8_t out[16][4], int alpha1) {
     uint32_t idx = (uint32_t)b[4] | (uint32_t)b[5] << 8 | (uint32_t)b[6] << 16 | (uint32_t)b[7] << 24;
     for (int i = 0; i < 16; i++) memcpy(out[i], p[idx >> (2 * i) & 3], 4);
 }
-static void bc_decode(int dec, const uint8_t *src, size_t src_pitch, uint32_t w, uint32_t h, uint8_t *dst) {   // dst: w * h * 4
-    uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, bs = dec == DEC_BC1 ? 8 : 16;
+static void bc_spread(uint8_t px[16][8]) { for (int i = 15; i >= 0; i--) memmove(px[i], (uint8_t *)px + 4 * i, 4); }   // 16 packed RGBA8 pixels → one per 8-byte slot
+static void bc_decode(int dec, const uint8_t *src, size_t src_pitch, uint32_t w, uint32_t h, uint8_t *dst) {   // dst: w * h * dec_bpp(dec)
+    uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, bs = dec == DEC_BC1 || dec == DEC_BC4 || dec == DEC_BC4S ? 8 : 16, pb = (uint32_t)dec_bpp(dec);
     for (uint32_t by = 0; by < bh; by++) for (uint32_t bx = 0; bx < bw; bx++) {
-        const uint8_t *b = src + by * src_pitch + bx * bs; uint8_t px[16][4];
-        if (dec == DEC_BC1) bc_color(b, px, 1);
-        else {
-            bc_color(b + 8, px, 0);
+        const uint8_t *b = src + by * src_pitch + bx * bs; uint8_t px[16][8];
+        if (dec == DEC_BC1) bc_color(b, (uint8_t (*)[4])px, 1), bc_spread(px);
+        else if (dec == DEC_BC4 || dec == DEC_BC4S || dec == DEC_BC5 || dec == DEC_BC5S) {
+            int sg = dec == DEC_BC4S || dec == DEC_BC5S, two = dec == DEC_BC5 || dec == DEC_BC5S; uint8_t rg[16][2] = {{0}}, r1[16] = {0};
+            if (two) bcdec_bc5(b, rg, 8, sg); else bcdec_bc4(b, r1, 4, sg);   // pitch in bytes: rows of 4 RG / R pixels
+            for (int i = 0; i < 16; i++) { px[i][0] = two ? rg[i][0] : r1[i]; px[i][1] = two ? rg[i][1] : 0; px[i][2] = 0; px[i][3] = sg ? 127 : 255; }
+        } else if (dec == DEC_BC7) bcdec_bc7(b, px, 32);   // RGBA8 rows of 4 pixels, in a block buffer of 8-byte pixels: pitch 32 bytes
+        else if (dec == DEC_BC6H || dec == DEC_BC6HS) {
+            uint16_t rgb[16][3]; bcdec_bc6h_half(b, rgb, 12, dec == DEC_BC6HS);   // pitch in halves
+            for (int i = 0; i < 16; i++) { uint16_t q[4] = {rgb[i][0], rgb[i][1], rgb[i][2], 0x3C00}; memcpy(px[i], q, 8); }
+        } else {
+            bc_color(b + 8, (uint8_t (*)[4])px, 0); bc_spread(px);
             if (dec == DEC_BC2) for (int i = 0; i < 16; i++) { int a = b[i / 2] >> (4 * (i & 1)) & 15; px[i][3] = (uint8_t)(a * 17); }
             else {
                 uint8_t a[8] = {b[0], b[1]};
@@ -383,7 +413,7 @@ static void bc_decode(int dec, const uint8_t *src, size_t src_pitch, uint32_t w,
         }
         for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
             uint32_t X = bx * 4 + x, Y = by * 4 + y;
-            if (X < w && Y < h) memcpy(dst + ((size_t)Y * w + X) * 4, px[y * 4 + x], 4);
+            if (X < w && Y < h) memcpy(dst + ((size_t)Y * w + X) * pb, dec == DEC_BC7 ? (const uint8_t *)px + y * 32 + x * 4 : px[y * 4 + x], pb);
         }
     }
 }
@@ -393,6 +423,7 @@ typedef struct { uint64_t key; VkImageView v; } vview;
 struct vtex {
     uint64_t serial; VkImage img; VkDeviceMemory m; int blk; fmt_t f; int nvn_fmt, target;
     uint32_t w, h, d, levels, layers; VkImageAspectFlags aspect; int uploaded, gpu;
+    int dirty;   // the CPU wrote its storage since the last upload (WriteTexels, a movie frame, a flushed pool range): uploaded again at its next use, unless the GPU renders into it
     vview *views; int nviews;
     struct vtex *next;
     uint64_t dead;   // released by the game: freed once the GPU has finished the submission that was being recorded then (fence dead)
@@ -405,9 +436,22 @@ static uint64_t *g_cpu_written; static int g_ncpu, g_ccpu;   // serials WriteTex
 static int cpu_written(uint64_t ser) { for (int i = 0; i < g_ncpu; i++) if (g_cpu_written[i] == ser) return 1; return 0; }
 
 static void tex_upload(vtex *v, const tex_t *t);
+// A texture with no packaged layout in a CPU_NO_ACCESS pool whose storage already holds data takes it as its initial content, as nvn_mtl.m tex_init_fill: games load a file into
+// memory and make a GPU-only pool over it (Metroid Dread's BC6H light probe cubemaps, which sampled as zero and left every lit surface black). Multisample, compressible
+// and depth textures stay GPU textures
+static int mem_any(const uint8_t *p, uint64_t n) { uint64_t i = 0, x; for (; i + 8 <= n; i += 8) { memcpy(&x, p + i, 8); if (x) return 1; } for (; i < n; i++) if (p[i]) return 1; return 0; }
+static int init_fill(const tex_t *t, const fmt_t *f) {
+    if (!t->mem || !t->pool || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->has_layout) return 0;
+    if (t->d.samples > 1 || (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) || f->depth || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    return mem_any(t->mem, t->L.size);
+}
 static vtex *tex_get(const tex_t *t, int for_rt) {
     pthread_mutex_lock(&g_rmu); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
-    if (v) { if (for_rt) v->gpu = 1; return v; }
+    if (v) {
+        if (for_rt) v->gpu = 1;
+        else if (v->dirty && !v->gpu && t->mem) { v->dirty = 0; tex_upload(v, t); }   // never over what the GPU drew: a flush of the pool range around a render target is not new content
+        return v;
+    }
     fmt_t f = fmt_of(t->d.format);
     if (!f.f) { static int n; if (n++ < 8) LOG("[RED] vk: texture format %#x has no Vulkan format yet (serial %llu)", t->d.format, (unsigned long long)t->serial); return NULL; }
     if (t->d.target == NVN_TEXTURE_TARGET_BUFFER) { RED_ONCE(3, "buffer textures are not implemented yet"); return NULL; }
@@ -435,7 +479,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
     to_general(C->up, v->img, v->aspect); C->up_used = 1;
     v->gpu = for_rt;
     pthread_mutex_lock(&g_rmu); v->next = g_tex[v->serial % NHASH]; g_tex[v->serial % NHASH] = v; pthread_mutex_unlock(&g_rmu);
-    int packaged = (t->has_layout || cpu_written(t->serial)) && t->mem && !for_rt;
+    int packaged = (t->has_layout || cpu_written(t->serial) || init_fill(t, &f)) && t->mem && !for_rt;
     if (packaged) tex_upload(v, t);
     else if (!for_rt) {   // contents come from the GPU (copies, render passes): start cleared, as a new texture's storage would read on hardware after a clear
         VkClearColorValue z = {{0}}; VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
@@ -452,13 +496,13 @@ static void tex_upload(vtex *v, const tex_t *t) {
         if (t->d.target == NVN_TEXTURE_TARGET_1D_ARRAY) h = 1;
         uint32_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh; size_t pitch = (size_t)bx * bpb, lsz = pitch * by * d;
         for (unsigned ly = 0; ly < v->layers; ly++) {
-            size_t out = v->f.dec ? (size_t)w * h * 4 * d : lsz;
+            size_t out = v->f.dec ? (size_t)w * h * dec_bpp(v->f.dec) * d : lsz;
             VkDeviceSize o = ring_alloc(out, 16);
             if (o == VK_WHOLE_SIZE) return;
             uint8_t *dst = C->ringp + o, *tmp = v->f.dec ? malloc(lsz) : dst;
             int rc = (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR) ? (memcpy(tmp, t->mem + nvn_tex_level_offset(&t->d, lv), lsz), 0) : nvn_deswizzle(&t->d, lv, ly, t->mem, tmp, pitch);
             if (rc) { RED_ONCE(5, "texture format %#x target %d: deswizzle failed", t->d.format, t->d.target); if (v->f.dec) free(tmp); continue; }
-            if (v->f.dec) { for (uint32_t z = 0; z < d; z++) bc_decode(v->f.dec, tmp + pitch * by * z, pitch, w, h, dst + (size_t)w * h * 4 * z); free(tmp); }
+            if (v->f.dec) { for (uint32_t z = 0; z < d; z++) bc_decode(v->f.dec, tmp + pitch * by * z, pitch, w, h, dst + (size_t)w * h * dec_bpp(v->f.dec) * z); free(tmp); }
             VkBufferImageCopy c = {o, 0, 0, {v->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, lv, ly, 1}, {0, 0, 0}, {w, h, d}};
             vkCmdCopyBufferToImage(C->up, C->ring, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
         }
@@ -549,6 +593,7 @@ void mtl_tex_release(tex_t *t) {
 }
 void mtl_tex_cpu_written(const tex_t *t) {
     pthread_mutex_lock(&g_rmu);
+    vtex *v = tex_find(t->serial); if (v) v->dirty = 1;
     if (!cpu_written(t->serial)) { if (g_ncpu == g_ccpu) { g_ccpu = g_ccpu ? 2 * g_ccpu : 64; g_cpu_written = realloc(g_cpu_written, g_ccpu * sizeof *g_cpu_written); } g_cpu_written[g_ncpu++] = t->serial; }
     pthread_mutex_unlock(&g_rmu);
 }
@@ -592,12 +637,95 @@ typedef struct {
     uint8_t *c1; uint32_t c1_len; uint32_t tg[3];
 } shader_t;
 static shader_t **g_sh; static int g_nsh;
+static int g_depth_zero;   // NVN depth mode (mtl_set_depth_zero, defined with the replay state)
 static const char *g_vkdir;
 static uint32_t *read_file(const char *path, size_t *n) {
     FILE *f = fopen(path, "rb"); if (!f) return NULL;
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     uint32_t *p = malloc((size_t)sz + 1); if (fread(p, 1, (size_t)sz, f) != (size_t)sz) { free(p); fclose(f); return NULL; }
     fclose(f); ((char *)p)[sz] = 0; *n = (size_t)sz; return p;
+}
+// NVN's GL depth convention (nvnDeviceSetDepthMode near = -w: Metroid Dread, Super Mario Odyssey...): clip-space z runs -w..w, Vulkan's 0..w. A vertex shader then ends with
+// z' = (z + w) / 2 -- the GL entry point dmsh_build.py adds to the Metal libraries (vs_depth), done here on the SPIR-V: before every return of the entry point the position
+// (a BuiltIn Position variable, or member of an output block) is read, rewritten and stored back. Returns a new word array (the caller frees it), NULL when no position is written
+// Position is decorated Invariant in every vertex shader: games draw a depth prepass with one vertex shader and the scene with another under the depth test EQUAL (Metroid Dread's
+// G-buffer pass), which on the Switch matches bit for bit; without the decoration the Mali compiler evaluated the two positions differently and the whole level failed the test
+static uint32_t *spv_invariant(const uint32_t *w, size_t nw, size_t *out_n) {
+    enum { OpDecorate = 71, OpMemberDecorate = 72, BuiltIn = 11, Position = 0, Invariant = 18 };
+    for (size_t i = 5; i < nw;) {   // already invariant: nothing to add
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len) return NULL;
+        if ((op == OpDecorate && len >= 3 && w[i + 2] == Invariant) || (op == OpMemberDecorate && len >= 4 && w[i + 3] == Invariant)) return NULL;
+        i += len;
+    }
+    uint32_t *o = malloc((nw + 8) * 4); size_t n = 0; int added = 0;
+    memcpy(o, w, 20); n = 5;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        memcpy(o + n, w + i, len * 4); n += len;
+        if (added < 2 && op == OpMemberDecorate && len >= 5 && w[i + 3] == BuiltIn && w[i + 4] == Position) { o[n++] = 4u << 16 | OpMemberDecorate; o[n++] = w[i + 1]; o[n++] = w[i + 2]; o[n++] = Invariant; added++; }
+        else if (added < 2 && op == OpDecorate && len >= 4 && w[i + 2] == BuiltIn && w[i + 3] == Position) { o[n++] = 3u << 16 | OpDecorate; o[n++] = w[i + 1]; o[n++] = Invariant; added++; }
+        i += len;
+    }
+    if (!added) { free(o); return NULL; }
+    *out_n = n; return o;
+}
+static uint32_t *spv_gl_depth(const uint32_t *w, size_t nw, size_t *out_n) {
+    enum { OpEntryPoint = 15, OpTypeInt = 21, OpTypeFloat = 22, OpTypeVector = 23, OpTypePointer = 32, OpConstant = 43, OpFunction = 54, OpVariable = 59, OpLoad = 61, OpStore = 62,
+           OpAccessChain = 65, OpDecorate = 71, OpMemberDecorate = 72, OpCompositeExtract = 81, OpCompositeInsert = 82, OpFAdd = 129, OpFMul = 133, OpReturn = 253, Output = 3 };
+    uint32_t bound = w[3], entry = 0, f32 = 0, v4 = 0, u32 = 0, pos_struct = 0, pos_member = 0, pos_var = 0, ptr_v4 = 0, cidx = 0, var = 0; int member_path = 0;
+    size_t first_fn = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len) return NULL;
+        if (op == OpEntryPoint && !entry) entry = w[i + 2];
+        else if (op == OpMemberDecorate && len >= 5 && w[i + 3] == 11 && w[i + 4] == 0) { pos_struct = w[i + 1]; pos_member = w[i + 2]; member_path = 1; }
+        else if (op == OpDecorate && len >= 4 && w[i + 2] == 11 && w[i + 3] == 0) pos_var = w[i + 1];
+        else if (op == OpTypeFloat && w[i + 2] == 32) f32 = w[i + 1];
+        else if (op == OpTypeInt && w[i + 2] == 32 && !u32) u32 = w[i + 1];
+        else if (op == OpFunction && !first_fn) first_fn = i;
+        i += len;
+    }
+    for (size_t i = 5; i < first_fn;) {   // the vector, pointer, index constant and variable, now the type IDs are known
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == OpTypeVector && w[i + 2] == f32 && w[i + 3] == 4) v4 = w[i + 1];
+        i += len;
+    }
+    for (size_t i = 5; i < first_fn;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == OpTypePointer && w[i + 2] == Output && w[i + 3] == v4) ptr_v4 = w[i + 1];
+        if (op == OpConstant && w[i + 1] == u32 && len == 4 && w[i + 3] == pos_member) cidx = w[i + 2];
+        if (op == OpVariable && w[i + 3] == Output) {
+            if (!member_path && w[i + 2] == pos_var) var = w[i + 2];
+            if (member_path) for (size_t j = 5; j < first_fn;) { uint32_t o2 = w[j] & 0xffff, l2 = w[j] >> 16; if (o2 == OpTypePointer && w[j + 1] == w[i + 1] && w[j + 3] == pos_struct) var = w[i + 2]; j += l2; }
+        }
+        i += len;
+    }
+    if (!entry || !f32 || !v4 || !var || (member_path && !u32)) return NULL;
+    uint32_t decl[16]; size_t nd = 0;
+    if (!ptr_v4) { ptr_v4 = bound++; decl[nd++] = 4u << 16 | OpTypePointer; decl[nd++] = ptr_v4; decl[nd++] = Output; decl[nd++] = v4; }
+    if (member_path && !cidx) { cidx = bound++; decl[nd++] = 4u << 16 | OpConstant; decl[nd++] = u32; decl[nd++] = cidx; decl[nd++] = pos_member; }
+    uint32_t half = bound++; float hf = 0.5f; uint32_t hb; memcpy(&hb, &hf, 4);
+    decl[nd++] = 4u << 16 | OpConstant; decl[nd++] = f32; decl[nd++] = half; decl[nd++] = hb;
+    size_t nret = 0; for (size_t i = first_fn; i < nw; i += w[i] >> 16) if ((w[i] & 0xffff) == OpReturn) nret++;
+    uint32_t *o = malloc((nw + nd + nret * 40) * 4); size_t n = 0; int in_entry = 0;
+    for (size_t i = 0; i < 5; i++) o[n++] = w[i];
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (i == first_fn) { memcpy(o + n, decl, nd * 4); n += nd; }
+        if (op == OpFunction) in_entry = w[i + 2] == entry;
+        if (op == OpReturn && in_entry) {
+            uint32_t p = var, ld = bound++, z = bound++, ww = bound++, sum = bound++, hz = bound++, nv = bound++;
+            if (member_path) { p = bound++; o[n++] = 5u << 16 | OpAccessChain; o[n++] = ptr_v4; o[n++] = p; o[n++] = var; o[n++] = cidx; }
+            o[n++] = 4u << 16 | OpLoad; o[n++] = v4; o[n++] = ld; o[n++] = p;
+            o[n++] = 5u << 16 | OpCompositeExtract; o[n++] = f32; o[n++] = z; o[n++] = ld; o[n++] = 2;
+            o[n++] = 5u << 16 | OpCompositeExtract; o[n++] = f32; o[n++] = ww; o[n++] = ld; o[n++] = 3;
+            o[n++] = 5u << 16 | OpFAdd; o[n++] = f32; o[n++] = sum; o[n++] = z; o[n++] = ww;
+            o[n++] = 5u << 16 | OpFMul; o[n++] = f32; o[n++] = hz; o[n++] = sum; o[n++] = half;
+            o[n++] = 6u << 16 | OpCompositeInsert; o[n++] = v4; o[n++] = nv; o[n++] = hz; o[n++] = ld; o[n++] = 2;
+            o[n++] = 3u << 16 | OpStore; o[n++] = p; o[n++] = nv;
+        }
+        memcpy(o + n, w + i, len * 4); n += len; i += len;
+    }
+    o[3] = bound; *out_n = n; return o;
 }
 static shader_t *shader_get(const uint8_t md[8]) {
     char key[17]; for (int i = 0; i < 8; i++) sprintf(key + 2 * i, "%02x", md[i]);
@@ -626,6 +754,11 @@ static shader_t *shader_get(const uint8_t md[8]) {
         }
     }
     free(txt);
+    if (s->stage == 0) { size_t nn; uint32_t *w2 = spv_invariant(spv, ns / 4, &nn); if (w2) { free(spv); spv = w2; ns = nn * 4; } }
+    if (s->stage == 0 && !g_depth_zero) {   // NVN's GL depth convention (see spv_gl_depth)
+        size_t nn; uint32_t *w2 = spv_gl_depth(spv, ns / 4, &nn);
+        if (w2) { free(spv); spv = w2; ns = nn * 4; } else LOG("[RED] vk: vertex shader %s: no position written, left as it is for the GL depth convention", key);
+    }
     // the fragment stage's resources move to set 1 (DescriptorSet decorations, operand 34)
     uint32_t set = s->stage == 1 ? 1 : 0;
     for (size_t i = 5; i < ns / 4;) { uint32_t w = spv[i], op = w & 0xffff, len = w >> 16; if (!len) break; if (op == 71 && len >= 4 && spv[i + 2] == 34) spv[i + 3] = set; i += len; }
@@ -721,6 +854,7 @@ static struct {   // the current render targets and the open dynamic rendering; 
     int n; vtex *ct[8]; VkImageView cv[8]; vtex *dt; VkImageView dv; uint32_t w, h; int open;
     uint8_t clr_c[8], clr_d, clr_s; VkClearColorValue cc[8]; float cd; uint32_t cs;
 } P;
+static int g_plog;   // DM_VK_PASSLOG=<frame>: that frame's passes and draws are logged (diagnostics)
 static int pass_begin(void);
 static void pass_end(void) {
     if (!P.open) { int pend = P.clr_d || P.clr_s; for (int i = 0; i < 8; i++) pend |= P.clr_c[i]; if (pend) pass_begin(); }   // clears with no draw after them still happen
@@ -741,6 +875,9 @@ static int pass_begin(void) {
     if (P.dt) { d.dv = P.dv; d.df = P.dt->f.f; d.stencil = P.dt->f.stencil; d.dl = P.clr_d ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
                 d.sl = P.clr_s ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD; d.dc = (VkClearDepthStencilValue){P.cd, P.cs}; }
     memset(P.clr_c, 0, sizeof P.clr_c); P.clr_d = P.clr_s = 0;
+    if (g_plog) { char b[512]; int o = 0; for (int i = 0; i < P.n; i++) o += snprintf(b + o, sizeof b - o, " c%d=%llu/%d%s", i, P.ct[i] ? (unsigned long long)P.ct[i]->serial : 0ull, (int)d.cf[i], d.cl[i] == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "");
+                  if (P.dt) snprintf(b + o, sizeof b - o, " d=%llu/%d%s%s", (unsigned long long)P.dt->serial, (int)d.df, d.dl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "", d.sl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/sclr" : "");
+                  LOG("plog: pass %ux%u%s", P.w, P.h, b); }
     VkFramebuffer fb = rp_begin(C->cb, &d); P.open = 1;
     if (fb) { if (C->nfb == C->cfb) { C->cfb = C->cfb ? 2 * C->cfb : 256; C->fb = realloc(C->fb, C->cfb * sizeof *C->fb); } C->fb[C->nfb++] = fb; }
     return 1;
@@ -858,16 +995,18 @@ static VkDeviceSize copy_in(uint64_t addr, uint64_t size, VkDeviceSize align) { 
     if (o != VK_WHOLE_SIZE) *e = (dcopy){addr, size, g_wgen, o};
     return o;
 }
+static uint64_t g_tex_miss[4];   // texture slots read as the black dummy: 0 no handle bound, 1 handle not registered, 2 texture not created, 3 no view (logged with the frame stats)
 static VkImageView tex_slot(int stage, uint64_t h, VkSampler *sm, int *ok) {
     int tid = (int)(h & 0xfffff); *ok = 0;
-    if (!tid) return g_dummy_view;
+    if (!tid) { g_tex_miss[0]++; return g_dummy_view; }
     pthread_mutex_lock(&g_rmu);
     treg_t tr = tid < g_ntreg ? g_treg[tid] : (treg_t){0};
     pthread_mutex_unlock(&g_rmu);
-    if (!tr.ok) return g_dummy_view;
-    vtex *v = tex_get(&tr.t, 0); if (!v) return g_dummy_view;
+    if (!tr.ok) { g_tex_miss[1]++; return g_dummy_view; }
+    vtex *v = tex_get(&tr.t, 0); if (!v) { g_tex_miss[2]++; return g_dummy_view; }
     VkImageView view = tex_view(v, &tr.t, &tr.v, tr.has_v, -1, 0);
     (void)sm; (void)stage; *ok = view != VK_NULL_HANDLE;
+    if (!view) g_tex_miss[3]++;
     return view ? view : g_dummy_view;
 }
 static VkDescriptorSet write_set(shader_t *s, int stage) {
@@ -946,6 +1085,8 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     k.nc = P.n; for (int i = 0; i < P.n; i++) { k.cf[i] = P.ct[i] && P.cv[i] ? P.ct[i]->f.f : VK_FORMAT_UNDEFINED; k.blend[i] = S.blend[i]; }
     k.color = S.color; k.chmask = S.chmask; k.poly = S.poly; k.samples = P.ct[0] ? 1 : 1;
     if (P.dt) { k.df = P.dt->f.f; k.stencil = P.dt->f.stencil; k.ds = S.ds; }
+    if (g_plog) LOG("plog:  draw vs %s fs %s n %u depth t%d w%d f%d stencil %d f%d ops %d/%d/%d ref %u vm %#x wm %#x blend %#x mask %#x cull %d", vs->key, fs ? fs->key : "-", dw ? dw->count : di->count,
+                    S.ds.dt, S.ds.dw, S.ds.df, S.ds.st, S.ds.sf_f, S.ds.fail_f, S.ds.zfail_f, S.ds.zpass_f, S.st_ref[0], S.st_vmask[0], S.st_wmask[0], S.color.blend_en, S.chmask.mask, S.poly.cull);
     VkPipelineLayout pl = layout_get(vs, fs);
     VkPipeline pp = pso_get(&k, pl);
     if (!pp) SKIP(5);
@@ -1184,7 +1325,11 @@ uint64_t mtl_sub_commit(void) {
     VkCommandBuffer cbs[2] = {C->up, C->cb};
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 2, cbs, 0, NULL};
     VKCHECK(vkResetFences(g_dev, 1, &C->fence));
-    pthread_mutex_lock(&g_qmu); VkResult r = vkQueueSubmit(g_q, 1, &si, C->fence); pthread_mutex_unlock(&g_qmu);
+    VkTimelineSemaphoreSubmitInfo ts = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO}; uint64_t wv, sv; VkPipelineStageFlags wst = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    pthread_mutex_lock(&g_qmu);
+    if (g_tl) { wv = g_tlv; sv = ++g_tlv; ts.waitSemaphoreValueCount = 1; ts.pWaitSemaphoreValues = &wv; ts.signalSemaphoreValueCount = 1; ts.pSignalSemaphoreValues = &sv;
+                si.pNext = &ts; si.waitSemaphoreCount = 1; si.pWaitSemaphores = &g_tl; si.pWaitDstStageMask = &wst; si.signalSemaphoreCount = 1; si.pSignalSemaphores = &g_tl; }
+    VkResult r = vkQueueSubmit(g_q, 1, &si, C->fence); pthread_mutex_unlock(&g_qmu);
     if (r != VK_SUCCESS) die("Vulkan: submission failed (%d)", (int)r);
     pthread_mutex_lock(&g_mu); g_pend[g_npend++] = g_ci; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
     return fence;
@@ -1203,7 +1348,6 @@ void mtl_finish(void) { mtl_wait(g_fence, UINT64_MAX); }
 void mtl_drain(void) { mtl_finish(); }
 
 // ---------- Presentation: counted; DM_VK_SHOTS writes chosen frames as BMP files ----------
-static _Atomic uint64_t g_presents;
 static void shot(const tex_t *t, uint64_t n) {
     static char *list; static const char *dir; static int init;
     if (!init) { init = 1; const char *e = getenv("DM_VK_SHOTS"); list = e ? strdup(e) : NULL; dir = getenv("DM_VK_SHOT_DIR"); if (!dir) dir = "."; }
@@ -1233,6 +1377,38 @@ static void shot(const tex_t *t, uint64_t n) {
         free(row); fclose(f); LOG("vk: frame %llu written to %s (%ux%u; %llu draws so far, %llu dropped)", (unsigned long long)n, path, w, h, (unsigned long long)g_stat_draws, (unsigned long long)g_stat_skip);
     }
     vkDestroyBuffer(g_dev, b, NULL); vkFreeMemory(g_dev, m, NULL);
+}
+// Diagnostics: DM_VK_RTDUMP=<frame> writes every color image the GPU rendered into, as it stands at that frame's present, to DM_VK_SHOT_DIR as
+// rt_<serial>_<w>x<h>_<VkFormat>.raw (level 0, layer 0, tightly packed), for comparing a frame's passes with the Mac's; DM_VK_RTDUMP_DEC=1 adds the textures decoded
+// from BC6H on upload. DM_VK_PASSLOG=<frame> logs that frame's passes (targets, clears) and draws (shaders, depth / stencil / blend state)
+static int rt_bpp(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8_UNORM: return 1; case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: return 2;
+        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R8G8B8A8_SNORM: return 4;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: return 8; case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
+        default: return 0;
+    }
+}
+static void rt_dump(uint64_t n) {
+    static int64_t at = -2; if (at == -2) { const char *e = getenv("DM_VK_RTDUMP"); at = e ? atoll(e) : -1; }
+    if ((int64_t)n != at) return;
+    const char *dir = getenv("DM_VK_SHOT_DIR"); if (!dir) dir = ".";
+    mtl_finish(); int nd = 0;
+    pthread_mutex_lock(&g_rmu);
+    for (int hsh = 0; hsh < NHASH; hsh++) for (vtex *v = g_tex[hsh]; v; v = v->next) {
+        int bpp = rt_bpp(v->f.f); if (!(v->gpu || (getenv("DM_VK_RTDUMP_DEC") && v->f.dec >= DEC_BC6H)) || !bpp || !(v->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) continue;
+        VkDeviceMemory m; void *px; VkDeviceSize sz = (VkDeviceSize)v->w * v->h * bpp;
+        VkBuffer b = buf_new(sz, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &m, &px);
+        VkCommandBuffer cb = once_begin(); barrier_all(cb);
+        VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {v->w, v->h, 1}};
+        vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &c); once_end(cb);
+        char path[1024]; snprintf(path, sizeof path, "%s/rt_%llu_%ux%u_%d.raw", dir, (unsigned long long)v->serial, v->w, v->h, (int)v->f.f);
+        FILE *f = fopen(path, "wb"); if (f) { fwrite(px, 1, (size_t)sz, f); fclose(f); nd++; }
+        vkDestroyBuffer(g_dev, b, NULL); vkFreeMemory(g_dev, m, NULL);
+    }
+    pthread_mutex_unlock(&g_rmu);
+    LOG("vk: frame %llu: %d render targets written to %s", (unsigned long long)n, nd, dir);
 }
 // ---------- Window ----------
 __attribute__((weak)) void *front_native_window(int *gen) { (void)gen; return NULL; }   // app/front_android.c; none in the adb front end
@@ -1365,13 +1541,18 @@ static void win_present(const tex_t *t, const int crop[4]) {
                 img_barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR); }
     else img_barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     vkEndCommandBuffer(cb);
-    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &P_->acq, &ws, 1, &cb, 1, &P_->done};
+    VkPipelineStageFlags ws[2] = {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+    VkSemaphore wsem[2] = {P_->acq, g_tl}, ssem[2] = {P_->done, g_tl}; uint64_t wv[2] = {0, 0}, sv[2] = {0, 0};
+    VkTimelineSemaphoreSubmitInfo ts = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, NULL, 2, wv, 2, sv};
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, g_tl ? &ts : NULL, g_tl ? 2 : 1, wsem, ws, 1, &cb, g_tl ? 2 : 1, ssem};
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &P_->done, 1, &W.sc, &idx, NULL};
-    pthread_mutex_lock(&g_qmu); vkQueueSubmit(g_q, 1, &si, P_->fence); r = vkQueuePresentKHR(g_q, &pi); pthread_mutex_unlock(&g_qmu);
+    pthread_mutex_lock(&g_qmu);
+    if (g_tl) { wv[1] = g_tlv; sv[1] = ++g_tlv; }
+    vkQueueSubmit(g_q, 1, &si, P_->fence); r = vkQueuePresentKHR(g_q, &pi); pthread_mutex_unlock(&g_qmu);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) W.gen = -1;
     front_window_lock(0);
 }
+static _Atomic uint64_t g_presents;
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)period_s;
     uint64_t n = atomic_fetch_add(&g_presents, 1) + 1;
@@ -1380,13 +1561,18 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         if (mtl_fps_target() == 30 && last && now - last < 33333333ull) { usleep((useconds_t)((33333333ull - (now - last)) / 1000)); now = now_ns(); }
         last = now; if (!t0) { t0 = now; n0 = n; } else if (now - t0 >= 1000000000ull) { g_fps_shown = (double)(n - n0) * 1e9 / (double)(now - t0); t0 = now; n0 = n; }
     }
+    if (t && g_has_surface && !g_tl) mtl_finish();   // no timeline semaphore: the frame's work is done before its present reads the window texture
     if (t && g_has_surface) win_present(t, crop);
     if (n == 1 || n % 600 == 0) LOG("vk: %llu frames presented, %llu draws, %llu dropped (no program %llu, shader %llu, no target %llu, indirect %llu, primitive %llu, pipeline %llu, descriptors %llu), %d pipelines, %d shaders",
                                     (unsigned long long)n, (unsigned long long)g_stat_draws, (unsigned long long)g_stat_skip, (unsigned long long)g_skip_why[0], (unsigned long long)g_skip_why[1], (unsigned long long)g_skip_why[2],
                                     (unsigned long long)g_skip_why[3], (unsigned long long)g_skip_why[4], (unsigned long long)g_skip_why[5], (unsigned long long)g_skip_why[6], g_npso, g_nsh);
+    if (n % 600 == 0) LOG("vk: texture slots read as black so far: no handle %llu, handle not registered %llu, texture not created %llu, no view %llu", (unsigned long long)g_tex_miss[0],
+                          (unsigned long long)g_tex_miss[1], (unsigned long long)g_tex_miss[2], (unsigned long long)g_tex_miss[3]);
     if (n % 600 == 0) { LOG("vk: per frame over the last 600: GPU %.2f ms, recording %.2f ms, waiting for the GPU %.2f ms, present waiting %.2f ms", atomic_exchange(&g_gpu_ns, 0) / 600e6,
                             atomic_exchange(&g_rec_ns, 0) / 600e6, atomic_exchange(&g_wait_ns, 0) / 600e6, atomic_exchange(&g_pwait_ns, 0) / 600e6); }
     if (t) shot(t, n);
+    rt_dump(n);
+    { static int64_t pl = -2; if (pl == -2) { const char *e = getenv("DM_VK_PASSLOG"); pl = e ? atoll(e) : -1; } g_plog = (int64_t)n + 1 == pl; }
     return n;
 }
 void mtl_present_wait(uint64_t ticket) { (void)ticket; }
@@ -1398,7 +1584,10 @@ int mtl_link_active(void) { return 0; }
 int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { (void)vsyncs; (void)timeout_ns; return 0; }
 uint32_t mtl_present_qos(void) { return 0; }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
-void mtl_set_depth_zero(int on) { g_depth_zero = on; if (!on) RED_ONCE(70, "NVN's GL depth convention (near = -w) is not converted yet: depth is squeezed"); }
+void mtl_set_depth_zero(int on) {   // vertex shaders loaded from here on follow it (spv_gl_depth); the games set it once at device init, before their first shader
+    if (on != g_depth_zero && g_nsh) LOG("[RED] vk: depth mode changed to %s after %d shaders were loaded: those keep the other convention", on ? "near = 0" : "GL (near = -w)", g_nsh);
+    g_depth_zero = on;
+}
 void mtl_set_origin_lower_left(int on) { g_origin_ll = on; }
 void mtl_set_frame(uint64_t f) { (void)f; }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }

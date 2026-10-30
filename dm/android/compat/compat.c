@@ -1,6 +1,8 @@
 // Apple API compatibility on Linux / bionic (see README.md)
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
 #include <semaphore.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,7 +62,23 @@ kern_return_t vm_remap(mach_port_t task, vm_address_t *to, vm_size_t size, vm_ad
     return KERN_FAILURE;
 }
 
-kern_return_t thread_info(mach_port_t th, thread_flavor_t f, thread_info_t out, mach_msg_type_number_t *cnt) { (void)th; (void)f; (void)out; (void)cnt; return KERN_FAILURE; }
+// A thread's state and CPU time from /proc/self/task/<tid>/stat (the port is the tid): run state R is running (the host's same-core preemption, hle_thread.c thr_running, waits on it), utime / stime in clock ticks
+kern_return_t thread_info(mach_port_t th, thread_flavor_t f, thread_info_t out, mach_msg_type_number_t *cnt) {
+    if (f != THREAD_BASIC_INFO || !cnt || *cnt < THREAD_BASIC_INFO_COUNT) return KERN_FAILURE;
+    char path[64], buf[512]; snprintf(path, sizeof path, "/proc/self/task/%u/stat", th);
+    int fd = open(path, O_RDONLY | O_CLOEXEC); if (fd < 0) return KERN_FAILURE;
+    ssize_t n = read(fd, buf, sizeof buf - 1); close(fd);
+    if (n <= 0) return KERN_FAILURE;
+    buf[n] = 0; char *p = strrchr(buf, ')'); if (!p || p[1] != ' ') return KERN_FAILURE;
+    char st = p[2]; unsigned long long ut = 0, sy = 0;   // fields after the name: state (3), ..., utime (14), stime (15)
+    if (sscanf(p + 4, "%*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &ut, &sy) != 2) return KERN_FAILURE;
+    static long hz; if (!hz) { hz = sysconf(_SC_CLK_TCK); if (hz <= 0) hz = 100; }
+    thread_basic_info_data_t *bi = (thread_basic_info_data_t *)out; memset(bi, 0, sizeof *bi);
+    bi->user_time.seconds = (int)(ut / hz); bi->user_time.microseconds = (int)(ut % hz * 1000000 / hz);
+    bi->system_time.seconds = (int)(sy / hz); bi->system_time.microseconds = (int)(sy % hz * 1000000 / hz);
+    bi->run_state = st == 'R' ? TH_STATE_RUNNING : TH_STATE_WAITING;
+    *cnt = THREAD_BASIC_INFO_COUNT; return KERN_SUCCESS;
+}
 kern_return_t thread_suspend(mach_port_t th) { (void)th; return KERN_FAILURE; }
 kern_return_t thread_resume(mach_port_t th) { (void)th; return KERN_FAILURE; }
 kern_return_t thread_get_state(mach_port_t th, int f, thread_state_t st, mach_msg_type_number_t *cnt) { (void)th; (void)f; (void)st; (void)cnt; return KERN_FAILURE; }

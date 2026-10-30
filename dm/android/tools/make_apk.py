@@ -3,10 +3,11 @@
 # signed with a development key. The game files are not in the APK (several GB): the deploy step copies them into the app's external folder over adb.
 #   make_apk.py <id> <NSP build folder> <out.apk> [--save <folder>] [--cheats <file>] [--label <name>] [--bundle]
 #     --bundle: the game files go inside the APK too (assets/game/, deflated, listed in assets/game/files.txt) and the menu unpacks them on the first start: one file, no
-#     computer needed. --test: package <package>.prueba, label "(prueba)": installs beside the real app without touching it. Android takes APKs below 4 GB only; past 2 GB the ZIP stays without ZIP64 records (apksigner and the installer read it as a plain ZIP)
+#     computer needed. Every file is stored as pieces, each piece once (assets/game/p/<hash>): archives of (hash, start, end) entries, such as Metroid Dread's .pkg files, are cut at
+#     their entries, which repeat across archives (Dread's 4.7 GB deflated becomes 3.7 GB), and whole files that repeat are stored once. --test: package <package>.prueba, label "(prueba)": installs beside the real app without touching it. Android takes APKs below 4 GB only; past 2 GB the ZIP stays without ZIP64 records (apksigner and the installer read it as a plain ZIP)
 #   make_apk.py --deploy <id> <NSP build folder> [--from-device <folder on the device that already has romfs/dm/vk/font>]
 # Tools: Homebrew's android-commandlinetools (build-tools 34, platform 33) and openjdk@21; the key is <NSP folder>/../android-debug.keystore (made once, kept so updates install over)
-import argparse, glob, os, re, shutil, subprocess, sys, tempfile, zipfile
+import argparse, glob, hashlib, os, re, shutil, struct, subprocess, sys, tempfile, zipfile
 HERE = os.path.dirname(os.path.abspath(__file__)); ANDROID = os.path.dirname(HERE)
 SDK = os.environ.get('ANDROID_SDK', '/opt/homebrew/share/android-commandlinetools')
 BT = os.path.join(SDK, 'build-tools', '34.0.0'); JAR = os.path.join(SDK, 'platforms', 'android-33', 'android.jar')
@@ -55,14 +56,19 @@ def build(a):
         z.write(lib, 'lib/arm64-v8a/libdmhost.so')
         if a.cheats: z.write(a.cheats, 'assets/cheats.txt')
         if a.save:
-            for f in sorted(os.listdir(a.save)):
-                p = os.path.join(a.save, f)
-                if os.path.isfile(p): z.write(p, 'assets/save/' + f)
+            for root, _, fs in os.walk(a.save):
+                for f in sorted(fs):
+                    if not f.startswith('.'): p = os.path.join(root, f); z.write(p, 'assets/save/' + os.path.relpath(p, a.save))
         if a.bundle:
-            listing = []
+            listing = []; stored = set(); raw = 0
             for rel, src in game_files(a.build):
-                z.write(src, 'assets/game/' + rel); listing.append(f'{rel}\t{os.path.getsize(src)}')
+                d = open(src, 'rb').read(); names = []
+                for off, n in pieces(d):
+                    k = hashlib.sha1(d[off:off + n]).hexdigest()[:24]; names.append(k)
+                    if k not in stored: stored.add(k); z.writestr(zipfile.ZipInfo('assets/game/p/' + k, (2020, 1, 1, 0, 0, 0)), d[off:off + n], zipfile.ZIP_DEFLATED); raw += n
+                listing.append(f'{rel}\t{len(d)}\t' + ' '.join(names))
             z.writestr('assets/game/files.txt', '\n'.join(listing) + '\n')
+            print(f'game: {len(listing)} files, {len(stored)} pieces, {raw / 1e9:.2f} GB stored once')
     if os.path.getsize(base) >= 0xFFFFFFFF: sys.exit(f'[RED] the APK would be {os.path.getsize(base) / 1e9:.1f} GB: Android installs APKs below 4 GB only')
     aligned = os.path.join(w, 'aligned.apk')
     run(os.path.join(BT, 'zipalign'), '-f', '-p', '4', base, aligned)
@@ -73,6 +79,22 @@ def build(a):
     run(os.path.join(BT, 'apksigner'), 'sign', '--ks', ks, '--ks-pass', 'pass:android', '--key-pass', 'pass:android', '--ks-key-alias', 'nxnative', '--out', a.out, aligned)
     shutil.rmtree(w, ignore_errors=True)
     print(f'{a.out}: {package(a.id, a.test)} "{label}", {os.path.getsize(a.out) / 1e6:.1f} MB' + (f', save from {a.save}' if a.save else '') + (f', cheats {os.path.basename(a.cheats)}' if a.cheats else ''))
+
+def pieces(d):   # (offset, length) ranges that cover the file: an archive of (u64 hash, u32 start, u32 end) entries after (u32 header size past this word, u32 data size, u32 count)
+    if len(d) >= 12:   # is cut at its entries
+        hs, ds, n = struct.unpack_from('<III', d, 0); hs += 4
+        if 0 < n and 12 + 16 * n <= hs and hs + ds == len(d):
+            ents = sorted(struct.unpack_from('<QII', d, 12 + 16 * i)[1:] for i in range(n)); out = []; pos = 0
+            if all(hs <= s <= e <= len(d) for s, e in ents):
+                for s, e in ents:
+                    if s < pos: break   # overlapping entries: kept whole
+                    if s > pos: out.append((pos, s - pos))
+                    if e > s: out.append((s, e - s))
+                    pos = e
+                else:
+                    if pos < len(d): out.append((pos, len(d) - pos))
+                    return out
+    return [(0, len(d))]
 
 def game_files(b):   # (path in the app's external folder, source) for every game file
     vk = glob.glob(os.path.join(b, 'shader', 'vk'))[0]; out = []
