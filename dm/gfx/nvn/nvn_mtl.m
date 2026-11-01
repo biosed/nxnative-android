@@ -11819,7 +11819,10 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
     // A texture whose content comes from its storage is uploaded when it is first resolved (and again when its pages change), in an upload batch only the submit thread may open.
     // Bastion fills both window textures with WriteTexels at boot (main+0x9374) and presents one before drawing into it: resolved on the present thread, the upload aborted the host.
     // Resolve it here, where the game queues the present, and commit the batch, so the display command buffer comes after the upload on the queue and the present thread finds it uploaded
-    if (t && !ev_val && on_sub_thread() && tex_from_storage(t)) { tex_mtl(t); up_flush(); }
+    // So is a window texture presented before anything drew into it: made on the present thread it skipped the zero fill (tex_zero_fill, submit thread only) and showed Metal's
+    // undefined content, a magenta screen on the M1. FINAL FANTASY XII THE ZODIAC AGE presents its window textures for its first frames with nothing drawn (its only command, SetRenderTargets,
+    // sits in a recording it restarts with a second BeginRecording)
+    if (t && !ev_val && on_sub_thread() && (tex_from_storage(t) || !tex_get(t->serial))) { tex_mtl(t); up_flush(); }
     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, present_start);
     link_sync();
     {   // Test switch DM_TEST_LINK_STALL=start seconds,duration seconds: counting from the first present, pause the display link at that point (imitating the display link not calling back while in the foreground) and release it when the duration is up. For verifying the fallback; not set in the product
