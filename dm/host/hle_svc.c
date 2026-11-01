@@ -1,6 +1,7 @@
 // Horizon kernel system calls (triggered by the SDK runtime once the SDK is loaded). Only what the P1 boot chain needs is implemented: memory layout + heap + query + debug output + timing.
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
+#include "hle.h"
 #include <sys/mman.h>
 #include <errno.h>
 #include <unistd.h>
@@ -104,6 +105,8 @@ enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=
        I_ProgramId=18, I_InitProcIdRange=19, I_UserExcAddr=20, I_TotalNonSys=21, I_UsedNonSys=22, I_IsApplication=23, I_FreeThreadCount=24 };
 
 static uint8_t g_seen[256];
+static _Alignas(0x1000) uint8_t g_user_exc_ctx[0x1000];   // GetInfo UserExceptionContextAddress: newer SDKs' SetDyingMessageRegion writes there
+HLE_HIB_STATIC(g_user_exc_ctx)
 
 // Stack destinations and their borrowed sources. Physical alias commits live in
 // g_alias_bits. One lock covers memory validation, protections, copying, budgets
@@ -181,6 +184,40 @@ static int64_t alias_unmapped(uint64_t off, uint64_t n) {
 }
 static _Atomic int64_t g_alias_mapped;   // bytes mapped in the alias region (page bitmap)
 
+// Hibernation: the guest main thread's stack when it is not its pthread's own (the host arena: a restored main thread runs on another pthread), for QueryMemory
+static uint64_t g_main_stack_lo, g_main_stack_hi;
+void svc_set_main_stack(uint64_t lo, uint64_t hi) { g_main_stack_lo = lo; g_main_stack_hi = hi; }
+// Hibernation: this file's state in a snapshot (section "svc"): the heap's open size, the MapMemory table, the alias region's page bitmaps and its mapped bytes, the main stack.
+// The memory itself and its protections are the snapshot's memory chunks
+typedef struct { uint64_t heap_cur, alias_mapped, main_lo, main_hi, nbits, nexp; int32_t nmap, pad; } hib_svc;
+static void mem_init(void);
+size_t dm_hib_svc_save(uint8_t **out) {
+    mem_init();
+    pthread_mutex_lock(&g_map_lock);
+    size_t pg = (size_t)getpagesize();
+    hib_svc h = {atomic_load(&g_heap_cur), (uint64_t)atomic_load(&g_alias_mapped), g_main_stack_lo, g_main_stack_hi, (g_alias_cap >> 18) + 1, g_alias_cap / pg / 64 + 1, g_nmap, 0};
+    size_t n = sizeof h + (size_t)g_nmap * sizeof g_map[0] + h.nbits * 8 + h.nexp * 8;
+    uint8_t *b = malloc(n), *p = b;
+    memcpy(p, &h, sizeof h); p += sizeof h; memcpy(p, g_map, (size_t)g_nmap * sizeof g_map[0]); p += (size_t)g_nmap * sizeof g_map[0];
+    for (uint64_t i = 0; i < h.nbits; i++) { uint64_t v = atomic_load(&g_alias_bits[i]); memcpy(p, &v, 8); p += 8; }
+    memcpy(p, g_alias_exposed, h.nexp * 8);
+    pthread_mutex_unlock(&g_map_lock);
+    *out = b; return n;
+}
+int dm_hib_svc_restore(const uint8_t *b, size_t n) {
+    mem_init();
+    hib_svc h; if (n < sizeof h) return -1; memcpy(&h, b, sizeof h);
+    size_t pg = (size_t)getpagesize();
+    if (h.nbits != (g_alias_cap >> 18) + 1 || h.nexp != g_alias_cap / pg / 64 + 1 || h.nmap < 0 || h.nmap > MAX_MAP || n != sizeof h + (size_t)h.nmap * sizeof g_map[0] + h.nbits * 8 + h.nexp * 8) return -1;
+    const uint8_t *p = b + sizeof h;
+    pthread_mutex_lock(&g_map_lock);
+    atomic_store(&g_heap_cur, h.heap_cur); atomic_store(&g_alias_mapped, (int64_t)h.alias_mapped); g_main_stack_lo = h.main_lo; g_main_stack_hi = h.main_hi;
+    g_nmap = h.nmap; memcpy(g_map, p, (size_t)h.nmap * sizeof g_map[0]); p += (size_t)h.nmap * sizeof g_map[0];
+    for (uint64_t i = 0; i < h.nbits; i++) { uint64_t v; memcpy(&v, p, 8); p += 8; atomic_store(&g_alias_bits[i], v); }
+    memcpy(g_alias_exposed, p, h.nexp * 8);
+    pthread_mutex_unlock(&g_map_lock);
+    return 0;
+}
 // Word-at-a-time boundaries of the bitmap run containing p (guest page index).
 static uint64_t alias_mask(unsigned n) { return n == 64 ? UINT64_MAX : (UINT64_C(1) << n) - 1; }
 static uint64_t alias_run_end(uint64_t p, uint64_t end, int mapped) {
@@ -601,6 +638,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             // later nn::os::GetCurrentStackInfo asserts that sp is still inside that range and aborts if not. Previously every address outside the guest address space was reported as "the 4 KiB page containing it",
             // so the main thread stack was recorded as one page. Whether the sp at init and a later sp share a page depends on the absolute position of the host stack top, which moves with the total length of environment variables / launch arguments (a different environment occasionally aborts at startup).
             uint64_t top = (uint64_t)pthread_get_stackaddr_np(pthread_self()), ssz = pthread_get_stacksize_np(pthread_self());
+            if (g_main_stack_hi && addr >= g_main_stack_lo && addr < g_main_stack_hi) { top = g_main_stack_hi; ssz = g_main_stack_hi - g_main_stack_lo; }   // hibernation: the main thread's stack in the arena, whichever pthread runs it
             if (addr < top && addr >= top - ssz) { base = top - ssz; size = ssz; state = 0xB/*Stack*/; perm = 3; }
             // Other host memory: report "free, no permissions" (the 4 KiB page around it) as Horizon does for unmapped addresses. It used to report Code+RX, and GetExceptionInfo walking back from main merged on through host memory down to 0
             else { base=addr & ~0xFFFull; size=0x1000; state=0/*Free*/; perm=0; } }
@@ -709,7 +747,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // 96 threads (pm_spec.cpp BaseApplicationThreads; a boost raises it to 256). Monster Train 2's Unity 2022.3 player creates a thread only when this is at least 1: the 0 it got here
         // left its main thread waiting at boot for a thread it never created (main+0x3e1ac4)
         case I_FreeThreadCount: { int thr_limit_used(void); int u = thr_limit_used(); v = u < 96 ? 96 - u : 0; break; }
-        case I_UserExcAddr: { static _Alignas(0x1000) uint8_t ctx[0x1000]; v = (uint64_t)ctx; break; }   // user exception context area: newer SDKs' SetDyingMessageRegion writes to +0x1c0 (0 would write through a null pointer)
+        case I_UserExcAddr: { v = (uint64_t)g_user_exc_ctx; break; }   // user exception context area: newer SDKs' SetDyingMessageRegion writes to +0x1c0 (0 would write through a null pointer)
         default: v = 0; break;
         }
         regs[0] = 0; regs[1] = v; return 0;

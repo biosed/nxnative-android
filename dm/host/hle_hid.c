@@ -885,3 +885,22 @@ PALMA_FAIL("_ZN2nn3hid37SetPalmaDataBaseIdentificationVersionERKNS0_21PalmaConne
 PALMA_FAIL("_ZN2nn3hid19SuspendPalmaFeatureERKNS0_21PalmaConnectionHandleERKNS_4util10BitFlagSetILi32ENS0_12PalmaFeatureEEE", "feature suspension", h_hid_PalmaSuspend, const void *h, const void *f)
 PALMA_FAIL("_ZN2nn3hid16ReadPalmaPlayLogERKNS0_21PalmaConnectionHandleERKt", "play log read", h_hid_PalmaLogRead, const void *h, const uint16_t *i)
 PALMA_FAIL("_ZN2nn3hid17ResetPalmaPlayLogERKNS0_21PalmaConnectionHandleERKt", "play log reset", h_hid_PalmaLogReset, const void *h, const uint16_t *i)
+
+// Hibernation (hle_hibsnap.c): what the game set and the sampling number in a snapshot. The sampling number goes on from the snapshot's: a game ignores a state older than the
+// last one it read, and a new process would count from the start again
+typedef struct { int64_t sampling; uint32_t ids_supported, styles_supported, hold_type, comm_mode, hh_mode, pad; uint64_t style_ev[DM_PLAYERS]; } hib_hid;
+size_t dm_hib_hid_save(uint8_t **out) {
+    hib_hid *h = calloc(1, sizeof *h);
+    h->sampling = atomic_load(&g_sampling); h->ids_supported = atomic_load(&g_ids_supported); h->styles_supported = g_styles_supported;
+    h->hold_type = g_hold_type; h->comm_mode = g_comm_mode; h->hh_mode = g_hh_mode;
+    for (int i = 0; i < DM_PLAYERS; i++) h->style_ev[i] = (uint64_t)(uintptr_t)atomic_load(&g_style_ev[i]);
+    *out = (uint8_t *)h; return sizeof *h;
+}
+int dm_hib_hid_restore(const uint8_t *b, size_t n) {
+    if (n != sizeof(hib_hid)) return -1;
+    const hib_hid *h = (const hib_hid *)b;
+    atomic_store(&g_sampling, h->sampling + 1000); atomic_store(&g_ids_supported, h->ids_supported); g_styles_supported = h->styles_supported;
+    g_hold_type = h->hold_type; g_comm_mode = h->comm_mode; g_hh_mode = h->hh_mode;
+    for (int i = 0; i < DM_PLAYERS; i++) atomic_store(&g_style_ev[i], (void *)(uintptr_t)h->style_ev[i]);
+    return 0;
+}

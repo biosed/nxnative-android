@@ -182,6 +182,8 @@ static void md_defer_drop(void *d) {
     g_ndfq = n; pthread_mutex_unlock(&g_dfmu);
 }
 // signal under the lock: the destructor first drops pending entries under it, so a signal never interleaves with destruction
+// Hibernation: whether the deferred-event thread exists (its queue is empty: a snapshot is written only with no decoder alive). Restored with the threads, it is not spawned again
+int dm_hib_movie_defer_thread(int set) { if (set >= 0) g_dfthr = set; return g_dfthr; }
 static void md_defer_body(void *arg) {
     (void)arg;
     dm_host_lock(&g_dfmu);

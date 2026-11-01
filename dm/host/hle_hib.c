@@ -139,6 +139,17 @@ static int arena_free(void *p) {
     return 1;
 }
 
+// Hibernation's own state in a snapshot (section "arena"): the arena's allocation state and the restartable calls' stub slots (both come out the same in every process that
+// loads the same modules, checked on restore)
+typedef struct { uint64_t mod_used, arena_used; uint64_t free_[1024]; uint64_t rs[16]; int32_t nrs, pad; } hib_arena;
+size_t dm_hib_arena_save(uint8_t **out) {
+    hib_arena *h = calloc(1, sizeof *h);
+    pthread_mutex_lock(&g_hib_lock);
+    h->mod_used = g_mod_used; h->arena_used = g_arena_used; for (int i = 0; i < 1024; i++) h->free_[i] = (uint64_t)(uintptr_t)g_free[i];
+    pthread_mutex_unlock(&g_hib_lock);
+    *out = (uint8_t *)h; return sizeof *h;
+}
+int dm_hib_arena_restore_state(const uint8_t *b, size_t n);
 // For the snapshot and the audit: the reservation and what is in use of it
 void dm_hib_layout(uint8_t **win, size_t *win_len, size_t *mod_used, uint8_t **arena, size_t *arena_used) {
     if (win) *win = g_win;
@@ -238,6 +249,33 @@ static void *rs_stub_for(void *fn) {
 void dm_hib_rs_call(void *fn, void *arg);
 void dm_hib_call(void (*fn)(void *), void *arg) { if (dm_hib_on()) dm_hib_rs_call((void *)fn, arg); else fn(arg); }
 
+// ---- Resuming a restored thread (hle_thread.c hib_resume) ----
+// dm_gate_resume(src, dst, ret): copies the 800-byte gate frame src to dst (the bottom of this thread's gate stack top, where entry.S dm_gate keeps it) without a call (dst lies
+// below the caller's stack pointer), then dispatches the gate from it (ret 0: the SVC runs from the start) or returns to the guest with its registers (ret 1)
+// dm_hib_rs_resume(frame): loads a restartable call's entry registers from its frame (see dm_hib_rs_body) and enters the stub again
+__asm__(".text\n.p2align 2\n.globl " DM_ASM_SYM(dm_gate_resume) "\n" DM_ASM_SYM(dm_gate_resume) ":\n"
+        "    mov x9, #50\n    mov x12, x0\n    mov x13, x1\n"
+        "1:  ldp x10, x11, [x12], #16\n    stp x10, x11, [x13], #16\n    subs x9, x9, #1\n    b.ne 1b\n"
+        "    mov sp, x1\n"
+        "    cbnz w2, 2f\n"
+        "    mov x30, x1\n    b " DM_ASM_SYM(dm_gate_from_frame) "\n"
+        "2:  b " DM_ASM_SYM(dm_gate_return_from_frame) "\n"
+        ".p2align 2\n.globl " DM_ASM_SYM(dm_hib_rs_resume) "\n" DM_ASM_SYM(dm_hib_rs_resume) ":\n"
+        "    mov x17, x0\n"
+        "    ldp d8, d9, [x17, #0xb8]\n    ldp d10, d11, [x17, #0xc8]\n    ldp d12, d13, [x17, #0xd8]\n    ldp d14, d15, [x17, #0xe8]\n"
+        "    ldp x19, x20, [x17, #0x48]\n    ldp x21, x22, [x17, #0x58]\n    ldp x23, x24, [x17, #0x68]\n    ldp x25, x26, [x17, #0x78]\n    ldp x27, x28, [x17, #0x88]\n"
+        "    ldp x29, x30, [x17, #0x98]\n    ldp x9, x16, [x17, #0xa8]\n    mov sp, x9\n"
+        "    ldp x0, x1, [x17, #0x00]\n    ldp x2, x3, [x17, #0x10]\n    ldp x4, x5, [x17, #0x20]\n    ldp x6, x7, [x17, #0x30]\n    ldr x8, [x17, #0x40]\n"
+        "    b " DM_ASM_SYM(dm_hib_rs_body) "\n");
+
+void dm_gate_resume(const uint64_t *src, uint64_t *dst, int ret); void dm_hib_rs_resume(const uint64_t *frame);
+extern uint64_t dm_gate_top[]; extern const uint8_t dm_gate_stubs[];
+static void resume_frame(const uint64_t *frame, int mode) {
+    if (mode == 2) dm_hib_rs_resume(frame);
+    // the frame goes where entry.S dm_gate keeps it: under this thread's gate stack top (its gate slot, thread.c guest_gate_stack)
+    int slot = (int)(((const uint8_t *)dm_slot_get(g_keygate) - dm_gate_stubs) / 16);
+    dm_gate_resume(frame, (uint64_t *)(uintptr_t)(dm_gate_top[slot] - 800), mode);
+}
 // The hooks the shared files call through (function pointers, so that unit tests can link those files without this one), set before main
 void *dm_libc_thunk(void *fn);   // hle_table.c
 static void *thunk_if_on(void *fn) {   // what the guest gets instead of a host function: a libc thunk or a restartable call's stub
@@ -248,5 +286,20 @@ __attribute__((constructor)) static void hib_hooks(void) {
     dm_hib_guest_as_hook = dm_hib_guest_as; dm_hib_module_map_hook = dm_hib_module_map; dm_hib_thunk_hook = thunk_if_on; dm_hib_ctl_hook = dm_hib_ctl;
     dm_hib_alloc_hook = arena_calloc; dm_hib_free_hook = arena_free; dm_hib_call_hook = dm_hib_call; dm_hib_native_hold_hook = dm_hib_native_hold;
     void dm_hib_suspend_now(int on); dm_hib_suspend_hook = dm_hib_suspend_now;
-    void guest_clock_kick(void); dm_hib_kick_hook = guest_clock_kick;
+    void guest_clock_kick(void); dm_hib_kick_hook = guest_clock_kick; dm_hib_resume_frame_hook = resume_frame;
+}
+
+int dm_hib_arena_restore_state(const uint8_t *b, size_t n) {
+    if (n != sizeof(hib_arena)) return -1;
+    const hib_arena *h = (const hib_arena *)b;
+    pthread_mutex_lock(&g_hib_lock);
+    int ok = h->mod_used == g_mod_used;
+    if (ok) {
+        size_t pg = (size_t)getpagesize(), was = (g_arena_used + pg - 1) & ~(pg - 1), now = (h->arena_used + pg - 1) & ~(pg - 1);
+        uint8_t *base = g_win + HIB_MODWIN - HIB_ARENA;
+        if (now > was && mprotect(base + was, now - was, PROT_READ | PROT_WRITE)) ok = 0;   // the arena's pages as far as the snapshot used them (its memory chunks fill them)
+        g_arena_used = h->arena_used; for (int i = 0; i < 1024; i++) g_free[i] = (fblk *)(uintptr_t)h->free_[i];
+    }
+    pthread_mutex_unlock(&g_hib_lock);
+    return ok ? 0 : -1;
 }

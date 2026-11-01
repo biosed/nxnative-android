@@ -9,7 +9,8 @@ enum { HIB_NOT_STARTED = 0,   // created, StartThread not called yet
        HIB_PRE_SVC = 1,       // at a gate, before its SVC ran: the frame holds the SVC's arguments, a restored thread runs the gate from the start
        HIB_POST_SVC = 2,      // at the exit of an SVC that finished: the frame holds its results
        HIB_RESTART = 3,       // blocked in a restartable host call (hle_hib.c stubs): rs holds the registers at its entry, a restored thread calls it again
-       HIB_WAIT = 4 };        // blocked in a kernel wait (lock, condition variable, address, synchronization object, sleep): the frame and the wait below
+       HIB_WAIT = 4,          // blocked in a kernel wait (lock, condition variable, address, synchronization object): the frame and the wait below
+       HIB_EXITED = 5 };      // exited, its handle not closed yet
 
 // One guest thread, as the snapshot keeps it
 typedef struct {
@@ -37,6 +38,10 @@ void dm_guest_unpark_all(void);
 // With every thread parked: describe them (returns the count) / hold the scheduler lock while memory is copied (no waiting thread can finish its SVC meanwhile)
 int dm_hib_threads(hib_thr *out, int max);
 void dm_hib_hold(int on);
+// Restore (hle_thread.c): the kernel section, then the threads (dm_hib_resume_all runs on the thread that becomes the guest main thread and does not return)
+size_t dm_hib_kernel_save(uint8_t **out);
+int dm_hib_kernel_restore(const uint8_t *b, size_t n, const hib_thr *recs, int nrec);
+void dm_hib_resume_all(int nrec);
 // Restartable host calls (hle_hib.c stubs): the stub's entry frame, registered on entry and cleared on return; and the point a blocked call stops at once it wakes
 void dm_hib_rs_enter(const uint64_t *frame);
 void dm_hib_rs_leave(void);

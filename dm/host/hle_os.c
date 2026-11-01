@@ -160,3 +160,12 @@ HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEm", "passed straight to the SD
     pthread_once(&g_sa_once, sa_init);
     return g_sa_big_align && size >= 0x10000 ? g_sa_alloc_al(self, size, 0x10000) : g_sa_alloc(self, size);
 }
+
+// Hibernation: the guest clock goes on from where the snapshot left it (it was frozen while the snapshot was written), not frozen for any reason
+void dm_hib_clock_restore(uint64_t guest_at_save) {
+    pthread_mutex_lock(&g_gfz_mu);
+    g_gfz_reasons = 0; atomic_store(&g_gfz_bg, 0);
+    atomic_store(&g_glag, now_ns() - guest_at_save); atomic_store(&g_gfz, 0);
+    pthread_cond_broadcast(&g_gfz_cv);
+    pthread_mutex_unlock(&g_gfz_mu);
+}

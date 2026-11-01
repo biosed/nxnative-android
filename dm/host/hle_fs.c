@@ -1045,3 +1045,61 @@ HLE_FORCE("_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE", "fsp-srv; save dat
 HLE_FORCE("_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE", "fsp-srv; file read priority, ignored by the host", void, h_fs_SetPrio, int prio) { (void)prio; }
 HLE_FORCE("_ZN2nn2fs6detail18IsEnabledAccessLogEj", "fsp-srv; access log always off (returns bool)", unsigned, h_fs_AccessLogMask, unsigned mask) { (void)mask; return 0; }
 HLE_FORCE("_ZN2nn2fs6detail18IsEnabledAccessLogEv", "fsp-srv; access log always off (returns bool)", unsigned, h_fs_AccessLog, void) { return 0; }
+
+// Hibernation (hle_hibsnap.c): the mount table and the open files in a snapshot. A mount comes back as it was, not mounted again: a save mount's work directory holds the
+// writes since its last Commit, which a new mount would drop (the snapshot's save fingerprint covers that directory). A RomFS image is opened again; an image entry handle
+// names its mount by index, the same after the restore. A plain file comes back on the same descriptor number (the guest holds it), opened again by its path
+typedef struct { char name[32], dir[1024], overlay[4096], commit[1024]; int32_t ro, txn_root, poison, img; } hib_mnt;
+typedef struct { int32_t fd, mode, txn, pad; char path[1024]; } hib_fd;
+size_t dm_hib_fs_save(uint8_t **out) {
+    pthread_mutex_lock(&g_lock);
+    int nfd = 0; for (int fd = 0; fd < 65536; fd++) if (g_fmode[fd]) nfd++;
+    size_t n = 8 + (size_t)g_nmnt * sizeof(hib_mnt) + (size_t)nfd * sizeof(hib_fd);
+    uint8_t *b = calloc(1, n), *p = b; int32_t c[2] = {g_nmnt, nfd}; memcpy(p, c, 8); p += 8;
+    for (int i = 0; i < g_nmnt; i++) {
+        hib_mnt *m = (hib_mnt *)p; p += sizeof *m;
+        memcpy(m->name, g_mnt[i].name, sizeof m->name); memcpy(m->dir, g_mnt[i].dir, sizeof m->dir); memcpy(m->overlay, g_mnt[i].overlay, sizeof m->overlay); memcpy(m->commit, g_mnt[i].commit, sizeof m->commit);
+        m->ro = g_mnt[i].ro; m->txn_root = g_mnt[i].txn_root; m->poison = atomic_load(&g_mnt[i].poison); m->img = g_mnt[i].img != NULL;
+    }
+    for (int fd = 0; fd < 65536; fd++) if (g_fmode[fd]) {
+        hib_fd *f = (hib_fd *)p; p += sizeof *f;
+        f->fd = fd; f->mode = g_fmode[fd]; f->txn = atomic_load(&g_ftxn[fd]);
+#ifdef __APPLE__
+        if (fcntl(fd, F_GETPATH, f->path)) f->path[0] = 0;
+#else
+        char lk[64]; snprintf(lk, sizeof lk, "/proc/self/fd/%d", fd); ssize_t k = readlink(lk, f->path, sizeof f->path - 1); f->path[k > 0 ? k : 0] = 0;
+#endif
+    }
+    pthread_mutex_unlock(&g_lock);
+    *out = b; return n;
+}
+int dm_hib_fs_restore(const uint8_t *b, size_t n) {
+    int32_t c[2]; if (n < 8) return -1; memcpy(c, b, 8);
+    if (c[0] < 0 || c[0] > MAX_MOUNT || c[1] < 0 || n != 8 + (size_t)c[0] * sizeof(hib_mnt) + (size_t)c[1] * sizeof(hib_fd)) return -1;
+    const hib_mnt *m = (const hib_mnt *)(b + 8); const hib_fd *f = (const hib_fd *)(m + c[0]);
+    pthread_once(&g_txn_lock_once, txn_locks_init);
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < c[0]; i++) {
+        memcpy(g_mnt[i].name, m[i].name, sizeof m[i].name); memcpy(g_mnt[i].dir, m[i].dir, sizeof m[i].dir); memcpy(g_mnt[i].overlay, m[i].overlay, sizeof m[i].overlay); memcpy(g_mnt[i].commit, m[i].commit, sizeof m[i].commit);
+        g_mnt[i].ro = m[i].ro; g_mnt[i].txn_root = m[i].txn_root; atomic_store(&g_mnt[i].poison, m[i].poison); atomic_store(&g_mnt[i].first_write_ns, 0);
+        g_mnt[i].img = m[i].img ? img_open(m[i].dir) : NULL;
+        if (m[i].img && !g_mnt[i].img) { pthread_mutex_unlock(&g_lock); LOG("[RED] hibernate: the RomFS image %s cannot be opened again", m[i].dir); return -1; }
+        LOG("fs mount %s restored: %s", g_mnt[i].name, g_mnt[i].dir);
+    }
+    g_nmnt = c[0];
+    int bad = 0;
+    for (int i = 0; i < c[1] && !bad; i++) {
+        int want = f[i].fd, mode = f[i].mode;
+        int fd = open(f[i].path, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
+        if (fd < 0) { LOG("[RED] hibernate: file %s cannot be opened again (errno %d)", f[i].path, errno); bad = 1; break; }
+        if (fd != want) {
+            if (fcntl(want, F_GETFD) != -1) { LOG("[RED] hibernate: descriptor %d of %s is taken in this process", want, f[i].path); close(fd); bad = 1; break; }
+            if (dup2(fd, want) != want) { close(fd); bad = 1; break; }
+            close(fd);
+        }
+        g_fmode[want] = (uint8_t)mode; atomic_store(&g_ftxn[want], (uint16_t)f[i].txn);
+        LOG("fs file restored on descriptor %d: %s", want, f[i].path);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return bad ? -1 : 0;
+}

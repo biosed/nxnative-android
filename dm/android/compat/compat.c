@@ -223,6 +223,9 @@ void CFDictionarySetValue(CFMutableDictionaryRef d, const void *k, const void *v
 }
 void CFDictionaryRemoveValue(CFMutableDictionaryRef d, const void *k) { size_t i = cf_find(d, k); if (d->k[i] == k) { d->k[i] = CF_TOMB; d->v[i] = NULL; d->n--; } }
 CFIndex CFDictionaryGetCount(CFMutableDictionaryRef d) { return (CFIndex)d->n; }
+void CFDictionaryGetKeysAndValues(CFMutableDictionaryRef d, const void **keys, const void **values) {   // in table order, as CoreFoundation gives no order either
+    size_t n = 0; for (size_t i = 0; i < d->cap; i++) if (d->k[i] && d->k[i] != CF_TOMB) { if (keys) keys[n] = d->k[i]; if (values) values[n] = d->v[i]; n++; }
+}
 kern_return_t vm_region_64(mach_port_t task, vm_address_t *addr, vm_size_t *size, int flavor, vm_region_info_t info, mach_msg_type_number_t *cnt, mach_port_t *obj) {
     (void)task; (void)addr; (void)size; (void)flavor; (void)info; (void)cnt; (void)obj; return KERN_FAILURE;
 }

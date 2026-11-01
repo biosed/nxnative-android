@@ -25,6 +25,7 @@ static _Atomic int g_ntf_opmode, g_ntf_perfmode;          // only pushed after t
 // (995 ms/s, 5-6 W on an iPhone). The count is read and the event set or cleared under g_mq_lock, so a push racing a pop cannot leave it cleared over a queued notification
 // (lock order g_mq_lock → G → g_se_lock; nothing takes g_mq_lock while holding G)
 static uint8_t g_mq_ev[0x80] __attribute__((aligned(16)));
+HLE_HIB_STATIC(g_mq_ev)
 static _Atomic int g_mq_ev_on;
 static void mq_ev_sync(void) {
     if (!atomic_load(&g_mq_ev_on)) return;
@@ -265,4 +266,26 @@ HLE_FORCE("_ZN2nn2oe13GetRegionCodeEv", "console region (set:sys); from DM_LANG"
 HLE_FORCE("_ZN2nn2oe17GetPseudoDeviceIdEPNS_4util4UuidE", "pseudo device ID; a fixed host value", void, h_oe_GetDevId, uint8_t *uuid) {
     static const uint8_t k[16] = {0x78, 0x62, 0x6c, 0x00, 0x53, 0x57, 0x4e, 0x41, 0x54, 0x49, 0x56, 0x45, 0x31, 0x30, 0x30, 0x31};
     memcpy(uuid, k, 16);
+}
+
+// Hibernation (hle_hibsnap.c): this file's state in a snapshot. The queue, the event's binding and the switches the game set; the focus state the game saw is restored too, and
+// the front end reports the real one as the restored game comes back (a resume from the background)
+typedef struct { uint32_t mq[MQ]; int32_t mqh, mqn, ev_on, ntf_opmode, ntf_perfmode, focus_mode, seen, focus, opmode, applets, inactivity; } hib_oe;
+size_t dm_hib_oe_save(uint8_t **out) {
+    hib_oe *h = calloc(1, sizeof *h);
+    pthread_mutex_lock(&g_mq_lock); memcpy(h->mq, g_mq, sizeof g_mq); h->mqh = g_mqh; h->mqn = g_mqn; pthread_mutex_unlock(&g_mq_lock);
+    h->ev_on = g_mq_ev_on; h->ntf_opmode = g_ntf_opmode; h->ntf_perfmode = g_ntf_perfmode; h->focus_mode = g_focus_mode; h->seen = g_seen; h->focus = g_focus; h->opmode = dm_opmode();
+    h->applets = g_applets; h->inactivity = g_inactivity_mode;
+    *out = (uint8_t *)h; return sizeof *h;
+}
+int dm_hib_oe_restore(const uint8_t *b, size_t n) {
+    if (n != sizeof(hib_oe)) return -1;
+    const hib_oe *h = (const hib_oe *)b;
+    pthread_mutex_lock(&g_mq_lock); memcpy(g_mq, h->mq, sizeof g_mq); g_mqh = h->mqh; g_mqn = h->mqn; pthread_mutex_unlock(&g_mq_lock);
+    g_mq_ev_on = h->ev_on; g_ntf_opmode = h->ntf_opmode; g_ntf_perfmode = h->ntf_perfmode; g_focus_mode = h->focus_mode; g_seen = h->seen; g_focus = h->focus; g_opmode = h->opmode;
+    g_applets = h->applets; g_inactivity_mode = h->inactivity;
+    pthread_once(&g_oe_once, oe_script_start);   // the game had made its first queue call before the snapshot (DM_OE_SCRIPT starts from there)
+    // a snapshot written in the background comes back as the app returning to the foreground, in the order the front ends report it
+    if (h->focus != 1) { dm_focus_set(2); dm_focus_set(1); }
+    return 0;
 }

@@ -66,6 +66,9 @@ typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
 // Hibernation (hle_hib.c): an HLE function that may block in host code (a host condition variable) is marked restartable. With DM_HIBERNATE its import goes through a
 // stub that records the registers at its entry, so a parked thread blocked inside it is restored by calling it again from there. It must have no effect before it blocks
 // that a second call would repeat, and its wait must call dm_hib_native_hold (hle_hib.h) when it wakes
+// A host static the guest uses as one of its own objects (a SystemEventType the host hands out): with hibernation its bytes are kept in the snapshot (hle_hibsnap.c)
+typedef struct { void *p; size_t n; const char *name; } hib_static_ent;
+#define HLE_HIB_STATIC(var) __attribute__((used, DM_SECTION(swhibst))) static const hib_static_ent hib_static_##var = {(void *)&(var), sizeof(var), #var};
 #define HLE_HIB_RESTARTABLE(cname) __attribute__((used, DM_SECTION(swrestart))) static void *const hib_restart_##cname = (void *)cname;
 // The game's call site inside a HLE_FORCE_BIG implementation: pass __builtin_return_address(0), which after a stack switch is the entry's own (hle_bigstack.c)
 void *dm_bigstack_caller(void *ra);

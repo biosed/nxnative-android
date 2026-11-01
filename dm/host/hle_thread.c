@@ -329,9 +329,14 @@ static int64_t block(thr_t *t, int kind, int64_t ns) {   // the core's token is 
     core_acquire(t);
     return r;
 }
+static int64_t block_wait(thr_t *t, int64_t ns);
 static int64_t block_(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
+    return block_wait(t, ns);
+}
+// The wait itself, with t already in the wait chain (hibernation links a restored thread's wait before any thread runs, then waits here)
+static int64_t block_wait(thr_t *t, int64_t ns) {
     hand_leave(t);
     struct timespec dl = {0};
     int det_wait = ns > 0 && dm_detclock_enabled();
@@ -1413,14 +1418,14 @@ void dm_hib_hold(int on) { if (on) pthread_mutex_lock(&G); else pthread_mutex_un
 int dm_hib_threads(hib_thr *out, int max) {
     int n = 0;
     for (thr_t *t = g_all; t && n < max; t = t->all) {
-        if (t->exited) continue;
         hib_thr *r = &out[n++]; memset(r, 0, sizeof *r);
         r->handle = t->handle; r->id = t->id; r->prio = t->prio; r->core = t->core; r->mask = t->mask; r->started = t->started; r->host_owned = t->host_owned; r->closed = t->closed;
         r->entry = t->entry; r->arg = t->arg; r->stack_top = t->stack_top; r->last_svc = t->last_svc;
         char nb[48]; snprintf(r->name, sizeof r->name, "%s", thr_name(t, nb, sizeof nb));
         r->k18 = t->hs_k18; r->ktls = t->hs_tls; r->ktlr = t->hs_tlr;
         const uint64_t *f = atomic_load(&t->svc_regs);
-        if (!t->started) r->stop = HIB_NOT_STARTED;
+        if (t->exited) r->stop = HIB_EXITED;   // its handle stays until closed (WaitSynchronization on it is signalled)
+        else if (!t->started) r->stop = HIB_NOT_STARTED;
         else if (t->hib_rs) { r->stop = HIB_RESTART; memcpy(r->frame, t->hib_rs, 0x100); }
         else {
             r->stop = t->hib_stop == 1 ? HIB_PRE_SVC : t->hib_stop == 2 ? HIB_POST_SVC : HIB_WAIT;
@@ -1451,4 +1456,130 @@ void dm_hib_native_hold(pthread_mutex_t *held) {
     t->hib_stop = 0;
     pthread_mutex_unlock(&G);
     if (held) pthread_mutex_lock(held);
+}
+
+// ---------- Hibernation: the kernel's state in a snapshot, and threads restored from one ----------
+// Section "kernel" (written with G held, every thread parked): the handle table (each thread handle names its thread by ID, each event end its event by an index into the
+// event list), the events, the SystemEvent bindings and the counters. The threads themselves are the snapshot's thread records (dm_hib_threads), exited ones included
+typedef struct { uint32_t nh, nev, nse, pad; uint64_t next_id, next_se_id, wseq; } hib_kern;
+typedef struct { int32_t type, ev; uint64_t tid; } hib_h;   // ev: index into the events (event ends), tid: the thread's ID (thread handles)
+typedef struct { int32_t signaled, refs; } hib_ev;
+typedef struct { uint64_t ev, id; uint32_t wh, pad; } hib_se;
+size_t dm_hib_kernel_save(uint8_t **out) {   // G held
+    event_t **evs = calloc(MAX_H, sizeof *evs); int nev = 0;
+    hib_h *hs = calloc(MAX_H, sizeof *hs);
+    for (int i = 0; i < MAX_H; i++) {
+        hs[i].type = g_h[i].type; hs[i].ev = -1;
+        if (g_h[i].type == O_THREAD) hs[i].tid = ((thr_t *)g_h[i].obj)->id;
+        else if (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W) {
+            int k = 0; while (k < nev && evs[k] != g_h[i].obj) k++;
+            if (k == nev) evs[nev++] = g_h[i].obj;
+            hs[i].ev = k;
+        }
+    }
+    pthread_mutex_lock(&g_se_lock);
+    hib_kern k = {MAX_H, (uint32_t)nev, (uint32_t)g_nse, 0, g_next_id, g_next_se_id, g_wseq};
+    size_t n = sizeof k + MAX_H * sizeof *hs + (size_t)nev * sizeof(hib_ev) + (size_t)g_nse * sizeof(hib_se);
+    uint8_t *b = malloc(n), *p = b;
+    memcpy(p, &k, sizeof k); p += sizeof k; memcpy(p, hs, MAX_H * sizeof *hs); p += MAX_H * sizeof *hs;
+    for (int i = 0; i < nev; i++) { hib_ev e = {evs[i]->signaled, evs[i]->refs}; memcpy(p, &e, sizeof e); p += sizeof e; }
+    for (int i = 0; i < g_nse; i++) { hib_se e = {(uint64_t)(uintptr_t)g_se[i].ev, g_se[i].id, g_se[i].wh, 0}; memcpy(p, &e, sizeof e); p += sizeof e; }
+    pthread_mutex_unlock(&g_se_lock);
+    free(evs); free(hs);
+    *out = b; return n;
+}
+// Restore, before any guest thread runs: thread objects for every record (the main thread's included), the handle table, the events, the bindings, and every kernel wait
+// linked into the wait chain at once, so that no signal sent by a thread restored first is lost
+static thr_t *g_hib_main;   // the restored main thread (dm_hib_resume_main)
+static hib_thr *g_hib_rec;  // its record, and every other thread's
+int dm_hib_kernel_restore(const uint8_t *b, size_t n, const hib_thr *recs, int nrec) {
+    hib_kern k; if (n < sizeof k) return -1; memcpy(&k, b, sizeof k);
+    if (k.nh != MAX_H || n != sizeof k + k.nh * sizeof(hib_h) + k.nev * sizeof(hib_ev) + k.nse * sizeof(hib_se)) return -1;
+    const hib_h *hs = (const hib_h *)(b + sizeof k); const hib_ev *ev = (const hib_ev *)(hs + k.nh); const hib_se *se = (const hib_se *)(ev + k.nev);
+    pthread_mutex_lock(&G);
+    event_t **evs = calloc(k.nev + 1, sizeof *evs);
+    for (uint32_t i = 0; i < k.nev; i++) { evs[i] = calloc(1, sizeof **evs); evs[i]->signaled = ev[i].signaled; evs[i]->refs = ev[i].refs; }
+    thr_t **ts = calloc((size_t)nrec + 1, sizeof *ts);
+    g_hib_rec = malloc(((size_t)nrec + 1) * sizeof *g_hib_rec); memcpy(g_hib_rec, recs, (size_t)nrec * sizeof *recs);
+    for (int i = nrec - 1; i >= 0; i--) {   // g_all in the order the records came (the records were written from g_all's head)
+        const hib_thr *r = &recs[i]; thr_t *t = calloc(1, sizeof *t);
+        pthread_cond_init(&t->cv, NULL); pthread_cond_init(&t->pcv, NULL);
+        t->handle = r->handle; t->id = r->id; t->prio = r->prio; t->core = r->core; t->mask = r->mask; t->entry = r->entry; t->arg = r->arg; t->stack_top = r->stack_top;
+        t->started = r->started; t->exited = r->stop == HIB_EXITED; t->closed = r->closed; t->host_owned = r->host_owned; t->last_svc = r->last_svc;
+        t->core_held = t->core_want = -1; t->born_ns = now_ns();
+        if (r->stop == HIB_WAIT && r->wkind != 4) {   // linked now; its pthread waits in block_wait (a synchronization wait runs its SVC again instead)
+            t->wkind = r->wkind; t->waddr = r->waddr; t->wkey = r->wkey; t->wtag = r->wtag; t->wseq = r->wseq; t->woke = 0;
+            t->next = g_wait; g_wait = t;
+        }
+        t->all = g_all; g_all = t; ts[i] = t;
+        if (r->handle == 0x1001 || (!g_hib_main && r->id == 0x51)) g_hib_main = t;   // the main thread: the first handle and ID svc_thread_main_init hands out
+    }
+    for (uint32_t i = 0; i < k.nh; i++) {
+        g_h[i].type = hs[i].type; g_h[i].obj = NULL;
+        if (hs[i].type == O_THREAD) { for (int j = 0; j < nrec; j++) if (recs[j].id == hs[i].tid) g_h[i].obj = ts[j]; if (!g_h[i].obj) { LOG("[RED] hibernate: handle %#x names a thread that is not in the snapshot", 0x1000 + i); g_h[i].type = O_FREE; } }
+        else if (hs[i].type == O_EVENT_R || hs[i].type == O_EVENT_W) g_h[i].obj = hs[i].ev >= 0 && (uint32_t)hs[i].ev < k.nev ? evs[hs[i].ev] : NULL;
+    }
+    g_next_id = k.next_id; g_wseq = k.wseq;
+    pthread_mutex_lock(&g_se_lock);
+    g_nse = (int)k.nse; for (uint32_t i = 0; i < k.nse && i < 512; i++) { g_se[i].ev = (void *)(uintptr_t)se[i].ev; g_se[i].wh = se[i].wh; g_se[i].id = se[i].id; }
+    g_next_se_id = k.next_se_id;
+    pthread_mutex_unlock(&g_se_lock);
+    pthread_mutex_unlock(&G);
+    free(evs); free(ts);
+    return g_hib_main ? 0 : -1;
+}
+
+// A restored thread's pthread: its slots, its gate stack, then back to where it stopped
+static void hib_resume(thr_t *t, const hib_thr *r) {
+    pthread_setspecific(g_keythr, t);
+    pthread_mutex_lock(&G);
+    t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt); t->host_work = &dm_host_work;
+    pthread_set_qos_class_self_np(prio_qos(t->prio), 0); qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0; pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
+    pthread_mutex_unlock(&G);
+    crash_thread_init();
+    dm_slot_set(g_key18, (void *)(uintptr_t)r->k18); dm_slot_set(g_keytls, (void *)(uintptr_t)r->ktls); dm_slot_set(g_keytlr, (void *)(uintptr_t)r->ktlr);
+    { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, r->name[0] ? r->name : thr_name(t, nb, sizeof nb)); pthread_setname_np(hn); }
+    if (r->stop == HIB_NOT_STARTED) {   // as thread_main from its wait for StartThread on (its regions were made before the snapshot)
+        guest_gate_stack(1);
+        pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_acquire(t); pthread_mutex_unlock(&G);
+        dm_thread_enter(t->entry, t->arg, t->stack_top);
+        die("guest thread entry returned");
+    }
+    if (r->stop == HIB_RESTART) { pthread_mutex_lock(&G); core_acquire(t); pthread_mutex_unlock(&G); guest_gate_stack(1); dm_hib_resume_frame_hook(r->frame, 2); }
+    // a gate frame: the gate stack's top is this pthread's stack below this frame (guest_gate_stack), the frame goes right under it (entry.S dm_gate)
+    guest_gate_stack(1);
+    uint64_t *self = (uint64_t *)malloc(sizeof r->frame); memcpy(self, r->frame, sizeof r->frame);
+    if (r->stop == HIB_WAIT && r->wkind != 4) {   // its wait was linked at restore: wait here, then return from the SVC with the wait's result, as the SVC would have
+        t->svc_pc = r->svc_pc; t->svc_x18 = r->k18;
+        pthread_mutex_lock(&G); int64_t res = block_wait(t, r->wleft_ns == 0 ? 1 : r->wleft_ns); core_acquire(t); pthread_mutex_unlock(&G);
+        self[0] = (uint64_t)res;
+        dm_hib_resume_frame_hook(self, 1);
+    }
+    if (r->stop == HIB_WAIT && r->wkind == 4 && r->wleft_ns >= 0) self[3] = (uint64_t)r->wleft_ns;   // WaitSynchronization runs again with the time it had left
+    pthread_mutex_lock(&G); core_acquire(t); pthread_mutex_unlock(&G);
+    dm_hib_resume_frame_hook(self, r->stop == HIB_POST_SVC);
+}
+static void *hib_thread_main(void *p) { int i = (int)(intptr_t)p; thr_t *t = NULL;
+    pthread_mutex_lock(&G); for (thr_t *u = g_all; u; u = u->all) if (u->id == g_hib_rec[i].id) t = u; pthread_mutex_unlock(&G);
+    hib_resume(t, &g_hib_rec[i]); return NULL; }
+// The restore's last step, on the thread that becomes the guest main thread (the front end's guest thread): a pthread for every other thread, then the main thread itself resumes
+void dm_hib_resume_all(int nrec) {
+    pthread_key_create(&g_keythr, NULL);
+    qos_map_init();
+    { const char *e = getenv("DM_PREEMPT"); g_core_preempt = e ? atoi(e) != 0 : DM_GAME_CORE_PREEMPT; }
+    pause_install();
+    hitch_init();
+    int mi = -1;
+    for (int i = 0; i < nrec; i++) {
+        if (g_hib_rec[i].stop == HIB_EXITED) continue;
+        thr_t *t = NULL; pthread_mutex_lock(&G); for (thr_t *u = g_all; u; u = u->all) if (u->id == g_hib_rec[i].id) t = u; pthread_mutex_unlock(&G);
+        if (t == g_hib_main) { mi = i; continue; }
+        pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 1 << 20); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        pthread_t pt; if (pthread_create(&pt, &a, hib_thread_main, (void *)(intptr_t)i)) die("hibernate: pthread_create");
+        pthread_attr_destroy(&a);
+        pthread_mutex_lock(&G); t->pt = pt; pthread_mutex_unlock(&G);
+    }
+    if (mi < 0) die("hibernate: the snapshot has no main thread");
+    LOG("hibernate: %d threads restored, the main thread resumes", nrec);
+    hib_resume(g_hib_main, &g_hib_rec[mi]);
 }
