@@ -969,7 +969,7 @@ static shader_t *shader_get(const uint8_t md[8]) {
     if (!spv || !txt) { LOG("[RED] vk: shader %s not in %s", key, g_vkdir); free(spv); free(txt); return s; }
     for (char *ln = strtok(txt, "\n"); ln; ln = strtok(NULL, "\n")) {
         char a[16], ty[8], kind[16], sk[16]; int b, cnt, reg, off, sreg, soff = -1, l, t;
-        if (sscanf(ln, "stage %15s", a) == 1) s->stage = !strcmp(a, "vs") ? 0 : !strcmp(a, "ps") ? 1 : !strcmp(a, "cs") ? 5 : -1;
+        if (sscanf(ln, "stage %15s", a) == 1) s->stage = !strcmp(a, "vs") ? 0 : !strcmp(a, "ps") ? 1 : !strcmp(a, "gs") ? 2 : !strcmp(a, "cs") ? 5 : -1;
         else if (sscanf(ln, "tg %u %u %u", &s->tg[0], &s->tg[1], &s->tg[2]) == 3) {}
         else if (!strncmp(ln, "c1 ", 3)) { size_t n = strlen(ln + 3) / 2; s->c1 = malloc(n + 16); s->c1_len = (uint32_t)n; for (size_t i = 0; i < n; i++) sscanf(ln + 3 + 2 * i, "%2hhx", &s->c1[i]); }
         else if (sscanf(ln, "vin %d %d", &l, &t) == 2 && l >= 0 && l < 32) { s->vin[l] = (uint8_t)t; s->vin_mask |= 1u << l; }
@@ -991,11 +991,11 @@ static shader_t *shader_get(const uint8_t md[8]) {
         size_t nn; uint32_t *w2 = spv_gl_depth(spv, ns / 4, &nn);
         if (w2) { free(spv); spv = w2; ns = nn * 4; } else LOG("[RED] vk: vertex shader %s: no position written, left as it is for the GL depth convention", key);
     }
-    spv_set(spv, ns / 4, s->stage == 1 ? 1 : 0);
+    spv_set(spv, ns / 4, s->stage == 1 ? 1 : s->stage == 2 ? 2 : 0);   // fragment resources in set 1, geometry in set 2
     VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, ns, spv};
     VkResult r = vkCreateShaderModule(g_dev, &mi, NULL, &s->mod); free(spv);
     if (r != VK_SUCCESS) { LOG("[RED] vk: shader %s rejected (%d)", key, (int)r); s->mod = VK_NULL_HANDLE; }
-    VkDescriptorSetLayoutBinding lb[64]; VkShaderStageFlags sf = s->stage == 0 ? VK_SHADER_STAGE_VERTEX_BIT : s->stage == 1 ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding lb[64]; VkShaderStageFlags sf = s->stage == 0 ? VK_SHADER_STAGE_VERTEX_BIT : s->stage == 1 ? VK_SHADER_STAGE_FRAGMENT_BIT : s->stage == 2 ? VK_SHADER_STAGE_GEOMETRY_BIT : VK_SHADER_STAGE_COMPUTE_BIT;
     static const VkDescriptorType DT[] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
                                           VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER};
     for (int i = 0; i < s->nb; i++) lb[i] = (VkDescriptorSetLayoutBinding){s->b[i].binding, DT[s->b[i].type], s->b[i].count, sf, NULL};
@@ -1004,15 +1004,15 @@ static shader_t *shader_get(const uint8_t md[8]) {
     return s;
 }
 static VkDescriptorSetLayout g_empty_dsl;
-typedef struct { shader_t *vs, *fs; VkPipelineLayout pl; } prog_vk;
+typedef struct { shader_t *vs, *fs, *gs; VkPipelineLayout pl; } prog_vk;
 static prog_vk *g_pl; static int g_npl;
-static VkPipelineLayout layout_get(shader_t *vs, shader_t *fs) {
-    for (int i = 0; i < g_npl; i++) if (g_pl[i].vs == vs && g_pl[i].fs == fs) return g_pl[i].pl;
+static VkPipelineLayout layout_get(shader_t *vs, shader_t *fs, shader_t *gs) {
+    for (int i = 0; i < g_npl; i++) if (g_pl[i].vs == vs && g_pl[i].fs == fs && g_pl[i].gs == gs) return g_pl[i].pl;
     if (!g_empty_dsl) { VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; VKCHECK(vkCreateDescriptorSetLayout(g_dev, &li, NULL, &g_empty_dsl)); }
-    VkDescriptorSetLayout sl[2] = {vs ? vs->dsl : g_empty_dsl, fs ? fs->dsl : g_empty_dsl};
-    VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, fs ? 2 : 1, sl, 0, NULL};
+    VkDescriptorSetLayout sl[3] = {vs ? vs->dsl : g_empty_dsl, fs ? fs->dsl : g_empty_dsl, gs ? gs->dsl : g_empty_dsl};
+    VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, gs ? 3 : fs ? 2 : 1, sl, 0, NULL};
     VkPipelineLayout pl; VKCHECK(vkCreatePipelineLayout(g_dev, &pi, NULL, &pl));
-    g_pl = realloc(g_pl, (g_npl + 1) * sizeof *g_pl); g_pl[g_npl++] = (prog_vk){vs, fs, pl};
+    g_pl = realloc(g_pl, (g_npl + 1) * sizeof *g_pl); g_pl[g_npl++] = (prog_vk){vs, fs, gs, pl};
     return pl;
 }
 
@@ -1152,7 +1152,7 @@ static void set_rt(const p_set_rt *r) {
 
 // Pipelines, cached by everything they are built from
 typedef struct {
-    shader_t *vs, *fs; int prim;
+    shader_t *vs, *fs, *gs; int prim;
     va_st attr[16]; int nattr; vs_st stream[16]; int nstream;
     blend_st blend[8]; color_st color; chmask_st chmask; ds_st ds; poly_st poly; int samples;
     VkFormat cf[8]; int nc; VkFormat df; int stencil;
@@ -1180,8 +1180,9 @@ static int bf_no_src1(int f) { if (!bf_src1(f)) return f; RED_ONCE(10, "dual-sou
 static VkPipeline pso_get(const pso_key *k, VkPipelineLayout pl) {
     uint64_t h = fnv(k, sizeof *k);
     for (int i = 0; i < g_npso; i++) if (g_pso[i].h == h && !memcmp(&g_pso[i].k, k, sizeof *k)) return g_pso[i].p;
-    VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, k->vs->mod, "main", NULL},
-                                             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, k->fs ? (k->dual ? k->fs->mod_dual : k->fs->mod) : VK_NULL_HANDLE, "main", NULL}};
+    VkPipelineShaderStageCreateInfo st[3] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, k->vs->mod, "main", NULL}}; uint32_t nst = 1;
+    if (k->gs) st[nst++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_GEOMETRY_BIT, k->gs->mod, "main", NULL};
+    if (k->fs) st[nst++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, k->dual ? k->fs->mod_dual : k->fs->mod, "main", NULL};
     VkVertexInputBindingDescription vb[16]; VkVertexInputAttributeDescription va[16]; uint32_t nvb = 0, nva = 0; uint32_t used = 0;
     for (int i = 0; i < k->nattr && i < 16; i++) {
         if (!(k->vs->vin_mask >> i & 1)) continue;
@@ -1231,7 +1232,7 @@ static VkPipeline pso_get(const pso_key *k, VkPipelineLayout pl) {
     VkRenderPass crp = VK_NULL_HANDLE;
     if (!g_dynrend) { VkAttachmentLoadOp ld[8]; for (int i = 0; i < 8; i++) ld[i] = VK_ATTACHMENT_LOAD_OP_LOAD;
                       crp = rp_get(k->cf, ld, k->nc, k->df, k->stencil, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_LOAD, VK_IMAGE_LAYOUT_GENERAL); }
-    VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, g_dynrend ? &rinfo : NULL, 0, k->fs ? 2 : 1, st, &vi, &ia, NULL, &vp, &rs, &ms, &ds, &cb, &dy, pl, crp, 0, VK_NULL_HANDLE, -1};
+    VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, g_dynrend ? &rinfo : NULL, 0, nst, st, &vi, &ia, NULL, &vp, &rs, &ms, &ds, &cb, &dy, pl, crp, 0, VK_NULL_HANDLE, -1};
     VkPipeline p; VkResult r = vkCreateGraphicsPipelines(g_dev, g_pcache, 1, &gi, NULL, &p);
     if (r != VK_SUCCESS) { LOG("[RED] vk: pipeline for %s / %s not created (%d)", k->vs->key, k->fs ? k->fs->key : "-", (int)r); p = VK_NULL_HANDLE; }
     if (g_npso == g_cpso) { g_cpso = g_cpso ? 2 * g_cpso : 256; g_pso = realloc(g_pso, g_cpso * sizeof *g_pso); }
@@ -1401,18 +1402,21 @@ static uint64_t g_stat_draws, g_stat_skip, g_skip_why[8];   // why: 0 no program
 #define SKIP(w) do { g_stat_skip++; g_skip_why[w]++; return; } while (0)
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!S.bst[0]) SKIP(0);
-    shader_t *vs = NULL, *fs = NULL;
-    for (int st = 0; st < 2; st++) {   // the vertex shader of the program bound to the vertex stage, the fragment shader of the one bound to the fragment stage (cached by program and serial)
+    shader_t *vs = NULL, *fs = NULL, *gs = NULL;
+    for (int st = 0; st < 3; st++) {   // the vertex shader of the program bound to the vertex stage, the fragment shader of the one bound to the fragment stage (cached by program and serial)
         const prog_t *p = S.bst[st]; if (!p) continue;
-        static struct { const prog_t *p; uint64_t ser; shader_t *sh[2]; } pc[1024];
+        static struct { const prog_t *p; uint64_t ser; shader_t *sh[3]; } pc[1024];
         unsigned h = (unsigned)(((uintptr_t)p >> 4) ^ p->serial) % 1024;
         if (pc[h].p != p || pc[h].ser != p->serial) {
-            pc[h].p = p; pc[h].ser = p->serial; pc[h].sh[0] = pc[h].sh[1] = NULL;
-            for (unsigned i = 0; i < p->nstage; i++) { uint8_t md[8]; if (!prog_key(p, i, md)) continue; shader_t *s = shader_get(md); if (s->stage == 0 || s->stage == 1) pc[h].sh[s->stage] = s; }
+            pc[h].p = p; pc[h].ser = p->serial; pc[h].sh[0] = pc[h].sh[1] = pc[h].sh[2] = NULL;
+            for (unsigned i = 0; i < p->nstage; i++) { uint8_t md[8]; if (!prog_key(p, i, md)) continue; shader_t *s = shader_get(md); if (s->stage >= 0 && s->stage <= 2) pc[h].sh[s->stage] = s; }
         }
-        if (st) fs = pc[h].sh[1]; else vs = pc[h].sh[0];
+        if (st == 2) gs = pc[h].sh[2]; else if (st) fs = pc[h].sh[1]; else vs = pc[h].sh[0];
     }
-    if (S.bst[2] || S.bst[3] || S.bst[4]) RED_ONCE(32, "geometry / tessellation stages are bound: not drawn with them yet");
+    // A geometry stage (FINAL FANTASY XII THE ZODIAC AGE's character shaders: 84 geometry shaders, whose pixel shaders read a varying only the geometry shader writes) runs as
+    // Vulkan's own, its resources in set 2, with the GPU's geometryShader. Without it, or for tessellation, the draw goes without those stages as before
+    if (gs && (!g_feat.geometryShader || !gs->mod)) { RED_ONCE(33, "geometry stage: %s; drawn without it", !g_feat.geometryShader ? "the GPU has no geometry shaders" : "the shader was not loaded"); gs = NULL; }
+    if (S.bst[3] || S.bst[4]) RED_ONCE(32, "tessellation stages are bound: not drawn with them yet");
     if (vk_skip() & SK_DRAW) SKIP(4);
     if (!vs || !vs->mod || (fs && !fs->mod)) SKIP(1);
     if (!pass_begin()) SKIP(2);
@@ -1420,7 +1424,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     int prim = dw ? dw->prim : di->prim;
     if (prim == NVN_DRAW_PRIMITIVE_LINE_LOOP || prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP || prim == NVN_DRAW_PRIMITIVE_PATCHES) { RED_ONCE(31, "primitive %d not implemented yet", prim); SKIP(4); }
     pso_key k; memset(&k, 0, sizeof k);
-    k.vs = vs; k.fs = fs; k.prim = prim; k.nattr = S.nattr; memcpy(k.attr, S.attr, sizeof k.attr); k.nstream = S.nstream; memcpy(k.stream, S.stream, sizeof k.stream);
+    k.vs = vs; k.fs = fs; k.gs = gs; k.prim = prim; k.nattr = S.nattr; memcpy(k.attr, S.attr, sizeof k.attr); k.nstream = S.nstream; memcpy(k.stream, S.stream, sizeof k.stream);
     k.nc = P.n; for (int i = 0; i < P.n; i++) { k.cf[i] = P.ct[i] && P.cv[i] ? P.ct[i]->f.f : VK_FORMAT_UNDEFINED; k.blend[i] = S.blend[i]; }
     k.color = S.color; k.chmask = S.chmask; k.poly = S.poly; k.samples = P.ct[0] ? 1 : 1;
     if (S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS) RED_ONCE(48, "the alpha test (ColorStateSetAlphaTest %d) is not implemented: fragments are not discarded by it", (int)S.color.alpha_func);
@@ -1445,17 +1449,19 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (P.dt) { k.df = P.dt->f.f; k.stencil = P.dt->f.stencil; k.ds = S.ds; }
     if (g_plog) LOG("plog:  draw vs %s fs %s n %u depth t%d w%d f%d stencil %d f%d ops %d/%d/%d ref %u vm %#x wm %#x blend %#x mask %#x cull %d", vs->key, fs ? fs->key : "-", dw ? dw->count : di->count,
                     S.ds.dt, S.ds.dw, S.ds.df, S.ds.st, S.ds.sf_f, S.ds.fail_f, S.ds.zfail_f, S.ds.zpass_f, S.st_ref[0], S.st_vmask[0], S.st_wmask[0], S.color.blend_en, S.chmask.mask, S.poly.cull);
-    VkPipelineLayout pl = layout_get(vs, fs);
+    VkPipelineLayout pl = layout_get(vs, fs, gs);
     VkPipeline pp = pso_get(&k, pl);
     if (!pp) SKIP(5);
     if (fs && P.n) fb_prepare(fs); else g_fb_n = 0;
     VkDescriptorSet sets[2] = {write_set(vs, 0), fs ? write_set(fs, 1) : VK_NULL_HANDLE};
     g_fb_n = 0;
-    if (!sets[0] || (fs && !sets[1])) SKIP(6);
+    VkDescriptorSet gset = gs ? write_set(gs, 2) : VK_NULL_HANDLE;
+    if (!sets[0] || (fs && !sets[1]) || (gs && !gset)) SKIP(6);
     for (int a = 0; a < P.n; a++) if (S.chmask.mask >> (4 * a) & 0xf) P.cwr[a] = P.cdrawn[a] = 1;
     VkCommandBuffer cb = C->cb;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, fs ? 2 : 1, sets, 0, NULL);
+    if (gs) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 2, 1, &gset, 0, NULL);
     // NVN's upper-left origin keeps D3D's y-up clip space; Vulkan's is y-down: the viewport is flipped (negative height)
     float x = 0, y = 0, w = (float)P.w, h = (float)P.h;
     if (S.has_vp) { x = S.vp[0][0]; y = S.vp[0][1]; w = S.vp[0][2]; h = S.vp[0][3]; }
