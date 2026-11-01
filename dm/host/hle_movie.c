@@ -445,22 +445,32 @@ static size_t md_aac_drain(mdec_t *d, int slot, size_t have, int64_t wait_us) {
         wait_us = 0;
     }
 }
+// A packet's output is never empty: with no decoder, or nothing finished yet (the decoder's start-up delay), it is one frame's worth of silence (1024 samples per
+// channel). FINAL FANTASY XII THE ZODIAC AGE's movie-audio thread reads a ring of the decoded PCM, and once that ring is empty after the track ended it hands its writer
+// the ring's null buffer + 0x10 for 0x3000 bytes (1024 frames, 6 channels) and faults there (sig 11 at 0x10, lr main+0x7d62ec): with no samples out, every AAC movie
+// ended that way
+static int md_aac_silence(mdec_t *d, int slot) {
+    size_t n = (size_t)1024 * 2 * (size_t)(d->ch > 0 ? d->ch : 2);
+    if (n > MD_PCM_CAP) n = MD_PCM_CAP;
+    memset(d->out[slot].frm, 0, n); d->out[slot].bytes = n; return 1;
+}
 static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
-    if (!d->aac && !md_aac_open(d)) return 0;
     if (n <= 0) return 0;
     if (d->out[slot].cap < MD_PCM_CAP) { free(d->out[slot].frm); d->out[slot].frm = malloc(MD_PCM_CAP); d->out[slot].cap = MD_PCM_CAP; }
+    if (!d->aac && !md_aac_open(d)) return md_aac_silence(d, slot);
     size_t have = 0; int fed = 0;
     for (int tries = 0; tries < 50 && !fed; tries++) {   // up to half a second for a free input buffer, taking finished output meanwhile
         ssize_t i = AMediaCodec_dequeueInputBuffer(d->aac, 10000);
         if (i < 0) { have = md_aac_drain(d, slot, have, 0); continue; }
         size_t cap; uint8_t *b = AMediaCodec_getInputBuffer(d->aac, (size_t)i, &cap);
-        if (!b || cap < (size_t)n) { if (!d->red_dec++) LOG("[RED] movie: AAC packet of %d bytes does not fit MediaCodec's %zu-byte buffer", n, cap); AMediaCodec_queueInputBuffer(d->aac, (size_t)i, 0, 0, 0, 0); return have > 0; }
+        if (!b || cap < (size_t)n) { if (!d->red_dec++) LOG("[RED] movie: AAC packet of %d bytes does not fit MediaCodec's %zu-byte buffer", n, cap); AMediaCodec_queueInputBuffer(d->aac, (size_t)i, 0, 0, 0, 0); break; }
         memcpy(b, p, (size_t)n); fed = AMediaCodec_queueInputBuffer(d->aac, (size_t)i, 0, (size_t)n, 0, 0) == AMEDIA_OK;
     }
     if (!fed && !d->red_dec++) LOG("[RED] movie: MediaCodec took no AAC input for half a second");
     have = md_aac_drain(d, slot, have, 2000);   // what this packet finished (2 ms: the software decoder runs on its own thread)
+    if (!have) return md_aac_silence(d, slot);
     d->out[slot].bytes = have;
-    return have > 0;
+    return 1;
 }
 #endif
 // The H.264 decoder, made by Configure (when the stream's parameter sets come with it) or by the first packet; RGBA pictures in the native texture mode either way.
