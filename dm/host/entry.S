@@ -5,8 +5,16 @@
 //    this thread's stub (thread.c guest_gate_stack). The stub passes the top of the thread's gate stack to dm_gate, which saves x0-x30 there, calls gate_dispatch(ret, regs) on that stack,
 //    writes the registers back and returns. Horizon's kernel never writes a thread's stack during an SVC; the gate stack keeps it so.
 #include "asm_sym.h"
+// In libdmhost.so (Android, ELF) a global symbol may be preempted, so a branch to one goes through the PLT, which clobbers x16 / x17: the gate and import stubs below would
+// take that detour at every SVC with the guest's x16 / x17 lost. HIDE makes each entry the stubs reach (and those C reaches) local to the library, so they bind directly
+#ifdef __APPLE__
+#define HIDE(name)
+#else
+#define HIDE(name) SYM_HIDDEN SYM(name)
+#endif
     .text
     .globl SYM(unimpl_stubs)
+    HIDE(unimpl_stubs)
     .p2align 3
 SYM(unimpl_stubs):
     .set k, 0
@@ -17,6 +25,7 @@ SYM(unimpl_stubs):
     .endr
 
     .globl SYM(unimpl_entry)
+    HIDE(unimpl_entry)
     .p2align 2
 SYM(unimpl_entry):
     stp x29, x30, [sp, #-96]!
@@ -47,6 +56,7 @@ SYM(dm_gate_top):
 
 // Stub k (16 bytes) serves gate slot k: x29 = the return point (the gate block holds the guest's x29 at [sp] and reloads it after the gate), x30 = the slot's gate stack top
     .globl SYM(dm_gate_stubs)
+    HIDE(dm_gate_stubs)
     .p2align 4
 SYM(dm_gate_stubs):
     .set k, 0
@@ -59,6 +69,7 @@ SYM(dm_gate_stubs):
     .endr
 
     .globl SYM(dm_gate)
+    HIDE(dm_gate)
     .p2align 2
 SYM(dm_gate):
     // The register frame (800 bytes) goes at the top of the gate stack, not below the guest's sp: on Horizon an SVC leaves the thread's stack as it was, including the words below sp.
@@ -171,6 +182,7 @@ SYM(dm_gate):
 // 3) dm_thread_enter(entry, arg, sp): guest thread start. Switch to the guest stack given by the SDK and call entry with x0 = argument;
 //    Horizon threads must exit via ExitThread; returning from entry is reported as an error.
     .globl SYM(dm_thread_enter)
+    HIDE(dm_thread_enter)
     .p2align 2
 SYM(dm_thread_enter):
     mov sp, x2
