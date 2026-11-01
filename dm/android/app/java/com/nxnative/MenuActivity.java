@@ -1,5 +1,5 @@
-// Start-up menu of the Android app (Spanish, as the Mac's start-up window in dm/host/front_mac.m): console mode, frame rate, screen fit, language, frame-rate counter, the
-// cheats of the game's build (each one chosen by the player, none on by default) and "no volver a mostrar". The choices go to <files>/settings.env, which the game's
+// Start-up menu of the Android app (English): console mode, frame rate, screen fit, language, frame-rate counter, the
+// cheats of the game's build (each one chosen by the player, none on by default) and "do not show again". The choices go to <files>/settings.env, which the game's
 // native activity (app/front_android.c, process ":game") reads at boot. The menu stays under the game: when the game ends (− and + held two seconds) it shows again.
 // On first start the bundled save (assets/save, the player's progress from another device) seeds the app's save folder; the cheat file is refreshed from assets/cheats.txt.
 // An APK with the game inside (make_apk.py --bundle: assets/game/ and its list files.txt, each file as its pieces in assets/game/p/) unpacks it into the external folder on its first start, and again after an update,
@@ -99,7 +99,7 @@ public class MenuActivity extends Activity {
     private void unpack() {
         unpacking = true; playButton.setEnabled(false);
         status.setVisibility(View.VISIBLE); bar.setVisibility(View.VISIBLE);
-        status.setText("Preparando el juego por primera vez (solo esta vez, unos minutos)...");
+        status.setText("Preparing the game for its first start (only this once, a few minutes)...");
         new Thread(() -> {
             String err = null;
             try {
@@ -108,7 +108,7 @@ public class MenuActivity extends Activity {
                     String l; while ((l = r.readLine()) != null) { String[] f = l.split("\t"); if (f.length >= 2) { (f.length > 2 && f[2].equals("=d") ? later : files).add(f); total += Long.parseLong(f[1]); } }
                 }
                 File ext = getExternalFilesDir(null);
-                if (ext.getUsableSpace() < total + (200L << 20)) throw new Exception(String.format(Locale.ROOT, "No hay espacio: se necesitan %.1f GB libres.", total / 1e9));
+                if (ext.getUsableSpace() < total + (200L << 20)) throw new Exception(String.format(Locale.ROOT, "Not enough space: %.1f GB free are needed.", total / 1e9));
                 new File(ext, ".unpacked").delete(); new File(ext, ".pending_data").delete();
                 long done = 0; byte[] buf = new byte[1 << 20]; int lastPct = -1;
                 for (String[] f : later) total -= Long.parseLong(f[1]);
@@ -121,7 +121,7 @@ public class MenuActivity extends Activity {
                             int n; while ((n = in.read(buf)) > 0) { out.write(buf, 0, n); done += n;
                                 int pct = (int) (done * 100 / Math.max(1, total));
                                 if (pct != lastPct) { lastPct = pct; final int p = pct; final long d = done, t = total; runOnUiThread(() -> { bar.setProgress(p);
-                                    status.setText(String.format(Locale.ROOT, "Preparando el juego por primera vez: %d%% (%.1f de %.1f GB)", p, d / 1e9, t / 1e9)); }); } }
+                                    status.setText(String.format(Locale.ROOT, "Preparing the game for its first start: %d%% (%.1f of %.1f GB)", p, d / 1e9, t / 1e9)); }); } }
                         }
                     }
                 }
@@ -133,9 +133,9 @@ public class MenuActivity extends Activity {
             final String fe = err;
             runOnUiThread(() -> {
                 unpacking = false;
-                if (fe != null) { status.setText("No se pudo preparar el juego: " + fe); status.setTextColor(Color.rgb(255, 120, 120)); return; }
+                if (fe != null) { status.setText("Could not prepare the game: " + fe); status.setTextColor(Color.rgb(255, 120, 120)); return; }
                 if (pendingData() != null) { askData(null); return; }
-                status.setText("Juego listo."); bar.setVisibility(View.GONE); playButton.setEnabled(true); playButton.requestFocus();
+                status.setText("Game ready."); bar.setVisibility(View.GONE); playButton.setEnabled(true); playButton.requestFocus();
             });
         }).start();
     }
@@ -156,14 +156,14 @@ public class MenuActivity extends Activity {
     private void askData(String problem) {
         playButton.setEnabled(false); status.setVisibility(View.VISIBLE); bar.setVisibility(View.GONE);
         status.setTextColor(problem != null ? Color.rgb(255, 120, 120) : Color.WHITE);
-        status.setText((problem != null ? problem + "\n" : "") + "Falta un paso: el juego no cabe en un solo APK. Toca \"Elegir archivo de datos\" y elige " + dataName()
-                       + " (lo copiaste junto al APK). Solo se hace una vez; después puedes borrar ese archivo.");
+        status.setText((problem != null ? problem + "\n" : "") + "One more step: the game does not fit in one APK. Tap \"Choose data file\" and pick " + dataName()
+                       + " (copied beside the APK). This is needed once; afterwards you can delete that file.");
         dataButton.setVisibility(View.VISIBLE); dataButton.requestFocus();
     }
     private void pickData() {
         android.content.Intent i = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(android.content.Intent.CATEGORY_OPENABLE); i.setType("*/*");
-        try { startActivityForResult(i, 7); } catch (Exception e) { askData("Este Android no tiene selector de archivos."); }
+        try { startActivityForResult(i, 7); } catch (Exception e) { askData("This Android has no file picker."); }
     }
     @Override protected void onActivityResult(int req, int res, android.content.Intent data) {
         super.onActivityResult(req, res, data);
@@ -174,7 +174,7 @@ public class MenuActivity extends Activity {
         java.util.Map<String, Long> left = new java.util.HashMap<>(); long total = 0; for (String[] f : want) { left.put(f[0], Long.parseLong(f[1])); total += Long.parseLong(f[1]); }
         final long tot = total;
         unpacking = true; dataButton.setVisibility(View.GONE); bar.setVisibility(View.VISIBLE); status.setTextColor(Color.WHITE);
-        status.setText("Copiando los datos del juego...");
+        status.setText("Copying the game data...");
         new Thread(() -> {
             String err = null; File ext = getExternalFilesDir(null);
             try (java.util.zip.ZipInputStream zin = new java.util.zip.ZipInputStream(new java.io.BufferedInputStream(getContentResolver().openInputStream(uri), 1 << 20))) {
@@ -184,31 +184,31 @@ public class MenuActivity extends Activity {
                     if (name.equals("nxdatos.txt")) {   // this package and this build: a data file from another version would not match the APK's files
                         java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream(); int k; while ((k = zin.read(buf)) > 0) bo.write(buf, 0, k);   // InputStream.readAllBytes is API 33
                         String[] id = new String(bo.toByteArray(), StandardCharsets.UTF_8).trim().split("\t");
-                        if (id.length < 2 || !id[0].equals(getPackageName()) || !id[1].equals(String.valueOf(versionCode()))) throw new Exception("ese archivo de datos es de otra versión del juego.");
+                        if (id.length < 2 || !id[0].equals(getPackageName()) || !id[1].equals(String.valueOf(versionCode()))) throw new Exception("that data file belongs to another version of the game.");
                         checked = true; continue;
                     }
-                    if (!checked) throw new Exception("ese archivo no es el archivo de datos de este juego.");
+                    if (!checked) throw new Exception("that file is not this game's data file.");
                     if (!left.containsKey(name) || name.contains("..")) continue;
                     File to = new File(ext, name); to.getParentFile().mkdirs();
                     try (OutputStream out = new FileOutputStream(to)) {
                         int n; while ((n = zin.read(buf)) > 0) { out.write(buf, 0, n); done += n;
                             int pct = (int) (done * 100 / Math.max(1, tot));
                             if (pct != lastPct) { lastPct = pct; final int p = pct; final long d = done; runOnUiThread(() -> { bar.setProgress(p);
-                                status.setText(String.format(Locale.ROOT, "Copiando los datos del juego: %d%% (%.1f de %.1f GB)", p, d / 1e9, tot / 1e9)); }); } }
+                                status.setText(String.format(Locale.ROOT, "Copying the game data: %d%% (%.1f of %.1f GB)", p, d / 1e9, tot / 1e9)); }); } }
                     }
-                    if (to.length() != left.get(name)) throw new Exception("el archivo " + name + " llegó incompleto.");
+                    if (to.length() != left.get(name)) throw new Exception("the file " + name + " arrived incomplete.");
                     left.remove(name);
                 }
-                if (!checked) throw new Exception("ese archivo no es el archivo de datos de este juego.");
-                if (!left.isEmpty()) throw new Exception("faltan " + left.size() + " archivos en el archivo de datos.");
+                if (!checked) throw new Exception("that file is not this game's data file.");
+                if (!left.isEmpty()) throw new Exception("missing " + left.size() + " files in the data file.");
                 new File(ext, ".pending_data").delete();
                 try (OutputStream o = new FileOutputStream(new File(ext, ".unpacked"))) { o.write((versionCode() + "\n").getBytes(StandardCharsets.UTF_8)); }
             } catch (Exception ex) { err = ex.getMessage() != null ? ex.getMessage() : ex.toString(); }
             final String fe = err;
             runOnUiThread(() -> {
                 unpacking = false;
-                if (fe != null) { askData("No se pudieron copiar los datos: " + fe); return; }
-                status.setText("Juego listo. Ya puedes borrar " + dataName() + "."); bar.setVisibility(View.GONE); playButton.setEnabled(true); playButton.requestFocus();
+                if (fe != null) { askData("Could not copy the data: " + fe); return; }
+                status.setText("Game ready. You can now delete " + dataName() + "."); bar.setVisibility(View.GONE); playButton.setEnabled(true); playButton.requestFocus();
             });
         }).start();
     }
@@ -254,38 +254,38 @@ public class MenuActivity extends Activity {
         ScrollView sv = new ScrollView(this); sv.setBackgroundColor(Color.rgb(16, 18, 28));
         LinearLayout col = new LinearLayout(this); col.setOrientation(LinearLayout.VERTICAL); col.setPadding(56, 32, 56, 48);
         sv.addView(col, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        col.addView(text(getApplicationInfo().loadLabel(getPackageManager()) + " — Configuración", 24, true));
-        col.addView(text("Elige cómo quieres jugar. Durante el juego, mantén − y + dos segundos para volver aquí.", 14, false));
+        col.addView(text(getApplicationInfo().loadLabel(getPackageManager()) + " — Settings", 24, true));
+        col.addView(text("Choose how to play. During the game, hold − and + for two seconds to come back here.", 14, false));
         status = text("", 15, true); status.setVisibility(View.GONE); col.addView(status);
         bar = new android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal); bar.setMax(100); bar.setVisibility(View.GONE); col.addView(bar);
-        dataButton = new Button(this); dataButton.setText("Elegir archivo de datos"); dataButton.setTextSize(18); dataButton.setVisibility(View.GONE);
+        dataButton = new Button(this); dataButton.setText("Choose data file"); dataButton.setTextSize(18); dataButton.setVisibility(View.GONE);
         dataButton.setOnClickListener(v -> pickData()); col.addView(dataButton);
         if (!gameFilesPresent() && !bundled()) {
-            TextView w = text("Faltan los archivos del juego en " + getExternalFilesDir(null) + " (romfs, dm, vk). Cópialos desde la computadora y vuelve a abrir la app.", 15, true);
+            TextView w = text("The game files are missing in " + getExternalFilesDir(null) + " (romfs, dm, vk). Copy them from the computer and open the app again.", 15, true);
             w.setTextColor(Color.rgb(255, 120, 120)); col.addView(w);
         }
-        mode = spinner(col, "Modo de consola", new String[]{"Portátil (más fluido)", "Dock (TV, más resolución)"}, prefs.getInt("opmode", 0) == 1 ? 1 : 0);
-        fps = spinner(col, "Cuadros por segundo", new String[]{"60 (predeterminado)", "30 (ahorra batería)"}, prefs.getInt("fps", 60) == 30 ? 1 : 0);
-        fit = spinner(col, "Pantalla", new String[]{"Mantener proporción (franjas negras)", "Llenar la pantalla (estirar)"}, prefs.getBoolean("stretch", false) ? 1 : 0);
+        mode = spinner(col, "Console mode", new String[]{"Handheld (smoother)", "Docked (TV, higher resolution)"}, prefs.getInt("opmode", 0) == 1 ? 1 : 0);
+        fps = spinner(col, "Frame rate", new String[]{"60 (default)", "30 (saves battery)"}, prefs.getInt("fps", 60) == 30 ? 1 : 0);
+        fit = spinner(col, "Screen", new String[]{"Keep aspect ratio (black bars)", "Fill the screen (stretch)"}, prefs.getBoolean("stretch", false) ? 1 : 0);
         String sys = systemLang();
         String[] langs = {"es-419", "en-US", "system"};
-        int ls = 0; for (int i = 0; i < langs.length; i++) if (langs[i].equals(prefs.getString("lang", "es-419"))) ls = i;
-        lang = spinner(col, "Idioma", new String[]{"Español (Latinoamérica)", "English", "Idioma del sistema (" + sys + ")"}, ls);
-        showFps = new CheckBox(this); showFps.setText("Mostrar los FPS en pantalla"); showFps.setTextColor(Color.WHITE); showFps.setChecked(prefs.getBoolean("showfps", false));
+        int ls = 0; for (int i = 0; i < langs.length; i++) if (langs[i].equals(prefs.getString("lang", "en-US"))) ls = i;
+        lang = spinner(col, "Game language", new String[]{"Spanish (Latin America)", "English", "System language (" + sys + ")"}, ls);
+        showFps = new CheckBox(this); showFps.setText("Show the frame rate on screen"); showFps.setTextColor(Color.WHITE); showFps.setChecked(prefs.getBoolean("showfps", false));
         col.addView(showFps);
         List<String> cheats = cheatNames();
         Set<String> on = prefs.getStringSet("cheats", new HashSet<>());
-        if (cheats.isEmpty()) col.addView(text("Este juego no tiene trucos para esta versión.", 15, false));
+        if (cheats.isEmpty()) col.addView(text("This game has no cheats for this version.", 15, false));
         else {
-            col.addView(text("Trucos (activa solo los que quieras)", 18, true));
+            col.addView(text("Cheats (turn on only the ones you want)", 18, true));
             for (int i = 0; i < cheats.size(); i++) {
                 CheckBox c = new CheckBox(this); c.setText(cheats.get(i)); c.setTextColor(Color.WHITE); c.setChecked(on.contains(String.valueOf(i + 1)));
                 cheatBoxes.add(c); col.addView(c);
             }
         }
-        skip = new CheckBox(this); skip.setText("No volver a mostrar este menú (− y + durante el juego lo abre otra vez)"); skip.setTextColor(Color.WHITE);
+        skip = new CheckBox(this); skip.setText("Do not show this menu again (− and + during the game open it again)"); skip.setTextColor(Color.WHITE);
         skip.setChecked(prefs.getBoolean("skip", false)); col.addView(skip);
-        Button play = playButton = new Button(this); play.setText("Jugar (START)"); play.setTextSize(20);
+        Button play = playButton = new Button(this); play.setText("Play (START)"); play.setTextSize(20);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT); lp.topMargin = 28;
         play.setOnClickListener(v -> { save(); play(); });
         col.addView(play, lp);
