@@ -106,22 +106,23 @@ static void pads_push_(void) {
 // ---------- On-screen controls ----------
 // Laid out from the window's height h: the D-pad bottom left, A B X Y bottom right (by position, as on the Switch), L / ZL and R / ZR in the top corners, − and + top centre
 typedef struct { float x, y, w, h; int on; char label[3]; } dm_ovl;
-enum { NVB = 15 };
+enum { NVB = 16 };
 static struct { const char *label; uint64_t bit; float cx, cy; } g_vb[NVB];
-static _Atomic int g_ovl_show; static _Atomic uint64_t g_ovl_on; static float g_vw, g_vh, g_vr, g_dx, g_dy;
+static _Atomic int g_ovl_show; static _Atomic uint64_t g_ovl_on; static float g_vw, g_vh, g_vr, g_dx, g_dy, g_rx, g_ry;   // g_rx / g_ry: the right stick's centre
 static void vb_layout(void) {
     ANativeWindow *w = front_native_window(NULL); if (!w) return;
     float W_ = (float)ANativeWindow_getWidth(w), H = (float)ANativeWindow_getHeight(w);
     if (W_ == g_vw && H == g_vh) return;
     g_vw = W_; g_vh = H; g_vr = 0.065f * H; float o = 0.12f * H, fx = W_ - 0.24f * H, fy = H - 0.25f * H;
     g_dx = 0.24f * H; g_dy = H - 0.25f * H;
+    g_rx = W_ - 0.66f * H; g_ry = H - 0.25f * H;   // the right stick, left of the face buttons (FINAL FANTASY XII THE ZODIAC AGE's camera)
     int i = 0;
     #define VB(l, b, x, y) g_vb[i++] = (typeof(g_vb[0])){l, b, x, y}
     VB("A", DM_BTN_A, fx + o, fy); VB("B", DM_BTN_B, fx, fy + o); VB("X", DM_BTN_X, fx, fy - o); VB("Y", DM_BTN_Y, fx - o, fy);
     VB("L", DM_BTN_L, 0.11f * H, 0.11f * H); VB("ZL", DM_BTN_ZL, 0.11f * H, 0.28f * H); VB("R", DM_BTN_R, W_ - 0.11f * H, 0.11f * H); VB("ZR", DM_BTN_ZR, W_ - 0.11f * H, 0.28f * H);
     VB("-", DM_BTN_MINUS, W_ / 2 - 0.1f * H, 0.08f * H); VB("+", DM_BTN_PLUS, W_ / 2 + 0.1f * H, 0.08f * H);
     VB("", DM_BTN_UP, g_dx, g_dy - o); VB("", DM_BTN_DOWN, g_dx, g_dy + o); VB("", DM_BTN_LEFT, g_dx - o, g_dy); VB("", DM_BTN_RIGHT, g_dx + o, g_dy);
-    VB("", 0, g_dx, g_dy);
+    VB("", 0, g_dx, g_dy); VB("RS", 0, g_rx, g_ry);
     #undef VB
 }
 // What the backend draws over the picture: one box per control, in window pixels (0 = hidden)
@@ -129,19 +130,20 @@ int front_overlay(dm_ovl *out, int max) {
     if (!atomic_load(&g_ovl_show)) return 0;
     vb_layout(); uint64_t on = atomic_load(&g_ovl_on); int n = 0;
     for (int i = 0; i < NVB && n < max; i++) {
-        dm_ovl *b = &out[n++]; float r = g_vb[i].bit ? g_vr : g_vr * 0.6f;
+        dm_ovl *b = &out[n++]; float r = g_vb[i].bit || g_vb[i].label[0] ? g_vr : g_vr * 0.6f;
         *b = (dm_ovl){g_vb[i].cx - r, g_vb[i].cy - r, 2 * r, 2 * r, g_vb[i].bit && (on & g_vb[i].bit) != 0, ""};
         snprintf(b->label, sizeof b->label, "%s", g_vb[i].label);
     }
     return n;
 }
-// Every finger on the screen: the buttons under it; on the D-pad its direction (eight ways) and the left stick, from the finger's offset to the pad's centre
+// Every finger on the screen: the buttons under it; on the D-pad its direction (eight ways) and the left stick, from the finger's offset to the pad's centre; on the right
+// stick's area the right stick the same way
 static void touch_event(AInputEvent *e) {
     vb_layout();
     int32_t act = AMotionEvent_getAction(e), kind = act & AMOTION_EVENT_ACTION_MASK, up_idx = -1;
     if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_CANCEL) up_idx = -2;
     else if (kind == AMOTION_EVENT_ACTION_POINTER_UP) up_idx = (act & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
-    uint64_t btn = 0; float sx = 0, sy = 0;
+    uint64_t btn = 0; float sx = 0, sy = 0, rsx = 0, rsy = 0;
     if (up_idx != -2) for (size_t p = 0; p < AMotionEvent_getPointerCount(e); p++) {
         if ((int32_t)p == up_idx) continue;
         float x = AMotionEvent_getX(e, p), y = AMotionEvent_getY(e, p), ddx = x - g_dx, ddy = y - g_dy;
@@ -151,12 +153,18 @@ static void touch_event(AInputEvent *e) {
                           float k = fminf(1.f, m / (0.12f * g_vh)); sx = ddx / m * k; sy = ddy / m * k; }
             continue;
         }
+        float rdx = x - g_rx, rdy = y - g_ry;
+        if (fabsf(rdx) < 0.18f * g_vh && fabsf(rdy) < 0.18f * g_vh) {
+            float m = hypotf(rdx, rdy), k = fminf(1.f, m / (0.12f * g_vh));
+            if (m > 0.03f * g_vh) { rsx = rdx / m * k; rsy = rdy / m * k; }
+            continue;
+        }
         for (int i = 0; i < 10; i++) if (fabsf(x - g_vb[i].cx) < 1.3f * g_vr && fabsf(y - g_vb[i].cy) < 1.3f * g_vr) btn |= g_vb[i].bit;
     }
     if (g_touch_slot < 0) g_touch_slot = dev_slot(-1000000);
     g_dev[g_touch_slot].btn = btn & ~(uint64_t)(DM_BTN_LEFT | DM_BTN_RIGHT | DM_BTN_UP | DM_BTN_DOWN) ;
     g_dev[g_touch_slot].btn |= btn & (DM_BTN_LEFT | DM_BTN_RIGHT | DM_BTN_UP | DM_BTN_DOWN);
-    g_dev[g_touch_slot].ax[AX_LX] = sx; g_dev[g_touch_slot].ax[AX_LY] = sy;
+    g_dev[g_touch_slot].ax[AX_LX] = sx; g_dev[g_touch_slot].ax[AX_LY] = sy; g_dev[g_touch_slot].ax[AX_RX] = rsx; g_dev[g_touch_slot].ax[AX_RY] = rsy;
     atomic_store(&g_ovl_on, btn); atomic_store(&g_ovl_show, 1);
     pads_push();
 }
