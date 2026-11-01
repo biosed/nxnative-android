@@ -58,7 +58,10 @@ public class MenuActivity extends Activity {
         buildUi();
         if (needsUnpack()) { if (pendingData() != null) askData(null); else unpack(); return; }
         boolean forced = new File(getFilesDir(), "show_menu").delete();
-        if (prefs.getBoolean("skip", false) && !forced && b == null && gameFilesPresent()) play();
+        // A game the process left in hibernation (DM_HIBERNATE: its snapshot in <files>/hibernate) resumes at once, as a Switch wakes; the menu is the − and + hold away.
+        // A snapshot the game cannot take (another version, damaged) is removed by the game, which then comes back here (show_menu)
+        boolean resume = new File(getFilesDir(), "hibernate/snap.bin").exists() && hibernationOn();
+        if ((prefs.getBoolean("skip", false) || resume) && !forced && b == null && gameFilesPresent()) play();
     }
     @Override protected void onPause() { super.onPause(); if (mode != null) save(); }   // choices are kept also when the menu is left without playing
     @Override protected void onResume() {
@@ -214,6 +217,16 @@ public class MenuActivity extends Activity {
                 status.setText("Game ready. You can now delete " + dataName() + "."); bar.setVisibility(View.GONE); playButton.setEnabled(true); playButton.requestFocus();
             });
         }).start();
+    }
+    // DM_HIBERNATE=<n> with n > 0 in the settings or in the diagnostics file <external>/env.txt (which wins), as the game reads them (app/front_android.c boot_env)
+    private boolean hibernationOn() {
+        String v = null;
+        for (File f : new File[] { new File(getFilesDir(), "settings.env"), new File(getExternalFilesDir(null), "env.txt") }) {
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(new java.io.FileInputStream(f), StandardCharsets.UTF_8))) {
+                String l; while ((l = r.readLine()) != null) if (l.startsWith("DM_HIBERNATE=")) v = l.substring(13).trim();
+            } catch (Exception e) { /* not there */ }
+        }
+        try { return v != null && Integer.parseInt(v) > 0; } catch (NumberFormatException e) { return false; }
     }
     private boolean gameFilesPresent() {
         File ext = getExternalFilesDir(null);

@@ -278,11 +278,12 @@ static const char *policy(void) {
     const char *g = dm_hib_nvn_refuse(); if (g) return g;
     return NULL;
 }
-static int g_saving;
+static int g_saving, g_forgotten;
 // Writes the snapshot. Returns 0 on success; the world runs again afterwards either way (the caller decides whether the process then goes on or stops).
 // gfx_closed: the caller closed the graphics gate already (its suspend sequence): it is opened for the park, so that a thread waiting at it reaches a gate of its own, and closed again
 int dm_hib_save_ex(int gfx_closed) {
     if (!dm_hib_on()) { LOG("[RED] hibernate: not on (DM_HIBERNATE=1 from the start)"); return -1; }
+    if (__atomic_load_n(&g_forgotten, __ATOMIC_SEQ_CST)) return -1;   // the game is ending (dm_hib_forget)
     uint8_t *win, *arena; size_t win_len, mod_used, arena_used; dm_hib_layout(&win, &win_len, &mod_used, &arena, &arena_used);
     if (!win) { LOG("[RED] hibernate: no fixed layout this session"); return -1; }
     if (__atomic_exchange_n(&g_saving, 1, __ATOMIC_SEQ_CST)) { LOG("[RED] hibernate: a snapshot is already being written"); return -1; }
@@ -353,6 +354,13 @@ int dm_hib_save(void) { return dm_hib_save_ex(0); }
 // The front ends' suspend sequence (the app leaving the screen): the snapshot is written on a thread of its own after the suspend, and the resume waits for it first
 static pthread_t g_sth; static int g_sth_on;
 static void *suspend_save(void *arg) { (void)arg; dm_hib_save_ex(1); return NULL; }
+// The player ends the game (Android's − and + held for the menu): its snapshot goes, and none is written from here on, a suspend racing the exit included
+void dm_hib_forget_now(void) {
+    __atomic_store_n(&g_forgotten, 1, __ATOMIC_SEQ_CST);
+    if (g_sth_on) { pthread_join(g_sth, NULL); g_sth_on = 0; }
+    char dir[1024], p[1100]; hib_dir(dir, sizeof dir); snprintf(p, sizeof p, "%s/snap.bin", dir);
+    if (!unlink(p)) LOG("hibernate: the game ends: its snapshot is removed");
+}
 // The game going on in this process makes the snapshot stale: it is removed at the resume (a snapshot is for a process that did not come back; the next suspend writes a new one)
 void dm_hib_suspend_now(int on) {
     if (!dm_hib_on()) return;
@@ -458,6 +466,12 @@ static int mem_apply(const uint8_t *d, size_t n, uint64_t addr, uint64_t mods_en
     if (p != (PROT_READ | PROT_WRITE) && mprotect((void *)(uintptr_t)addr, len, p)) return -1;
     return 0;
 }
+// A snapshot that cannot be restored is removed (it never will be); a front end that started the game to resume it goes back to its menu (dm_hib_refused_hook), others boot it
+static void refused(const char *p, const char *why) {
+    LOG("hibernate: snapshot %s not restored (%s): removed; %s", p, why, dm_hib_refused_hook ? "back to the menu" : "the game starts as usual");
+    unlink(p);
+    if (dm_hib_refused_hook) dm_hib_refused_hook();
+}
 int dm_hib_restore_prepare(void) {
     const char *e = getenv("DM_HIB_RESTORE");
     if (!e || !*e || !dm_hib_on()) return 0;
@@ -465,19 +479,20 @@ int dm_hib_restore_prepare(void) {
     if (!strcmp(e, "1")) snprintf(p, sizeof p, "%s/snap.bin", dir); else snprintf(p, sizeof p, "%s", e);
     uint64_t t0 = now_ns();
     rd_t r;
-    if (rd_open(&r, p, why, sizeof why)) { LOG("hibernate: no restore (%s): the game starts as usual", why); return 0; }
-    if (hdr_check(&r.h, why, sizeof why)) { LOG("hibernate: snapshot %s not restored (%s): the game starts as usual", p, why); rd_close(&r); return 0; }
+    if (access(p, F_OK)) { LOG("hibernate: no snapshot at %s: the game starts as usual", p); return 0; }
+    if (rd_open(&r, p, why, sizeof why)) { refused(p, why); return 0; }
+    if (hdr_check(&r.h, why, sizeof why)) { rd_close(&r); refused(p, why); return 0; }
     // everything is read and checked before anything is changed: a damaged chunk leaves the process as it was
     void **chunks = calloc(r.n + 1, sizeof *chunks); size_t *lens = calloc(r.n + 1, sizeof *lens); int ok = 1;
-    for (uint32_t i = 0; i < r.n && ok; i++) if (!(chunks[i] = rd_chunk(&r, i, &lens[i]))) { LOG("[RED] hibernate: snapshot %s chunk %u damaged: the game starts as usual", p, i); ok = 0; }
+    for (uint32_t i = 0; i < r.n && ok; i++) if (!(chunks[i] = rd_chunk(&r, i, &lens[i]))) { snprintf(why, sizeof why, "chunk %u damaged", i); ok = 0; }
     uint64_t t1 = now_ns();
     const hib_thr *recs = NULL; int nrec = 0; const uint8_t *kern = NULL; size_t kern_n = 0;
     for (uint32_t i = 0; i < r.n && ok; i++) {
         if (r.tab[i].type == HIB_C_THREADS) { recs = chunks[i]; nrec = (int)(lens[i] / sizeof *recs); }
         if (r.tab[i].type == HIB_C_SECTION && !strcmp((const char *)chunks[i], "kernel")) { kern = (const uint8_t *)chunks[i] + 16; kern_n = lens[i] - 16; }
     }
-    if (ok && (!recs || !kern)) { LOG("[RED] hibernate: snapshot %s has no threads or no kernel state", p); ok = 0; }
-    if (!ok) { for (uint32_t i = 0; i < r.n; i++) free(chunks[i]); free(chunks); free(lens); rd_close(&r); return 0; }
+    if (ok && (!recs || !kern)) { snprintf(why, sizeof why, "no threads or no kernel state"); ok = 0; }
+    if (!ok) { for (uint32_t i = 0; i < r.n; i++) free(chunks[i]); free(chunks); free(lens); rd_close(&r); refused(p, why); return 0; }
     // from here on the process is the snapshot's: a failure stops it
     uint8_t *win, *arena; size_t win_len, mod_used, arena_used; dm_hib_layout(&win, &win_len, &mod_used, &arena, &arena_used);
     uint64_t pages = 0;

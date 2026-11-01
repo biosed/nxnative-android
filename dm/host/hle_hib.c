@@ -286,7 +286,8 @@ __attribute__((constructor)) static void hib_hooks(void) {
     dm_hib_guest_as_hook = dm_hib_guest_as; dm_hib_module_map_hook = dm_hib_module_map; dm_hib_thunk_hook = thunk_if_on; dm_hib_ctl_hook = dm_hib_ctl;
     dm_hib_alloc_hook = arena_calloc; dm_hib_free_hook = arena_free; dm_hib_call_hook = dm_hib_call; dm_hib_native_hold_hook = dm_hib_native_hold;
     void dm_hib_suspend_now(int on); dm_hib_suspend_hook = dm_hib_suspend_now;
-    void guest_clock_kick(void); dm_hib_kick_hook = guest_clock_kick; dm_hib_resume_frame_hook = resume_frame;
+    void guest_clock_kick(void); dm_hib_kick_hook = guest_clock_kick;
+    void dm_hib_forget_now(void); dm_hib_forget_hook = dm_hib_forget_now; dm_hib_resume_frame_hook = resume_frame;
 }
 
 int dm_hib_arena_restore_state(const uint8_t *b, size_t n) {

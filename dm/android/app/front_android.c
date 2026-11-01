@@ -281,12 +281,20 @@ static int input_cb(int fd, int events, void *data) {
 static char g_files[512];
 static void back_to_menu(void) {
     static _Atomic int once; if (atomic_exchange(&once, 1)) return;
+    if (dm_hib_forget_hook) dm_hib_forget_hook();   // the game ends here: no hibernation snapshot to resume (dm/host/hle_hibsnap.c)
     char p[600]; snprintf(p, sizeof p, "%s/show_menu", g_files); FILE *f = fopen(p, "w"); if (f) fclose(f);
     LOG("front end: − and + held: back to the menu");
     ANativeActivity_finish(g_act);
     dm_host_shutdown("back to the menu");
 }
 
+// The hibernation snapshot the menu resumed the game for was refused (removed by the host): back to the menu, quietly (show_menu keeps it from starting the game again)
+static void hib_refused(void) {
+    char p[600]; snprintf(p, sizeof p, "%s/show_menu", g_files); FILE *f = fopen(p, "w"); if (f) fclose(f);
+    LOG("front end: the hibernation snapshot was refused: back to the menu");
+    ANativeActivity_finish(g_act);
+    dm_host_shutdown("hibernation snapshot refused");
+}
 // ---------- Boot: environment from the menu's settings, log, then the host on its own thread ----------
 static char *g_argv[4];
 static void boot_env(const char *files, const char *ext) {
@@ -307,7 +315,10 @@ static void boot_env(const char *files, const char *ext) {
     snprintf(p, sizeof p, "%s/cheats", files); if (!access(p, R_OK)) setenv("DM_CHEATS", p, 0);   // the cheats folder (<build>.txt files; hle_cheats.c)
     // DM_HIBERNATE: a snapshot the last process wrote and did not come back from (dm/host/hle_hibsnap.c keeps it in <files>/hibernate) is where the game resumes
     snprintf(p, sizeof p, "%s/hibernate/snap.bin", files);
-    if (getenv("DM_HIBERNATE") && atoi(getenv("DM_HIBERNATE")) > 0 && !access(p, R_OK)) { setenv("DM_HIB_RESTORE", p, 0); fprintf(stderr, "boot: hibernation snapshot %s found: the game resumes there\n", p); }
+    if (getenv("DM_HIBERNATE") && atoi(getenv("DM_HIBERNATE")) > 0 && !access(p, R_OK)) {
+        setenv("DM_HIB_RESTORE", p, 0); dm_hib_refused_hook = hib_refused;   // a snapshot the host refuses (another build, damaged) is removed, and the menu shows
+        fprintf(stderr, "boot: hibernation snapshot %s found: the game resumes there\n", p);
+    }
     chdir(files);
     g_argv[0] = strdup("dmhost"); snprintf(p, sizeof p, "%s/dm", ext); g_argv[1] = strdup(p);
 }
