@@ -204,6 +204,22 @@ size_t dm_hib_svc_save(uint8_t **out) {
     pthread_mutex_unlock(&g_map_lock);
     *out = b; return n;
 }
+// Hibernation's check after a restore (hle_hibsnap.c): the ranges the guest has open, which must be readable and writable: the heap's open part, each MapMemory mapping (in host
+// pages) and the alias region's committed pages (runs of its page bitmap, in host pages). Sorted by address within each kind; returns the count
+int svc_hib_open_ranges(uint64_t (*out)[2], int max) {
+    int n = 0; uint64_t pg = (uint64_t)getpagesize();
+    pthread_mutex_lock(&g_map_lock);
+    if (g_heap && atomic_load(&g_heap_cur) && n < max) { out[n][0] = (uint64_t)(uintptr_t)g_heap; out[n][1] = out[n][0] + atomic_load(&g_heap_cur); n++; }
+    for (int i = 0; i < g_nmap && n < max; i++) { out[n][0] = g_map[i].base & ~(pg - 1); out[n][1] = (g_map[i].base + g_map[i].size + pg - 1) & ~(pg - 1); n++; }
+    uint64_t pages = g_alias_cap >> 12, run = 0; int in = 0;
+    for (uint64_t p = 0; p <= pages && n < max; p++) {
+        int m = p < pages && (atomic_load(&g_alias_bits[p >> 6]) >> (p & 63) & 1);
+        if (m && !in) { run = p; in = 1; }
+        if (!m && in) { out[n][0] = ((uint64_t)(uintptr_t)g_alias + (run << 12)) & ~(pg - 1); out[n][1] = ((uint64_t)(uintptr_t)g_alias + (p << 12) + pg - 1) & ~(pg - 1); n++; in = 0; }
+    }
+    pthread_mutex_unlock(&g_map_lock);
+    return n;
+}
 int dm_hib_svc_restore(const uint8_t *b, size_t n) {
     mem_init();
     hib_svc h; if (n < sizeof h) return -1; memcpy(&h, b, sizeof h);

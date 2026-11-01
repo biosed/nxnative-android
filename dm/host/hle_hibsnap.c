@@ -418,18 +418,19 @@ int dm_hib_verify(const char *path) {
     if (!path || !*path) { char dir[1024]; hib_dir(dir, sizeof dir); snprintf(p, sizeof p, "%s/snap.bin", dir); path = p; }
     rd_t r; uint64_t t0 = now_ns();
     if (rd_open(&r, path, why, sizeof why)) { LOG("[RED] hib verify %s: %s", path, why); return -1; }
-    uint64_t raw = 0, mem = 0, pages = 0; int bad = -1, nthr = 0;
+    uint64_t raw = 0, mem = 0, pages = 0, ro = 0; int bad = -1, nthr = 0;
     for (uint32_t i = 0; i < r.n && bad < 0; i++) {
         size_t n; uint8_t *d = rd_chunk(&r, i, &n);
         if (!d) { bad = (int)i; break; }
         raw += n;
-        if (r.tab[i].type == HIB_C_MEM) { uint64_t len; memcpy(&len, d, 8); mem += len; const uint8_t *bm = d + 16; for (uint64_t o = 0; o < len; o += ZPAGE) pages += bm[o / ZPAGE / 8] >> (o / ZPAGE % 8) & 1; }
+        if (r.tab[i].type == HIB_C_MEM) { uint64_t len, pz; memcpy(&len, d, 8); memcpy(&pz, d + 8, 8); mem += len; if ((pz & 3) != 3) ro += len;
+                                          const uint8_t *bm = d + 16; for (uint64_t o = 0; o < len; o += ZPAGE) pages += bm[o / ZPAGE / 8] >> (o / ZPAGE % 8) & 1; }
         if (r.tab[i].type == HIB_C_THREADS) nthr = (int)r.tab[i].addr;
         free(d);
     }
     if (bad >= 0) LOG("[RED] hib verify %s: chunk %d of %u damaged", path, bad, r.n);
-    else LOG("hib verify %s: whole: game %s, written %llu, %u chunks, %d threads, %.1f MB of memory spans (%.1f MB not zero), %.1f MB raw in %.1f MB; read in %.0f ms", path, r.h.game,
-             (unsigned long long)r.h.created_unix, r.n, nthr, mem / 1048576.0, pages * ZPAGE / 1048576.0, raw / 1048576.0, r.size / 1048576.0, (now_ns() - t0) / 1e6);
+    else LOG("hib verify %s: whole: game %s, written %llu, %u chunks, %d threads, %.1f MB of memory spans (%.1f MB not zero, %.1f MB written while not writable), %.1f MB raw in %.1f MB; read in %.0f ms", path, r.h.game,
+             (unsigned long long)r.h.created_unix, r.n, nthr, mem / 1048576.0, pages * ZPAGE / 1048576.0, ro / 1048576.0, raw / 1048576.0, r.size / 1048576.0, (now_ns() - t0) / 1e6);
     rd_close(&r);
     return bad >= 0 ? -1 : 0;
 }
@@ -466,9 +467,47 @@ static int mem_apply(const uint8_t *d, size_t n, uint64_t addr, uint64_t mods_en
         if (bm[o / ZPAGE / 8] >> (o / ZPAGE % 8) & 1) { if (data + ZPAGE > end) return -1; memcpy((void *)(uintptr_t)(addr + o), data, ZPAGE); data += ZPAGE; }
         else if (addr < mods_end) memset((void *)(uintptr_t)(addr + o), 0, ZPAGE);
     }
-    int p = (prot & 1 ? PROT_READ : 0) | (prot & 2 ? PROT_WRITE : 0) | (prot & 4 ? PROT_EXEC : 0);
-    if (p != (PROT_READ | PROT_WRITE) && mprotect((void *)(uintptr_t)addr, len, p)) return -1;
+    // Every kept page comes back readable and writable, whatever protection it had when written: guest memory has no read-only pages of its own (SetHeapSize, MapMemory and
+    // MapPhysicalMemory open it read-write), and a read-only one was write-protected by the GPU dirty tracker (nvn_dirty.c), whose state starts over in this process. Kept as it
+    // was, its first write faulted with no tracker page behind it (FF12 on Android crashed at its first area change after a restore)
+    (void)prot;
     return 0;
+}
+// After memory is back: every range the guest has open (svc_hib_open_ranges: the heap, the MapMemory mappings, the alias region's committed pages) must be readable and writable;
+// the ranges that are not, as the platform's region list shows them, are logged
+int svc_hib_open_ranges(uint64_t (*out)[2], int max);   // hle_svc.c
+static void prot_check(void) {
+    static uint64_t want[65536][2]; static span_t have[65536];
+    int nw = svc_hib_open_ranges(want, 65536), nh = 0;
+#ifdef __APPLE__
+    for (mach_vm_address_t a = 0; nh < 65536; ) {
+        mach_vm_size_t s; natural_t depth = 0; struct vm_region_submap_info_64 info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (mach_vm_region_recurse(mach_task_self(), &a, &s, &depth, (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS) break;
+        if ((info.protection & 3) == 3) { if (nh && have[nh - 1].hi == a) have[nh - 1].hi = a + s; else have[nh++] = (span_t){a, a + s, 3}; }
+        a += s;
+    }
+#else
+    FILE *f = fopen("/proc/self/maps", "r"); char ln[512];
+    while (f && fgets(ln, sizeof ln, f) && nh < 65536) {
+        unsigned long long a, e; char perm[8] = "";
+        if (sscanf(ln, "%llx-%llx %7s", &a, &e, perm) < 3 || perm[0] != 'r' || perm[1] != 'w') continue;
+        if (nh && have[nh - 1].hi == a) have[nh - 1].hi = e; else have[nh++] = (span_t){a, e, 3};
+    }
+    if (f) fclose(f);
+#endif
+    uint64_t bytes = 0, missing = 0; int bad = 0;
+    for (int i = 0; i < nw; i++) {
+        bytes += want[i][1] - want[i][0];
+        for (uint64_t a = want[i][0]; a < want[i][1]; ) {   // the region list is sorted: walk the part of want[i] it covers
+            int k = 0; while (k < nh && have[k].hi <= a) k++;
+            if (k < nh && have[k].lo <= a) { a = have[k].hi; continue; }
+            uint64_t e = k < nh && have[k].lo < want[i][1] ? have[k].lo : want[i][1];
+            if (bad++ < 8) LOG("[RED] hibernate: %#llx-%#llx is open to the guest but not readable and writable after the restore", (unsigned long long)a, (unsigned long long)e);
+            missing += e - a; a = e;
+        }
+    }
+    LOG("hibernate: protections checked: %d ranges the guest has open, %.1f MB%s", nw, bytes / 1048576.0, bad ? ", some not readable and writable (above)" : ", all readable and writable");
+    (void)missing;
 }
 // A snapshot that cannot be restored is removed (it never will be); a front end that started the game to resume it goes back to its menu (dm_hib_refused_hook), others boot it
 static void refused(const char *p, const char *why) {
@@ -511,6 +550,7 @@ int dm_hib_restore_prepare(void) {
         for (size_t k = 0; k < sizeof g_sec / sizeof *g_sec; k++)
             if (!strcmp(nm, g_sec[k].name) && g_sec[k].restore && g_sec[k].restore((const uint8_t *)chunks[i] + 16, lens[i] - 16)) die("hibernate: restoring section %s failed", nm);
     }
+    prot_check();   // the svc section is back: what the guest has open is known
     dm_hib_clock_restore(r.h.guest_ns);
     g_nrthr = nrec; g_restoring = 1;
     for (uint32_t i = 0; i < r.n; i++) free(chunks[i]);
