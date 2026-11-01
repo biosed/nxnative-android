@@ -1537,7 +1537,9 @@ static void hib_resume(thr_t *t, const hib_thr *r) {
     pthread_set_qos_class_self_np(prio_qos(t->prio), 0); qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0; pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
     pthread_mutex_unlock(&G);
     crash_thread_init();
-    dm_slot_set(g_key18, (void *)(uintptr_t)r->k18); dm_slot_set(g_keytls, (void *)(uintptr_t)r->ktls); dm_slot_set(g_keytlr, (void *)(uintptr_t)r->ktlr);
+    // a thread that never ran guest code noted no slots: its regions are made again, as thread_main makes them (the SDK reads them only from the thread itself)
+    if (r->stop == HIB_NOT_STARTED || !r->ktlr) { guest_thread_init(); guest_thread_set_id(t->id); }
+    else { dm_slot_set(g_key18, (void *)(uintptr_t)r->k18); dm_slot_set(g_keytls, (void *)(uintptr_t)r->ktls); dm_slot_set(g_keytlr, (void *)(uintptr_t)r->ktlr); }
     { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, r->name[0] ? r->name : thr_name(t, nb, sizeof nb)); pthread_setname_np(hn); }
     if (r->stop == HIB_NOT_STARTED) {   // as thread_main from its wait for StartThread on (its regions were made before the snapshot)
         guest_gate_stack(1);
