@@ -8869,8 +8869,11 @@ static void fb_prepare(NvProg *pr) {
     uint32_t wm = 0;   // the attachments this draw writes
     for (int k = 0; k < R.rt.n && k < 8; k++) if (R.rt.color[k] && ((S.chmask.mask >> (4 * k)) & 0xf) && (fs->rf.color_known ? fs->rf.color_mask >> k & 1 : 1)) wm |= 1u << k;
     if (g_enc && (wm & g_fb_rmask)) { g_fb_split++; rp_end(); fb_pass_sync(); }   // an earlier draw of this pass read an attachment this one writes: it must not see these writes
-    for (int i = 0; i < fs->rf.nb && g_fb_n < 4; i++) { const nvn_rbind *b = &fs->rf.b[i]; if (b->kind != NVN_RB_TEX || b->reg >= NTEX) continue;
-        int tid = (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff); if (!tid) continue;
+    for (int i = 0; i < fs->rf.nb && g_fb_n < 4; i++) { const nvn_rbind *b = &fs->rf.b[i];
+        // A bound slot, or a handle read from a uniform buffer (TEXU, as encode_args reads it): FINAL FANTASY XII THE ZODIAC AGE's full-screen passes sample their own attachment through
+        // such handles, and reading it directly left single magenta pixels (most on rows 128 apart) in its scene colour on the M1, and magenta streaks in its blurred cutscene frames
+        int tid = b->kind == NVN_RB_TEX && b->reg < NTEX ? (int)(tex_slot_h(S.tex[1], S.img[1], b->reg) & 0xfffff) : b->kind == NVN_RB_TEXU && !b->n ? ubo_tex_id(ubo_handle_b(1, b)) : 0;
+        if (!tid) continue;
         os_unfair_lock_lock(&g_rmu); uint64_t ser = tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t.serial : 0; os_unfair_lock_unlock(&g_rmu);
         if (!ser) continue;
         for (int k = 0; k < R.rt.n && k < 8 && g_fb_n < 4; k++) { if (!R.rt.color[k] || R.rt.color[k]->serial != ser) continue;
