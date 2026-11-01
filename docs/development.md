@@ -207,7 +207,10 @@ both back before any guest thread runs.
 The front ends call `dm_hib_suspend(1)` at the end of their suspend sequence
 (the Mac's minimised window, `DM_OE_SCRIPT` `bg=1`) and `dm_hib_suspend(0)`
 before resuming. `DM_CTL` `hib save`, `hib verify`, `hib park` and
-`hib unpark` drive it by hand; `DM_HIB_VERIFY=<file>` checks a snapshot.
+`hib unpark` drive it by hand; `DM_HIB_VERIFY=<file>` checks a snapshot. On Android the app goes straight back into
+the game when a snapshot exists and `DM_HIBERNATE` is on (`settings.env` or
+`<external>/env.txt`); a refused snapshot is removed and the menu shows, and
+holding − and + (back to the menu) ends the game without one.
 
 ## Continuous integration
 
