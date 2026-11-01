@@ -919,6 +919,9 @@ HLE_FORCE("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", "fsp-srv → 
 
 // ---------- Directories ----------
 typedef struct { DIR *d; char path[1024]; DIR *od; char opath[1024]; DirectoryEntry *snap; int64_t nsnap, psnap; int mode; } dirh_t;
+// Open directory handles: the guest holds them as host pointers, so hibernation writes no snapshot while one is open
+static _Atomic int g_dirs_open;
+int dm_fs_dirs_open(void) { return atomic_load(&g_dirs_open); }
 static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
     char fwd[1024]; rest = fwd_slashes(rest, fwd, sizeof fwd);
     char *roots = strdup(m->overlay);
@@ -971,7 +974,7 @@ HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → o
         if (k >= 0 && g_mnt[mi].img->e[k].type) errno = ENOTDIR, k = -1;
         if (k < 0) return err_res("opendir", path);
         const romfs_img *m = g_mnt[mi].img; const img_ent *x = &m->e[k];
-        dirh_t *h = calloc(1, sizeof *h); if (!h || !(h->snap = calloc(x->b ? x->b : 1, sizeof *h->snap))) die("RomFS image directory allocation failed");
+        dirh_t *h = calloc(1, sizeof *h); atomic_fetch_add(&g_dirs_open, 1); if (!h || !(h->snap = calloc(x->b ? x->b : 1, sizeof *h->snap))) die("RomFS image directory allocation failed");
         h->nsnap = (int64_t)x->b; h->mode = mode; strlcpy(h->path, path, sizeof h->path);
         for (uint64_t j = 0; j < x->b; j++) {
             const img_ent *c = &m->e[x->a + j]; DirectoryEntry *o = &h->snap[j];
@@ -982,7 +985,7 @@ HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → o
     }
     HP(path); DIR *d = opendir(hp);
     if (!d) return err_res("opendir", hp);
-    dirh_t *h = calloc(1, sizeof *h); h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
+    dirh_t *h = calloc(1, sizeof *h); atomic_fetch_add(&g_dirs_open, 1); h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
     const char *c = strchr(path, ':');
     if (c) for (int i = 0; i < g_nmnt; i++) if (g_mnt[i].overlay[0] && strlen(g_mnt[i].name) == (size_t)(c - path) && !strncmp(g_mnt[i].name, path, (size_t)(c - path))) {
         dir_snapshot(h, &g_mnt[i], c + 1); break;
@@ -1009,7 +1012,7 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
 }
 HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → closedir(3)", void, h_fs_CloseDirectory, uint64_t hh) {
     if (!hh) return;   // the game also closes after a failed open (handle 0): nothing to do in the original either
-    dirh_t *h = (dirh_t *)hh; if (h->d) closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);
+    dirh_t *h = (dirh_t *)hh; if (h->d) closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h); atomic_fetch_sub(&g_dirs_open, 1);
 }
 
 // ---------- Overloads from newer SDKs (SDK 16: MountRom without a cache, ReadFile without the bytes-read output / with read options, directory entry count) ----------

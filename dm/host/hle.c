@@ -2,6 +2,7 @@
 #include "hle.h"
 #include <dlfcn.h>
 #include <time.h>
+#include <stdatomic.h>
 
 // ---------- Unimplemented imports: named stubs (the statically assembled stub table in entry.S, the k-th = movz x9,#k; b unimpl_entry) ----------
 #define MAX_STUB 4096                 // Matches the .rept count in entry.S
@@ -46,7 +47,6 @@ static const hle_ent *hle_find(const char *name) {
     return NULL;
 }
 
-void *(*dm_hib_thunk_hook)(void *fn);   // hle_hib.c sets it with DM_HIBERNATE (a hook: unit tests link this file alone)
 uint64_t resolve_import(module_t *m, const char *name) {
     const hle_ent *e = hle_find(name);
     if (e) {
@@ -115,7 +115,12 @@ uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs) {
         const gate_t *g = &g_gate[i];
         if (g->ret == ret_addr) switch (g->kind) {
             case G_CNTPCT: case G_CNTVCT: {
-                guest_clock_read_wait();
+                // hibernation: a timer read is a gate a thread can stop at; one waiting for the clock in the background (guest_clock_read_wait) comes back here to stop
+                for (;;) {
+                    if (atomic_load(&dm_hib_parking_now)) { void thr_svc_enter(uint64_t *, uint64_t), thr_svc_leave(void); thr_svc_enter(regs, g->orig); thr_svc_leave(); }
+                    guest_clock_read_wait();
+                    if (!atomic_load(&dm_hib_parking_now)) break;
+                }
                 uint64_t t = guest_ns() * 12 / 625;    // 19.2 MHz system counter; original instruction mrs xN, cntpct_el0, arg = N
                 regs[g->arg] = t;
                 return t;

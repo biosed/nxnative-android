@@ -12,6 +12,7 @@
 #include <limits.h>
 #include "dm.h"
 #include "dm_uc.h"
+#include "hle_hib.h"
 #include <errno.h>
 #include <sched.h>
 #include <signal.h>
@@ -92,6 +93,11 @@ typedef struct thr {
     const uint32_t *whs; int whn;   // WaitSynchronization's handle array (guest memory, valid while the thread waits there): a signal wakes only waiters that hold the signalled object
     int ctx_ok; uint64_t ctx_x[29], ctx_fp, ctx_lr, ctx_sp, ctx_pc; uint32_t ctx_pstate, ctx_fpcr, ctx_fpsr; __uint128_t ctx_v[32];
     pthread_cond_t pcv;
+    // Hibernation (dm_guest_park_all): where the thread stopped. hib_stop 1 = at a gate before its SVC ran (svc_regs, svc_pc: the gate frame), 2 = at the SVC's exit (the
+    // frame holds its results), 3 = blocked in a restartable host call (hib_rs: its entry registers, hle_hib.c); a thread in a kernel wait (wkind) is stopped there
+    int hib_stop; const uint64_t *hib_rs;
+    int hs_ok; uint64_t hs_k18, hs_tls, hs_tlr;   // the thread's slots, read by the thread itself while parked (another thread cannot read them)
+    struct timespec wdl; int wtimed;   // the current kernel wait's deadline (CLOCK_REALTIME) when it has one: a snapshot keeps the time left
 } thr_t;
 static thr_t *g_all;
 extern __thread _Atomic int dm_host_work;   // declared in hle.h too; defined in hle_nvn.c
@@ -99,6 +105,9 @@ static _Atomic uint64_t g_preempt_n, g_preempt_ns;   // same-core handoffs: coun
 static int g_core_preempt;   // also check already-runnable peers after every thread SVC (profile / DM_PREEMPT)
 
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
+// Hibernation: every guest thread stops at its next gate (dm_guest_park_all) while this is set; a pause by SetThreadActivity is per thread (pause_req)
+#define g_hib_park dm_hib_parking_now   // dm.h
+#define PAUSING(t) ((t)->pause_req || atomic_load(&g_hib_park))
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
 static pthread_key_t g_keythr;
@@ -125,6 +134,9 @@ static thr_t *cur(void) {
     if (!t) die("thread SVC called from a non-guest thread");
     return t;
 }
+static void hib_note_slots(thr_t *t) {   // on t's own thread
+    t->hs_k18 = (uint64_t)(uintptr_t)dm_slot_get(g_key18); t->hs_tls = (uint64_t)(uintptr_t)dm_slot_get(g_keytls); t->hs_tlr = (uint64_t)(uintptr_t)dm_slot_get(g_keytlr); t->hs_ok = 1;
+}
 // Horizon's per-core priority ordering: a woken higher-priority thread pinned to
 // the caller's core runs until it blocks before the signalling thread continues.
 // See docs/reference/threads.md, "Same-core wake handoffs", for the movie lifetime failure this prevents.
@@ -133,7 +145,7 @@ void dm_thread_mark_host(void) { thr_t *t = pthread_getspecific(g_keythr); if (t
 // Holding G. wake() clears wkind before the pthread resumes; it must already count as runnable in that window, even if Mach still reports WAITING / STOPPED.
 // Explicit host GPU work and contended native codec locks do not occupy a guest core. Ordinary host dispatch delays and HLE calls do, until a guest wait / sleep / exit says otherwise.
 static int thr_runnable(const thr_t *t) {
-    return !t->wkind && !t->sleeping && !t->native_wait && !t->pause_req && !(t->host_work && *t->host_work);
+    return !t->wkind && !t->sleeping && !t->native_wait && !PAUSING(t) && !(t->host_work && *t->host_work);
 }
 // Holding G. Whether t was made runnable for self's current handoff (by self, or by a thread that was) and has not blocked since
 static int thr_in_handoff(const thr_t *t, const thr_t *self) {
@@ -151,7 +163,7 @@ void dm_thread_native_wait(int entering) {
     thr_t *t = pthread_getspecific(g_keythr);
     if (!t) return;
     pthread_mutex_lock(&G);
-    if (entering) { if (!t->native_wait++) core_release(t); hand_leave(t); }   // core_serial: blocked here, it gives its core's token away as in a kernel wait
+    if (entering) { if (!t->native_wait++) core_release(t); hand_leave(t); if (t->hib_rs) hib_note_slots(t); }   // core_serial: blocked here, it gives its core's token away as in a kernel wait
     else { if (!t->native_wait) die("unbalanced native HLE wait"); if (!--t->native_wait && !t->core_away) core_acquire(t); }
     pthread_mutex_unlock(&G);
 }
@@ -321,13 +333,24 @@ static int64_t block_(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     hand_leave(t);
-    struct timespec dl;
+    struct timespec dl = {0};
     int det_wait = ns > 0 && dm_detclock_enabled();
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
     if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
+    t->wtimed = ns > 0 && !det_wait; t->wdl = dl;
     while (!t->woke) {
         int rc;
+        if (atomic_load(&g_hib_park)) {   // hibernation: no time passes for a waiting thread while the world is parked (the guest clock is frozen too); its deadline moves on by as much
+            struct timespec p0, p1; clock_gettime(CLOCK_REALTIME, &p0);
+            hib_note_slots(t); pthread_cond_broadcast(&t->pcv);
+            while (atomic_load(&g_hib_park) && !t->woke) pthread_cond_wait(&t->cv, &G);
+            clock_gettime(CLOCK_REALTIME, &p1);
+            int64_t d = (int64_t)(p1.tv_sec - p0.tv_sec) * 1000000000ll + (p1.tv_nsec - p0.tv_nsec);
+            dl.tv_sec += d / 1000000000; dl.tv_nsec += d % 1000000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+            t->wdl = dl;
+            continue;
+        }
         if (det_wait) {
             uint64_t now = guest_ns();
             if (now >= guest_deadline) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
@@ -468,13 +491,20 @@ void thr_svc_enter(uint64_t *regs, uint64_t pc) {
         pthread_mutex_lock(&G); qos_apply(t); pthread_mutex_unlock(&G);
     }
     if (atomic_load(&t->pause_req)) { pthread_mutex_lock(&G); if (t->pause_req && !t->paused) { t->paused = 1; pthread_cond_broadcast(&t->pcv); } pthread_mutex_unlock(&G); }
+    if (atomic_load(&g_hib_park) && !t->hib_rs) {   // hibernation: stop here, before the SVC runs (not inside a restartable host call: it runs on to its wait); a restored thread runs it from the start (its arguments are in the frame)
+        pthread_mutex_lock(&G);
+        hib_note_slots(t);
+        while (atomic_load(&g_hib_park)) { t->hib_stop = 1; pthread_cond_broadcast(&t->pcv); pthread_cond_wait(&t->pcv, &G); }
+        t->hib_stop = 0;
+        pthread_mutex_unlock(&G);
+    }
 }
 void thr_svc_leave(void) {
     thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
     int in = 1; if (atomic_compare_exchange_strong(&t->svc_state, &in, 0)) { atomic_store(&t->svc_regs, NULL); return; }   // no pause requested: G is not needed (every other thread's SVC takes it)
     pthread_mutex_lock(&G);
-    while (t->pause_req) { t->paused = 1; pthread_cond_broadcast(&t->pcv); pthread_cond_wait(&t->pcv, &G); }
-    t->paused = 0; atomic_fetch_and(&t->svc_state, ~1); atomic_store(&t->svc_regs, NULL);
+    while (t->pause_req || (atomic_load(&g_hib_park) && !t->hib_rs)) { t->paused = 1; if (atomic_load(&g_hib_park)) { hib_note_slots(t); t->hib_stop = 2; } pthread_cond_broadcast(&t->pcv); pthread_cond_wait(&t->pcv, &G); }
+    t->paused = 0; t->hib_stop = 0; atomic_fetch_and(&t->svc_state, ~1); atomic_store(&t->svc_regs, NULL);
     pthread_mutex_unlock(&G);
 }
 static void pause_install(void) {
@@ -1331,4 +1361,94 @@ void hle_clear_system_event(void *ev) {   // Clear a bound service-layer SystemE
         e->signaled = 0;
     }
     pthread_mutex_unlock(&G);
+}
+
+// ---------- Hibernation: park every guest thread (hle_hib.h) ----------
+// The flag stops each thread at its next gate (an SVC, a timer read or a spin-wait pass: thr_svc_enter, before the SVC runs), at the exit of an SVC it is in (thr_svc_leave),
+// in the kernel wait it is blocked in (block_: woken once to read its slots, no timeout fires while parked), or in a restartable host call it is blocked in (dm_hib_native_hold).
+// A thread is never stopped in guest code by a signal: the rewriter's slot sequences hold host values in registers for a few instructions, which a snapshot must not keep
+static int hib_stable(const thr_t *t) {   // holding G
+    if (!t->started || t->exited) return 1;
+    if (!t->hs_ok) return 0;
+    if (t->hib_rs) return t->native_wait || t->hib_stop == 3;   // a restartable host call stops only in its wait
+    return t->hib_stop || (t->wkind && !t->woke);
+}
+int dm_guest_park_all(int timeout_ms, char *why, size_t n) {
+    atomic_store(&g_hib_park, 1);
+    pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t; t = t->all) { atomic_fetch_or(&t->svc_state, 2); pthread_cond_broadcast(&t->cv); }   // waiters wake once to read their slots
+    pthread_mutex_unlock(&G);
+    if (dm_hib_kick_hook) dm_hib_kick_hook();   // readers of the frozen clock come back to their gate
+    uint64_t t0 = now_ns();
+    for (;;) {
+        pthread_mutex_lock(&G);
+        int pending = 0; char buf[512] = ""; size_t at = 0;
+        for (thr_t *t = g_all; t; t = t->all) if (!hib_stable(t)) {
+            pending++;
+            if (at < sizeof buf - 96) { char nb[48]; at += (size_t)snprintf(buf + at, sizeof buf - at, "%s%#x '%s' (last svc %#x%s%s%s)", at ? ", " : "", t->handle, thr_name(t, nb, sizeof nb), t->last_svc,
+                                                  atomic_load(&t->svc_regs) ? ", in an SVC" : "", t->native_wait ? ", in a host wait" : "", t->host_owned ? ", host-created" : ""); }
+        }
+        pthread_mutex_unlock(&G);
+        if (!pending) { LOG("hibernate: every guest thread parked in %.1f ms", (now_ns() - t0) / 1e6); return 0; }
+        if (now_ns() - t0 > (uint64_t)timeout_ms * 1000000ull) {
+            snprintf(why, n, "%d thread(s) did not stop within %d ms: %s", pending, timeout_ms, buf);
+            dm_guest_unpark_all();
+            return -1;
+        }
+        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+    }
+}
+void dm_guest_unpark_all(void) {
+    pthread_mutex_lock(&G);
+    atomic_store(&g_hib_park, 0);
+    for (thr_t *t = g_all; t; t = t->all) {
+        if (!(t->hib_rs && t->native_wait)) t->hs_ok = 0;   // a thread still blocked in a restartable call has not run: the slots it noted at its wait stand
+        if (!t->pause_req) atomic_fetch_and(&t->svc_state, ~2);
+        pthread_cond_broadcast(&t->pcv); pthread_cond_broadcast(&t->cv);
+    }
+    pthread_mutex_unlock(&G);
+}
+void dm_hib_hold(int on) { if (on) pthread_mutex_lock(&G); else pthread_mutex_unlock(&G); }
+// With the world parked and G held (dm_hib_hold): one record per thread that has not exited
+int dm_hib_threads(hib_thr *out, int max) {
+    int n = 0;
+    for (thr_t *t = g_all; t && n < max; t = t->all) {
+        if (t->exited) continue;
+        hib_thr *r = &out[n++]; memset(r, 0, sizeof *r);
+        r->handle = t->handle; r->id = t->id; r->prio = t->prio; r->core = t->core; r->mask = t->mask; r->started = t->started; r->host_owned = t->host_owned; r->closed = t->closed;
+        r->entry = t->entry; r->arg = t->arg; r->stack_top = t->stack_top; r->last_svc = t->last_svc;
+        char nb[48]; snprintf(r->name, sizeof r->name, "%s", thr_name(t, nb, sizeof nb));
+        r->k18 = t->hs_k18; r->ktls = t->hs_tls; r->ktlr = t->hs_tlr;
+        const uint64_t *f = atomic_load(&t->svc_regs);
+        if (!t->started) r->stop = HIB_NOT_STARTED;
+        else if (t->hib_rs) { r->stop = HIB_RESTART; memcpy(r->frame, t->hib_rs, 0x100); }
+        else {
+            r->stop = t->hib_stop == 1 ? HIB_PRE_SVC : t->hib_stop == 2 ? HIB_POST_SVC : HIB_WAIT;
+            if (f) memcpy(r->frame, f, sizeof r->frame);
+            r->svc_pc = t->svc_pc;
+            if (r->stop == HIB_WAIT) {
+                r->wkind = t->wkind; r->waddr = t->waddr; r->wkey = t->wkey; r->wtag = t->wtag; r->wseq = t->wseq; r->whs = (uint64_t)(uintptr_t)t->whs; r->whn = t->whn; r->wleft_ns = -1;
+                if (t->wtimed) {
+                    struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+                    int64_t left = (int64_t)(t->wdl.tv_sec - now.tv_sec) * 1000000000ll + (t->wdl.tv_nsec - now.tv_nsec);
+                    r->wleft_ns = left > 0 ? left : 0;
+                }
+            }
+        }
+    }
+    return n;
+}
+// Restartable host calls (hle_hib.c): the stub registers its entry frame on the calling thread
+void dm_hib_rs_enter(const uint64_t *frame) { thr_t *t = pthread_getspecific(g_keythr); if (t) { t->hib_rs = frame; hib_note_slots(t); } }
+void dm_hib_rs_leave(void) { thr_t *t = pthread_getspecific(g_keythr); if (t) t->hib_rs = NULL; }
+// A restartable call's wait woke while the world is parked: stop here (its host lock released meanwhile, so that the snapshot can read that subsystem's state), until unparked
+void dm_hib_native_hold(pthread_mutex_t *held) {
+    thr_t *t = pthread_getspecific(g_keythr);
+    if (!t || !t->hib_rs || !atomic_load(&g_hib_park)) return;
+    if (held) pthread_mutex_unlock(held);
+    pthread_mutex_lock(&G);
+    while (atomic_load(&g_hib_park)) { t->hib_stop = 3; pthread_cond_broadcast(&t->pcv); pthread_cond_wait(&t->pcv, &G); }
+    t->hib_stop = 0;
+    pthread_mutex_unlock(&G);
+    if (held) pthread_mutex_lock(held);
 }

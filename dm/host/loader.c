@@ -22,7 +22,6 @@ pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
 enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_N };
 
 uint64_t resolve_import(module_t *m, const char *name);
-void *(*dm_hib_module_map_hook)(size_t len);   // hle_hib.c sets it (a hook: unit tests link this file without it): the fixed module window with DM_HIBERNATE
 static void *module_map(size_t len) { return dm_hib_module_map_hook ? dm_hib_module_map_hook(len) : mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); }
 int hle_implements(const char *name);
 void gate_register(uint64_t ret_addr, const char *kind, int arg, uint64_t orig);
@@ -208,7 +207,9 @@ static void *force_lookup(const char *name) {
         unsigned i = g_fidx[j] - 1;
         if (!strcmp(g_force[i].name, name)) {
             if (!g_force_hits[i]++ && g_flag.imports) LOG("force %s  (%s)", name, g_force[i].why);
-            void *hlecount_wrap(const char *, const char *, void *); return hlecount_wrap("FORCE", name, g_force[i].fn);   // A counting stub when DM_HLECOUNT is set
+            void *fn = g_force[i].fn;
+            if (dm_hib_thunk_hook) { void *h = dm_hib_thunk_hook(fn); if (h) fn = h; }   // hibernation: a restartable call's stub (hle_hib.c)
+            void *hlecount_wrap(const char *, const char *, void *); return hlecount_wrap("FORCE", name, fn);   // A counting stub when DM_HLECOUNT is set
         }
     }
     return NULL;

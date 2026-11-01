@@ -38,7 +38,6 @@ static uint8_t *g_stack; static size_t g_stack_cap;
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < g_reserve; }
 
 // The block's size: the profile's, its alias region replaced by DM_ALIAS_SIZE's when that is set (checked in mem_init_once). hle_hib.c reserves it before the modules are mapped
-void *(*dm_hib_guest_as_hook)(size_t len);   // hle_hib.c sets it (a hook, not a call: unit tests link this file alone): the fixed place with DM_HIBERNATE, NULL otherwise
 size_t svc_guest_reserve_size(void) {
     const char *as = getenv("DM_ALIAS_SIZE");
     size_t alias = as && *as ? (size_t)strtoull(as, NULL, 0) : DM_GAME_MEM_ALIAS;

@@ -175,8 +175,8 @@ HLE_FORCE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", "set
 // bg=1 / bg=0: the whole "to background / back to foreground" sequence, in the same order as the scene lifecycle in front_ios.m (resign active -> enter background; enter foreground -> become active), minus the audio session reset iOS does on returning.
 // Used to reproduce "after going to the background and back" problems on the Mac (audio take-over and resume, guest clock freeze, graphics suspend); to imitate the process being suspended as well, send dmhost SIGSTOP / SIGCONT between the two items
 static void script_bg(int on) {
-    if (on) { dm_focus_set(2); dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); }
-    else { dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(2); dm_focus_set(1); }
+    if (on) { dm_focus_set(2); dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); dm_hib_suspend(1); }   // hibernation: the snapshot (hle_hibsnap.c)
+    else { dm_hib_suspend(0); dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(2); dm_focus_set(1); }
 }
 static void *oe_script(void *arg) {
     char *buf = arg; uint64_t t0 = now_ns();
@@ -226,11 +226,13 @@ HLE_FORCE("_ZN2nn2oe22PopNotificationMessageEv", "system notification queue (blo
             dm_thread_native_wait(1);
             pthread_cond_wait(&g_mq_cond, &g_mq_lock);
             dm_thread_native_wait(0);
+            dm_hib_hold_here(&g_mq_lock);   // hibernation: stays here while the world is parked (hle_hib.h)
         }
         pthread_mutex_unlock(&g_mq_lock);
         if (h_oe_TryPopMsg(&m)) return m;   // another thread may have taken it in between: wait again
     }
 }
+HLE_HIB_RESTARTABLE(h_oe_PopMsg)   // nothing happens before its wait: a restored thread waiting here calls it again
 HLE_FORCE("_ZN2nn2oe27GetNotificationMessageEventEv", "notification event: the host's auto-clear SystemEvent, signalled while the queue holds notifications", void *, h_oe_GetMsgEv, void) {
     pthread_once(&g_oe_once, oe_script_start);   // DM_OE_SCRIPT also for games that wait on the event and pop only once it fires (Monster Hunter Rise)
     if (!atomic_load(&g_mq_ev_on)) { hle_bind_system_event(g_mq_ev, 1); atomic_store(&g_mq_ev_on, 1); mq_ev_sync(); }   // bound on the game's thread (it runs SDK code)

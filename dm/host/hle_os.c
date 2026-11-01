@@ -80,9 +80,10 @@ static pthread_cond_t g_gfz_cv = PTHREAD_COND_INITIALIZER; static _Atomic int g_
 void guest_clock_read_wait(void) {
     if (!atomic_load(&g_gfz_bg) || atomic_load(&dm_host_work)) return;
     pthread_mutex_lock(&g_gfz_mu);
-    while (g_gfz_reasons & 2u) pthread_cond_wait(&g_gfz_cv, &g_gfz_mu);
+    while ((g_gfz_reasons & 2u) && !atomic_load(&dm_hib_parking_now)) pthread_cond_wait(&g_gfz_cv, &g_gfz_mu);   // hibernation parks a reader at its gate instead (hle.c)
     pthread_mutex_unlock(&g_gfz_mu);
 }
+void guest_clock_kick(void) { pthread_mutex_lock(&g_gfz_mu); pthread_cond_broadcast(&g_gfz_cv); pthread_mutex_unlock(&g_gfz_mu); }   // hibernation: readers waiting above look at the park flag
 void guest_clock_freeze_for(int reason, int on) {
     pthread_mutex_lock(&g_gfz_mu);
     if (on) g_gfz_reasons |= 1u << reason; else g_gfz_reasons &= ~(1u << reason);

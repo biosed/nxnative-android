@@ -8,6 +8,8 @@
 // macOS reserves 0xfc0000000-0x7000000000 (vm_region tag 31; a hint inside it lands at 0x7000000000) and hands out mmap(NULL) upward from 0x7000000000, so the Mac's base is above that, at 512 GB.
 // When the range is taken, hibernation is off for the session (the game runs as without it); it is never moved, a snapshot names the base it was written with.
 #include "dm.h"
+#include "hle.h"
+#include "hle_hib.h"
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -113,6 +115,30 @@ void *dm_hib_arena_alloc(size_t len, size_t align) {
     return r;
 }
 
+// Arena blocks for host objects that come and go (thread-local regions, host-created threads' ThreadType): a 16-byte header with the size class, then the object; a freed block
+// goes on its class's list (classes are the sizes rounded up to 64 bytes, at most 64 KB; bigger blocks are never freed, the guest main thread's stack is one)
+void dm_hib_layout(uint8_t **win, size_t *win_len, size_t *mod_used, uint8_t **arena, size_t *arena_used);
+typedef struct fblk { struct fblk *next; } fblk;
+static fblk *g_free[1024];
+static void *arena_calloc(size_t size) {
+    size_t cls = (size + 63) / 64; if (!cls) cls = 1;
+    if (cls < 1024) {
+        pthread_mutex_lock(&g_hib_lock); fblk *b = g_free[cls]; if (b) g_free[cls] = b->next; pthread_mutex_unlock(&g_hib_lock);
+        if (b) { memset(b, 0, cls * 64); return b; }
+    }
+    if (cls >= 1024) return dm_hib_arena_alloc((size + 0x3FFF) & ~(size_t)0x3FFF, 0x4000);   // whole pages, no header (a thread stack): never freed
+    uint64_t *h = dm_hib_arena_alloc(16 + cls * 64, 64);   // fresh arena pages are zero
+    if (!h) return NULL;
+    h[0] = cls; return h + 2;
+}
+static int arena_free(void *p) {
+    uint8_t *arena; size_t used; dm_hib_layout(NULL, NULL, NULL, &arena, &used);
+    if (!arena || (uint8_t *)p < arena || (uint8_t *)p >= arena + used) return 0;
+    size_t cls = ((uint64_t *)p)[-2];
+    if (cls < 1024) { pthread_mutex_lock(&g_hib_lock); fblk *b = p; b->next = g_free[cls]; g_free[cls] = b; pthread_mutex_unlock(&g_hib_lock); }
+    return 1;
+}
+
 // For the snapshot and the audit: the reservation and what is in use of it
 void dm_hib_layout(uint8_t **win, size_t *win_len, size_t *mod_used, uint8_t **arena, size_t *arena_used) {
     if (win) *win = g_win;
@@ -122,10 +148,14 @@ void dm_hib_layout(uint8_t **win, size_t *win_len, size_t *mod_used, uint8_t **a
     if (arena_used) *arena_used = g_arena_used;
 }
 
-// DM_CTL "hib <command>": "audit <path>" writes the pointer audit (hle_hibaudit.c)
+// DM_CTL "hib <command>": "audit <path>" writes the pointer audit (hle_hibaudit.c), "save" writes the snapshot and "verify [path]" checks one (hle_hibsnap.c), "park" / "unpark" stop and start every guest thread
 void dm_hib_audit(const char *path);
 void dm_hib_ctl(const char *cmd) {
     if (!strncmp(cmd, "audit ", 6)) { dm_hib_audit(cmd + 6); return; }
+    if (!strcmp(cmd, "save")) { int dm_hib_save(void); dm_hib_save(); return; }
+    if (!strncmp(cmd, "verify", 6)) { int dm_hib_verify(const char *); const char *p = cmd + 6; while (*p == ' ') p++; dm_hib_verify(p); return; }
+    if (!strcmp(cmd, "park")) { char why[1024]; if (dm_guest_park_all(3000, why, sizeof why)) LOG("[RED] hib park: %s", why); else LOG("hib park: parked"); return; }
+    if (!strcmp(cmd, "unpark")) { dm_guest_unpark_all(); LOG("hib unpark: running"); return; }
     LOG("[RED] DM_CTL hib: unknown command %s", cmd);
 }
 
@@ -137,6 +167,7 @@ void dm_hib_ctl(const char *cmd) {
 extern char **environ;
 void dm_hib_exec_fixed(int argc, char **argv) {
     (void)argc;
+    { const char *v = getenv("DM_HIB_VERIFY"); if (v && *v) { int dm_hib_verify(const char *); exit(dm_hib_verify(v) ? 1 : 0); } }   // tool mode: check a snapshot file and exit
     if (!dm_hib_on() || !_dyld_get_image_vmaddr_slide(0)) return;
     if (getenv("DM_HIB_REEXEC")) { LOG("[RED] hibernate: the executable still slid by %#lx after executing itself with ASLR off", (long)_dyld_get_image_vmaddr_slide(0)); return; }
     char path[4096]; uint32_t n = sizeof path;
@@ -160,10 +191,62 @@ uintptr_t dm_hib_image_base(void) {
 #endif
 }
 
+// ---- Restartable host calls (hle.h HLE_HIB_RESTARTABLE) ----
+// dm_hib_rs_body is entered with the call's registers as at its entry and x16 = the function. It keeps them in a frame on the caller's stack (the guest's), registers the frame
+// with the thread (dm_hib_rs_enter), calls the function and returns its result (x0 / x1, q0-q3). Frame, 0x160 bytes: x0-x8 at 0, x19-x28 at 0x48, x29 / x30 at 0x98, the sp at entry
+// at 0xa8, the function at 0xb0, d8-d15 at 0xb8, the results at 0x100. A restored thread loads those registers and enters dm_hib_rs_body again: the call starts over.
+// Each restartable import gets an entry stub dm_hib_rs_e<k> that loads its function from slot k; host code calls one through dm_hib_rs_call(fn, arg)
+#define RS_N 16
+uint64_t dm_hib_rs_slot[RS_N];
+#ifdef __APPLE__
+#define RS_SLOT(k) "    adrp x16, _dm_hib_rs_slot@PAGE\n    add x16, x16, _dm_hib_rs_slot@PAGEOFF\n    ldr x16, [x16, #" #k "*8]\n"
+#else
+#define RS_SLOT(k) "    adrp x16, dm_hib_rs_slot\n    add x16, x16, :lo12:dm_hib_rs_slot\n    ldr x16, [x16, #" #k "*8]\n"
+#endif
+#define RS_ENTRY(k) ".p2align 2\n.globl " DM_ASM_SYM(dm_hib_rs_e##k) "\n" DM_ASM_SYM(dm_hib_rs_e##k) ":\n" RS_SLOT(k) "    b " DM_ASM_SYM(dm_hib_rs_body) "\n"
+__asm__(".text\n.p2align 2\n.globl " DM_ASM_SYM(dm_hib_rs_body) "\n" DM_ASM_SYM(dm_hib_rs_body) ":\n"
+        "    sub sp, sp, #0x160\n"
+        "    stp x0, x1, [sp, #0x00]\n    stp x2, x3, [sp, #0x10]\n    stp x4, x5, [sp, #0x20]\n    stp x6, x7, [sp, #0x30]\n    str x8, [sp, #0x40]\n"
+        "    stp x19, x20, [sp, #0x48]\n    stp x21, x22, [sp, #0x58]\n    stp x23, x24, [sp, #0x68]\n    stp x25, x26, [sp, #0x78]\n    stp x27, x28, [sp, #0x88]\n"
+        "    stp x29, x30, [sp, #0x98]\n    add x9, sp, #0x160\n    stp x9, x16, [sp, #0xa8]\n"
+        "    stp d8, d9, [sp, #0xb8]\n    stp d10, d11, [sp, #0xc8]\n    stp d12, d13, [sp, #0xd8]\n    stp d14, d15, [sp, #0xe8]\n"
+        "    add x29, sp, #0x98\n    mov x0, sp\n    bl " DM_ASM_SYM(dm_hib_rs_enter) "\n"
+        "    ldp x0, x1, [sp, #0x00]\n    ldp x2, x3, [sp, #0x10]\n    ldp x4, x5, [sp, #0x20]\n    ldp x6, x7, [sp, #0x30]\n    ldr x8, [sp, #0x40]\n    ldr x16, [sp, #0xb0]\n"
+        "    blr x16\n"
+        "    stp x0, x1, [sp, #0x100]\n    stp q0, q1, [sp, #0x110]\n    stp q2, q3, [sp, #0x130]\n"
+        "    bl " DM_ASM_SYM(dm_hib_rs_leave) "\n"
+        "    ldp x0, x1, [sp, #0x100]\n    ldp q0, q1, [sp, #0x110]\n    ldp q2, q3, [sp, #0x130]\n"
+        "    ldp x29, x30, [sp, #0x98]\n    add sp, sp, #0x160\n    ret\n"
+        ".p2align 2\n.globl " DM_ASM_SYM(dm_hib_rs_call) "\n" DM_ASM_SYM(dm_hib_rs_call) ":\n    mov x16, x0\n    mov x0, x1\n    b " DM_ASM_SYM(dm_hib_rs_body) "\n"
+        RS_ENTRY(0) RS_ENTRY(1) RS_ENTRY(2) RS_ENTRY(3) RS_ENTRY(4) RS_ENTRY(5) RS_ENTRY(6) RS_ENTRY(7)
+        RS_ENTRY(8) RS_ENTRY(9) RS_ENTRY(10) RS_ENTRY(11) RS_ENTRY(12) RS_ENTRY(13) RS_ENTRY(14) RS_ENTRY(15));
+extern const char dm_hib_rs_e0[] __asm__(DM_ASM_SYM(dm_hib_rs_e0));
+#define RS_STUB_SIZE 16   // adrp, add, ldr, b
+static int g_nrs;
+// The entry stub for a function marked restartable (NULL for any other): one per function, given out as the guest's import
+static void *rs_stub_for(void *fn) {
+    unsigned long sz = 0; void *const *t = (void *const *)DM_SECTION_DATA(swrestart, &sz);
+    int marked = 0; for (unsigned long i = 0; t && i < sz / sizeof *t; i++) if (t[i] == fn) marked = 1;
+    if (!marked) return NULL;
+    pthread_mutex_lock(&g_hib_lock);
+    int k = 0; while (k < g_nrs && dm_hib_rs_slot[k] != (uint64_t)(uintptr_t)fn) k++;
+    if (k == g_nrs) { if (g_nrs == RS_N) die("hibernate: more than %d restartable host calls", RS_N); dm_hib_rs_slot[g_nrs++] = (uint64_t)(uintptr_t)fn; }
+    pthread_mutex_unlock(&g_hib_lock);
+    return (void *)(dm_hib_rs_e0 + RS_STUB_SIZE * k);
+}
+// Host code calling a restartable function of its own (a host-created thread's body): through the stub with hibernation, directly otherwise
+void dm_hib_rs_call(void *fn, void *arg);
+void dm_hib_call(void (*fn)(void *), void *arg) { if (dm_hib_on()) dm_hib_rs_call((void *)fn, arg); else fn(arg); }
+
 // The hooks the shared files call through (function pointers, so that unit tests can link those files without this one), set before main
-extern void *(*dm_hib_guest_as_hook)(size_t), *(*dm_hib_module_map_hook)(size_t), *(*dm_hib_thunk_hook)(void *); extern void (*dm_hib_ctl_hook)(const char *);
 void *dm_libc_thunk(void *fn);   // hle_table.c
-static void *thunk_if_on(void *fn) { return dm_hib_on() ? dm_libc_thunk(fn) : NULL; }
+static void *thunk_if_on(void *fn) {   // what the guest gets instead of a host function: a libc thunk or a restartable call's stub
+    if (!dm_hib_on()) return NULL;
+    void *t = dm_libc_thunk(fn); return t ? t : rs_stub_for(fn);
+}
 __attribute__((constructor)) static void hib_hooks(void) {
     dm_hib_guest_as_hook = dm_hib_guest_as; dm_hib_module_map_hook = dm_hib_module_map; dm_hib_thunk_hook = thunk_if_on; dm_hib_ctl_hook = dm_hib_ctl;
+    dm_hib_alloc_hook = arena_calloc; dm_hib_free_hook = arena_free; dm_hib_call_hook = dm_hib_call; dm_hib_native_hold_hook = dm_hib_native_hold;
+    void dm_hib_suspend_now(int on); dm_hib_suspend_hook = dm_hib_suspend_now;
+    void guest_clock_kick(void); dm_hib_kick_hook = guest_clock_kick;
 }

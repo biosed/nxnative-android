@@ -208,7 +208,6 @@ void hid_keys_init(void) {
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "dump" logs what each guest thread waits on and the graphics wait points
 //   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "#…" is ignored.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
-void (*dm_hib_ctl_hook)(const char *cmd);   // hle_hib.c sets it (a hook: unit tests link this file alone)
 static void *ctl_main(void *arg) {
     const char *path = arg; long off = 0; char line[1100];
     for (;;) {

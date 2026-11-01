@@ -160,6 +160,9 @@ static void md_event(mdec_t *d, int i) {   // 0 input 1 output 2 format 3 error
 // g_dfmu and each decoder's dmu are held while guest code signals events, so guest threads take them with dm_host_lock: a thread waiting for one counts as blocked, and the
 // signaller's handoff does not wait for it (Kirby and the Forgotten Land froze at its first guide movie: the handoff waited for the input thread, which waited for dmu)
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size);
+// Live decoders: hibernation writes no snapshot while one exists (a decoder's state lives in libvpx / VideoToolbox, which cannot be saved)
+static _Atomic int g_md_live;
+int dm_movie_live(void) { return atomic_load(&g_md_live); }
 void dm_host_lock(pthread_mutex_t *m);   // hle_thread.c
 static pthread_mutex_t g_dfmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_dfcv = PTHREAD_COND_INITIALIZER;
 static struct { void *d; int ev; uint64_t due; } g_dfq[64]; static int g_ndfq, g_dfthr;
@@ -191,8 +194,12 @@ static void md_defer_body(void *arg) {
             if (d->started) md_event(d, e);   // not after Stop: the game takes its events apart right after Stop (a Stop within 2 ms of a Flush let the deferred signal hit events being torn down)
             continue;
         }
+        void dm_thread_native_wait(int entering);
+        dm_thread_native_wait(1);   // blocked in host code: with hibernation a restartable call (hle_guestthread.c spawn_tramp), parked here
         if (!next) pthread_cond_wait(&g_dfcv, &g_dfmu);
         else { uint64_t w = next - now; struct timespec ts = { (time_t)(w / 1000000000u), (long)(w % 1000000000u) }; pthread_cond_timedwait_relative_np(&g_dfcv, &g_dfmu, &ts); }
+        dm_thread_native_wait(0);
+        dm_hib_hold_here(&g_dfmu);
     }
 }
 // log the first 12 calls one by one, then every 2^k-th (DM_MOVIE_TRACE=1: every call, with the calling thread and the decoder: Unity drives a movie's audio and video decoders from one thread)
@@ -500,7 +507,7 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
     // Audio: Vorbis to PCM16 (Link's Awakening's movies carry a Vorbis track; without a decoder the SDK's player plays them silent), AAC to PCM16 with AudioToolbox (Monster Hunter Rise)
     int audio = (type == MD_TYPE_VORBIS || type == MD_TYPE_AAC) && fmt == MD_FMT_PCM16;
     if (!audio && (type < 1 || type > 3 || (fmt != MD_FMT_NV12 && !(fmt == MD_FMT_ABGR && mode == MD_MODE_TEX)))) { LOG("[RED] movie: decoder type %d output %d mode %d not supported by the host, every method returns failure", type, fmt, mode); return; }
-    mdec_t *d = calloc(1, sizeof *d);
+    mdec_t *d = calloc(1, sizeof *d); atomic_fetch_add(&g_md_live, 1);
     pthread_mutex_init(&d->mu, NULL); pthread_mutex_init(&d->dmu, NULL); pthread_mutex_init(&d->wmu, NULL); pthread_cond_init(&d->wcv, NULL);
     d->type = type; d->fmt = fmt; d->mode = mode;
     // A Vorbis decoder keeps 64 outputs, an AAC decoder 32 (about 0.7 s), a video decoder 16. The host decodes far faster than the Switch, and a player that feeds its decoders in file order
@@ -540,6 +547,7 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatE", "mov
 }
 static void md_free(void **self) {
     mdec_t *d = md_of(self); if (!d) return;
+    atomic_fetch_sub(&g_md_live, 1);
     md_defer_drop(d);
     if (!MD_AUDIO(d)) atomic_store_explicit(&g_movie_pic_ns, 0, memory_order_relaxed);
     self[1] = NULL;
