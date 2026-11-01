@@ -1255,6 +1255,24 @@ def mesh_finish(pair):
 _mesh = GAME.table('geo_mesh.tsv')
 if _mesh.exists():
     with cf.ThreadPoolExecutor(NJ) as ex: list(ex.map(mesh_finish, [tuple(ln.split()[:2]) for ln in _mesh.read_text().splitlines() if ln.strip() and not ln.startswith('#')]))
+# Wide lines as mesh shaders (dmsh_mesh.compose_lines): <vertex key>_ln for each vertex shader in the profile's line_mesh.tsv; the host draws a line-list draw wider than
+# one pixel with it, and as one-pixel lines otherwise (nvn_geometry.inc line_mesh_draw)
+LINE_STATS = collections.Counter()
+def line_finish(vk):
+    src = os.path.join(out, vk + '_b.metal')
+    libs = [os.path.join(out, f'{vk}_ln.metallib')] + ([os.path.join(IOSOUT, f'{vk}_ln.metallib')] if IOSOUT else [])
+    if not os.path.exists(src): LINE_STATS['missing a library'] += 1; return
+    try: msl = dmsh_mesh.compose_lines(open(src).read())
+    except ValueError as e: LINE_STATS['not composed'] += 1; print(f'[RED] line mesh {vk}: {e}', flush=True); return
+    path = os.path.join(w, f'{vk}_ln.metal'); open(path, 'w').write(msl)
+    try:
+        if 'mac' in TARGETS: MTL.compile('mac', path, libs[0])
+        if IOSOUT: MTL.compile('ios', path, libs[1])
+        LINE_STATS['built'] += 1
+    except subprocess.CalledProcessError as e: LINE_STATS['failed to compile'] += 1; print(f'[RED] line mesh {vk}: does not compile ({str(e)[:120]})', flush=True)
+_lines = GAME.table('line_mesh.tsv')
+if _lines.exists():
+    with cf.ThreadPoolExecutor(NJ) as ex: list(ex.map(line_finish, [ln.split()[0] for ln in _lines.read_text().splitlines() if ln.strip() and not ln.startswith('#')]))
 shutil.rmtree(w, ignore_errors=True)
 st = collections.Counter(r[1] for r in res)
 print(f'shaders {len(res)}: ok {st["ok"]}, ' + ', '.join(f'{k} {v}' for k, v in st.items() if k != 'ok'))
@@ -1269,6 +1287,7 @@ print(f'logic operation libraries (<key>_bl, dmsh_logic.py): {LOGIC_STATS["gener
 print(f'pulling libraries (<key>_bp, dmsh_pull.py): {PULL_STATS["generated"]} generated, {PULL_STATS["failed"]} failed to compile, {PULL_STATS["not generated"]} not generated, '
       f'{PULL_STATS["no stage input"]} vertex shaders without stage inputs (none needed)')
 print('mesh libraries (<vertex>_<geometry>_m3, dmsh_mesh.py): ' + (', '.join(f'{k} {v}' for k, v in MESH_STATS.items()) or 'none'))
+print('wide-line libraries (<vertex>_ln, dmsh_mesh.compose_lines): ' + (', '.join(f'{k} {v}' for k, v in LINE_STATS.items()) or 'none'))
 print(MTL.summary())
 for lvl in [k for k in st if k != 'ok']:
     for e, n in collections.Counter(r[2] for r in res if r[1] == lvl).most_common(10): print(f'  [{lvl}] {n:5d}  {e}')

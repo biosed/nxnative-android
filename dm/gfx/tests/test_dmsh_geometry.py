@@ -383,6 +383,25 @@ class MeshPassthrough(unittest.TestCase):
                 r = subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', '-fmodules-cache-path=' + d + '/modules', str(Path(d, 'm.metal')), '-o', str(Path(d, 'm.air'))], capture_output=True, text=True)
                 self.assertEqual(r.returncode, 0, r.stderr[-2000:])
 
+    def test_compose_lines(self):
+        src = dmsh_mesh.compose_lines(MESH_VS)
+        self.assertIn('[[mesh]] void dm_line(', src)
+        self.assertIn('[[mesh]] void dm_line_z(', src)
+        self.assertIn(f'metal::mesh<main0_out, dm_line_prim, {4 * dmsh_mesh.SEGS}, {2 * dmsh_mesh.SEGS}, metal::topology::triangle>', src)
+        self.assertIn('dm_e[dm_t] = dm_vs_main0(', src)
+        self.assertIn('dm_v0.gl_Position.xy += dm_n * dm_a.gl_Position.w;', src)   # the end moved in pixels, scaled back by w
+        self.assertIn('dm_m.set_index(dm_x + 5u, dm_v + 3u);', src)                 # two triangles a segment
+        self.assertNotIn('[[point_size]]', src)
+        if shutil.which('xcrun') and sys.platform == 'darwin':
+            with tempfile.TemporaryDirectory() as d:
+                Path(d, 'l.metal').write_text(src)
+                r = subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', '-fmodules-cache-path=' + d + '/modules', str(Path(d, 'l.metal')), '-o', str(Path(d, 'l.air'))], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+
+    def test_compose_lines_needs_a_position(self):
+        with self.assertRaisesRegex(ValueError, 'no position output'):
+            dmsh_mesh.compose_lines(MESH_VS.replace('[[position, invariant]]', '[[user(locn9)]]'))
+
     def test_compose_rejects_clip_z(self):
         lean, _ = dmsh_geometry.lean(LEAN_KERNEL, 134)
         with self.assertRaisesRegex(ValueError, 'clip z'):

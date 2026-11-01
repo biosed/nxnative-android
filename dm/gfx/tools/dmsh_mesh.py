@@ -40,10 +40,9 @@ def _entry(src, kind, name):
     return m
 
 
-def compose(vs_src, gs_src, reads):
-    """vs_src: the vertex shader's library source (<key>_b.metal); gs_src: the lean kernel
-    (<geometry key>_bl3.metal) and the capture words it reads, in its record order."""
-    if 2 in reads or not reads: raise ValueError('mesh: the kernel reads clip z or nothing')
+def _vertex_functions(vs_src):
+    """The vertex shader's pulling entries (dmsh_pull) as functions dm_vs_<entry>: (source, {entry: call arguments}, the resource parameters the mesh entry takes
+    over, the output words before the point size was dropped)."""
     pulled, info = dmsh_pull.variant(vs_src)   # keeps main0 / main0_z only
     if pulled is None or not isinstance(info, dict): raise ValueError(f'mesh: no pulling entry: {info}')
     words = dmsh_geometry.output_words(pulled)
@@ -64,6 +63,15 @@ def compose(vs_src, gs_src, reads):
         res = rparams
         pulled = pulled[:m.start()] + f'\nstatic inline main0_out dm_vs_{name}(' + ', '.join(fparams) + ')\n{\n' + pulled[m.end():]
         entries[name] = args
+    if res is None: raise ValueError('mesh: no vertex entries')
+    return pulled, entries, res, words
+
+
+def compose(vs_src, gs_src, reads):
+    """vs_src: the vertex shader's library source (<key>_b.metal); gs_src: the lean kernel
+    (<geometry key>_bl3.metal) and the capture words it reads, in its record order."""
+    if 2 in reads or not reads: raise ValueError('mesh: the kernel reads clip z or nothing')
+    pulled, entries, res, words = _vertex_functions(vs_src)
     # The kernel as a function: capture reads from threadgroup memory, the topology map as the identity
     # (triangle t's vertices are 3t..3t+2), the mask store into dm_mask, index stores dropped
     k = _entry(gs_src, 'kernel', 'main0')
@@ -103,7 +111,6 @@ def compose(vs_src, gs_src, reads):
            'namespace dm_v {', _strip_head(pulled), '}', 'namespace dm_g {', _strip_head(gfn), '}', 'using namespace dm_v;',
            'struct dm_mesh_draw { device const uchar* ib; uint itype; uint first; uint count; int base_vertex; uint base_instance; };',
            'struct dm_mesh_prim { bool culled [[primitive_culled]]; };']
-    if res is None: raise ValueError('mesh: no vertex entries')
     for name, args in entries.items():
         out.append(f'''[[mesh]] void dm_mesh{name[5:]}(metal::mesh<main0_out, dm_mesh_prim, {3 * PRIMS}, {PRIMS}, metal::topology::triangle> dm_m, {', '.join(res)},
     constant dm_mesh_draw& dm_d [[buffer({DRAW_SLOT})]], constant dm_g::spvDescriptorSetBuffer0& dm_gset [[buffer({GS_SLOT})]],
@@ -126,6 +133,58 @@ def compose(vs_src, gs_src, reads):
         dm_g::dm_gs({', '.join(gargs)}, dm_rec, dm_p0 * {3 * n}u, dm_mask);
         dm_m.set_index(dm_t * 3u, dm_t * 3u); dm_m.set_index(dm_t * 3u + 1u, dm_t * 3u + 1u); dm_m.set_index(dm_t * 3u + 2u, dm_t * 3u + 2u);
         dm_m.set_primitive(dm_t, dm_mesh_prim{{(dm_mask & 1u) == 0u}});
+    }}
+}}''')
+    return '\n'.join(out) + '\n'
+
+
+SEGS = 32   # = nvn_geometry.inc LINE_MESH_SEGS
+
+
+def compose_lines(vs_src):
+    """Wide lines as one Metal mesh shader (<vertex key>_ln): Metal rasterizes lines one pixel wide, so a line-list draw with a
+    wider SetLineWidth is drawn as quads. A threadgroup takes SEGS segments: each of 2 * SEGS threads runs the vertex shader's
+    pulling entry for one index position, then each of the first SEGS threads emits its segment as two triangles, its ends moved
+    half the width to either side, perpendicular to the segment in pixels (dm_line_draw.half_width over the half viewport, times w
+    so the offset survives the perspective divide). Every other output is the end's own, so the pixel shader sees what it would
+    on the line. A segment of zero length in pixels is culled, as a GPU draws no pixel for it."""
+    pulled, entries, res, _ = _vertex_functions(vs_src)
+    st = re.search(r'struct main0_out\s*\{(.*?)\};', pulled, re.S)
+    pos = st and re.search(r'float4 (\w+) \[\[position', st[1])
+    if not pos: raise ValueError('lines: no position output')
+    p = pos[1]
+    out = ['#include <metal_stdlib>', '#include <simd/simd.h>', '#include <metal_atomic>', 'using namespace metal;',
+           'namespace dm_v {', _strip_head(pulled), '}', 'using namespace dm_v;',
+           'struct dm_line_draw { device const uchar* ib; uint itype; uint first; uint count; int base_vertex; uint base_instance; uint pad; float2 half_viewport; float half_width; };',
+           'struct dm_line_prim { bool culled [[primitive_culled]]; };']
+    for name, args in entries.items():
+        out.append(f'''[[mesh]] void dm_line{name[5:]}(metal::mesh<main0_out, dm_line_prim, {4 * SEGS}, {2 * SEGS}, metal::topology::triangle> dm_m, {', '.join(res)},
+    constant dm_line_draw& dm_d [[buffer({DRAW_SLOT})]], uint dm_t [[thread_index_in_threadgroup]], uint dm_tg [[threadgroup_position_in_grid]])
+{{
+    threadgroup main0_out dm_e[{2 * SEGS}];
+    uint dm_s0 = dm_tg * {SEGS}u, dm_ns = min({SEGS}u, dm_d.count / 2u - dm_s0);
+    if (dm_t < dm_ns * 2u) {{
+        uint dm_i = dm_d.first + dm_s0 * 2u + dm_t;
+        uint dm_ix = dm_d.itype == 0u ? dm_i : dm_d.itype == 1u ? uint(dm_d.ib[dm_i]) : dm_d.itype == 2u ? uint(((device const ushort*)dm_d.ib)[dm_i]) : ((device const uint*)dm_d.ib)[dm_i];
+        uint dm_vid = dm_ix + uint(dm_d.base_vertex), dm_bv = uint(dm_d.base_vertex), dm_bi = dm_d.base_instance, dm_iid = dm_bi;
+        dm_e[dm_t] = dm_vs_{name}({', '.join(args)});
+    }}
+    if (dm_t == 0u) dm_m.set_primitive_count(dm_ns * 2u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (dm_t < dm_ns) {{
+        main0_out dm_a = dm_e[dm_t * 2u], dm_b = dm_e[dm_t * 2u + 1u];
+        float2 dm_d2 = (dm_b.{p}.xy / dm_b.{p}.w - dm_a.{p}.xy / dm_a.{p}.w) * dm_d.half_viewport;
+        float dm_len = length(dm_d2);
+        float2 dm_n = dm_len > 1e-6f ? float2(-dm_d2.y, dm_d2.x) / dm_len * dm_d.half_width / dm_d.half_viewport : float2(0.0f);
+        main0_out dm_v0 = dm_a, dm_v1 = dm_a, dm_v2 = dm_b, dm_v3 = dm_b;
+        dm_v0.{p}.xy += dm_n * dm_a.{p}.w; dm_v1.{p}.xy -= dm_n * dm_a.{p}.w;
+        dm_v2.{p}.xy += dm_n * dm_b.{p}.w; dm_v3.{p}.xy -= dm_n * dm_b.{p}.w;
+        uint dm_v = dm_t * 4u, dm_x = dm_t * 6u;
+        dm_m.set_vertex(dm_v, dm_v0); dm_m.set_vertex(dm_v + 1u, dm_v1); dm_m.set_vertex(dm_v + 2u, dm_v2); dm_m.set_vertex(dm_v + 3u, dm_v3);
+        dm_m.set_index(dm_x, dm_v); dm_m.set_index(dm_x + 1u, dm_v + 1u); dm_m.set_index(dm_x + 2u, dm_v + 2u);
+        dm_m.set_index(dm_x + 3u, dm_v + 2u); dm_m.set_index(dm_x + 4u, dm_v + 1u); dm_m.set_index(dm_x + 5u, dm_v + 3u);
+        bool dm_cull = !(dm_len > 1e-6f);
+        dm_m.set_primitive(dm_t * 2u, dm_line_prim{{dm_cull}}); dm_m.set_primitive(dm_t * 2u + 1u, dm_line_prim{{dm_cull}});
     }}
 }}''')
     return '\n'.join(out) + '\n'
