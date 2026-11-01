@@ -19,6 +19,7 @@ DM_CHEATS_ON	switch	Comma-separated cheat names turned on at launch, besides the
 DM_CHEATS_WINDOW	switch	`1` opens the Mac Cheats panel beside the game from the start
 DM_COPY_GAME_RESOURCES	switch	`NO` skips the Xcode build phase that copies the game's resources into the app (`stage_resources.sh`, on by default); `build_ipa.sh` sets it for its unsigned build, which packs them itself
 DM_COPY_ROMFS	switch	`NO` keeps the game files out of the app, in the Xcode build phase (`stage_resources.sh`) and in the unsigned IPA of `build_ipa.sh` (on by default): `main.m` takes the validated `Documents/romfs.img` copied by `scripts/push_romfs.sh`, then a `Documents/romfs` folder; the build writes the image's identity as `romfs.id` into the app, and `main.m` uses only a matching image (`--romfs separate` of the NSP script sets this)
+DM_CORE_SERIAL	switch	`0` / `1` overrides core_serial (default on for Android, off on Apple): a thread pinned to one core holds that core's token while it runs guest code, so one Switch core's threads run one at a time (hle_thread.c)
 DM_CTL	diagnostic	`=<file>` (Mac): the host polls the file every 100 ms and runs each appended line: button presses, `shot`, `passdump`, `texdump`, `env KEY=VALUE`, `peek`, `memdump`, `drag` and more
 DM_DBG	diagnostic	When set, prints the guest's `svcOutputDebugString` text to stderr as `[guest]` lines
 DM_DBG_AU_FRAMES	diagnostic	`=<frames>` asks the Mac's Core Audio output for that many frames per callback instead of about 5 ms (1024 reproduces the iOS default that caused crackling)
@@ -129,6 +130,7 @@ DM_NVN_HILITE	diagnostic	`=<fragment shader key>,…`: those draws use a solid c
 DM_NVN_IXCLOG	diagnostic	`=<n>` logs the first n indirect draw and dispatch conversions (record to arguments) once the GPU has run them
 DM_NVN_KEYDUMP	diagnostic	`=<fs key>[:n[:every]]`: for up to n draws of that fragment shader (default 6), logs the pass dump binding lines plus vertex formats, vertex streams and uniform values; meant for devices
 DM_NVN_LAZY_CLEAR	switch	`0` makes clears with no draw after them open a pass of their own, as before; by default they wait to become the load action of the next pass on that target
+DM_NVN_LINE_MESH	switch	`0` draws line lists wider than one pixel one pixel wide instead of as quads through the vertex shader's wide-line library (nvn_geometry.inc line_mesh_draw)
 DM_NVN_LOADPROBE	diagnostic	`=1`, `2` or `3`: attachments whose load is skipped are cleared to a sentinel colour (`3` NaN; `1` NaN for float formats) and the sentinel pixels left at pass end are counted (should be 0)
 DM_NVN_LOG	diagnostic	`=1` logs the creation of NVN objects
 DM_NVN_MAGSCAN	diagnostic	`=<fs key>[:every[:phase]]`: device self-check that reads each pass's colour attachments every `every` frames (default 30) and logs `[mag]` lines for solid magenta 16×16 blocks or non-finite pixels
@@ -193,6 +195,7 @@ DM_OODLE_SERVE	switch	`=1`: the host answers decode requests on stdin / stdout w
 DM_OPMODE	player	The operation mode the game sees: `0` handheld, `1` console (default: the profile's `op_mode`, console unless set); read once at startup
 DM_PAD_MERGE	switch	`=1` merges every controller into player 1, as before, instead of giving each controller a player of its own (Mac and iOS)
 DM_PATCH_FRONT	switch	`=<bytes>`: the size of the patch area right before the module base for a long text (`BIG_TEXT`); set only by the rewriter's own rerun with the size it needs
+DM_PATCH_TP	switch	rewriter (patch_nso.py): `android` keeps the thread slots behind bionic's TLS_SLOT_APP instead of Apple's TSD at tpidrro_el0 (the Android host refuses other modules); default `apple`
 DM_PHONE_MOTION	switch	On iOS, whether the phone's own device motion drives player 1's six-axis sensor: `auto` (default) while no controller supplies fresh motion, `1` phone only, `0` never; each source keeps its own orientation
 DM_PREEMPT	switch	`0` / `1` overrides the profile's `core_preempt`: also check already-runnable higher-priority peers on the caller's core after every thread SVC
 DM_PRELOAD	diagnostic	Set: on the Mac, runs the host's early background loading (`dm_host_preload_start`) as the iOS app does, to exercise that path
@@ -263,6 +266,7 @@ DM_SAVE	path	This run's save folder (must be set); the device save is `<DM_SAVE>
 DM_SAVED_CHOICES	switch	`0` ignores the player's saved choices (launcher.<VAR> in the app's preferences) and leaves them saved; the Mac launcher and the iOS settings screen
 DM_SAVE_SYNC	player	Cloud saves: the folder whose `<title ID>/save.dmsync` the save is synced through, `icloud` for iCloud Drive/nxnative Saves (the Mac); `0` or unset, off. The Mac launcher sets the folder chosen in its settings window's Cloud saves, the iPhone app the one picked in its launcher (dm/host/save_sync.h)
 DM_SCHEME_NAME	switch	Set by `build_ipa.sh` itself for xcodegen's `project.yml`: the Xcode scheme name, `DmIOS`, or `<display name> (<title ID>)` for a project prepared with `--prepare-xcode`
+DM_SCREEN_FIT	player	Android: `stretch` stretches the picture to the whole screen instead of keeping its aspect ratio (nvn_vk.c)
 DM_SCREEN_MATCH	switch	`0` keeps the screen's refresh rate in fullscreen; by default a Mac screen whose rate is not a multiple of the game's frame rate switches to one that is (144 → 120 Hz)
 DM_SF_TRACE	diagnostic	`=1` logs every request on the game's own HIPC client sessions that the host answers (`hle_sf.c`)
 DM_SHAKE_G	switch	`=<G>`: on iOS, the acceleration beyond gravity above which a flick of the phone shakes the controller's six-axis sensor (default 1.5)
@@ -306,7 +310,17 @@ DM_UDC_SELFTEST	diagnostic	`=1` runs a start-up check of DontCare load and store
 DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.py`, for `shader_split.py` (default `ue_shaders` beside the RomFS); needed when the RomFS has Unreal paks
 DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (`r.Streaming.PoolSize`) is raised to, overriding the profile's `ue_texture_pool`; `0` keeps the game's own pool. On iOS only this switch turns it on (`Documents/env.txt`)
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
+DM_VK_DIR	path	Android: the folder of the shaders' SPIR-V (`<key>.spv`, `<key>.vk.txt` from dm/android/tools/spv_android.py) and the pipeline cache
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
+DM_VK_NO_DYNREND	test	Android: `1` uses render passes made per pass even where dynamic rendering is available (the path for Vulkan 1.1 / 1.2 GPUs without it)
+DM_VK_NO_TIMELINE	test	Android: set, submissions are not chained by a timeline semaphore even where the GPU has one
+DM_VK_PASSLOG	diagnostic	Android: `=<frame>[+]` logs that frame's passes, draws, copies and dispatches (targets, clears, shaders, depth / stencil / blend)
+DM_VK_RTDUMP	diagnostic	Android: `=<frame>[,<frames>]` writes every render target of that frame (and the next ones) as raw files into DM_VK_SHOT_DIR
+DM_VK_RTDUMP_DEC	diagnostic	Android: with DM_VK_RTDUMP, also writes the textures decoded from BC4-7 on upload
+DM_VK_SHOTS	diagnostic	Android: `=<frame>,…` writes the presented image of those frames into DM_VK_SHOT_DIR
+DM_VK_SHOT_DIR	path	Android: where DM_VK_SHOTS and DM_VK_RTDUMP write (default: the current folder)
+DM_VK_SKIP	diagnostic	Android: `=<mask>` leaves out kinds of GPU work (1 buffer→texture, 2 texture→texture, 4 texture→buffer, 8 clears, 16 uploads, 32 draws / dispatches), for bisecting a wrong picture
+DM_VK_TEXCOUNT	diagnostic	Android: set, every 600 presents logs the live textures by kind and how many share their storage start with an older one
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
 DM_WATCH	diagnostic	`=<s>` dumps all threads after that many seconds (SIGALRM) and turns on the stall watchdog; off unless set
 DM_WATCH_SAMPLE	diagnostic	`=<path>` (Mac): when the stall watchdog fires, samples the process for 1 s with `/usr/bin/sample` and writes the thread stacks to that path

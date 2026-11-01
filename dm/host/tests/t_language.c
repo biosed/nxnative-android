@@ -20,6 +20,7 @@ uint64_t hle_system_event_binding(void *ev) { (void)ev; return 1; }
 int hle_signal_system_event_binding(uint64_t binding) { (void)binding; return 1; }
 uint32_t hle_hid_connected_npad(void) { return 0; }
 void dm_host_helper_qos(qos_class_t q) { (void)q; }
+int dm_guest_as_contains(uintptr_t a) { (void)a; return 0; }   // hle_svc.c: no guest address space here, so the big-stack take-overs (GetDeviceLocationName, hle_bigstack.c) run on the calling host stack
 
 static int checks, fails;
 #define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s\n", msg); } } while (0)
