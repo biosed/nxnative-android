@@ -121,6 +121,7 @@ SYM(dm_gate):
     // Hibernation (hle_hib.c dm_gate_resume) enters here with x30 = a gate frame it rebuilt on this thread's gate stack (dispatch the gate from it), or at
     // dm_gate_return_from_frame with sp = that frame (the SVC already ran: only return to the guest)
     .globl SYM(dm_gate_from_frame)
+    SYM_HIDDEN SYM(dm_gate_from_frame)
 SYM(dm_gate_from_frame):
 1:  mov sp, x30
     ldr x29, [sp, #232]
@@ -128,6 +129,7 @@ SYM(dm_gate_from_frame):
     mov x1, sp                // regs
     bl SYM(gate_dispatch)
     .globl SYM(dm_gate_return_from_frame)
+    SYM_HIDDEN SYM(dm_gate_return_from_frame)
 SYM(dm_gate_return_from_frame):
     ldr x9, [sp, #784]
     msr fpcr, x9

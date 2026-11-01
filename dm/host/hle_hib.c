@@ -203,6 +203,8 @@ uintptr_t dm_hib_image_base(void) {
 }
 
 // ---- Restartable host calls (hle.h HLE_HIB_RESTARTABLE) ----
+// Every symbol here is hidden: a branch to a preemptible symbol in a shared object (Android's libdmhost.so) goes through the PLT, whose stub uses x16 and x17, and x16 carries the
+// function into dm_hib_rs_body (the first Android run jumped into the GOT).
 // dm_hib_rs_body is entered with the call's registers as at its entry and x16 = the function. It keeps them in a frame on the caller's stack (the guest's), registers the frame
 // with the thread (dm_hib_rs_enter), calls the function and returns its result (x0 / x1, q0-q3). Frame, 0x160 bytes: x0-x8 at 0, x19-x28 at 0x48, x29 / x30 at 0x98, the sp at entry
 // at 0xa8, the function at 0xb0, d8-d15 at 0xb8, the results at 0x100. A restored thread loads those registers and enters dm_hib_rs_body again: the call starts over.
@@ -214,8 +216,8 @@ uint64_t dm_hib_rs_slot[RS_N];
 #else
 #define RS_SLOT(k) "    adrp x16, dm_hib_rs_slot\n    add x16, x16, :lo12:dm_hib_rs_slot\n    ldr x16, [x16, #" #k "*8]\n"
 #endif
-#define RS_ENTRY(k) ".p2align 2\n.globl " DM_ASM_SYM(dm_hib_rs_e##k) "\n" DM_ASM_SYM(dm_hib_rs_e##k) ":\n" RS_SLOT(k) "    b " DM_ASM_SYM(dm_hib_rs_body) "\n"
-__asm__(".text\n.p2align 2\n.globl " DM_ASM_SYM(dm_hib_rs_body) "\n" DM_ASM_SYM(dm_hib_rs_body) ":\n"
+#define RS_ENTRY(k) ".p2align 2\n.globl " DM_ASM_SYM(dm_hib_rs_e##k) "\n" DM_ASM_HIDDEN " " DM_ASM_SYM(dm_hib_rs_e##k) "\n" DM_ASM_SYM(dm_hib_rs_e##k) ":\n" RS_SLOT(k) "    b " DM_ASM_SYM(dm_hib_rs_body) "\n"
+__asm__(".text\n.p2align 2\n.globl " DM_ASM_SYM(dm_hib_rs_body) "\n" DM_ASM_HIDDEN " " DM_ASM_SYM(dm_hib_rs_body) "\n" DM_ASM_SYM(dm_hib_rs_body) ":\n"
         "    sub sp, sp, #0x160\n"
         "    stp x0, x1, [sp, #0x00]\n    stp x2, x3, [sp, #0x10]\n    stp x4, x5, [sp, #0x20]\n    stp x6, x7, [sp, #0x30]\n    str x8, [sp, #0x40]\n"
         "    stp x19, x20, [sp, #0x48]\n    stp x21, x22, [sp, #0x58]\n    stp x23, x24, [sp, #0x68]\n    stp x25, x26, [sp, #0x78]\n    stp x27, x28, [sp, #0x88]\n"
@@ -253,14 +255,14 @@ void dm_hib_call(void (*fn)(void *), void *arg) { if (dm_hib_on()) dm_hib_rs_cal
 // dm_gate_resume(src, dst, ret): copies the 800-byte gate frame src to dst (the bottom of this thread's gate stack top, where entry.S dm_gate keeps it) without a call (dst lies
 // below the caller's stack pointer), then dispatches the gate from it (ret 0: the SVC runs from the start) or returns to the guest with its registers (ret 1)
 // dm_hib_rs_resume(frame): loads a restartable call's entry registers from its frame (see dm_hib_rs_body) and enters the stub again
-__asm__(".text\n.p2align 2\n.globl " DM_ASM_SYM(dm_gate_resume) "\n" DM_ASM_SYM(dm_gate_resume) ":\n"
+__asm__(".text\n.p2align 2\n.globl " DM_ASM_SYM(dm_gate_resume) "\n" DM_ASM_HIDDEN " " DM_ASM_SYM(dm_gate_resume) "\n" DM_ASM_SYM(dm_gate_resume) ":\n"
         "    mov x9, #50\n    mov x12, x0\n    mov x13, x1\n"
         "1:  ldp x10, x11, [x12], #16\n    stp x10, x11, [x13], #16\n    subs x9, x9, #1\n    b.ne 1b\n"
         "    mov sp, x1\n"
         "    cbnz w2, 2f\n"
         "    mov x30, x1\n    b " DM_ASM_SYM(dm_gate_from_frame) "\n"
         "2:  b " DM_ASM_SYM(dm_gate_return_from_frame) "\n"
-        ".p2align 2\n.globl " DM_ASM_SYM(dm_hib_rs_resume) "\n" DM_ASM_SYM(dm_hib_rs_resume) ":\n"
+        ".p2align 2\n.globl " DM_ASM_SYM(dm_hib_rs_resume) "\n" DM_ASM_HIDDEN " " DM_ASM_SYM(dm_hib_rs_resume) "\n" DM_ASM_SYM(dm_hib_rs_resume) ":\n"
         "    mov x17, x0\n"
         "    ldp d8, d9, [x17, #0xb8]\n    ldp d10, d11, [x17, #0xc8]\n    ldp d12, d13, [x17, #0xd8]\n    ldp d14, d15, [x17, #0xe8]\n"
         "    ldp x19, x20, [x17, #0x48]\n    ldp x21, x22, [x17, #0x58]\n    ldp x23, x24, [x17, #0x68]\n    ldp x25, x26, [x17, #0x78]\n    ldp x27, x28, [x17, #0x88]\n"
