@@ -822,6 +822,15 @@ HLE_FORCE("_ZN2nn3hid17GetDebugPadStatesEPNS0_13DebugPadStateEi", "debug pad sta
     for (int i = 0; i < n; i++) { memset(s + 32 * i, 0, 32); *(int64_t *)(s + 32 * i) = top - i; }
     return n > 0 ? n : 0;
 }
+// SDK 20 (Hollow Knight 1.5): the digitizer and the handle-based mouse calls, all reaching hid services the host does not have
+HLE_FORCE("_ZN2nn3hid19InitializeDigitizerEv", "digitizer; the host has none", void, h_hid_DigitizerInit, void) {}
+HLE_FORCE("_ZN2nn3hid14GetMouseHandleEv", "mouse handle: a fixed one (no mouse is ever connected)", uint64_t, h_hid_MouseHandle, void) { return 0; }
+HLE_FORCE("_ZN2nn3hid19GetDebugMouseHandleEv", "debug mouse handle: a fixed one (never connected)", uint64_t, h_hid_DbgMouseHandle, void) { return 0; }
+HLE_FORCE("_ZN2nn3hid15InitializeMouseERKNS0_11MouseHandleE", "mouse (handle form); not provided by the host", void, h_hid_InitMouseH, const void *h) { (void)h; }
+HLE_FORCE("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEiRKNS0_11MouseHandleE", "mouse states (handle form): 0 entries", int, h_hid_MouseStatesH, void *out, int n, const void *h) { (void)out; (void)n; (void)h; return 0; }
+HLE_FORCE("_ZN2nn3hid13GetMouseStateEPNS0_10MouseStateERKNS0_11MouseHandleE", "mouse state (handle form): not connected (MouseState 0x28 bytes zeroed)", void, h_hid_MouseStateH, void *st, const void *h) {
+    (void)h; memset(st, 0, 0x28); ((int64_t *)st)[0] = atomic_fetch_add(&g_sampling, 1) + 1;
+}
 HLE_FORCE("_ZN2nn3hid25EnableSixAxisSensorFusionERKNS0_19SixAxisSensorHandleEb", "six-axis sensor fusion; ignored by the host", void, h_hid_SixFusionOn, const uint32_t *h, uint32_t on) { (void)h; (void)on; }
 HLE_FORCE("_ZN2nn3hid28IsSixAxisSensorFusionEnabledERKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion: off", unsigned, h_hid_SixFusionQ, const uint32_t *h) { (void)h; return 0; }
 HLE_FORCE("_ZN2nn3hid25GetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleE", "gyroscope zero-drift mode: standard", int, h_hid_GyroGet, const uint32_t *h) { (void)h; return 1; }

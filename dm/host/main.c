@@ -5,7 +5,9 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdatomic.h>
 #include <sys/resource.h>
+#ifdef __APPLE__
 #include <sys/sysctl.h>
+#endif
 #include <sys/time.h>
 #include <unistd.h>
 void probe_install(void); void hid_keys_init(void); void stubs_report(void); void crash_install(void); void guest_thread_init(void); void guest_gate_stack(int own_stack); uint32_t svc_thread_main_init(void);
@@ -49,6 +51,18 @@ static void flags_init(void) {
 }
 
 // Zero point of the boot timeline = process creation time (p_starttime from sysctl KERN_PROC_PID, wall clock) converted to the now_ns monotonic time base; same definition on Mac / iOS
+#ifndef __APPLE__
+// Linux: field 22 of /proc/self/stat is the start time in clock ticks after boot, on CLOCK_BOOTTIME's time base
+static uint64_t proc_start_mono_ns(void) {
+    uint64_t mono = now_ns(); struct timespec bt; char b[1024]; unsigned long long st = 0;
+    FILE *f = fopen("/proc/self/stat", "r"); size_t n = f ? fread(b, 1, sizeof b - 1, f) : 0; if (f) fclose(f); b[n] = 0;
+    char *p = strrchr(b, ')'); int field = 2;
+    for (; p && *p && field < 22; p++) if (*p == ' ') field++;
+    if (!p || sscanf(p, "%llu", &st) != 1 || clock_gettime(CLOCK_BOOTTIME, &bt)) return mono;
+    int64_t age = (int64_t)bt.tv_sec * 1000000000ll + bt.tv_nsec - (int64_t)(st * (1000000000ull / (unsigned long long)sysconf(_SC_CLK_TCK)));
+    return age > 0 ? mono - (uint64_t)age : mono;
+}
+#else
 static uint64_t proc_start_mono_ns(void) {
     struct kinfo_proc kp; size_t n = sizeof kp; int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
     uint64_t mono = now_ns(); struct timeval tv; gettimeofday(&tv, NULL);
@@ -56,6 +70,7 @@ static uint64_t proc_start_mono_ns(void) {
     int64_t age = (int64_t)(tv.tv_sec - kp.kp_proc.p_starttime.tv_sec) * 1000000000ll + (tv.tv_usec - kp.kp_proc.p_starttime.tv_usec) * 1000ll;
     return age > 0 ? mono - (uint64_t)age : mono;
 }
+#endif
 
 // Host loading (independent of UIKit / Metal): read the NSO, relocate, forced take-over, probes / tick gate / keys, start prefetch. By default it runs synchronously in main;
 // the iOS front end can call dm_host_preload_start(same arguments) at the very start of the App's main() so that it runs first on a background thread, in parallel with the UIKit startup chain (⓪ + ① ≈ max(UIKit chain, host loading)).

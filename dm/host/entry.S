@@ -4,20 +4,21 @@
 // 2) dm_gate_stubs + dm_gate: the rewriter replaces svc / cntpct reads with a gate block that pushes the guest's x29 / x30 and calls the address in the thread's KGATE slot, which is
 //    this thread's stub (thread.c guest_gate_stack). The stub passes the top of the thread's gate stack to dm_gate, which saves x0-x30 there, calls gate_dispatch(ret, regs) on that stack,
 //    writes the registers back and returns. Horizon's kernel never writes a thread's stack during an SVC; the gate stack keeps it so.
+#include "asm_sym.h"
     .text
-    .globl _unimpl_stubs
+    .globl SYM(unimpl_stubs)
     .p2align 3
-_unimpl_stubs:
+SYM(unimpl_stubs):
     .set k, 0
     .rept 4096                // = hle.c MAX_STUB
     movz x9, #k
-    b _unimpl_entry
+    b SYM(unimpl_entry)
     .set k, k + 1
     .endr
 
-    .globl _unimpl_entry
+    .globl SYM(unimpl_entry)
     .p2align 2
-_unimpl_entry:
+SYM(unimpl_entry):
     stp x29, x30, [sp, #-96]!
     mov x29, sp
     stp x0, x1, [sp, #16]
@@ -27,30 +28,38 @@ _unimpl_entry:
     str x8, [sp, #80]
     mov x0, x9
     add x1, sp, #16
-    bl _unimpl_c
+    bl SYM(unimpl_c)
     ldp x29, x30, [sp], #96
     ret
 
 // The gate stacks' tops, one per gate slot (thread.c guest_gate_stack). Page-aligned, so that stub k reaches its entry with adrp and an immediate offset alone
-    .globl _dm_gate_top
+    .globl SYM(dm_gate_top)
+#ifdef __APPLE__
     .zerofill __DATA,__bss,_dm_gate_top,8192,12      // 8 × 1024 (= thread.c GATE_SLOTS)
+#else
+    .bss
+    .balign 4096
+SYM(dm_gate_top):
+    .zero 8192                                        // 8 × 1024 (= thread.c GATE_SLOTS)
+    .text
+#endif
 
 // Stub k (16 bytes) serves gate slot k: x29 = the return point (the gate block holds the guest's x29 at [sp] and reloads it after the gate), x30 = the slot's gate stack top
-    .globl _dm_gate_stubs
+    .globl SYM(dm_gate_stubs)
     .p2align 4
-_dm_gate_stubs:
+SYM(dm_gate_stubs):
     .set k, 0
     .rept 1024                // = thread.c GATE_SLOTS
     mov x29, x30
-    adrp x30, _dm_gate_top@PAGE
+    adrp x30, PAGE(dm_gate_top)
     ldr x30, [x30, #(8 * k)]
-    b _dm_gate
+    b SYM(dm_gate)
     .set k, k + 1
     .endr
 
-    .globl _dm_gate
+    .globl SYM(dm_gate)
     .p2align 2
-_dm_gate:
+SYM(dm_gate):
     // The register frame (800 bytes) goes at the top of the gate stack, not below the guest's sp: on Horizon an SVC leaves the thread's stack as it was, including the words below sp.
     // A collector that records a thread's sp before a blocking call and then scans from there finds pointers its callees left below their returned frames: Streets of Rage 4's BRUTE
     // garbage collector parks a thread in Thread.Sleep with the caller's x20 only in such a word (main+0x2ff4c80's frame), which the old frame here overwrote, so a live array was freed.
@@ -107,12 +116,12 @@ _dm_gate:
     b.lo 1f
     mov sp, x30
     mov x0, x9
-    bl _dm_gate_nested
+    bl SYM(dm_gate_nested)
 1:  mov sp, x30
     ldr x29, [sp, #232]
     ldr x0, [sp, #240]        // Return point = gate identifier
     mov x1, sp                // regs
-    bl _gate_dispatch
+    bl SYM(gate_dispatch)
     ldr x9, [sp, #784]
     msr fpcr, x9
     ldr x9, [sp, #776]
@@ -160,14 +169,14 @@ _dm_gate:
 
 // 3) dm_thread_enter(entry, arg, sp): guest thread start. Switch to the guest stack given by the SDK and call entry with x0 = argument;
 //    Horizon threads must exit via ExitThread; returning from entry is reported as an error.
-    .globl _dm_thread_enter
+    .globl SYM(dm_thread_enter)
     .p2align 2
-_dm_thread_enter:
+SYM(dm_thread_enter):
     mov sp, x2
     mov x29, #0
     mov x16, x0
     mov x0, x1
     adr x30, 1f
     br x16
-1:  bl _dm_thread_returned
+1:  bl SYM(dm_thread_returned)
     brk #0

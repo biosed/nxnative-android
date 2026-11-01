@@ -1,7 +1,5 @@
 // Import resolution (implemented ones go to the host, the rest go to named stubs) and host gate dispatch.
 #include "hle.h"
-#include <mach-o/getsect.h>
-#include <mach-o/ldsyms.h>
 #include <dlfcn.h>
 #include <time.h>
 
@@ -32,7 +30,7 @@ static unsigned *g_hle_idx, g_hle_mask; static const hle_ent *g_hle_sec;
 static const hle_ent *hle_find(const char *name) {
     if (!g_hle_mask) {
         unsigned long secsz;
-        g_hle_sec = (const hle_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swhle", &secsz);
+        g_hle_sec = (const hle_ent *)DM_SECTION_DATA(swhle, &secsz);
         unsigned n = g_hle_sec ? (unsigned)(secsz / sizeof *g_hle_sec) : 0;
         unsigned cap = 16; while (cap < n * 2) cap <<= 1;
         g_hle_idx = calloc(cap, sizeof *g_hle_idx); g_hle_mask = cap - 1;
