@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 #include <stdatomic.h>
 #include <time.h>
 
@@ -209,6 +210,20 @@ void crash_install(void) {
         pthread_detach(th);
     }
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGILL, &sa, 0); sigaction(SIGTRAP, &sa, 0);
+#if !TARGET_OS_IPHONE
+    // Task exception ports are inherited across fork / exec: a parent's crash handler that holds them (an agent's runtime launching the game from its shell held bad access, bad
+    // instruction, arithmetic and breakpoint) gets every fault first, never answers, and the faulting thread waits there for good, so none of the handlers above ran (a DM_PROBE brk
+    // stopped the guest thread on it, a page fault would have too). Unless a debugger is attached (lldb relies on those ports), give them back to the kernel's signal path
+    { struct kinfo_proc kp; size_t kl = sizeof kp; int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+      exception_mask_t em[EXC_TYPES_COUNT]; mach_msg_type_number_t en = EXC_TYPES_COUNT; mach_port_t ep[EXC_TYPES_COUNT]; exception_behavior_t eb[EXC_TYPES_COUNT]; thread_state_flavor_t ef[EXC_TYPES_COUNT];
+      const exception_mask_t want = EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_ARITHMETIC | EXC_MASK_BREAKPOINT;
+      int traced = !sysctl(mib, 4, &kp, &kl, NULL, 0) && (kp.kp_proc.p_flag & P_TRACED);
+      if (!traced && task_get_exception_ports(mach_task_self(), want, em, &en, ep, eb, ef) == KERN_SUCCESS)
+          for (mach_msg_type_number_t i = 0; i < en; i++) if (MACH_PORT_VALID(ep[i])) {
+              LOG("crash: inherited task exception port for mask %#x cleared: faults go to the host's signal handlers", em[i]);
+              task_set_exception_ports(mach_task_self(), em[i], MACH_PORT_NULL, EXCEPTION_DEFAULT, THREAD_STATE_NONE);
+          } }
+#endif
     // abort() too (an assertion or an uncaught exception in the host or a framework): Big Brain Academy: Brain vs. Brain died once with SIGABRT 11 minutes into a run with nothing
     // in the log and no crash report, so where it came from was lost
     sigaction(SIGABRT, &sa, 0);
