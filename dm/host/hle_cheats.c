@@ -57,7 +57,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <mach/mach.h>       // vm_read_overwrite / vm_write: guest pages the game maps and unmaps while a pass runs (guest_page_read / _write)
-#if !TARGET_OS_IPHONE
+#if TARGET_OS_OSX
 #include <mach/mach_vm.h>    // the alias mapping of main's pages (mach_vm_remap), below; the iPhone SDK has no mach_vm.h
 #include <mach/vm_prot.h>
 #endif
@@ -171,8 +171,8 @@ static uint8_t *g_alias;       // the alias mapping of main's image (same layout
 // Map main's image a second time, writable. Called once a cheat file is actually picked (at init that is before the
 // guest starts, so nothing protects or tracks these pages yet); the mapping stays for the process's lifetime, the
 // loader's per-page protections never change after load. Not on the iPhone: its SDK has no mach_vm.h, and its code pages
-// are the app's signed pages, which no mapping can make writable; cheats write only data there
-#if TARGET_OS_IPHONE
+// are the app's signed pages, which no mapping can make writable; cheats write only data there. Not on Android either (no mach_vm_remap): data only, as on the iPhone
+#if !TARGET_OS_OSX
 static void alias_setup(void) { g_alias = NULL; }
 #else
 static void alias_setup(void) {

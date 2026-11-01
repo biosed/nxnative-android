@@ -37,6 +37,7 @@ SYM(unimpl_entry):
 #ifdef __APPLE__
     .zerofill __DATA,__bss,_dm_gate_top,8192,12      // 8 × 1024 (= thread.c GATE_SLOTS)
 #else
+    SYM_HIDDEN SYM(dm_gate_top)                       // reached by adrp from the stubs: in a shared object only a hidden symbol may be
     .bss
     .balign 4096
 SYM(dm_gate_top):

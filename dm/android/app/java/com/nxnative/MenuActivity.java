@@ -214,7 +214,7 @@ public class MenuActivity extends Activity {
     }
     private boolean gameFilesPresent() {
         File ext = getExternalFilesDir(null);
-        return ext != null && new File(ext, "romfs").isDirectory() && new File(ext, "dm").isDirectory() && new File(ext, "vk").isDirectory();
+        return ext != null && new File(ext, "romfs").exists() && new File(ext, "dm").isDirectory() && new File(ext, "vk").isDirectory();   // romfs: a folder, or a RomFS image (hle_fs.c)
     }
 
     // The cheats of the bundled file, numbered as the host numbers them (dm/host/hle_cheat.c: [Name] entries with code; {Name} master codes always run and are not listed)

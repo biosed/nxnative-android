@@ -30,4 +30,8 @@ static inline int pthread_cond_timedwait_relative_np(pthread_cond_t *c, pthread_
     t.tv_sec += rel->tv_sec; t.tv_nsec += rel->tv_nsec; if (t.tv_nsec >= 1000000000) { t.tv_sec++; t.tv_nsec -= 1000000000; }
     return pthread_cond_timedwait(c, m, &t);
 }
+// BSD's stable sort (hle_hid.c orders the DM_KEYS steps with it); compat.c
+int mergesort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *));
+// Darwin's name of struct stat's modification time (save_sync.c)
+#define st_mtimespec st_mtim
 #endif

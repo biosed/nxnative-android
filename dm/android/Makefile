@@ -19,7 +19,8 @@ GAME_DIR := $(if $(wildcard ../games/$(GAME)/game.tsv),../games/$(GAME),$(GAME_G
 CFLAGS := -MMD -MP -O1 -g -fPIC -fvisibility=hidden -D_GNU_SOURCE -Wall -Wno-unused-function -Wno-format -Wno-deprecated-declarations -Wno-incompatible-pointer-types-discards-qualifiers \
           -include compat/dm_compat.h -Icompat -I$(HOST) -I../gfx/nvn -I../gfx/nvn/include -I../third_party/vulkan-headers/include -I$(GAME_GEN) -I$(GAME_DIR) \
           -I../third_party/libvpx -I../third_party/stb_vorbis
-SRC := $(HOST)/main.c $(HOST)/loader.c $(HOST)/hle.c $(HOST)/crash.c $(HOST)/probe.c $(HOST)/thread.c $(sort $(wildcard $(HOST)/hle_*.c)) $(HOST)/entry.S \
+# hle_cheats.c is left out (GCD blocks, mach_vm): src/cheats_none.c answers its calls with no cheats
+SRC := $(HOST)/main.c $(HOST)/loader.c $(HOST)/hle.c $(HOST)/crash.c $(HOST)/probe.c $(HOST)/thread.c $(HOST)/save_sync.c $(sort $(filter-out $(HOST)/hle_cheats.c,$(wildcard $(HOST)/hle_*.c))) $(HOST)/entry.S \
        ../gfx/hle_nv.c ../gfx/hle_vi.c $(sort $(wildcard ../gfx/nvn/*.c ../gfx/nvn/*.S ../gfx/tex/*.c))
 # Graphics backend: BACKEND=vk (default, src/nvn_vk.c) or null (null/nvn_null.c: nothing drawn, the game runs)
 BACKEND ?= vk

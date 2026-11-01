@@ -229,3 +229,18 @@ kern_return_t vm_region_64(mach_port_t task, vm_address_t *addr, vm_size_t *size
 kern_return_t thread_policy_get(mach_port_t th, thread_policy_flavor_t f, thread_policy_t p, mach_msg_type_number_t *cnt, boolean_t *def) { (void)th; (void)f; (void)p; (void)cnt; (void)def; return KERN_FAILURE; }
 // Darwin's per-thread performance counters (libsyscall): not available, the caller's zeros stay
 int thread_selfcounts(int type, void *buf, size_t nbytes) { (void)type; (void)buf; (void)nbytes; return -1; }
+// BSD's mergesort: a stable sort (bionic has none); 0, or -1 with errno set when the buffer cannot be allocated
+int mergesort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *)) {
+    if (n < 2) return 0;
+    uint8_t *a = base, *t = malloc(n * size); if (!t) return -1;
+    for (size_t w = 1; w < n; w *= 2) {
+        for (size_t lo = 0; lo < n; lo += 2 * w) {
+            size_t mid = lo + w < n ? lo + w : n, hi = lo + 2 * w < n ? lo + 2 * w : n, i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) { if (cmp(a + j * size, a + i * size) < 0) memcpy(t + k++ * size, a + j++ * size, size); else memcpy(t + k++ * size, a + i++ * size, size); }
+            memcpy(t + k * size, a + i * size, (mid - i) * size); k += mid - i;
+            memcpy(t + k * size, a + j * size, (hi - j) * size);
+        }
+        memcpy(a, t, n * size);
+    }
+    free(t); return 0;
+}

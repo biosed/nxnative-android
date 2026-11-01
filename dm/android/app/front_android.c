@@ -20,7 +20,6 @@
 #include <unistd.h>
 
 int dm_main(int argc, char **argv);   // dm/host/main.c, compiled with -Dmain=dm_main
-void dm_cheats_start(void);
 void dm_focus_set(int st);
 void dm_audio_suspend(int on);
 void dm_gfx_suspend(int on);
@@ -38,7 +37,7 @@ int front_screen_max_fps(void) { return 0; }
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
     (void)title; (void)sub; (void)guide; (void)initial; (void)max_chars; (void)out; (void)out_cap; return -1;
 }
-void front_run(void (*guest)(void)) { dm_cheats_start(); guest(); }
+void front_run(void (*guest)(void)) { guest(); }   // the cheats are loaded by the host itself (main.c dm_cheats_init)
 
 // ---------- Controllers: one state per input device; buttons are ORed, each stick comes from the device that moves it furthest ----------
 #define NDEV 8
@@ -217,7 +216,7 @@ static void boot_env(const char *files, const char *ext) {
     for (int i = 0; i < 3; i++) { snprintf(p, sizeof p, "%s/%s", ext, sub[i][1]); setenv(sub[i][0], p, 0); }
     snprintf(p, sizeof p, "%s/save", files); mkdir(p, 0755); setenv("DM_SAVE", p, 0);
     snprintf(p, sizeof p, "%s/temp", files); mkdir(p, 0755); setenv("DM_TEMP", p, 0);
-    snprintf(p, sizeof p, "%s/cheats.txt", files); if (!access(p, R_OK)) setenv("DM_CHEATS", p, 0);
+    snprintf(p, sizeof p, "%s/cheats", files); if (!access(p, R_OK)) setenv("DM_CHEATS", p, 0);   // the cheats folder (<build>.txt files; hle_cheats.c)
     chdir(files);
     g_argv[0] = strdup("dmhost"); snprintf(p, sizeof p, "%s/dm", ext); g_argv[1] = strdup(p);
 }

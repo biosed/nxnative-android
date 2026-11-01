@@ -3,7 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <compression.h>
+#ifdef __APPLE__
 __asm__(".linker_option \"-lcompression\"");   // libcompression (LZFSE) links itself: the host, the iOS app and the tests that compile this file need no link flag
+#endif
 
 // The walk below names every pointer field of every payload by its offset. A change to a payload struct in nvn_obj.h must come here too: these asserts stop the build
 // instead of letting a capture carry a host pointer or relocate the wrong bytes. The numbers are the layout the walk was written against.

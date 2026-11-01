@@ -12,7 +12,12 @@
 import argparse, glob, hashlib, os, re, shutil, struct, subprocess, sys, tempfile, zipfile
 HERE = os.path.dirname(os.path.abspath(__file__)); ANDROID = os.path.dirname(HERE)
 SDK = os.environ.get('ANDROID_SDK', '/opt/homebrew/share/android-commandlinetools')
-BT = os.path.join(SDK, 'build-tools', '34.0.0'); JAR = os.path.join(SDK, 'platforms', 'android-33', 'android.jar')
+def _sdk_dir(kind, want):   # the wanted build-tools / platform, else the newest one the SDK has (Android Studio's SDK may hold only newer ones)
+    p = os.path.join(SDK, kind, want)
+    if os.path.isdir(p) or not os.path.isdir(os.path.join(SDK, kind)): return p
+    have = sorted(os.listdir(os.path.join(SDK, kind)), key=lambda v: [int(x) if x.isdigit() else 0 for x in re.split(r'[.-]', v)])
+    return os.path.join(SDK, kind, have[-1]) if have else p
+BT = _sdk_dir('build-tools', '34.0.0'); JAR = os.path.join(_sdk_dir('platforms', 'android-33'), 'android.jar')
 JAVA = os.environ.get('JAVA_HOME', '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home')
 APK_GAME_LIMIT = int(os.environ.get('APK_GAME_LIMIT', 3_800_000_000))   # bytes of game in the APK before the rest goes to the data file (Android and its tools read no ZIP64: an APK stays below 4 GB)
 ENV = dict(os.environ, JAVA_HOME=JAVA, PATH=os.path.join(JAVA, 'bin') + os.pathsep + os.environ['PATH'])
@@ -112,10 +117,16 @@ def game_files(b):   # (path in the app's external folder, source) for every gam
     for f in sorted(glob.glob(os.path.join(b, 'patched_android', '*.patched.bin')) + glob.glob(os.path.join(b, 'patched_android', '*.tsv'))): out.append(('dm/' + os.path.basename(f), f))
     for f in sorted(glob.glob(os.path.join(vk, '*.spv')) + glob.glob(os.path.join(vk, '*.vk.txt'))): out.append(('vk/' + os.path.basename(f), f))
     for f in sorted(glob.glob(os.path.join(b, 'font', '*'))): out.append(('font/' + os.path.basename(f), f))
-    romfs = glob.glob(os.path.join(b, 'extract', '*', 'RomFS'))[-1]
+    romfs = romfs_source(b)
+    if os.path.isfile(romfs): out.append(('romfs', romfs)); return out   # a RomFS image: the host mounts the file itself (hle_fs.c romfs_image)
     for root, _, fs in os.walk(romfs):
         for f in sorted(fs): p = os.path.join(root, f); out.append(('romfs/' + os.path.relpath(p, romfs), p))
     return out
+
+def romfs_source(b):   # the extracted RomFS folder, or the RomFS image build_ipa_from_nsp.py makes instead (extract/<version>/RomFS.img)
+    found = glob.glob(os.path.join(b, 'extract', '*', 'RomFS')) or glob.glob(os.path.join(b, 'extract', '*', 'RomFS.img'))
+    if not found: sys.exit(f'[RED] no RomFS folder or RomFS.img under {b}/extract')
+    return found[-1]
 
 def deploy(a):
     ext = f'/sdcard/Android/data/{package(a.id)}/files'
@@ -123,7 +134,7 @@ def deploy(a):
         run('adb', 'shell', f'mkdir -p {ext} && for d in romfs dm vk font; do rm -rf {ext}/$d; cp -r {a.from_device}/$d {ext}/$d; done')
     else:   # adb cannot make folders inside Android/data (Android 13: secure_mkdirs is refused): pushed to /data/local/tmp, then copied on the device
         b = a.build; tmp = '/data/local/tmp/nx_deploy'   # the folders themselves: adb push copies symbolic links as links, which the device refuses
-        src = {'dm': os.path.join(b, 'patched_android'), 'vk': glob.glob(os.path.join(b, 'shader', 'vk'))[0], 'font': os.path.join(b, 'font'), 'romfs': glob.glob(os.path.join(b, 'extract', '*', 'RomFS'))[-1]}
+        src = {'dm': os.path.join(b, 'patched_android'), 'vk': glob.glob(os.path.join(b, 'shader', 'vk'))[0], 'font': os.path.join(b, 'font'), 'romfs': romfs_source(b)}
         run('adb', 'shell', f'rm -rf {tmp}; mkdir -p {tmp} {ext}')
         for d in ('dm', 'vk', 'font', 'romfs'):
             run('adb', 'push', src[d], f'{tmp}/{d}', stdout=subprocess.DEVNULL)
