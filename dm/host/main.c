@@ -42,6 +42,18 @@ static void guest_main(void) {
     LOG("nnMain returned");
 }
 
+// Hibernation (DM_HIBERNATE, hle_hib.c): guest memory points into the guest main thread's stack (the SDK's thread records, objects it lives on), so with hibernation it runs on a
+// 64 MB stack in the host arena, at a fixed address, on a pthread of its own; the front end's thread waits for it as it would for guest_main
+static void *guest_main_arena(void *a) { (void)a; guest_main(); return NULL; }
+static void guest_main_entry(void) {
+    void *st = dm_hib_calloc(64u << 20);
+    if (!st) { guest_main(); return; }
+    void svc_set_main_stack(uint64_t lo, uint64_t hi); svc_set_main_stack((uint64_t)(uintptr_t)st, (uint64_t)(uintptr_t)st + (64u << 20));
+    pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstack(&at, st, 64u << 20);
+    pthread_t th; if (pthread_create(&th, &at, guest_main_arena, NULL)) die("cannot start the guest main thread on its arena stack");
+    pthread_join(th, NULL);
+}
+
 struct dm_flags g_flag;
 uint64_t g_t0_ns;
 static void flags_init(void) {
@@ -162,6 +174,6 @@ int main(int argc, char **argv) {
     { void dm_fps_state_apply(void); dm_fps_state_apply(); }   // frame rate and render scale into the frame step state page (loader.c): the iOS launcher sets them after the loading began
     { int dm_hib_restore_prepare(void); void dm_hib_restore_main(void);   // DM_HIBERNATE with DM_HIB_RESTORE: back where a snapshot left the game (hle_hibsnap.c)
       if (dm_hib_restore_prepare()) { front_run(dm_hib_restore_main); return 0; } }
-    front_run(guest_main);
+    front_run(guest_main_entry);
     return 0;
 }

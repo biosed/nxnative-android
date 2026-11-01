@@ -1187,9 +1187,6 @@ void front_run(void (*guest)(void)) {
         // Guest thread: 64 MiB stack (the Switch main thread stack is specified by npdm; the host gives plenty)
         static guest_arg ga; ga.fn = guest;
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);
-        int dm_hib_restoring(void);
-        if (!dm_hib_restoring()) { void *st = dm_hib_calloc(64u << 20); void svc_set_main_stack(uint64_t, uint64_t);
-            if (st) { pthread_attr_setstack(&a, st, 64u << 20); svc_set_main_stack((uint64_t)(uintptr_t)st, (uint64_t)(uintptr_t)st + (64u << 20)); } }   // hibernation: the stack in the host arena, at a fixed address (guest memory points into it)
         pthread_t th; if (pthread_create(&th, &a, guest_tramp, &ga)) die("pthread_create guest");
         [NSApp run];
     }
