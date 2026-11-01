@@ -72,14 +72,15 @@ def strip_caps(d):
 
 VTYPE = {'float': 0, 'uint': 1, 'int': 2}
 def vk_txt(j):
-    """stage <vs|ps|cs> / tg <x y z> / c1 <hex> / vin <location> <0 float, 1 uint, 2 int> / b <binding> <type> <count> <kind> <reg> <off or bank> <sampler kind> <sampler reg>; -1 / - = none"""
+    """stage <vs|ps|cs> / tg <x y z> / c1 <hex> / vin <location> <0 float, 1 uint, 2 int> / b <binding> <type> <count> <kind> <reg> <off or bank> <sampler kind> <sampler reg> <sampler off>;
+    -1 / - = none. The sampler's byte offset places a samp_ubo handle word, which the host ORs with the texture's (a type-1 handle, nvn_vk.c texu_handle)"""
     L = [f"stage {j['stage']}"]
     if j.get('tg'): L.append('tg ' + ' '.join(str(x) for x in j['tg']))
     if j.get('c1'): L.append(f"c1 {j['c1']}")
     for v in j.get('vertex_inputs', []): L.append(f"vin {v['location']} {VTYPE.get(v['msl_type'].rstrip('1234'), 0)}")
     for b in j['bindings']:
         s_ = b.get('samp', {}); r = b.get('reg'); sr = s_.get('reg')
-        L.append(f"b {b['binding']} {b['type']} {b['count']} {b['kind']} {-1 if r is None else r} {b.get('off', b.get('bank', -1))} {s_.get('kind', '-')} {-1 if sr is None else sr}")
+        L.append(f"b {b['binding']} {b['type']} {b['count']} {b['kind']} {-1 if r is None else r} {b.get('off', b.get('bank', -1))} {s_.get('kind', '-')} {-1 if sr is None else sr} {s_.get('off', -1)}")
     return '\n'.join(L) + '\n'
 
 if sys.argv[1] == '--txt':   # rewrite the .vk.txt files of an output folder from its .vk.json, and strip its SPIR-V's unused capabilities
@@ -97,7 +98,8 @@ for f in os.listdir(os.path.dirname(XLATE)):
     if f != 'dmsh_xlate': os.symlink(os.path.join(os.path.dirname(XLATE), f), os.path.join(xd, f))
 wrapper = os.path.join(xd, 'dmsh_xlate'); open(wrapper, 'w').write(f'#!/bin/sh\nexec "{sys.executable}" "{os.path.abspath(__file__)}" --xlate "$@"\n'); os.chmod(wrapper, 0o755)
 env = dict(os.environ, XLATE=wrapper, SPV_KEEP=keep, DMSH_CAS=os.path.join(w, 'cas'), DMSH_PREFILL=cache, WORK=w)
-r = subprocess.run([sys.executable, os.path.join(REPO, 'dm/gfx/tools/dmsh_build.py'), pkg, os.path.join(w, 'cache')], env=env, capture_output=True, text=True)
+# through own_compilers.py, as the NSP script builds them: DM_ALLOW_OTHER_METAL=1 accepts this Mac's Metal compiler when it is not the lock's (the SPIR-V does not depend on it)
+r = subprocess.run([sys.executable, os.path.join(REPO, 'dm/gfx/tools/own_compilers.py'), pkg, os.path.join(w, 'cache')], env=env, capture_output=True, text=True)
 print(r.stdout[-3000:], r.stderr[-2000:])
 b = glob.glob(os.path.join(w, 'cache', 'b-*'))
 if r.returncode or not b: sys.exit('[RED] the shader build failed')
