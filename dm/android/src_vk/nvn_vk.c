@@ -1873,7 +1873,8 @@ static struct { VkSurfaceKHR surf; VkSwapchainKHR sc; VkImage img[8]; VkImageVie
 #define NPRES 3
 static struct { VkCommandPool pool; VkCommandBuffer cb; VkFence fence; VkSemaphore acq, done; VkFramebuffer fb; } g_pres[NPRES]; static int g_pi;
 static void win_drop(void) {
-    if (W.sc) { vkDeviceWaitIdle(g_dev); for (uint32_t i = 0; i < W.n; i++) vkDestroyImageView(g_dev, W.view[i], NULL); vkDestroySwapchainKHR(g_dev, W.sc, NULL); W.sc = VK_NULL_HANDLE; }
+    // the queue is externally synchronized: no submission while the device drains
+    if (W.sc) { pthread_mutex_lock(&g_qmu); vkDeviceWaitIdle(g_dev); pthread_mutex_unlock(&g_qmu); for (uint32_t i = 0; i < W.n; i++) vkDestroyImageView(g_dev, W.view[i], NULL); vkDestroySwapchainKHR(g_dev, W.sc, NULL); W.sc = VK_NULL_HANDLE; }
     if (W.surf) { vkDestroySurfaceKHR(g_inst, W.surf, NULL); W.surf = VK_NULL_HANDLE; }
 }
 static int win_make(ANativeWindow *aw) {
@@ -1964,6 +1965,9 @@ static void img_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkI
                               VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
+// The window is going away (app/front_android.c, NativeActivity onNativeWindowDestroyed, holding front_window_lock): the swapchain and surface go now, before Android
+// takes the window back; the device, pipelines and every game image stay. The next present after a new window makes a new swapchain (the generation differs)
+void dm_vk_window_lost(void) { if (!g_dev) return; win_drop(); W.gen = -1; LOG("vk: window gone: swapchain and surface released"); }
 static void win_present(const tex_t *t, const int crop[4]) {
     int gen; ANativeWindow *aw = front_native_window(&gen);
     front_window_lock(1);

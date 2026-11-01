@@ -24,6 +24,8 @@ void dm_focus_set(int st);
 void dm_audio_suspend(int on);
 void dm_gfx_suspend(int on);
 void dm_host_shutdown(const char *why);
+void guest_clock_freeze_for(int reason, int on);
+void dm_vk_window_lost(void);   // src_vk/nvn_vk.c
 
 static ANativeActivity *g_act;
 static pthread_mutex_t g_wmu = PTHREAD_MUTEX_INITIALIZER;
@@ -271,14 +273,55 @@ static void immersive(ANativeActivity *a) {
 
 // ---------- Activity callbacks ----------
 static void on_window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; pthread_mutex_lock(&g_wmu); g_win = w; atomic_fetch_add(&g_win_gen, 1); pthread_mutex_unlock(&g_wmu); LOG("front end: window %dx%d", ANativeWindow_getWidth(w), ANativeWindow_getHeight(w)); }
-static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; pthread_mutex_lock(&g_wmu); g_win = NULL; atomic_fetch_add(&g_win_gen, 1); pthread_mutex_unlock(&g_wmu); }
+// The window goes when the activity stops (screen off, another app): the swapchain and surface are released with it, before Android takes the window back
+static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; pthread_mutex_lock(&g_wmu); g_win = NULL; atomic_fetch_add(&g_win_gen, 1); dm_vk_window_lost(); pthread_mutex_unlock(&g_wmu); }
 static void on_window_resized(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; atomic_fetch_add(&g_win_gen, 1); }
 static void on_input_created(ANativeActivity *a, AInputQueue *q) { (void)a; g_iq = q; AInputQueue_attachLooper(q, ALooper_forThread(), 1, input_cb, NULL); }
 static void on_input_destroyed(ANativeActivity *a, AInputQueue *q) { (void)a; AInputQueue_detachLooper(q); g_iq = NULL; }
-static void on_resume(ANativeActivity *a) { (void)a; dm_focus_set(1); dm_audio_suspend(0); }
-static void on_pause(ANativeActivity *a) { (void)a; dm_audio_suspend(1); dm_focus_set(3); }
+// ---------- Suspend and resume, as a Switch going to sleep ----------
+// The activity stopping (the screen off, home, another app) suspends the game the way the iOS front end does for the background and Horizon for sleep: the game gets
+// OutOfFocus then Background (oe focus notifications), audio stops (AAudio), the guest clock is frozen (no time passes for its timers), and the graphics gate closes
+// (dm_gfx_suspend: the game's next submit or present blocks there, so its threads stall at their next frame, and in-flight GPU work is drained). The process stays, kept
+// by GameService (a foreground service with an ongoing notification), with every game resource in memory. The activity starting again reverses it in the opposite order;
+// focus comes back with the window focus. Before this the game ran on unseen in the background, its frames dropped for want of a window
+static pthread_mutex_t g_lmu = PTHREAD_MUTEX_INITIALIZER; static int g_suspended;
+static void game_suspend(int on) {
+    pthread_mutex_lock(&g_lmu);
+    if (on != g_suspended) {
+        g_suspended = on;
+        if (on) { dm_focus_set(2); dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); LOG("front end: suspended (the activity stopped)"); }
+        else { dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(2); LOG("front end: resumed (the activity started)"); }
+    }
+    pthread_mutex_unlock(&g_lmu);
+}
+// GameService's static methods (app/java/com/nxnative/GameService.java), through the activity's class loader (FindClass on this thread sees the system classes only)
+static void game_service(ANativeActivity *a, const char *method, int arg) {
+    JNIEnv *env = a->env;
+    jobject ld = (*env)->CallObjectMethod(env, a->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "getClassLoader", "()Ljava/lang/ClassLoader;"));
+    jstring nm = (*env)->NewStringUTF(env, "com.nxnative.GameService");
+    jclass cl = ld ? (jclass)(*env)->CallObjectMethod(env, ld, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, ld), "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;"), nm) : NULL;
+    if (cl && !(*env)->ExceptionCheck(env)) {
+        int set = !strcmp(method, "setSuspended");
+        jmethodID m = (*env)->GetStaticMethodID(env, cl, method, set ? "(Landroid/content/Context;Z)V" : "(Landroid/content/Context;)V");
+        if (m && !(*env)->ExceptionCheck(env)) { if (set) (*env)->CallStaticVoidMethod(env, cl, m, a->clazz, (jboolean)(arg != 0)); else (*env)->CallStaticVoidMethod(env, cl, m, a->clazz); }
+    }
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); LOG("[RED] front end: GameService.%s failed", method); }
+    (*env)->DeleteLocalRef(env, nm);
+}
+static void on_start(ANativeActivity *a) { game_suspend(0); game_service(a, "setSuspended", 0); }
+static void on_stop(ANativeActivity *a) { game_suspend(1); game_service(a, "setSuspended", 1); }
+static void on_resume(ANativeActivity *a) { (void)a; }
+static void on_pause(ANativeActivity *a) { (void)a; dm_focus_set(2); }   // still visible behind something (a dialog, a split screen): out of focus, running
 static void on_focus(ANativeActivity *a, int f) { if (f) immersive(a); dm_focus_set(f ? 1 : 2); }
-static void on_destroy(ANativeActivity *a) { (void)a; dm_host_shutdown("activity destroyed"); }
+// Destroyed by the player leaving (− and + held, back_to_menu, finish) the game ends; destroyed by Android while the process stays (to reclaim memory, its activity
+// only), the game stays suspended and a new activity takes over its window (ANativeActivity_onCreate: the host runs once per process)
+static void on_destroy(ANativeActivity *a) {
+    JNIEnv *env = a->env;
+    jboolean fin = (*env)->CallBooleanMethod(env, a->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "isFinishing", "()Z"));
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); fin = 1; }
+    if (fin) dm_host_shutdown("activity destroyed");
+    else LOG("front end: the activity was destroyed by Android, not finished: the game stays suspended");
+}
 
 __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActivity *a, void *saved, size_t saved_n) {
     (void)saved; (void)saved_n;
@@ -287,9 +330,11 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     a->callbacks->onNativeWindowResized = on_window_resized;
     a->callbacks->onInputQueueCreated = on_input_created; a->callbacks->onInputQueueDestroyed = on_input_destroyed;
     a->callbacks->onResume = on_resume; a->callbacks->onPause = on_pause; a->callbacks->onWindowFocusChanged = on_focus; a->callbacks->onDestroy = on_destroy;
+    a->callbacks->onStart = on_start; a->callbacks->onStop = on_stop;
     ANativeActivity_setWindowFlags(a, 0x80 /* KEEP_SCREEN_ON */ | 0x400 /* FULLSCREEN */, 0);
     immersive(a);
     static int booted; if (booted++) return;   // the activity can be made again (rotation, a return): the host runs once per process
+    game_service(a, "start", 0);   // in the foreground now, as starting a foreground service requires
     snprintf(g_files, sizeof g_files, "%s", a->internalDataPath);
     boot_env(a->internalDataPath, a->externalDataPath);
     pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 16 << 20);

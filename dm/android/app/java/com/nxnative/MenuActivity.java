@@ -50,6 +50,9 @@ public class MenuActivity extends Activity {
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // The notification that keeps a suspended game in memory (GameService) needs the notification permission from Android 13 on; asked once, the game runs without it too
+        if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
         prefs = getSharedPreferences("menu", MODE_PRIVATE);
         seedFiles();
         buildUi();
