@@ -457,7 +457,7 @@ static int md_aac_silence(mdec_t *d, int slot) {
 static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
     if (n <= 0) return 0;
     if (d->out[slot].cap < MD_PCM_CAP) { free(d->out[slot].frm); d->out[slot].frm = malloc(MD_PCM_CAP); d->out[slot].cap = MD_PCM_CAP; }
-    if (!d->aac && !md_aac_open(d)) return md_aac_silence(d, slot);
+    if (!d->aac && (d->red_vb || !md_aac_open(d))) return md_aac_silence(d, slot);   // red_vb: the decoder failed to open (said once): not tried again for every packet
     size_t have = 0; int fed = 0;
     for (int tries = 0; tries < 50 && !fed; tries++) {   // up to half a second for a free input buffer, taking finished output meanwhile
         ssize_t i = AMediaCodec_dequeueInputBuffer(d->aac, 10000);
