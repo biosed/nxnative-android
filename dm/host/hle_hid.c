@@ -208,6 +208,7 @@ void hid_keys_init(void) {
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "dump" logs what each guest thread waits on and the graphics wait points
 //   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "#…" is ignored.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
+void (*dm_hib_ctl_hook)(const char *cmd);   // hle_hib.c sets it (a hook: unit tests link this file alone)
 static void *ctl_main(void *arg) {
     const char *path = arg; long off = 0; char line[1100];
     for (;;) {
@@ -218,6 +219,7 @@ static void *ctl_main(void *arg) {
                 off += (long)n; line[--n] = 0; if (n && line[n - 1] == '\r') line[--n] = 0;
                 if (!n || line[0] == '#') continue;
                 if (!strcmp(line, "dump")) { crash_dump_now("DM_CTL dump"); continue; }
+                if (!strncmp(line, "hib ", 4)) { if (dm_hib_ctl_hook) dm_hib_ctl_hook(line + 4); continue; }   // hibernation (hle_hib.c)
                 if (!strncmp(line, "shot ", 5)) { dm_gfx_shot_at(1, line + 5); LOG("DM_CTL: screenshot of the next frame → %s", line + 5); continue; }
                 if (!strncmp(line, "texlist ", 8)) { void dm_gfx_texlist(int target); dm_gfx_texlist(atoi(line + 8)); continue; }
                 if (!strncmp(line, "texraw ", 7)) { void dm_gfx_texraw(uint64_t serial, const char *path); char *e2; uint64_t s = strtoull(line + 7, &e2, 10); while (*e2 == ' ') e2++; dm_gfx_texraw(s, e2); continue; }

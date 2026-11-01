@@ -534,6 +534,31 @@ static void hitch_grab(thr_t *t, hitch_t *h) {
     }
     thread_resume(t->mport);
 }
+// Hibernation (hle_hibaudit.c, later the snapshot): each guest thread's handle, its guest stack pointer and where it is, holding G. In an SVC the gate frame has the sp (the gate block's
+// sp, the guest's stack above it); otherwise the thread is suspended for a moment and its register state read (Apple only: Android's compat has no thread_get_state, sp is 0 there).
+// where: 1 in an SVC, 2 in guest code, 3 in host code (an HLE function, or a thread the host created), 0 unknown. top: the stack top CreateThread was given (0 for the main thread)
+int dm_thr_stack_list(uint32_t *handle, uint64_t *sp, uint64_t *top, int *where, int max) {
+    int n = 0;
+    pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t && n < max; t = t->all) {
+        if (!t->started || t->exited || pthread_equal(t->pt, pthread_self())) continue;
+        handle[n] = t->handle; top[n] = t->stack_top; sp[n] = 0; where[n] = 0;
+        const uint64_t *r = atomic_load(&t->svc_regs);
+        if (r) { sp[n] = r[99]; where[n] = 1; }
+        else if (t->mport && thread_suspend(t->mport) == KERN_SUCCESS) {
+            arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state(t->mport, ARM_THREAD_STATE64, (thread_state_t)&st, &c) == KERN_SUCCESS) {
+                r = atomic_load(&t->svc_regs);   // entered an SVC meanwhile: the gate frame is the context
+                if (r) { sp[n] = r[99]; where[n] = 1; }
+                else { sp[n] = __darwin_arm_thread_state64_get_sp(st); where[n] = module_of((void *)__darwin_arm_thread_state64_get_pc(st)) ? 2 : 3; }
+            }
+            thread_resume(t->mport);
+        }
+        n++;
+    }
+    pthread_mutex_unlock(&G);
+    return n;
+}
 static void hitch_log(const hitch_t *h) {
     static const char *kinds[] = {"run", "mutex", "condvar", "address", "sync"};
     char w[900]; size_t q = 0, n = sizeof w; w[0] = 0;
