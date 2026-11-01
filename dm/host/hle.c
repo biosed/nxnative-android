@@ -46,11 +46,14 @@ static const hle_ent *hle_find(const char *name) {
     return NULL;
 }
 
+void *(*dm_hib_thunk_hook)(void *fn);   // hle_hib.c sets it with DM_HIBERNATE (a hook: unit tests link this file alone)
 uint64_t resolve_import(module_t *m, const char *name) {
     const hle_ent *e = hle_find(name);
     if (e) {
         if (g_flag.imports) { Dl_info di; dladdr(e->fn, &di); LOG("import %s -> %s", name, di.dli_sname); }
-        void *hlecount_wrap(const char *, const char *, void *); return (uint64_t)hlecount_wrap("HLE", name, e->fn);   // With DM_HLECOUNT it is a counting stub (including the libc passthrough table)
+        void *fn = e->fn;
+        if (dm_hib_thunk_hook) { void *t = dm_hib_thunk_hook(fn); if (t) fn = t; }   // hibernation: a fixed address in the host executable for a library function (hle_table.c)
+        void *hlecount_wrap(const char *, const char *, void *); return (uint64_t)hlecount_wrap("HLE", name, fn);   // With DM_HLECOUNT it is a counting stub (including the libc passthrough table)
     }
     // Reuse the stub if one was already allocated for the same name (its own hash: the reuse scan over every stub was quadratic in the stub count)
     void *hlecount_wrap(const char *, const char *, void *);

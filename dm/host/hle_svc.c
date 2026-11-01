@@ -37,6 +37,13 @@ static uint8_t *g_stack; static size_t g_stack_cap;
 // The address lies in the guest address block (every guest thread stack is here: the game's own heap or the stack region); the big-stack entry (hle_bigstack.c) uses it to decide whether to switch stacks
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < g_reserve; }
 
+// The block's size: the profile's, its alias region replaced by DM_ALIAS_SIZE's when that is set (checked in mem_init_once). hle_hib.c reserves it before the modules are mapped
+void *(*dm_hib_guest_as_hook)(size_t len);   // hle_hib.c sets it (a hook, not a call: unit tests link this file alone): the fixed place with DM_HIBERNATE, NULL otherwise
+size_t svc_guest_reserve_size(void) {
+    const char *as = getenv("DM_ALIAS_SIZE");
+    size_t alias = as && *as ? (size_t)strtoull(as, NULL, 0) : DM_GAME_MEM_ALIAS;
+    return RESERVE - DM_GAME_MEM_ALIAS + alias;
+}
 static void *alias_windows_thread(void *arg);
 static void *regions_thread(void *arg);
 static void mem_init_once(void) {
@@ -50,7 +57,9 @@ static void mem_init_once(void) {
     size_t alias = DM_GAME_MEM_ALIAS; const char *as = getenv("DM_ALIAS_SIZE");
     if (as && *as) { alias = (size_t)strtoull(as, NULL, 0); if (alias < 0x10000000 || (alias & (pg - 1))) die("DM_ALIAS_SIZE %s: at least 256 MB, in whole host pages", as); }
     g_reserve = RESERVE - DM_GAME_MEM_ALIAS + alias;
-    g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (g_reserve != svc_guest_reserve_size()) die("guest address-space size %#zx, expected %#zx", g_reserve, svc_guest_reserve_size());
+    g_as = dm_hib_guest_as_hook ? dm_hib_guest_as_hook(g_reserve) : NULL;
+    if (!g_as) g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (g_as == MAP_FAILED) die("reserve guest AS");
     // Fixed partition (all inside the reserved block): alias 2.875 GB, stack 256 MB, heap the remaining 1.625 GB.
     // In newer SDKs the AddressRegionManager always takes 0x3fe00000 (~1 GB) at the start of the alias region as its node area (sdk 0x134728) before handing out regions; with a 512 MB alias region the very first AllocateAddressRegion fails (0x1803).
@@ -127,6 +136,22 @@ int dm_guest_heap_read(uint64_t addr, void *out, size_t len) {
 static int map_find(uint64_t a, uint64_t n) {       // returns a 1-based index, 0 = no overlap; caller holds g_map_lock
     for (int i = 0; i < g_nmap; i++) if (a < g_map[i].base + g_map[i].size && g_map[i].base < a + n) return i + 1;
     return 0;
+}
+// Hibernation: the MapMemory mapping (a thread stack moved into the stack region) that holds address a, 0 when none
+int svc_map_span(uint64_t a, uint64_t *base, uint64_t *size) {
+    pthread_mutex_lock(&g_map_lock);
+    int k = map_find(a, 1);
+    if (k) { *base = g_map[k - 1].base; *size = g_map[k - 1].size; }
+    pthread_mutex_unlock(&g_map_lock);
+    return k != 0;
+}
+// The source of a MapMemory mapping that holds address a (heap memory the guest does not touch while it is mapped: the stale copy of a moved stack), 0 when none
+int svc_map_source_span(uint64_t a, uint64_t *base, uint64_t *size) {
+    int r = 0;
+    pthread_mutex_lock(&g_map_lock);
+    for (int i = 0; i < g_nmap && !r; i++) if (g_map[i].src && a >= g_map[i].src && a < g_map[i].src + g_map[i].size) { *base = g_map[i].src; *size = g_map[i].size; r = 1; }
+    pthread_mutex_unlock(&g_map_lock);
+    return r;
 }
 static void map_add(uint64_t b, uint64_t n, uint64_t src, uint32_t st) {   // caller holds g_map_lock
     if (g_nmap >= MAX_MAP) die("mapping table full");
