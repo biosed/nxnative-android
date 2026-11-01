@@ -59,6 +59,20 @@ static uint64_t key_bit(int32_t k) {
         case AKEYCODE_BUTTON_THUMBL: return DM_BTN_LS; case AKEYCODE_BUTTON_THUMBR: return DM_BTN_RS;
         case AKEYCODE_BUTTON_START: return DM_BTN_PLUS; case AKEYCODE_BUTTON_SELECT: case AKEYCODE_BACK: return DM_BTN_MINUS;
         case AKEYCODE_DPAD_LEFT: return DM_BTN_LEFT; case AKEYCODE_DPAD_UP: return DM_BTN_UP; case AKEYCODE_DPAD_RIGHT: return DM_BTN_RIGHT; case AKEYCODE_DPAD_DOWN: return DM_BTN_DOWN;
+        case AKEYCODE_BUTTON_C: return DM_BTN_ZR; case AKEYCODE_BUTTON_Z: return DM_BTN_ZL;   // six-button pads (Sega layout)
+    }
+    return 0;
+}
+// A physical keyboard (USB, Bluetooth, a keyboard cover), mapped as the Mac's (dm/host/front_mac.m): WASD the left stick, the arrows the D-pad or, with Shift held, the right
+// stick, J K U I = A B X Y, Q E = L R, Z C = ZL ZR, F G = press the left / right stick, Return = +, Tab = −, Space = shake the controller. It is one more device slot
+static struct { int w, a, s, d, left, up, right, down, shift; uint64_t btn; } g_kbd;
+static int g_kbd_slot = -1;
+static uint64_t kbd_bit(int32_t k) {
+    switch (k) {
+        case AKEYCODE_J: return DM_BTN_A; case AKEYCODE_K: return DM_BTN_B; case AKEYCODE_U: return DM_BTN_X; case AKEYCODE_I: return DM_BTN_Y;
+        case AKEYCODE_F: return DM_BTN_LS; case AKEYCODE_G: return DM_BTN_RS;
+        case AKEYCODE_Q: return DM_BTN_L; case AKEYCODE_E: return DM_BTN_R; case AKEYCODE_Z: return DM_BTN_ZL; case AKEYCODE_C: return DM_BTN_ZR;
+        case AKEYCODE_ENTER: case AKEYCODE_NUMPAD_ENTER: return DM_BTN_PLUS; case AKEYCODE_TAB: return DM_BTN_MINUS; case AKEYCODE_SPACE: return DM_BTN_SHAKE;
     }
     return 0;
 }
@@ -82,7 +96,7 @@ static void pads_push_(void) {
         if (!g_dev[i].used) continue;
         const float *a = g_dev[i].ax; uint64_t b = g_dev[i].btn;
         if (a[AX_HX] < -0.5f) b |= DM_BTN_LEFT; if (a[AX_HX] > 0.5f) b |= DM_BTN_RIGHT; if (a[AX_HY] < -0.5f) b |= DM_BTN_UP; if (a[AX_HY] > 0.5f) b |= DM_BTN_DOWN;
-        if (a[AX_LT] > 0.5f || a[AX_BRAKE] > 0.5f) b |= DM_BTN_ZL; if (a[AX_RT] > 0.5f || a[AX_GAS] > 0.5f) b |= DM_BTN_ZR;
+        if (a[AX_LT] > 0.35f || a[AX_BRAKE] > 0.35f) b |= DM_BTN_ZL; if (a[AX_RT] > 0.35f || a[AX_GAS] > 0.35f) b |= DM_BTN_ZR;   // analog triggers as the digital ZL / ZR
         btn |= b;
         float m0 = hypotf(a[AX_LX], a[AX_LY]), m1 = hypotf(a[AX_RX], a[AX_RY]);
         if (m0 > bm[0]) { bm[0] = m0; best[0] = a[AX_LX]; best[1] = a[AX_LY]; }
@@ -193,15 +207,56 @@ static void touch_event(AInputEvent *e) {
     atomic_store(&g_ovl_on, btn); atomic_store(&g_ovl_show, 1);
     pads_push();
 }
+static void kbd_apply(void) {   // the keyboard's slot from its keys
+    if (g_kbd_slot < 0) g_kbd_slot = dev_slot(-2000000);
+    float *ax = g_dev[g_kbd_slot].ax; memset(ax, 0, sizeof g_dev[0].ax);
+    ax[AX_LX] = (float)(g_kbd.d - g_kbd.a); ax[AX_LY] = (float)(g_kbd.s - g_kbd.w);   // full tilt; diagonals combine (the host clamps the vector)
+    uint64_t b = g_kbd.btn;
+    if (g_kbd.shift) { ax[AX_RX] = (float)(g_kbd.right - g_kbd.left); ax[AX_RY] = (float)(g_kbd.down - g_kbd.up); }
+    else b |= (g_kbd.left ? DM_BTN_LEFT : 0) | (g_kbd.up ? DM_BTN_UP : 0) | (g_kbd.right ? DM_BTN_RIGHT : 0) | (g_kbd.down ? DM_BTN_DOWN : 0);
+    g_dev[g_kbd_slot].btn = b;
+}
+static int kbd_event(AInputEvent *e) {   // 1: a key of the keyboard's map
+    int32_t k = AKeyEvent_getKeyCode(e), act = AKeyEvent_getAction(e), down = act == AKEY_EVENT_ACTION_DOWN;
+    if (act != AKEY_EVENT_ACTION_DOWN && act != AKEY_EVENT_ACTION_UP) return 0;
+    int *f = NULL;
+    switch (k) {
+        case AKEYCODE_W: f = &g_kbd.w; break; case AKEYCODE_A: f = &g_kbd.a; break; case AKEYCODE_S: f = &g_kbd.s; break; case AKEYCODE_D: f = &g_kbd.d; break;
+        case AKEYCODE_DPAD_LEFT: f = &g_kbd.left; break; case AKEYCODE_DPAD_UP: f = &g_kbd.up; break; case AKEYCODE_DPAD_RIGHT: f = &g_kbd.right; break; case AKEYCODE_DPAD_DOWN: f = &g_kbd.down; break;
+        case AKEYCODE_SHIFT_LEFT: case AKEYCODE_SHIFT_RIGHT: f = &g_kbd.shift; break;
+    }
+    uint64_t m = f ? 0 : kbd_bit(k);
+    if (!f && !m) return 0;
+    if (down && AKeyEvent_getRepeatCount(e) > 0) return 1;   // auto-repeat: the key is held already
+    if (f) *f = down; else g_kbd.btn = down ? g_kbd.btn | m : g_kbd.btn & ~m;
+    if (f != &g_kbd.shift) g_kbd.shift = (AKeyEvent_getMetaState(e) & AMETA_SHIFT_ON) != 0;   // Shift released while the window had no focus
+    kbd_apply(); pads_push(); return 1;
+}
+// Everything let go (the game suspends, or the window loses focus): a key or button released meanwhile sends this window no event, and would stay held
+static void input_release_all(void) {
+    pthread_mutex_lock(&g_pmu);
+    for (int i = 0; i < NDEV; i++) { g_dev[i].btn = 0; memset(g_dev[i].ax, 0, sizeof g_dev[i].ax); }
+    memset(&g_kbd, 0, sizeof g_kbd); g_latch = 0; g_combo_since = 0; g_nptr = 0;
+    pthread_mutex_lock(&g_smu); memset(g_stick, 0, sizeof g_stick); pthread_mutex_unlock(&g_smu);
+    pads_push_();
+    pthread_mutex_unlock(&g_pmu);
+}
 static int on_input(AInputEvent *e) {
     int32_t type = AInputEvent_getType(e), src = AInputEvent_getSource(e);
     static int seen; if (!seen++) LOG("front end: first input event (type %d, source %#x)", type, src);
     int s = dev_slot(AInputEvent_getDeviceId(e));
     if (type == AINPUT_EVENT_TYPE_MOTION && (src & AINPUT_SOURCE_TOUCHSCREEN) == AINPUT_SOURCE_TOUCHSCREEN) { touch_event(e); return 1; }
-    if (src & (AINPUT_SOURCE_GAMEPAD | AINPUT_SOURCE_JOYSTICK | AINPUT_SOURCE_DPAD)) atomic_store(&g_ovl_show, 0);   // a controller in use: the on-screen controls go
+    // A controller's events carry the gamepad, joystick or D-pad source bits; a keyboard's only the keyboard's (its arrows send the same DPAD keycodes as a pad)
+    int pad = (src & (AINPUT_SOURCE_GAMEPAD | AINPUT_SOURCE_JOYSTICK)) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK || (src & AINPUT_SOURCE_DPAD) == AINPUT_SOURCE_DPAD;
+    int kbd = !pad && type == AINPUT_EVENT_TYPE_KEY && (src & AINPUT_SOURCE_KEYBOARD) == AINPUT_SOURCE_KEYBOARD && AInputEvent_getDeviceId(e) > 0;   // not the on-screen keyboard (-1: injected)
+    if (pad || kbd) atomic_store(&g_ovl_show, 0);   // a controller or keyboard in use: the on-screen controls go until the next touch
+    if (kbd && kbd_event(e)) return 1;
     if (type == AINPUT_EVENT_TYPE_KEY) {
-        uint64_t b = key_bit(AKeyEvent_getKeyCode(e)); if (!b) return AKeyEvent_getKeyCode(e) == AKEYCODE_BACK;
-        if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN) g_dev[s].btn |= b; else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP) g_dev[s].btn &= ~b;
+        int32_t k = AKeyEvent_getKeyCode(e);
+        if (k == AKEYCODE_BUTTON_MODE || k == AKEYCODE_HOME) return 0;   // the system's own (home)
+        uint64_t b = key_bit(k); if (!b) return k == AKEYCODE_BACK;
+        if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN) { if (AKeyEvent_getRepeatCount(e) > 0) return 1; g_dev[s].btn |= b; }
+        else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP) g_dev[s].btn &= ~b;
         pads_push(); return 1;
     }
     if (type == AINPUT_EVENT_TYPE_MOTION && (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK) {
@@ -289,7 +344,7 @@ static void game_suspend(int on) {
     pthread_mutex_lock(&g_lmu);
     if (on != g_suspended) {
         g_suspended = on;
-        if (on) { dm_focus_set(2); dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); LOG("front end: suspended (the activity stopped)"); }
+        if (on) { input_release_all(); dm_focus_set(2); dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); LOG("front end: suspended (the activity stopped)"); }
         else { dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(2); LOG("front end: resumed (the activity started)"); }
     }
     pthread_mutex_unlock(&g_lmu);
@@ -312,7 +367,7 @@ static void on_start(ANativeActivity *a) { game_suspend(0); game_service(a, "set
 static void on_stop(ANativeActivity *a) { game_suspend(1); game_service(a, "setSuspended", 1); }
 static void on_resume(ANativeActivity *a) { (void)a; }
 static void on_pause(ANativeActivity *a) { (void)a; dm_focus_set(2); }   // still visible behind something (a dialog, a split screen): out of focus, running
-static void on_focus(ANativeActivity *a, int f) { if (f) immersive(a); dm_focus_set(f ? 1 : 2); }
+static void on_focus(ANativeActivity *a, int f) { if (f) immersive(a); else input_release_all(); dm_focus_set(f ? 1 : 2); }
 // Destroyed by the player leaving (− and + held, back_to_menu, finish) the game ends; destroyed by Android while the process stays (to reclaim memory, its activity
 // only), the game stays suspended and a new activity takes over its window (ANativeActivity_onCreate: the host runs once per process)
 static void on_destroy(ANativeActivity *a) {
