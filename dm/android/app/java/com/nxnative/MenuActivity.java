@@ -40,7 +40,7 @@ import java.util.Set;
 public class MenuActivity extends Activity {
     private SharedPreferences prefs;
     private Spinner mode, fps, fit, lang;
-    private CheckBox showFps, skip;
+    private CheckBox showFps, skip, hibernate;
     private final List<CheckBox> cheatBoxes = new ArrayList<>();
     private boolean launched;
     private Button playButton;
@@ -218,7 +218,7 @@ public class MenuActivity extends Activity {
             });
         }).start();
     }
-    // DM_HIBERNATE=<n> with n > 0 in the settings or in the diagnostics file <external>/env.txt (which wins), as the game reads them (app/front_android.c boot_env)
+    // DM_HIBERNATE=<n> with n > 0 in the settings (the menu's "Resume after the app is closed") or in the diagnostics file <external>/env.txt (which wins), as the game reads them (app/front_android.c boot_env)
     private boolean hibernationOn() {
         String v = null;
         for (File f : new File[] { new File(getFilesDir(), "settings.env"), new File(getExternalFilesDir(null), "env.txt") }) {
@@ -299,6 +299,9 @@ public class MenuActivity extends Activity {
                 cheatBoxes.add(c); col.addView(c);
             }
         }
+        // Hibernation (DM_HIBERNATE, dm/host/hle_hibsnap.c): leaving the game writes it to storage, and opening the app after Android closed it goes back there. Off by default while it is tested
+        hibernate = new CheckBox(this); hibernate.setText("Resume after the app is closed (beta): leaving the game saves where you are, opening the app goes back there");
+        hibernate.setTextColor(Color.WHITE); hibernate.setChecked(prefs.getBoolean("hibernate", false)); col.addView(hibernate);
         skip = new CheckBox(this); skip.setText("Do not show this menu again (− and + during the game open it again)"); skip.setTextColor(Color.WHITE);
         skip.setChecked(prefs.getBoolean("skip", false)); col.addView(skip);
         Button play = playButton = new Button(this); play.setText("Play (START)"); play.setTextSize(20);
@@ -322,11 +325,11 @@ public class MenuActivity extends Activity {
         String[] langs = {"es-419", "en-US", "system"};
         prefs.edit().putInt("opmode", mode.getSelectedItemPosition() == 1 ? 1 : 0).putInt("fps", fps.getSelectedItemPosition() == 1 ? 30 : 60)
              .putBoolean("stretch", fit.getSelectedItemPosition() == 1).putString("lang", langs[lang.getSelectedItemPosition()])
-             .putBoolean("showfps", showFps.isChecked()).putStringSet("cheats", on).putBoolean("skip", skip.isChecked()).apply();
+             .putBoolean("showfps", showFps.isChecked()).putStringSet("cheats", on).putBoolean("skip", skip.isChecked()).putBoolean("hibernate", hibernate.isChecked()).apply();
         String l = langs[lang.getSelectedItemPosition()]; if (l.equals("system")) l = systemLang();
         String env = "DM_OPMODE=" + (mode.getSelectedItemPosition() == 1 ? 1 : 0) + "\nDM_FPS=" + (fps.getSelectedItemPosition() == 1 ? 30 : 60)
                    + "\nDM_SCREEN_FIT=" + (fit.getSelectedItemPosition() == 1 ? "stretch" : "keep") + "\nDM_LANG=" + l + "\nDM_SHOW_FPS=" + (showFps.isChecked() ? 1 : 0)
-                   + "\nDM_CHEATS_ON=" + list + "\n";
+                   + "\nDM_CHEATS_ON=" + list + "\nDM_HIBERNATE=" + (hibernate.isChecked() ? 1 : 0) + "\n";
         try (OutputStream o = new FileOutputStream(new File(getFilesDir(), "settings.env"))) { o.write(env.getBytes(StandardCharsets.UTF_8)); } catch (Exception e) { /* the defaults apply */ }
     }
     private void play() {
