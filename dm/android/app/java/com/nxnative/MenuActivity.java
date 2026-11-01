@@ -50,18 +50,20 @@ public class MenuActivity extends Activity {
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        // The notification that keeps a suspended game in memory (GameService) needs the notification permission from Android 13 on; asked once, the game runs without it too
-        if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
-            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
         prefs = getSharedPreferences("menu", MODE_PRIVATE);
+        // A game the process left in hibernation (DM_HIBERNATE: its snapshot in <files>/hibernate) resumes at once, as a Switch wakes; the menu is the − and + hold away.
+        // Also when Android made this activity again after closing the app's processes (b != null): that is the case hibernation is for. A snapshot the game cannot take
+        // (another version, damaged) is removed by the game, which then comes back here (show_menu)
+        boolean resume = new File(getFilesDir(), "hibernate/snap.bin").exists() && hibernationOn() && !new File(getFilesDir(), "show_menu").exists();
+        // The notification that keeps a suspended game in memory (GameService) needs the notification permission from Android 13 on; asked once, the game runs without it too.
+        // Not on a start that goes straight back into the game: the system dialog would open over it (asked at the next start that shows the menu)
+        if (!resume && android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
         seedFiles();
         buildUi();
         if (needsUnpack()) { if (pendingData() != null) askData(null); else unpack(); return; }
         boolean forced = new File(getFilesDir(), "show_menu").delete();
-        // A game the process left in hibernation (DM_HIBERNATE: its snapshot in <files>/hibernate) resumes at once, as a Switch wakes; the menu is the − and + hold away.
-        // A snapshot the game cannot take (another version, damaged) is removed by the game, which then comes back here (show_menu)
-        boolean resume = new File(getFilesDir(), "hibernate/snap.bin").exists() && hibernationOn();
-        if ((prefs.getBoolean("skip", false) || resume) && !forced && b == null && gameFilesPresent()) play();
+        if (((prefs.getBoolean("skip", false) && b == null) || resume) && !forced && gameFilesPresent()) play();
     }
     @Override protected void onPause() { super.onPause(); if (mode != null) save(); }   // choices are kept also when the menu is left without playing
     @Override protected void onResume() {
