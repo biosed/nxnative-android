@@ -101,6 +101,18 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
                 FAIL("B binding %s has no resolved slot number", [b[@"msl_name"] UTF8String]);
             o->nb++;
         }
+        // A bindless handle of type 1 (dmsh_build.py decode_ubo_tex) is two words, the texture's and the sampler's, which the hardware ORs before taking either ID (Ryujinx TextureHandle):
+        // a texture binding <name> and its sampler <name>Smplr each name one word. Reading only its own word gave FINAL FANTASY XII THE ZODIAC AGE's scene composite
+        // (1f225c10a8c8c313) texture 0 for its depth input (its texture word holds only the colour sampler's ID; the depth texture's ID is in the other word), so the
+        // depth it writes for the HUD was 0 and every depth-tested floating HP bar failed its test
+        for (int i = 0; i < o->nb; i++) {
+            nvn_rbind *t = &o->b[i]; NSString *tn = bs[i][@"msl_name"];
+            if (t->kind != NVN_RB_TEXU || t->n || ![tn isKindOfClass:[NSString class]]) continue;
+            NSString *sn = [tn stringByAppendingString:@"Smplr"], *sw = [sn stringByAppendingString:@"_w"];   // the sampler and its border colour twin
+            for (int k = 0; k < o->nb; k++) { nvn_rbind *s = &o->b[k]; NSString *kn = bs[k][@"msl_name"];
+                if (s->kind != NVN_RB_SAMPU || s->n || !([kn isEqual:sn] || [kn isEqual:sw]) || (s->reg == t->reg && s->off == t->off)) continue;
+                t->pair = s->pair = 1; t->preg = s->reg; t->poff = s->off; s->preg = t->reg; s->poff = t->off; }
+        }
         NSDictionary *dr = j[@"drv_reads"];
         if ([dr isKindOfClass:[NSDictionary class]]) { o->drv_read[0] = dr[@"0"] != nil; o->drv_read[2] = dr[@"2"] != nil; }
         // A declared driver-segment binding means the shader reads it: the build's drv_reads scan (dmsh_build.py) matches only fragment-shader names (fp_c0 / fp_c2), so vertex and compute
