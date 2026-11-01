@@ -114,6 +114,7 @@ __attribute__((weak)) void (*dm_hib_kick_hook)(void) = 0;
 // The front ends' side: dm_hib_forget_hook (hle_hibsnap.c) drops the snapshot and writes no more (the player ends the game: Android's − and + held); dm_hib_refused_hook, set by a
 // front end that started the game to resume it (Android's auto-resume), is called when the snapshot it found is refused (another build, damaged): back to its menu
 __attribute__((weak)) void (*dm_hib_forget_hook)(void) = 0;
+__attribute__((weak)) void (*dm_hib_flush_hook)(void) = 0;   // waits for a snapshot being written (the process is about to end: the snapshot stays)
 __attribute__((weak)) void (*dm_hib_refused_hook)(void) = 0;
 // A restored thread goes back to where it stopped (hle_hib.c, does not return): mode 0 dispatches the gate frame (the SVC runs from the start), 1 returns to the guest from it, 2 calls
 // a restartable host call again from its entry frame

@@ -315,10 +315,11 @@ static void boot_env(const char *files, const char *ext) {
     snprintf(p, sizeof p, "%s/cheats", files); if (!access(p, R_OK)) setenv("DM_CHEATS", p, 0);   // the cheats folder (<build>.txt files; hle_cheats.c)
     // DM_HIBERNATE: a snapshot the last process wrote and did not come back from (dm/host/hle_hibsnap.c keeps it in <files>/hibernate) is where the game resumes
     snprintf(p, sizeof p, "%s/hibernate/snap.bin", files);
-    if (getenv("DM_HIBERNATE") && atoi(getenv("DM_HIBERNATE")) > 0 && !access(p, R_OK)) {
+    int hib_on = getenv("DM_HIBERNATE") && atoi(getenv("DM_HIBERNATE")) > 0, snap = !access(p, R_OK);
+    if (hib_on && snap) {
         setenv("DM_HIB_RESTORE", p, 0); dm_hib_refused_hook = hib_refused;   // a snapshot the host refuses (another build, damaged) is removed, and the menu shows
-        fprintf(stderr, "boot: hibernation snapshot %s found: the game resumes there\n", p);
-    }
+        fprintf(stderr, "boot: hibernate: snapshot %s found, DM_HIBERNATE on: restoring it\n", p);
+    } else fprintf(stderr, "boot: hibernate: %s, %s: no restore\n", hib_on ? "DM_HIBERNATE on" : "DM_HIBERNATE off", snap ? "a snapshot exists (left as it is)" : "no snapshot");
     chdir(files);
     g_argv[0] = strdup("dmhost"); snprintf(p, sizeof p, "%s/dm", ext); g_argv[1] = strdup(p);
 }
@@ -388,7 +389,8 @@ static void on_destroy(ANativeActivity *a) {
     JNIEnv *env = a->env;
     jboolean fin = (*env)->CallBooleanMethod(env, a->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "isFinishing", "()Z"));
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); fin = 1; }
-    if (fin) { if (dm_hib_forget_hook) dm_hib_forget_hook(); dm_host_shutdown("activity destroyed"); }   // finished, the game ends: no hibernation snapshot to resume
+    // finished without the − and + hold (a recents swipe, the task removed): the hibernation snapshot the stop began is written to the end and kept; only back_to_menu drops it
+    if (fin) { if (dm_hib_flush_hook) dm_hib_flush_hook(); dm_host_shutdown("activity destroyed"); }
     else LOG("front end: the activity was destroyed by Android, not finished: the game stays suspended");
 }
 

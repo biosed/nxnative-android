@@ -361,6 +361,10 @@ void dm_hib_forget_now(void) {
     char dir[1024], p[1100]; hib_dir(dir, sizeof dir); snprintf(p, sizeof p, "%s/snap.bin", dir);
     if (!unlink(p)) LOG("hibernate: the game ends: its snapshot is removed");
 }
+// The process ends without the player ending the game (Android's recents swipe, the task removed, the system closing it): the snapshot the suspend is writing is finished first, and kept
+void dm_hib_flush_now(void) {
+    if (g_sth_on) { pthread_join(g_sth, NULL); g_sth_on = 0; LOG("hibernate: the process ends: the snapshot is kept for the next start"); }
+}
 // The game going on in this process makes the snapshot stale: it is removed at the resume (a snapshot is for a process that did not come back; the next suspend writes a new one)
 void dm_hib_suspend_now(int on) {
     if (!dm_hib_on()) return;
