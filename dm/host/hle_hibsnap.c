@@ -493,7 +493,8 @@ int dm_hib_restore_prepare(void) {
     }
     if (ok && (!recs || !kern)) { snprintf(why, sizeof why, "no threads or no kernel state"); ok = 0; }
     if (!ok) { for (uint32_t i = 0; i < r.n; i++) free(chunks[i]); free(chunks); free(lens); rd_close(&r); refused(p, why); return 0; }
-    // from here on the process is the snapshot's: a failure stops it
+    // from here on the process is the snapshot's: a failure stops it. The snapshot is marked used first, so that a crash while it is put back cannot make a launch loop
+    { char used[1100]; snprintf(used, sizeof used, "%s.restored", p); rename(p, used); }
     uint8_t *win, *arena; size_t win_len, mod_used, arena_used; dm_hib_layout(&win, &win_len, &mod_used, &arena, &arena_used);
     uint64_t pages = 0;
     for (uint32_t i = 0; i < r.n; i++) if (r.tab[i].type == HIB_C_MEM) {
@@ -512,8 +513,7 @@ int dm_hib_restore_prepare(void) {
     free(chunks); free(lens);
     LOG("hibernate: restored %s (written %llu): %d threads, %llu memory chunks; read and checked in %.0f ms, put back in %.0f ms", p, (unsigned long long)r.h.created_unix, nrec,
         (unsigned long long)pages, (t1 - t0) / 1e6, (now_ns() - t1) / 1e6);
-    rd_close(&r);
-    char used[1100]; snprintf(used, sizeof used, "%s.restored", p); rename(p, used);   // a snapshot is restored once: the game goes on from here
+    rd_close(&r);   // restored once (renamed .restored above): the game goes on from here
     return 1;
 }
 void dm_hib_restore_main(void) { dm_hib_resume_all(g_nrthr); }

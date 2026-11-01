@@ -388,7 +388,7 @@ static void on_destroy(ANativeActivity *a) {
     JNIEnv *env = a->env;
     jboolean fin = (*env)->CallBooleanMethod(env, a->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "isFinishing", "()Z"));
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); fin = 1; }
-    if (fin) dm_host_shutdown("activity destroyed");
+    if (fin) { if (dm_hib_forget_hook) dm_hib_forget_hook(); dm_host_shutdown("activity destroyed"); }   // finished, the game ends: no hibernation snapshot to resume
     else LOG("front end: the activity was destroyed by Android, not finished: the game stays suspended");
 }
 
