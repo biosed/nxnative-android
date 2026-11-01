@@ -305,6 +305,9 @@ static void boot_env(const char *files, const char *ext) {
     snprintf(p, sizeof p, "%s/save", files); mkdir(p, 0755); setenv("DM_SAVE", p, 0);
     snprintf(p, sizeof p, "%s/temp", files); mkdir(p, 0755); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/cheats", files); if (!access(p, R_OK)) setenv("DM_CHEATS", p, 0);   // the cheats folder (<build>.txt files; hle_cheats.c)
+    // DM_HIBERNATE: a snapshot the last process wrote and did not come back from (dm/host/hle_hibsnap.c keeps it in <files>/hibernate) is where the game resumes
+    snprintf(p, sizeof p, "%s/hibernate/snap.bin", files);
+    if (getenv("DM_HIBERNATE") && atoi(getenv("DM_HIBERNATE")) > 0 && !access(p, R_OK)) { setenv("DM_HIB_RESTORE", p, 0); fprintf(stderr, "boot: hibernation snapshot %s found: the game resumes there\n", p); }
     chdir(files);
     g_argv[0] = strdup("dmhost"); snprintf(p, sizeof p, "%s/dm", ext); g_argv[1] = strdup(p);
 }
@@ -344,8 +347,8 @@ static void game_suspend(int on) {
     pthread_mutex_lock(&g_lmu);
     if (on != g_suspended) {
         g_suspended = on;
-        if (on) { input_release_all(); dm_focus_set(2); dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); LOG("front end: suspended (the activity stopped)"); }
-        else { dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(2); LOG("front end: resumed (the activity started)"); }
+        if (on) { input_release_all(); dm_focus_set(2); dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); dm_hib_suspend(1); LOG("front end: suspended (the activity stopped)"); }   // dm_hib_suspend: DM_HIBERNATE's snapshot, written on a thread of its own (dm/host/hle_hibsnap.c)
+        else { dm_hib_suspend(0); dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(2); LOG("front end: resumed (the activity started)"); }
     }
     pthread_mutex_unlock(&g_lmu);
 }

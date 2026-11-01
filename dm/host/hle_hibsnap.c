@@ -353,10 +353,15 @@ int dm_hib_save(void) { return dm_hib_save_ex(0); }
 // The front ends' suspend sequence (the app leaving the screen): the snapshot is written on a thread of its own after the suspend, and the resume waits for it first
 static pthread_t g_sth; static int g_sth_on;
 static void *suspend_save(void *arg) { (void)arg; dm_hib_save_ex(1); return NULL; }
+// The game going on in this process makes the snapshot stale: it is removed at the resume (a snapshot is for a process that did not come back; the next suspend writes a new one)
 void dm_hib_suspend_now(int on) {
     if (!dm_hib_on()) return;
     if (on && !g_sth_on) { if (!pthread_create(&g_sth, NULL, suspend_save, NULL)) g_sth_on = 1; }
-    else if (!on && g_sth_on) { pthread_join(g_sth, NULL); g_sth_on = 0; }
+    else if (!on && g_sth_on) {
+        pthread_join(g_sth, NULL); g_sth_on = 0;
+        char dir[1024], p[1100]; hib_dir(dir, sizeof dir); snprintf(p, sizeof p, "%s/snap.bin", dir);
+        if (!unlink(p)) LOG("hibernate: back in the foreground: the snapshot is stale now, removed");
+    }
 }
 
 // ---- reading a snapshot back ----
