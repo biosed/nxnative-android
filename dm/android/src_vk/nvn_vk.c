@@ -112,7 +112,8 @@ static void img_mem_free(int blk, VkDeviceMemory m, VkDeviceSize off, VkDeviceSi
 #define RING_MAX (64u << 20)
 #define RING_XMAX (256u << 20)
 #define RING_CAP (160ull << 20)   // all contexts' own rings together: past it a ring does not grow, and a submission that outgrows it takes extra rings (freed when it is done)
-typedef struct { int kind; void *dst; uint32_t mode, v; uint64_t addr; uint32_t type; const uint8_t *src; size_t n; } post_t;   // kind 1 event, 2 counter, 3 copy ring → guest, 4 samples-passed report (src: n query indices; n == SIZE_MAX: unknown, reported visible)
+typedef struct { int kind; void *dst; uint32_t mode, v; uint64_t addr; uint32_t type; const uint8_t *src; size_t n; } post_t;   // kind 5: n bytes from src where they differ from the snapshot at addr (4-byte words); kind 6: v rows of type bytes, mode apart
+static uint64_t g_wb_words, g_wb_bytes;   // dispatch write-backs: words the GPU changed and written back / bytes of the ranges looked at (completion thread)   // kind 1 event, 2 counter, 3 copy ring → guest, 4 samples-passed report (src: n query indices; n == SIZE_MAX: unknown, reported visible)
 typedef struct vtex vtex;
 typedef struct {
     VkCommandPool pool; VkCommandBuffer cb, up; VkFence fence; VkDescriptorPool dp;
@@ -276,6 +277,13 @@ static void ctx_complete(ctx_t *c) {
             if (p->addr) { uint64_t rec[2] = {total, gpu_ticks()}; memcpy((void *)p->addr, rec, sizeof rec); }
             free((void *)p->src);
         }
+        else if (p->kind == 5) {   // a dispatch's storage buffer: the words the GPU changed (see dispatch)
+            const uint8_t *snap = (const uint8_t *)(uintptr_t)p->addr, *now = p->src; uint8_t *dst = p->dst; size_t i = 0, nw = 0;
+            for (; i + 4 <= p->n; i += 4) if (memcmp(now + i, snap + i, 4)) { memcpy(dst + i, now + i, 4); nw++; }
+            for (; i < p->n; i++) if (now[i] != snap[i]) dst[i] = now[i];
+            free((void *)snap); g_wb_words += nw; g_wb_bytes += p->n;
+        }
+        else if (p->kind == 6) { for (uint32_t r = 0; r < p->v; r++) memcpy((uint8_t *)p->dst + (size_t)r * p->mode, p->src + (size_t)r * p->mode, p->type); }   // rows: v rows of type bytes, mode apart
         else if (p->kind == 3) { memcpy(p->dst, p->src, p->n);
             if (c->plog && p->n <= 64) { float f[16]; memcpy(f, p->src, p->n); LOG("plog: written back %#llx +%zu: %g %g %g %g%s", (unsigned long long)(uintptr_t)p->dst, p->n, f[0], p->n > 4 ? f[1] : 0, p->n > 8 ? f[2] : 0, p->n > 12 ? f[3] : 0, p->n > 16 ? " ..." : ""); } }
     }
@@ -1414,7 +1422,9 @@ static void lin_writeback(vtex *v) {
     VkDeviceSize o = ring_alloc(n, 16); if (o == VK_WHOLE_SIZE) return;
     VkBufferImageCopy bc = {o, v->linrow / v->linbpb, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {v->w, v->h, 1}};
     vkCmdCopyImageToBuffer(C->cb, v->img, VK_IMAGE_LAYOUT_GENERAL, C->ring, 1, &bc);
-    post_add((post_t){3, (void *)v->mem, 0, 0, 0, 0, C->ringp + o, n});
+    size_t packed = (size_t)v->w * v->linbpb;   // a pitch past the texels: only the texels go back, the bytes between rows stay the guest's
+    if (v->linrow > packed) post_add((post_t){6, (void *)v->mem, v->linrow, v->h, 0, (uint32_t)packed, C->ringp + o, n});
+    else post_add((post_t){3, (void *)v->mem, 0, 0, 0, 0, C->ringp + o, n});
     if (!g_lin_wb++) LOG("vk: linear render target %ux%u format %d goes back to its storage after each pass (serial %llu)", v->w, v->h, (int)v->f.f, (unsigned long long)v->serial);
 }
 static void pass_end(void) {
@@ -1806,11 +1816,11 @@ static VkBufferView tbuf_view(int stage, uint64_t h, int storage) {
     uint64_t n = el * (uint64_t)bpb, addr = (uint64_t)(uintptr_t)tr.t.mem;
     VkDeviceSize al = g_props.limits.minTexelBufferOffsetAlignment; if (al < 16) al = 16;
     VkBuffer b = VK_NULL_HANDLE; VkDeviceSize off = 0; uint8_t *p = NULL;
-    int ci = g_ci;
-    if (gw_find(addr, n, al, &b, &off, &p)) ci = g_gw_ci;   // what a dispatch wrote (this submission's, or an earlier one's still running)
+    int ci = g_ci, from_gw = 0;
+    if (gw_find(addr, n, al, &b, &off, &p)) { ci = g_gw_ci; from_gw = 1; }   // what a dispatch wrote (this submission's, or an earlier one's still running)
     else { off = copy_in(addr, n, al); if (off != VK_WHOLE_SIZE && off % al) off = ring_put((const void *)(uintptr_t)addr, n, al);   // a cached copy at a smaller alignment
            if (off == VK_WHOLE_SIZE) return VK_NULL_HANDLE; b = C->ring; p = C->ringp + off; }
-    if (storage && stage == 5 && g_nwb < 16) g_wb[g_nwb++] = (gw_t){addr, n, b, off, p, 0, ci};
+    if (storage && stage == 5 && g_nwb < 16) g_wb[g_nwb++] = (gw_t){addr, n, b, off, p, (uint64_t)from_gw, ci};   // fence field: 1 = GPU-written source (see dispatch)
     return bview(b, off, n, f.f);
 }
 // Element k of a dynamic slot array: the texture bound to slot k, combined, else separate (as nvn_mtl.m NVN_RB_TEXD)
@@ -1864,9 +1874,12 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                 const p_bind_buf *u = b->kind == K_SBUF ? &S.ssbo[stage][b->reg] : &S.ubo[stage][b->reg];
                 VkBuffer gb = VK_NULL_HANDLE; VkDeviceSize go = 0; uint8_t *gp = NULL; int gci = g_ci;
                 VkDeviceSize al = b->type == BT_UBO ? g_props.limits.minUniformBufferOffsetAlignment : g_props.limits.minStorageBufferOffsetAlignment; if (!al) al = 256;
-                if (u->addr && u->size && gw_find(u->addr, u->size, al, &gb, &go, &gp)) { *d = (VkDescriptorBufferInfo){gb, go, u->size}; gci = g_gw_ci; }
+                int from_gw = 0;
+                if (u->addr && u->size && gw_find(u->addr, u->size, al, &gb, &go, &gp)) { *d = (VkDescriptorBufferInfo){gb, go, u->size}; gci = g_gw_ci; from_gw = 1; }
                 else if (u->addr && u->size) { VkDeviceSize o = copy_in(u->addr, u->size, 256); if (o != VK_WHOLE_SIZE) { *d = (VkDescriptorBufferInfo){C->ring, o, u->size}; gb = C->ring; go = o; gp = C->ringp + o; } }
-                if (stage == 5 && gb && g_nwb < 16) g_wb[g_nwb++] = (gw_t){u->addr, u->size, gb, go, gp, 0, gci};
+                // A compute shader's storage buffer is what its dispatch may write: only a storage-buffer binding of a module that stores to one (a uniform binding, or a module
+                // that only reads, writes nothing, and its range used to be written back whole at completion over whatever the CPU had written there since)
+                if (stage == 5 && gb && b->type == BT_SSBO && s->ssbo_wr && g_nwb < 16) g_wb[g_nwb++] = (gw_t){u->addr, u->size, gb, go, gp, (uint64_t)from_gw, gci};
                 if (stage != 5 && s->ssbo_wr) { static const shader_t *seen[8]; static int nseen; int k = 0; while (k < nseen && seen[k] != s) k++;
                                   if (k == nseen && nseen < 8) { seen[nseen++] = s; LOG("[RED] vk: shader %s (stage %d) binds storage buffer c%d at %#llx size %llu: what a draw writes to it is lost", s->key, stage, b->reg, (unsigned long long)u->addr, (unsigned long long)u->size); } }
             } else if (b->kind == K_DRVCB) {   // driver segments: c2 holds the bound texture / sampler handles (as nvn_mtl.m fills them), c0 the storage buffer table
@@ -2260,9 +2273,20 @@ static void dispatch(const p_dispatch *d) {
     trace_add('c', cs->key, NULL, ib ? 0 : g[0], ib ? 0 : g[1], ib ? 0 : g[2], ib != VK_NULL_HANDLE, g_ws_zero_tb);
     barrier_cs(C->cb);
     for (int i = 0; i < g_nwb; i++) {
-        gw_t *w = &g_wb[i];
+        gw_t *w = &g_wb[i]; int from_gw = w->fence != 0;
         gw_add(w->addr, w->size, w->buf, w->off, w->p, g_fence + 1, w->ci);   // this submission's fence value (mtl_sub_commit assigns g_fence + 1)
-        post_add((post_t){3, (void *)(uintptr_t)w->addr, 0, 0, 0, 0, w->p, w->size});
+        // Back into guest memory at completion, only what the GPU changed. The GPU writes the bytes a shader stores and no others: the whole range written back put the bytes the
+        // dispatch was recorded with over everything the CPU wrote there while the submission ran (a frame or two in flight). So the bytes it starts from are kept (the guest's,
+        // copied into the ring now), and the completion writes back the 4-byte words that differ from them (post kind 5). A range already set to go back in this submission keeps
+        // its first entry (its snapshot holds the guest's bytes; the ring holds the final ones). A range another submission's GPU work wrote goes back whole, as before
+        int dup = 0;
+        for (int k = 0; k < C->npost && !dup; k++) { const post_t *q = &C->post[k]; uint64_t qa = (uint64_t)(uintptr_t)q->dst;
+            if (q->kind == 3 && qa == w->addr && q->src == w->p && q->n == w->size) dup = 1;   // the same range again
+            else if (q->kind == 5 && w->addr >= qa && w->addr + w->size <= qa + q->n && q->src + (w->addr - qa) == w->p) dup = 1; }   // inside one that goes back by its changed words
+        if (dup) continue;
+        uint8_t *snap = !from_gw && w->ci == g_ci && w->p ? malloc(w->size) : NULL;
+        if (snap) { memcpy(snap, w->p, w->size); post_add((post_t){5, (void *)(uintptr_t)w->addr, 0, 0, (uint64_t)(uintptr_t)snap, 0, w->p, w->size}); }
+        else post_add((post_t){3, (void *)(uintptr_t)w->addr, 0, 0, 0, 0, w->p, w->size});
     }
     g_stat_draws++;
 }
@@ -2380,7 +2404,9 @@ static void copy_t2b(const p_copy_t2t *c) {   // src = the texture, dst field of
     // Until the submission completes and the bytes go back to guest memory, later reads of the destination (a buffer-to-texture copy, a buffer copy, a draw's buffers) take them
     // from the ring, as a dispatch's writes (gw_add); they read the guest's stale bytes before
     gw_add((uint64_t)(uintptr_t)c->dst, n, C->ring, o, C->ringp + o, g_fence + 1, g_ci);
-    post_add((post_t){3, (void *)c->dst, 0, 0, 0, 0, C->ringp + o, n});
+    size_t packed = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
+    if (row > packed) post_add((post_t){6, (void *)c->dst, (uint32_t)row, (uint32_t)rows, 0, (uint32_t)packed, C->ringp + o, n});   // a row stride past the texels: only the texels go back, the bytes between rows stay the guest's
+    else post_add((post_t){3, (void *)c->dst, 0, 0, 0, 0, C->ringp + o, n});
 }
 static void clear_tex(const p_clear_tex *c) {
     if (vk_skip() & SK_CLEAR) return;
@@ -2960,11 +2986,12 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                           (unsigned long long)g_tex_miss[1], (unsigned long long)g_tex_miss[2], (unsigned long long)g_tex_miss[3]);
     if (n % 600 == 0) { extern uint64_t g_nsub_stat; static uint64_t ls;
         LOG("vk: recording per frame over the last 600: draws %.2f ms (descriptor sets %.2f ms, %.0f%% reused), dispatches %.2f ms, texture uploads %.2f ms (%.1f MB), vkQueueSubmit %.2f ms; %.1f submissions a frame;"
-            " GPU-written data of a running submission used in place %llu times, copied %llu times, waited for %llu times (%.2f ms a frame; indirect draws %llu, partial ranges %llu, misfits in-submission %llu); copies from GPU-written bytes: into textures %llu, buffers %llu",
+            " GPU-written data of a running submission used in place %llu times, copied %llu times, waited for %llu times (%.2f ms a frame; indirect draws %llu, partial ranges %llu, misfits in-submission %llu); copies from GPU-written bytes: into textures %llu, buffers %llu; dispatch write-backs %.1f KB of %.1f KB looked at",
             g_t_draw / 600e6, g_t_ws / 600e6, g_dsc_hit + g_dsc_miss ? 100.0 * g_dsc_hit / (g_dsc_hit + g_dsc_miss) : 0.0, g_t_disp / 600e6, g_t_up / 600e6, g_up_bytes / 600e6 * 1e3 / 1e3, g_t_sub / 600e6,
             (g_nsub_stat - ls) / 600.0, (unsigned long long)atomic_exchange(&g_gw_held, 0), (unsigned long long)atomic_exchange(&g_gw_copied, 0), (unsigned long long)atomic_exchange(&g_gw_waits, 0), atomic_exchange(&g_gw_wait_ns, 0) / 600e6,
             (unsigned long long)atomic_exchange(&g_gw_why[0], 0), (unsigned long long)atomic_exchange(&g_gw_why[1], 0), (unsigned long long)atomic_exchange(&g_gw_why[2], 0),
-            (unsigned long long)atomic_exchange(&g_gw_b2t, 0), (unsigned long long)atomic_exchange(&g_gw_b2b, 0));
+            (unsigned long long)atomic_exchange(&g_gw_b2t, 0), (unsigned long long)atomic_exchange(&g_gw_b2b, 0), g_wb_words * 4 / 1024.0, g_wb_bytes / 1024.0);
+        g_wb_words = g_wb_bytes = 0;
         ls = g_nsub_stat; g_t_draw = g_t_ws = g_t_disp = g_t_up = g_t_sub = 0; g_up_bytes = 0; g_dsc_hit = g_dsc_miss = 0; }
     if (n % 600 == 0) {   // memory: the process (RSS, its anonymous part, PSS) and what the backend holds
         long rss = 0, anon = 0, pss = 0; char ln[256]; FILE *f = fopen("/proc/self/status", "re");
