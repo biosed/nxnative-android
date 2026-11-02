@@ -102,13 +102,13 @@ static void img_mem_free(int blk, VkDeviceMemory m, VkDeviceSize off, VkDeviceSi
 }
 
 // ---------- Submission contexts: command buffers, ring buffer, descriptor pool, the writes that wait for completion ----------
-#define NCTX 8   // submissions in flight: Unreal submits several command buffers a frame, and with 3 the CPU could not record a frame ahead of the GPU
+#define NCTX 24   // ~2.5 frames of Unreal's ~9 submissions: with 8 the CPU could not get one frame ahead, and reusing a context whose ring a later submission still read (its hold) drained the GPU first: CPU and GPU took turns (recording 12.7 + waiting 12.5 ms a frame) // submissions in flight: Unreal submits several command buffers a frame, and with 3 the CPU could not record a frame ahead of the GPU
 #define NOQ 4096   // occlusion queries per submission
 #define NTQ 1024   // GPU timestamps per submission (512 regions)
 // Ring sizes: each context's own ring starts at RING_MIN and follows what its submissions use (ring_fit: grown to the peak, up to RING_MAX; halved after a stretch that used less
 // than a quarter; back to RING_MIN on a low-memory signal); a submission that outgrows it gets extra rings of the size it needs, freed when it is done. Eight fixed 48 MB rings
 // held 384 MB of host-visible memory whatever the game needed, and with FINAL FANTASY RESONANCE open HyperOS killed other apps for memory
-#define RING_MIN (8u << 20)
+#define RING_MIN (4u << 20)
 #define RING_MAX (64u << 20)
 #define RING_XMAX (256u << 20)
 typedef struct { int kind; void *dst; uint32_t mode, v; uint64_t addr; uint32_t type; const uint8_t *src; size_t n; } post_t;   // kind 1 event, 2 counter, 3 copy ring → guest, 4 samples-passed report (src: n query indices; n == SIZE_MAX: unknown, reported visible)
@@ -2359,7 +2359,7 @@ static void clear_tex(const p_clear_tex *c) {
 
 // ---------- Submission ----------
 // The context's own ring sized to what its submissions take (its previous one is complete, and nothing holds its ring: mtl_sub_begin waited for both)
-static _Atomic uint64_t g_trim_gen;
+static _Atomic uint64_t g_trim_gen, g_wait_fence_ns, g_wait_hold_ns;
 void dm_vk_trim(void) { atomic_fetch_add(&g_trim_gen, 1); }
 void tex_evict_hook(void) { tex_evict(atomic_load(&g_trim_gen)); }   // the front end's low-memory signal (app/front_android.c): every ring back to RING_MIN at its next use
 static void ring_fit(ctx_t *c) {
@@ -2376,7 +2376,10 @@ void mtl_sub_begin(void) {
     vk_init();
     g_ci = (g_ci + 1) % NCTX; ctx_t *c = &g_ctx[g_ci];
     uint64_t w0 = now_ns();
-    pthread_mutex_lock(&g_mu); while (c->fence_val > g_done || c->hold > g_done) pthread_cond_wait(&g_cv, &g_mu); pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_mu);
+    { uint64_t t1 = now_ns(); while (c->fence_val > g_done) pthread_cond_wait(&g_cv, &g_mu); uint64_t t2 = now_ns(); while (c->hold > g_done) pthread_cond_wait(&g_cv, &g_mu);
+      atomic_fetch_add(&g_wait_fence_ns, t2 - t1); atomic_fetch_add(&g_wait_hold_ns, now_ns() - t2); }   // its own submission still running / a later one still reading its ring
+    pthread_mutex_unlock(&g_mu);
     pthread_mutex_lock(&g_gwmu); c->hold = 0; pthread_mutex_unlock(&g_gwmu);
     atomic_fetch_add(&g_wait_ns, now_ns() - w0);
     ring_fit(c);
@@ -2890,6 +2893,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                           (unsigned long long)g_tbuf_miss[1], (unsigned long long)g_tbuf_miss[2]);
     if (n % 600 == 0) { uint64_t gp = atomic_exchange(&g_gpu_kind_ns[0], 0), gd = atomic_exchange(&g_gpu_kind_ns[1], 0), gc = atomic_exchange(&g_gpu_kind_ns[2], 0);
                         LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them)", gp / 600e6, gd / 600e6, gc / 600e6); }
+    if (n % 600 == 0) { LOG("vk: waiting for a free submission context per frame: %.2f ms for its own submission, %.2f ms for a later one still reading its ring (%d contexts)",
+                        atomic_exchange(&g_wait_fence_ns, 0) / 600e6, atomic_exchange(&g_wait_hold_ns, 0) / 600e6, NCTX); }
     if (n % 600 == 0) { LOG("vk: per frame over the last 600: GPU %.2f ms, recording %.2f ms, waiting for the GPU %.2f ms, present waiting %.2f ms", atomic_exchange(&g_gpu_ns, 0) / 600e6,
                             atomic_exchange(&g_rec_ns, 0) / 600e6, atomic_exchange(&g_wait_ns, 0) / 600e6, atomic_exchange(&g_pwait_ns, 0) / 600e6); }
     if (t) shot(t, n);
