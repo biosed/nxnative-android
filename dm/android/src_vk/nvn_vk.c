@@ -965,6 +965,11 @@ static VkImageView tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_v
     VkImageAspectFlags asp = v->aspect;
     if (asp & VK_IMAGE_ASPECT_DEPTH_BIT && rt != 1 && rt != 3) asp = want_stencil && (asp & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
     if (want_stencil && rt != 1 && rt != 3 && !(v->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) RED_ONCE(74, "a stencil view of texture format %#x, which has no stencil here: reads depth", fmtn);
+    // The stencil where the shader looks for it: the Switch's GPU returns a stencil-mode read with the stencil in the second component (Unreal's STENCIL_COMPONENT_SWIZZLE .g on the
+    // Switch), and the translated shader takes that component's raw bits; a Vulkan stencil view has it in the first, the second reads 0. Unreal's CopyStencilToLightingChannelsPS
+    // ((stencil >> 4) & lighting channel bits, from .y) wrote no lighting channel anywhere, and what a channel-limited light should light stayed dark (FINAL FANTASY RESONANCE's battle
+    // sprites as dark silhouettes). The second component now reads the first (an identity swizzle {R, R, B, A})
+    if (asp == VK_IMAGE_ASPECT_STENCIL_BIT && !rt) for (int i = 0; i < 4; i++) if (swz[i] == 3) swz[i] = 2;
     uint64_t key = (uint64_t)f.f | (uint64_t)vt << 16 | (uint64_t)bl << 20 | (uint64_t)nl << 25 | (uint64_t)b0 << 30 | (uint64_t)nly << 42 | (uint64_t)(swz[0] | swz[1] << 3 | swz[2] << 6 | swz[3] << 9) << 50 | (uint64_t)(rt == 2 || rt == 3) << 62 | (uint64_t)(rt == 1 || rt == 3) << 63;
     if (asp == VK_IMAGE_ASPECT_STENCIL_BIT) key = ~key;   // the stencil aspect's views apart from the depth ones
     for (int i = 0; i < v->nviews; i++) if (v->views[i].key == key) return v->views[i].v;
