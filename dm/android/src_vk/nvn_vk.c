@@ -2606,9 +2606,16 @@ static void rt_dump(uint64_t n, int force) {
 // ---------- Window ----------
 __attribute__((weak)) void *front_native_window(int *gen) { (void)gen; return NULL; }   // app/front_android.c; none in the adb front end
 __attribute__((weak)) void front_window_lock(int on) { (void)on; }
-static struct { VkSurfaceKHR surf; VkSwapchainKHR sc; VkImage img[8]; VkImageView view[8]; uint32_t n; VkFormat fmt; VkExtent2D ext; int gen; } W;
+// pre: the transform the swapchain was made with (a 180-degree one when the tablet is held upside down: the picture is turned in the final blit and the overlay's rectangles, so
+// the compositor need not turn it); tf/cext: the surface's current transform and extent then, to tell a real change from a driver that keeps saying SUBOPTIMAL
+static struct { VkSurfaceKHR surf; VkSwapchainKHR sc; VkImage img[8]; VkImageView view[8]; uint32_t n; VkFormat fmt; VkExtent2D ext, cext; int gen;
+                VkSurfaceTransformFlagBitsKHR pre, tf; uint64_t made_ns, chk_ns, nsub; const char *why; } W;
 #define NPRES 3
 static struct { VkCommandPool pool; VkCommandBuffer cb; VkFence fence; VkSemaphore acq, done; VkFramebuffer fb; } g_pres[NPRES]; static int g_pi;
+static const char *tf_name(VkSurfaceTransformFlagBitsKHR t) {
+    switch (t) { case VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR: return "0"; case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR: return "90"; case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: return "180";
+                 case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: return "270"; default: return "mirrored"; }
+}
 static void win_drop(void) {
     // the queue is externally synchronized: no submission while the device drains
     if (W.sc) { pthread_mutex_lock(&g_qmu); vkDeviceWaitIdle(g_dev); pthread_mutex_unlock(&g_qmu); for (uint32_t i = 0; i < W.n; i++) vkDestroyImageView(g_dev, W.view[i], NULL); vkDestroySwapchainKHR(g_dev, W.sc, NULL); W.sc = VK_NULL_HANDLE; }
@@ -2625,7 +2632,10 @@ static int win_make(ANativeWindow *aw) {
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR; for (uint32_t i = 0; i < npm; i++) if (pm[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = pm[i];   // the host paces presents itself; mailbox never blocks it
     // The swapchain is made the window's way up and Android's compositor turns it (a phone whose screen is portrait by nature, playing in landscape, reports its
     // current extent and transform rotated); the window's own size is that way up
+    // Upright or upside down the swapchain is made the screen's current way (180 degrees is turned by us, for free in the blit); a quarter turn is left to the compositor
     VkSurfaceTransformFlagBitsKHR pre = cap.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : cap.currentTransform;
+    if (cap.currentTransform == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR && (cap.supportedTransforms & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR)) pre = VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR;
+    W.pre = pre; W.tf = cap.currentTransform; W.cext = cap.currentExtent;
     W.ext = (VkExtent2D){(uint32_t)ANativeWindow_getWidth(aw), (uint32_t)ANativeWindow_getHeight(aw)};
     if (pre == cap.currentTransform && cap.currentExtent.width != UINT32_MAX) W.ext = cap.currentExtent;
     if (W.ext.width < cap.minImageExtent.width) W.ext.width = cap.minImageExtent.width; if (W.ext.width > cap.maxImageExtent.width) W.ext.width = cap.maxImageExtent.width;
@@ -2644,8 +2654,31 @@ static int win_make(ANativeWindow *aw) {
         VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT}; VKCHECK(vkCreateFence(g_dev, &fi, NULL, &g_pres[i].fence));
         VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; VKCHECK(vkCreateSemaphore(g_dev, &sci, NULL, &g_pres[i].acq)); VKCHECK(vkCreateSemaphore(g_dev, &sci, NULL, &g_pres[i].done));
     }
-    LOG("vk: swapchain %ux%u, %u images, format %d, %s", W.ext.width, W.ext.height, W.n, W.fmt, mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "fifo");
+    LOG("vk: swapchain %ux%u, %u images, format %d, %s, transform %s (screen %s), why: %s", W.ext.width, W.ext.height, W.n, W.fmt, mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "fifo",
+        tf_name(pre), tf_name(cap.currentTransform), W.why ? W.why : "new window");
+    W.why = NULL; W.made_ns = now_ns(); W.nsub = 0;
     return 1;
+}
+// A present or acquire said SUBOPTIMAL. Android says it every frame while the swapchain's transform is not the screen's (a quarter turn, which the compositor does), so
+// making a new swapchain then only shows black frames, over and over. A new one is made only when the screen's transform or size really changed since this one was made,
+// and at most twice a second
+static void win_suboptimal(void) {
+    W.nsub++;
+    uint64_t t = now_ns(); if (t - W.made_ns < 500000000ull || t - W.chk_ns < 500000000ull) return;
+    W.chk_ns = t; VkSurfaceCapabilitiesKHR cap; if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_pd, W.surf, &cap) != VK_SUCCESS) return;
+    if (cap.currentTransform != W.tf) W.why = "the screen turned";
+    else if (cap.currentExtent.width != W.cext.width || cap.currentExtent.height != W.cext.height) W.why = "the window's size changed";
+    else return;
+    LOG("vk: suboptimal %llu times; %s (transform %s -> %s, %ux%u -> %ux%u)", (unsigned long long)W.nsub, W.why, tf_name(W.tf), tf_name(cap.currentTransform),
+        W.cext.width, W.cext.height, cap.currentExtent.width, cap.currentExtent.height);
+    W.gen = -1;
+}
+// The overlay's rectangles in window coordinates, turned with the swapchain
+static void ovl_clear(VkCommandBuffer cb, const VkClearAttachment *a, uint32_t n, VkClearRect *r) {
+    if (W.pre == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR)
+        for (uint32_t i = 0; i < n; i++) { r[i].rect.offset.x = (int32_t)W.ext.width - r[i].rect.offset.x - (int32_t)r[i].rect.extent.width;
+                                           r[i].rect.offset.y = (int32_t)W.ext.height - r[i].rect.offset.y - (int32_t)r[i].rect.extent.height; }
+    vkCmdClearAttachments(cb, 1, a, n, r);
 }
 // Over the picture: the frame-rate counter and the on-screen controls (front_overlay), drawn as cleared rectangles -- a 3x5 font, button outlines, a filled button while pressed
 typedef struct { float x, y, w, h; int on; char label[3]; } dm_ovl;
@@ -2692,10 +2725,10 @@ static VkFramebuffer overlay_draw(VkCommandBuffer cb, uint32_t img, int show_fps
     #undef CLIP
     VkClearAttachment black = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0, 0, 0, 1}}}}, white = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.85f, 0.85f, 0.9f, 1}}}},
                       grey = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.35f, 0.35f, 0.45f, 1}}}}, green = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.3f, 1, 0.3f, 1}}}};
-    if (nb) vkCmdClearAttachments(cb, 1, &black, nb, bg);
-    if (nf) vkCmdClearAttachments(cb, 1, &grey, nf, fills);
-    if (nl) vkCmdClearAttachments(cb, 1, &white, nl, lines);
-    if (ng) vkCmdClearAttachments(cb, 1, nov ? &white : &green, ng, fg);
+    if (nb) ovl_clear(cb, &black, nb, bg);
+    if (nf) ovl_clear(cb, &grey, nf, fills);
+    if (nl) ovl_clear(cb, &white, nl, lines);
+    if (ng) ovl_clear(cb, nov ? &white : &green, ng, fg);
     rp_end(cb);
     return fb;
 }
@@ -2719,8 +2752,9 @@ static void win_present(const tex_t *t, const int crop[4]) {
     { uint64_t w0 = now_ns(); vkWaitForFences(g_dev, 1, &P_->fence, VK_TRUE, UINT64_MAX); atomic_fetch_add(&g_pwait_ns, now_ns() - w0); }
     if (P_->fb) { vkDestroyFramebuffer(g_dev, P_->fb, NULL); P_->fb = VK_NULL_HANDLE; }
     uint32_t idx; VkResult r = vkAcquireNextImageKHR(g_dev, W.sc, 1000000000ull, P_->acq, VK_NULL_HANDLE, &idx);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.gen = -1; front_window_lock(0); return; }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.gen = -1; W.why = "out of date at acquire"; front_window_lock(0); return; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { front_window_lock(0); return; }
+    if (r == VK_SUBOPTIMAL_KHR) win_suboptimal();
     vkResetFences(g_dev, 1, &P_->fence);
     VkCommandBuffer cb = P_->cb; vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL}; vkBeginCommandBuffer(cb, &bi);
@@ -2733,6 +2767,8 @@ static void win_present(const tex_t *t, const int crop[4]) {
     int32_t dw = (int32_t)W.ext.width, dh = (int32_t)W.ext.height, dx = 0, dy = 0;
     if (!stretch) { if ((int64_t)dw * sh > (int64_t)dh * sw) { dw = (int32_t)((int64_t)dh * sw / sh); dx = ((int32_t)W.ext.width - dw) / 2; } else { dh = (int32_t)((int64_t)dw * sh / sw); dy = ((int32_t)W.ext.height - dh) / 2; } }
     VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{sx, sy, 0}, {sx + sw, sy + sh, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
+    if (W.pre == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) {   // upside down: the destination corners swapped turn the picture half round
+        b.dstOffsets[0] = (VkOffset3D){(int32_t)W.ext.width - dx, (int32_t)W.ext.height - dy, 0}; b.dstOffsets[1] = (VkOffset3D){(int32_t)W.ext.width - dx - dw, (int32_t)W.ext.height - dy - dh, 1}; }
     vkCmdBlitImage(cb, v->img, VK_IMAGE_LAYOUT_GENERAL, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
     static int show = -1; if (show < 0) { const char *e = getenv("DM_SHOW_FPS"); show = e && atoi(e); }
     static dm_ovl ov[64]; int nov = front_overlay(ov, 64);   // buttons, and a ring of dots and a knob per stick held
@@ -2748,7 +2784,7 @@ static void win_present(const tex_t *t, const int crop[4]) {
     pthread_mutex_lock(&g_qmu);
     if (g_tl) { wv[1] = g_tlv; sv[1] = ++g_tlv; g_after_present = 1; }
     vkQueueSubmit(g_q, 1, &si, P_->fence); r = vkQueuePresentKHR(g_q, &pi); pthread_mutex_unlock(&g_qmu);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) W.gen = -1;
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.gen = -1; W.why = "out of date at present"; } else if (r == VK_SUBOPTIMAL_KHR && W.gen != -1) win_suboptimal();
     front_window_lock(0);
 }
 static _Atomic uint64_t g_presents;
@@ -2772,7 +2808,8 @@ static void pw_draw(uint32_t done, uint32_t total) {   // one frame of the pre-w
     vkWaitForFences(g_dev, 1, &P_->fence, VK_TRUE, UINT64_MAX);
     if (P_->fb) { vkDestroyFramebuffer(g_dev, P_->fb, NULL); P_->fb = VK_NULL_HANDLE; }
     uint32_t idx; VkResult r = vkAcquireNextImageKHR(g_dev, W.sc, 1000000000ull, P_->acq, VK_NULL_HANDLE, &idx);
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { if (r == VK_ERROR_OUT_OF_DATE_KHR) W.gen = -1; front_window_lock(0); return; }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.gen = -1; W.why = "out of date at acquire"; } front_window_lock(0); return; }
+    if (r == VK_SUBOPTIMAL_KHR) win_suboptimal();
     vkResetFences(g_dev, 1, &P_->fence);
     VkCommandBuffer cb = P_->cb; vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL}; vkBeginCommandBuffer(cb, &bi);
@@ -2791,8 +2828,8 @@ static void pw_draw(uint32_t done, uint32_t total) {   // one frame of the pre-w
     VkClearRect outline = {{{(int32_t)bx, (int32_t)by}, {bw, bh}}, 0, 1}, fill = {{{(int32_t)bx, (int32_t)by}, {fw ? fw : 1, bh}}, 0, 1};
     VkClearAttachment white = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.85f, 0.85f, 0.9f, 1}}}}, dark = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.2f, 0.22f, 0.3f, 1}}}},
                       bar = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.35f, 0.7f, 1.0f, 1}}}};
-    vkCmdClearAttachments(cb, 1, &dark, 1, &outline); if (fw) vkCmdClearAttachments(cb, 1, &bar, 1, &fill);
-    if (nt) vkCmdClearAttachments(cb, 1, &white, nt, tr);
+    ovl_clear(cb, &dark, 1, &outline); if (fw) ovl_clear(cb, &bar, 1, &fill);
+    if (nt) ovl_clear(cb, &white, nt, tr);
     rp_end(cb);
     img_barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     vkEndCommandBuffer(cb);
@@ -2800,7 +2837,7 @@ static void pw_draw(uint32_t done, uint32_t total) {   // one frame of the pre-w
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &P_->acq, &ws, 1, &cb, 1, &P_->done};
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &P_->done, 1, &W.sc, &idx, NULL};
     pthread_mutex_lock(&g_qmu); vkQueueSubmit(g_q, 1, &si, P_->fence); r = vkQueuePresentKHR(g_q, &pi); pthread_mutex_unlock(&g_qmu);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) W.gen = -1;
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.gen = -1; W.why = "out of date at present"; } else if (r == VK_SUBOPTIMAL_KHR && W.gen != -1) win_suboptimal();
     front_window_lock(0);
 }
 int dm_vk_prewarm(void) {   // the front end, before the game's main: 0 when there is nothing to make
