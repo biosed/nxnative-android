@@ -1,4 +1,4 @@
-// Start-up menu of the Android app (English): console mode, frame rate, screen fit, language, frame-rate counter, the
+// Start-up menu of the Android app (English): console mode, frame rate, screen fit, language, frame-rate counter, the on-screen controls' layout editor (ControlsActivity), the
 // cheats of the game's build (each one chosen by the player, none on by default) and "do not show again". The choices go to <files>/settings.env, which the game's
 // native activity (app/front_android.c, process ":game") reads at boot. The menu stays under the game: when the game ends (− and + held two seconds) it shows again.
 // On first start the bundled save (assets/save, the player's progress from another device) seeds the app's save folder; the cheat file is refreshed from assets/cheats.txt.
@@ -306,6 +306,10 @@ public class MenuActivity extends Activity {
         hibernate.setTextColor(Color.WHITE); hibernate.setChecked(prefs.getBoolean("hibernate", false)); col.addView(hibernate);
         skip = new CheckBox(this); skip.setText("Do not show this menu again (− and + during the game open it again)"); skip.setTextColor(Color.WHITE);
         skip.setChecked(prefs.getBoolean("skip", false)); col.addView(skip);
+        Button controls = new Button(this); controls.setText("Atur tombol (on-screen controls)"); controls.setTextSize(16); controls.setAllCaps(false);   // ControlsActivity: the layout editor
+        controls.setOnClickListener(v -> startActivity(new Intent(this, ControlsActivity.class)));
+        LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT); cl.topMargin = 20;
+        col.addView(controls, cl);
         Button play = playButton = new Button(this); play.setText("Play (START)"); play.setTextSize(20);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT); lp.topMargin = 28;
         play.setOnClickListener(v -> { save(); play(); });
