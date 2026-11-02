@@ -183,7 +183,7 @@ static void gw_add(uint64_t addr, uint64_t size, VkBuffer buf, VkDeviceSize off,
 // since Unreal updates its GPU scene and culls with compute and draws from the results in the next command buffer. Without may_hold (indirect arguments the CPU reads) the earlier
 // submission is waited for and its bytes read from guest memory, where the completion put them: 0 then, as for no entry. g_gw_ci: the context of the ring of the last hit
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);
-static int g_gw_ci; static _Atomic uint64_t g_gw_wait_ns, g_gw_waits, g_gw_held, g_gw_copied, g_gw_why[3];   // why: 0 indirect draw arguments, 1 range not inside the written one, 2 this submission's, not fitting
+static int g_gw_ci; static _Atomic uint64_t g_gw_wait_ns, g_gw_waits, g_gw_held, g_gw_copied, g_gw_why[3], g_gw_b2t, g_gw_b2b;   // b2t / b2b: texture and buffer copies made from GPU-written bytes   // why: 0 indirect draw arguments, 1 range not inside the written one, 2 this submission's, not fitting
 static VkDeviceSize ring_alloc(VkDeviceSize n, VkDeviceSize align);
 static VkDeviceSize ring_put(const void *src, VkDeviceSize n, VkDeviceSize align);
 // A read over [addr, addr + size) that earlier submissions still running wrote parts of (Unreal binds its whole GPU-scene buffer; a dispatch updated a few records of it): the guest's
@@ -744,6 +744,7 @@ static int g_occ_over;
 static _Atomic uint64_t g_presents;   // frames presented (mtl_present)
 static uint64_t g_evicted, g_remade;   // textures evicted / made again from their storage (the memory line)
 static int tex_remake(vtex *v, const tex_t *t);
+static uint64_t g_pkg_up, g_pkg_reup;   // textures uploaded from their storage when made / again after the game wrote it (the packaged textures line, mtl_pkg_stats)
 static uint64_t g_bvgen;   // the submission's number (bview, the linear texture hashes)
 static vtex *tex_get(const tex_t *t, int for_rt) {
     pthread_mutex_lock(&g_rmu); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
@@ -755,7 +756,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
         v->last_frame = atomic_load(&g_presents); v->last_fence = g_fence + 1;
         if (v->evicted && !tex_remake(v, t)) return NULL;   // evicted while unused (tex_evict): made again from its storage
         if (for_rt) v->gpu = 1;
-        else if (!v->gpu && t->mem && (v->dirty || (v->span && nvn_dirty_since_span(v->span, t->mem, t->L.size, v->stamp)))) { v->dirty = 0; tex_upload(v, t); }   // never over what the GPU drew: a flush of the pool range around a render target is not new content
+        else if (!v->gpu && t->mem && (v->dirty || (v->span && nvn_dirty_since_span(v->span, t->mem, t->L.size, v->stamp)))) { v->dirty = 0; tex_upload(v, t); g_pkg_reup++; }   // never over what the GPU drew: a flush of the pool range around a render target is not new content
         return v;
     }
     fmt_t f = fmt_of(t->d.format);
@@ -800,7 +801,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
                               packaged ? " uploaded" : "", for_rt ? " render-target" : ""); }
     if (v->lcpu && packaged) { v->lhash = mem_hash(t->mem, t->L.size); v->lhash_gen = g_bvgen; }
     v->ci = ii; v->packaged = packaged && !for_rt; v->last_frame = atomic_load(&g_presents); v->last_fence = g_fence + 1;
-    if (packaged) tex_upload(v, t);
+    if (packaged) { tex_upload(v, t); g_pkg_up++; }
     else {   // contents come from the GPU (copies, render passes): start cleared, as a new texture's storage would read on hardware after a clear. Render targets too: a pass that
              // loads one before anything drew into it, or a window texture presented with nothing drawn (FINAL FANTASY XII THE ZODIAC AGE's first frames; magenta on the Metal host
              // until it zero-filled them), would read Vulkan's undefined content
@@ -854,6 +855,10 @@ static void tex_upload_(vtex *v, const tex_t *t) {
     if (g_plog) LOG("plog:  upload %llu fmt %#x %ux%ux%u levels %u layers %u target %d", (unsigned long long)t->serial, t->d.format, v->w, v->h, v->d, v->levels, v->layers, t->d.target);
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) { RED_ONCE(4, "texture format %#x: block size unknown, not uploaded", t->d.format); return; }
+    // As nvn_mtl.m does for packaged textures: the storage is write-protected, and a game write to it (streamed texture data arriving after the texture was made, as Super Mario
+    // Odyssey's normal maps do; noise until then) brings a new upload at the texture's next use (tex_get). The stamp is taken and the pages protected BEFORE the storage is read
+    // (nvn_dirty.h): protected after the read, a write landing while it ran, or on a page a write had already unprotected, was never seen, and the texture kept what it was mid-write
+    if (t->mem && !v->gpu && nvn_dirty_tracked(t->mem, t->L.size)) { v->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size); v->span = nvn_dirty_span(t->mem, t->L.size); }
     for (unsigned lv = 0; lv < v->levels; lv++) {
         if (lv < 32 && (v->gpu_lv >> lv & 1)) continue;   // a copy on the GPU wrote this level: its storage does not hold that
         uint32_t w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1, d = v->d >> lv ? v->d >> lv : 1;
@@ -862,7 +867,7 @@ static void tex_upload_(vtex *v, const tex_t *t) {
         for (unsigned ly = 0; ly < v->layers; ly++) {
             size_t out = v->f.dec ? (size_t)w * h * dec_bpp(v->f.dec) * d : lsz;
             VkDeviceSize o = ring_alloc(out, 16);
-            if (o == VK_WHOLE_SIZE) return;
+            if (o == VK_WHOLE_SIZE) { v->dirty = 1; return; }   // not uploaded: again at the next use (the stamp above would say nothing changed)
             uint8_t *dst = C->ringp + o, *tmp = v->f.dec ? malloc(lsz) : dst;
             int rc = 0;
             if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) {
@@ -882,9 +887,6 @@ static void tex_upload_(vtex *v, const tex_t *t) {
         }
     }
     C->up_used = 1; v->uploaded = 1;
-    // As nvn_mtl.m does for packaged textures: the storage is write-protected after the upload, and a game write to it (streamed texture data arriving after the texture was
-    // made, as Super Mario Odyssey's normal maps do; noise until then) brings a new upload at the texture's next use (tex_get)
-    if (t->mem && !v->gpu && nvn_dirty_tracked(t->mem, t->L.size)) { nvn_dirty_protect(t->mem, t->L.size); v->stamp = nvn_dirty_now(); v->span = nvn_dirty_span(t->mem, t->L.size); }
 }
 static void tex_free(vtex *v) {   // released by the game: draws already recorded (and the one being recorded) may still use it
     pthread_mutex_lock(&g_gbmu);
@@ -2301,7 +2303,11 @@ static void copy_b2t(const p_copy_b2t *c) {
     const NVNcopyRegion *r = &c->r; uint32_t w = (uint32_t)r->width, h = (uint32_t)r->height, d = (uint32_t)(r->depth > 0 ? r->depth : 1);
     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((w + bw - 1) / bw) * bpb, img = S.copy_img_stride ? (size_t)S.copy_img_stride : row * ((h + bh - 1) / bh);
     pass_end();
-    VkDeviceSize o = copy_in(c->src, img * d, 16); if (o == VK_WHOLE_SIZE) return;
+    // The source as the GPU will hold it: what a dispatch or a texture-to-buffer copy wrote there (this submission's, or an earlier one's still running) is only in a ring until
+    // its submission completes, and the guest's bytes are stale until then; else the guest's bytes
+    VkBuffer sb = C->ring; VkDeviceSize o;
+    if (!gw_find(c->src, img * d, 16, &sb, &o, NULL)) { sb = C->ring; o = copy_in(c->src, img * d, 16); if (o == VK_WHOLE_SIZE) return; }
+    else atomic_fetch_add(&g_gw_b2t, 1);
     uint32_t lv = c->has_view && c->view.set_levels ? c->view.base_level : 0, ly = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     if (lv < 32) v->gpu_lv |= 1u << lv;   // this level's content now comes from copies (see copy_t2t)
     int is3d = v->target == NVN_TEXTURE_TARGET_3D;
@@ -2311,7 +2317,7 @@ static void copy_b2t(const p_copy_b2t *c) {
     }
     VkBufferImageCopy bc = {o, (uint32_t)(row / bpb * bw), (uint32_t)(img / row * bh), {v->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, lv, is3d ? 0 : ly + (uint32_t)r->zoffset, is3d ? 1 : d},
                             {r->xoffset, r->yoffset, is3d ? r->zoffset : 0}, {w, h, is3d ? d : 1}};
-    gpu_mark(2, 0); vkCmdCopyBufferToImage(C->cb, C->ring, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc); gpu_mark(2, 1);
+    gpu_mark(2, 0); vkCmdCopyBufferToImage(C->cb, sb, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc); gpu_mark(2, 1);
     barrier_xfer(C->cb);
 }
 static void copy_t2t(const p_copy_t2t *c) {
@@ -2358,6 +2364,9 @@ static void copy_t2b(const p_copy_t2t *c) {   // src = the texture, dst field of
                             {c->sr.xoffset, c->sr.yoffset, 0}, {w, h, 1}};
     gpu_mark(2, 0); vkCmdCopyImageToBuffer(C->cb, s->img, VK_IMAGE_LAYOUT_GENERAL, C->ring, 1, &bc); gpu_mark(2, 1);
     barrier_xfer(C->cb);
+    // Until the submission completes and the bytes go back to guest memory, later reads of the destination (a buffer-to-texture copy, a buffer copy, a draw's buffers) take them
+    // from the ring, as a dispatch's writes (gw_add); they read the guest's stale bytes before
+    gw_add((uint64_t)(uintptr_t)c->dst, n, C->ring, o, C->ringp + o, g_fence + 1, g_ci);
     post_add((post_t){3, (void *)c->dst, 0, 0, 0, 0, C->ringp + o, n});
 }
 static void clear_tex(const p_clear_tex *c) {
@@ -2420,7 +2429,19 @@ void mtl_sub_begin(void) {
 }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
-void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) { memmove((void *)dst, (const void *)src, n); wlog_add(dst, n); }
+// A buffer copy is made on the CPU as the command list is walked (the in-order writes, wlog). Where the source holds bytes the GPU wrote and has not put back in guest memory
+// yet (gw_find), the copy is made on the GPU from them into the ring instead, and the destination becomes a GPU-written range like the source (gw_add, back at completion)
+static int gw_any(uint64_t a, uint64_t n) { int r = 0; pthread_mutex_lock(&g_gwmu); for (int i = 0; i < g_ngw && !r; i++) r = a < g_gw[i].addr + g_gw[i].size && g_gw[i].addr < a + n; pthread_mutex_unlock(&g_gwmu); return r; }
+void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
+    memmove((void *)dst, (const void *)src, n); wlog_add(dst, n);
+    if (!n || !g_ngw || !gw_any(src, n)) return;
+    pass_end();
+    VkBuffer sb; VkDeviceSize so; if (!gw_find(src, n, 16, &sb, &so, NULL)) { memmove((void *)dst, (const void *)src, n); return; }   // complete now (gw_find waited for it): in guest memory
+    VkDeviceSize ro = ring_alloc(n, 16); if (ro == VK_WHOLE_SIZE) { RED_ONCE(93, "a buffer copy of GPU-written bytes found no room in the ring: copied from guest memory"); return; }
+    VkBufferCopy bc = {so, ro, n}; vkCmdCopyBuffer(C->cb, sb, C->ring, 1, &bc); barrier_xfer(C->cb);
+    gw_add(dst, n, C->ring, ro, C->ringp + ro, g_fence + 1, g_ci); post_add((post_t){3, (void *)(uintptr_t)dst, 0, 0, 0, 0, C->ringp + ro, n});
+    atomic_fetch_add(&g_gw_b2b, 1);
+}
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post_add((post_t){1, (void *)val, mode, v}); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) { post_add((post_t){2, NULL, 0, 0, addr, type}); }
 static void mtl_exec_(const uint8_t *p);
@@ -2926,10 +2947,11 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                           (unsigned long long)g_tex_miss[1], (unsigned long long)g_tex_miss[2], (unsigned long long)g_tex_miss[3]);
     if (n % 600 == 0) { extern uint64_t g_nsub_stat; static uint64_t ls;
         LOG("vk: recording per frame over the last 600: draws %.2f ms (descriptor sets %.2f ms, %.0f%% reused), dispatches %.2f ms, texture uploads %.2f ms (%.1f MB), vkQueueSubmit %.2f ms; %.1f submissions a frame;"
-            " GPU-written data of a running submission used in place %llu times, copied %llu times, waited for %llu times (%.2f ms a frame; indirect draws %llu, partial ranges %llu, misfits in-submission %llu)",
+            " GPU-written data of a running submission used in place %llu times, copied %llu times, waited for %llu times (%.2f ms a frame; indirect draws %llu, partial ranges %llu, misfits in-submission %llu); copies from GPU-written bytes: into textures %llu, buffers %llu",
             g_t_draw / 600e6, g_t_ws / 600e6, g_dsc_hit + g_dsc_miss ? 100.0 * g_dsc_hit / (g_dsc_hit + g_dsc_miss) : 0.0, g_t_disp / 600e6, g_t_up / 600e6, g_up_bytes / 600e6 * 1e3 / 1e3, g_t_sub / 600e6,
             (g_nsub_stat - ls) / 600.0, (unsigned long long)atomic_exchange(&g_gw_held, 0), (unsigned long long)atomic_exchange(&g_gw_copied, 0), (unsigned long long)atomic_exchange(&g_gw_waits, 0), atomic_exchange(&g_gw_wait_ns, 0) / 600e6,
-            (unsigned long long)atomic_exchange(&g_gw_why[0], 0), (unsigned long long)atomic_exchange(&g_gw_why[1], 0), (unsigned long long)atomic_exchange(&g_gw_why[2], 0));
+            (unsigned long long)atomic_exchange(&g_gw_why[0], 0), (unsigned long long)atomic_exchange(&g_gw_why[1], 0), (unsigned long long)atomic_exchange(&g_gw_why[2], 0),
+            (unsigned long long)atomic_exchange(&g_gw_b2t, 0), (unsigned long long)atomic_exchange(&g_gw_b2b, 0));
         ls = g_nsub_stat; g_t_draw = g_t_ws = g_t_disp = g_t_up = g_t_sub = 0; g_up_bytes = 0; g_dsc_hit = g_dsc_miss = 0; }
     if (n % 600 == 0) {   // memory: the process (RSS, its anonymous part, PSS) and what the backend holds
         long rss = 0, anon = 0, pss = 0; char ln[256]; FILE *f = fopen("/proc/self/status", "re");
@@ -3020,7 +3042,7 @@ void mtl_ubp_why(uint64_t w[5]) { memset(w, 0, 5 * sizeof *w); }
 void mtl_ubp_stats(uint64_t *a, uint64_t *b, uint64_t *c) { *a = *b = *c = 0; }
 void mtl_ubd_stats(uint64_t *a, uint64_t *b) { *a = *b = 0; }
 void mtl_res_stats(char *out, size_t n) { if (n) snprintf(out, n, "vulkan"); }
-void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = *reuploads = 0; }
+void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_up; *reuploads = g_pkg_reup; }
 uint64_t mtl_pkg_miss(void) { return 0; }
 void mtl_mem_stat(unsigned long long a, unsigned long long b) { (void)a; (void)b; }
 void mtl_lc_stats(uint64_t *a, uint64_t *b) { *a = *b = 0; }
