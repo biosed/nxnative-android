@@ -11,6 +11,7 @@
 # Tools: Homebrew's android-commandlinetools (build-tools 34, platform 33) and openjdk@21; the key is <NSP folder>/../android-debug.keystore (made once, kept so updates install over)
 import argparse, glob, hashlib, os, re, shutil, struct, subprocess, sys, tempfile, zipfile
 HERE = os.path.dirname(os.path.abspath(__file__)); ANDROID = os.path.dirname(HERE)
+sys.path.insert(0, HERE); import controls_atlas   # the on-screen controls' sprite atlas, rasterized from app/res_svg into the APK's assets/controls (never into git)
 SDK = os.environ.get('ANDROID_SDK', '/opt/homebrew/share/android-commandlinetools')
 def _sdk_dir(kind, want):   # the wanted build-tools / platform, else the newest one the SDK has (Android Studio's SDK may hold only newer ones)
     p = os.path.join(SDK, kind, want)
@@ -37,6 +38,8 @@ MANIFEST = '''<?xml version="1.0" encoding="utf-8"?>
               android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode|screenLayout|smallestScreenSize">
       <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
     </activity>
+    <activity android:name="com.nxnative.ControlsActivity" android:exported="false" android:screenOrientation="sensorLandscape"
+              android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode|screenLayout|smallestScreenSize"/>
     <activity android:name="android.app.NativeActivity" android:process=":game" android:exported="false" android:screenOrientation="sensorLandscape"
               android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode|screenLayout|smallestScreenSize|density|fontScale|locale|layoutDirection|touchscreen|colorMode">
       <meta-data android:name="android.app.lib_name" android:value="dmboot"/>
@@ -72,6 +75,8 @@ def build(a):
         z.write(lib, 'lib/arm64-v8a/libdmhost.so')
         z.write(boot, 'lib/arm64-v8a/libdmboot.so')
         if a.cheats: z.write(a.cheats, 'assets/cheats.txt')
+        png, txt = controls_atlas.build(os.path.join(w, 'controls'))
+        z.write(png, 'assets/controls/atlas.png', zipfile.ZIP_STORED); z.write(txt, 'assets/controls/atlas.txt')   # stored: the PNG is compressed already
         if a.save:
             for root, _, fs in os.walk(a.save):
                 for f in sorted(fs):
