@@ -171,6 +171,7 @@ static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) g = now_ns();
 typedef struct { uint64_t addr, size; VkBuffer buf; VkDeviceSize off; uint8_t *p; uint64_t fence; int ci; } gw_t;   // ci: the context whose ring holds it
 enum { NGW = 512 };
 static gw_t g_gw[NGW]; static int g_ngw; static pthread_mutex_t g_gwmu = PTHREAD_MUTEX_INITIALIZER;
+static void xr_raise(VkBuffer b, uint64_t until);   // an extra ring a later submission reads stays until it is done (see g_xr)
 static void gw_add(uint64_t addr, uint64_t size, VkBuffer buf, VkDeviceSize off, uint8_t *p, uint64_t fence, int ci) {
     pthread_mutex_lock(&g_gwmu);
     for (int i = 0; i < g_ngw; i++) if (g_gw[i].addr == addr && g_gw[i].size == size) { g_gw[i] = g_gw[--g_ngw]; break; }   // the newer write of one range replaces the older
@@ -199,7 +200,7 @@ static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align)
         if (e->fence == g_fence + 1) { cur = 1; continue; }
         uint64_t lo = e->addr > addr ? e->addr : addr, hi = e->addr + e->size < addr + size ? e->addr + e->size : addr + size;
         VkBufferCopy bc = {e->off + (lo - e->addr), ro + (lo - addr), hi - lo}; vkCmdCopyBuffer(C->up, e->buf, C->ring, 1, &bc); C->up_used = 1;
-        ctx_t *o = &g_ctx[e->ci]; if (o->hold < g_fence + 1) o->hold = g_fence + 1;
+        ctx_t *o = &g_ctx[e->ci]; if (o->hold < g_fence + 1) o->hold = g_fence + 1; xr_raise(e->buf, g_fence + 1);
     }
     if (cur) {   // parts this submission's own dispatches wrote: copied here, in order, after them (outside a render pass: the open one is ended and begun again)
         int was_open = g_pass_open_(); if (was_open) pass_end();
@@ -229,7 +230,7 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
                 *buf = C->ring; *off = ro; if (p) *p = C->ringp + ro; g_gw_ci = g_ci; hit = 1; atomic_fetch_add(&g_gw_copied, 1); break;
             }
             if (!may_hold) { wait = e->fence; why = 0; break; }
-            ctx_t *o = &g_ctx[e->ci]; if (o->hold < g_fence + 1) o->hold = g_fence + 1;
+            ctx_t *o = &g_ctx[e->ci]; if (o->hold < g_fence + 1) o->hold = g_fence + 1; xr_raise(e->buf, g_fence + 1);
             if (!fits) {   // at an offset the binding cannot take: copied into this submission's ring at the start of the submission (the upload command buffer), when it is complete
                 VkDeviceSize ro = ring_alloc(size, align < 16 ? 16 : align);
                 if (ro == VK_WHOLE_SIZE) { wait = e->fence; why = 1; break; }
@@ -253,9 +254,21 @@ static void gw_expire(uint64_t fence) {   // completion: the submission's writes
     for (int i = 0; i < g_ngw;) if (g_gw[i].fence <= fence) g_gw[i] = g_gw[--g_ngw]; else i++;
     pthread_mutex_unlock(&g_gwmu);
 }
-static struct { VkBuffer b; VkDeviceMemory m; uint64_t until; VkDeviceSize size; } *g_xr; static int g_nxr, g_cxr;   // extra rings kept for a later submission that reads them (completion thread only)
+// Extra rings kept past their own submission for later ones that read them (under g_gwmu). A later submission can find a range in one after its context completed --
+// a dispatch registers the range it read from there as its own write, still in that ring, and a third submission reads it from that entry -- so `until` follows every
+// such reader (xr_raise, where gw_find holds a context for a reader), and a ring any live GPU-written entry still points into is not freed either. The release fence
+// used to be taken once, when the ring's own context completed: a later reader's write-back then copied from freed memory (FINAL FANTASY RESONANCE, a Limit Burst:
+// SIGSEGV in the completion thread's memcpy, its source in the freed ring)
+static struct { VkBuffer b; VkDeviceMemory m; uint64_t until; VkDeviceSize size; } *g_xr; static int g_nxr, g_cxr;
+static void xr_raise(VkBuffer b, uint64_t until) { for (int i = 0; i < g_nxr; i++) if (g_xr[i].b == b && g_xr[i].until < until) g_xr[i].until = until; }   // caller holds g_gwmu
 static void xr_free(uint64_t done) {
-    for (int i = 0; i < g_nxr;) if (g_xr[i].until <= done) { vkDestroyBuffer(g_dev, g_xr[i].b, NULL); vkFreeMemory(g_dev, g_xr[i].m, NULL); atomic_fetch_sub(&g_extra_ring_bytes, g_xr[i].size); g_xr[i] = g_xr[--g_nxr]; } else i++;
+    pthread_mutex_lock(&g_gwmu);
+    for (int i = 0; i < g_nxr;) {
+        int used = g_xr[i].until > done; for (int k = 0; k < g_ngw && !used; k++) used = g_gw[k].buf == g_xr[i].b;
+        if (used) { i++; continue; }
+        vkDestroyBuffer(g_dev, g_xr[i].b, NULL); vkFreeMemory(g_dev, g_xr[i].m, NULL); atomic_fetch_sub(&g_extra_ring_bytes, g_xr[i].size); g_xr[i] = g_xr[--g_nxr];
+    }
+    pthread_mutex_unlock(&g_gwmu);
 }
 static _Atomic uint64_t g_gpu_kind_ns[3];   // GPU time inside render passes, dispatches, copies (gpu_mark); the rest of a submission's span is time between them
 static void ctx_complete(ctx_t *c) {
@@ -289,12 +302,14 @@ static void ctx_complete(ctx_t *c) {
     }
     c->npost = 0;
     gw_expire(c->fence_val);
-    pthread_mutex_lock(&g_gwmu); uint64_t hold = c->hold; pthread_mutex_unlock(&g_gwmu);
+    pthread_mutex_lock(&g_gwmu); uint64_t hold = c->hold;
     for (int i = 0; i < c->nextra; i++) {
-        if (hold > c->fence_val) {   // a later submission reads it (gw_find): freed once that one is done (xr_free)
+        int used = hold > c->fence_val; for (int k = 0; k < g_ngw && !used; k++) used = g_gw[k].buf == c->extra[i].b;
+        if (used) {   // a later submission reads it (gw_find), or a live entry points into it: freed once nothing does (xr_free)
             if (g_nxr == g_cxr) { g_cxr = g_cxr ? 2 * g_cxr : 16; g_xr = realloc(g_xr, g_cxr * sizeof *g_xr); }
-            g_xr[g_nxr++] = (typeof(g_xr[0])){c->extra[i].b, c->extra[i].m, hold, c->extra[i].size}; continue; }
+            g_xr[g_nxr++] = (typeof(g_xr[0])){c->extra[i].b, c->extra[i].m, hold > c->fence_val ? hold : c->fence_val + 1, c->extra[i].size}; continue; }
         vkDestroyBuffer(g_dev, c->extra[i].b, NULL); vkFreeMemory(g_dev, c->extra[i].m, NULL); atomic_fetch_sub(&g_extra_ring_bytes, c->extra[i].size); }
+    pthread_mutex_unlock(&g_gwmu);
     c->nextra = 0;
     for (int i = 0; i < c->nfb; i++) vkDestroyFramebuffer(g_dev, c->fb[i], NULL);
     c->nfb = 0;
