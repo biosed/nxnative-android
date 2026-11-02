@@ -665,7 +665,7 @@ NVN(nvnSyncInitialize, NVNboolean, NVNsync *s, NVNdevice *d) { (void)d; *(sync_t
 NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
-void mtl_pd_note(const char *what, uint64_t v);
+void mtl_pd_note(const char *what, uint64_t v); int mtl_pd_on(void);
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); mtl_pd_note("queue fence sync, fence", ((sync_t *)s)->fence); }
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
 // A GPU-side wait on a sync: the host has a single Metal queue that executes submissions in order, so commands before the fence are always done first and nothing needs waiting. A sync not fenced yet (fenced later by another thread) is not waited for here; logged once
@@ -682,8 +682,8 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
     if (w(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
-    mtl_pd_note("CPU SyncWait blocks on fence", o->fence);
     uint64_t t0 = now_ns(); dm_core_leave(); int ok = w(o->fence, timeout); dm_core_return(); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
+    if (mtl_pd_on()) { char tn[32] = ""; pthread_getname_np(pthread_self(), tn, sizeof tn); char what[96]; snprintf(what, sizeof what, "CPU SyncWait (thread %s) waited %.2f ms for fence", tn, (now_ns() - t0) / 1e6); mtl_pd_note(what, o->fence); }
     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
