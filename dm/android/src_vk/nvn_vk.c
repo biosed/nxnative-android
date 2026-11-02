@@ -1612,24 +1612,28 @@ static VkPipeline pso_get(const pso_key *k, VkPipelineLayout pl, int may_wait) {
 }
 
 static int hexkey(const char *s, uint8_t md[8]) { for (int i = 0; i < 8; i++) if (sscanf(s + 2 * i, "%2hhx", &md[i]) != 1) return 0; return 1; }
-static _Atomic uint64_t g_pre_made, g_pre_had;
+static _Atomic uint64_t g_pre_made, g_pre_had, g_pre_slow;
+static void pso_precreate_one(const pso_rec *r) {
+    uint8_t md[8]; pso_key k = r->k;
+    if (!r->vs[0] || !hexkey(r->vs, md) || !(k.vs = shader_get(md)) || !k.vs->mod) return;
+    if (r->fs[0]) { if (!hexkey(r->fs, md) || !(k.fs = shader_get(md)) || !k.fs->mod) return; }
+    if (r->gs[0]) { if (!hexkey(r->gs, md) || !(k.gs = shader_get(md)) || !k.gs->mod) return; }
+    if (k.dual && (!k.fs || !fs_dual_mod(k.fs))) return;
+    VkPipelineLayout pl = layout_get(k.vs, k.fs, k.gs);
+    uint64_t h = fnv(&k, sizeof k); uint32_t i = 0;
+    pthread_mutex_lock(&g_psomu);
+    if (pso_find_(&k, h, &i)) { pthread_mutex_unlock(&g_psomu); atomic_fetch_add(&g_pre_had, 1); return; }
+    pso_ent *e = pso_insert_(&k, h, pl, i); pthread_mutex_unlock(&g_psomu);
+    uint64_t t0 = now_ns(); e->p = pso_create(&k, pl); atomic_store_explicit(&e->state, 1, memory_order_release); atomic_fetch_add(&g_pre_made, 1);
+    if (now_ns() - t0 > 3000000ull) atomic_fetch_add(&g_pre_slow, 1);   // not in the driver's cache: compiled
+}
+static int g_prewarm_ran;
+static int g_prewarm_depth = -1;   // the depth mode the pre-warm loaded shaders under (dm_vk_prewarm), from the last run's vk_depth_mode
 static void *pso_precreate(void *a) {
-    (void)a; const char *d = getenv("DM_VK_DIR"); if (!d) return NULL;
+    (void)a; const char *d = getenv("DM_VK_DIR"); if (!d || g_prewarm_ran) return NULL;   // the pre-warm before the game did it already
     char p[1100]; snprintf(p, sizeof p, "%s/../pipeline_keys.bin", d); FILE *f = fopen(p, "rb"); if (!f) return NULL;
     uint64_t t0 = now_ns(); pso_rec r; uint64_t n = 0;
-    while (fread(&r, sizeof r, 1, f) == 1) {
-        n++; uint8_t md[8]; pso_key k = r.k;
-        if (!r.vs[0] || !hexkey(r.vs, md) || !(k.vs = shader_get(md)) || !k.vs->mod) continue;
-        if (r.fs[0]) { if (!hexkey(r.fs, md) || !(k.fs = shader_get(md)) || !k.fs->mod) continue; }
-        if (r.gs[0]) { if (!hexkey(r.gs, md) || !(k.gs = shader_get(md)) || !k.gs->mod) continue; }
-        if (k.dual && (!k.fs || !fs_dual_mod(k.fs))) continue;
-        VkPipelineLayout pl = layout_get(k.vs, k.fs, k.gs);
-        uint64_t h = fnv(&k, sizeof k); uint32_t i = 0;
-        pthread_mutex_lock(&g_psomu);
-        if (pso_find_(&k, h, &i)) { pthread_mutex_unlock(&g_psomu); atomic_fetch_add(&g_pre_had, 1); continue; }
-        pso_ent *e = pso_insert_(&k, h, pl, i); pthread_mutex_unlock(&g_psomu);
-        e->p = pso_create(&k, pl); atomic_store_explicit(&e->state, 1, memory_order_release); atomic_fetch_add(&g_pre_made, 1);
-    }
+    while (fread(&r, sizeof r, 1, f) == 1) { n++; pso_precreate_one(&r); }
     fclose(f);
     LOG("vk: pipelines of earlier runs made again: %llu of %llu recorded (%llu already there) in %.1f s", (unsigned long long)atomic_load(&g_pre_made), (unsigned long long)n,
         (unsigned long long)atomic_load(&g_pre_had), (now_ns() - t0) / 1e9);
@@ -2629,7 +2633,9 @@ static double g_fps_shown;
 static uint16_t glyph(char c) {   // rows top to bottom, 3 bits each
     static const char *const G[] = {"0111101101101111", "1010010010010010", "2111001111100111", "3111001111001111", "4101101111001001", "5111100111001111", "6111100111101111",
                                     "7111001001001001", "8111101111101111", "9111101111001111", "A010101111101101", "B110101110101110", "X101101010101101", "Y101101010010010",
-                                    "L100100100100111", "R110101110101101", "Z111001010100111", "+000010111010000", "-000000111000000"};
+                                    "L100100100100111", "R110101110101101", "Z111001010100111", "+000010111010000", "-000000111000000",
+                                    "M101111111101101", "E111100111100111", "N110101101101101", "I111010010010111", "P110101110100100", "K101101110101101", "S111100111001111",
+                                    "H101101111101101", "D110101101101110", "T111010010010010", "U101101101101111", "W101101111111101", "/001001010100100", ".000000000000010"};
     for (size_t i = 0; i < sizeof G / sizeof *G; i++) if (G[i][0] == c) { uint16_t g = 0; for (int k = 1; k <= 15; k++) g = (uint16_t)(g << 1 | (G[i][k] == '1')); return g; }
     return 0;
 }
@@ -2725,6 +2731,78 @@ static void win_present(const tex_t *t, const int crop[4]) {
     front_window_lock(0);
 }
 static _Atomic uint64_t g_presents;
+// ---------- Shader pre-warm before the game starts ----------
+// Every pipeline earlier runs made (pipeline_keys.bin) is made again before the game boots, on worker threads, behind a screen "MENYIAPKAN SHADER x / y" with a progress bar, so
+// effects and skills met before never stall the game for a first-time shader load or compile (100-300 ms each in FINAL FANTASY RESONANCE's battles). The player's own tap on the
+// screen skips the wait (dm_vk_prewarm_cancel, from the front end's input); the rest is made in the background as the game starts. The first run after the list grows takes
+// longer (real compiles), later ones only seconds (the driver's pipeline cache)
+static _Atomic int g_pw_cancel; static pso_rec *g_pw_recs; static uint32_t g_pw_total; static _Atomic uint32_t g_pw_next, g_pw_done;
+void dm_vk_prewarm_cancel(void) { atomic_store(&g_pw_cancel, 1); }
+static void *pw_worker(void *a) {
+    (void)a;
+    for (uint32_t i; (i = atomic_fetch_add(&g_pw_next, 1)) < g_pw_total;) { pso_precreate_one(&g_pw_recs[i]); atomic_fetch_add(&g_pw_done, 1); }
+    return NULL;
+}
+static void pw_draw(uint32_t done, uint32_t total) {   // one frame of the pre-warm screen
+    int gen; front_window_lock(1); ANativeWindow *aw = front_native_window(&gen);
+    if (!aw || gen != W.gen) { win_drop(); W.gen = gen; if (aw) win_make(aw); }
+    if (!aw || !W.sc) { front_window_lock(0); return; }
+    typeof(g_pres[0]) *P_ = &g_pres[g_pi]; g_pi = (g_pi + 1) % NPRES;
+    vkWaitForFences(g_dev, 1, &P_->fence, VK_TRUE, UINT64_MAX);
+    if (P_->fb) { vkDestroyFramebuffer(g_dev, P_->fb, NULL); P_->fb = VK_NULL_HANDLE; }
+    uint32_t idx; VkResult r = vkAcquireNextImageKHR(g_dev, W.sc, 1000000000ull, P_->acq, VK_NULL_HANDLE, &idx);
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { if (r == VK_ERROR_OUT_OF_DATE_KHR) W.gen = -1; front_window_lock(0); return; }
+    vkResetFences(g_dev, 1, &P_->fence);
+    VkCommandBuffer cb = P_->cb; vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL}; vkBeginCommandBuffer(cb, &bi);
+    img_barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkClearColorValue bgc = {{0.06f, 0.07f, 0.11f, 1}}; VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cb, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &bgc, 1, &rr);
+    img_barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    rp_desc d = {.n = 1, .cv = {W.view[idx]}, .cf = {W.fmt}, .cl = {VK_ATTACHMENT_LOAD_OP_LOAD}, .w = W.ext.width, .h = W.ext.height, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    P_->fb = rp_begin(cb, &d);
+    static VkClearRect tr[2048]; uint32_t nt = 0, ww = W.ext.width, hh = W.ext.height, cell = hh / 90 ? hh / 90 : 2;
+    char t1[64]; snprintf(t1, sizeof t1, "MENYIAPKAN SHADER %u / %u", done, total);
+    const char *t2 = "KETUK UNTUK LEWATI";
+    nt = text_rects(tr, nt, 2048, t1, (int32_t)((ww - strlen(t1) * 4 * cell) / 2), (int32_t)(hh / 2 - 9 * cell), cell);
+    uint32_t c2 = cell * 2 / 3 ? cell * 2 / 3 : 1; nt = text_rects(tr, nt, 2048, t2, (int32_t)((ww - strlen(t2) * 4 * c2) / 2), (int32_t)(hh / 2 + 8 * cell), c2);
+    uint32_t bw = ww * 6 / 10, bx = (ww - bw) / 2, by = hh / 2, bh = cell * 3, fw = total ? (uint32_t)((uint64_t)bw * done / total) : 0;
+    VkClearRect outline = {{{(int32_t)bx, (int32_t)by}, {bw, bh}}, 0, 1}, fill = {{{(int32_t)bx, (int32_t)by}, {fw ? fw : 1, bh}}, 0, 1};
+    VkClearAttachment white = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.85f, 0.85f, 0.9f, 1}}}}, dark = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.2f, 0.22f, 0.3f, 1}}}},
+                      bar = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.35f, 0.7f, 1.0f, 1}}}};
+    vkCmdClearAttachments(cb, 1, &dark, 1, &outline); if (fw) vkCmdClearAttachments(cb, 1, &bar, 1, &fill);
+    if (nt) vkCmdClearAttachments(cb, 1, &white, nt, tr);
+    rp_end(cb);
+    img_barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    vkEndCommandBuffer(cb);
+    VkPipelineStageFlags ws = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &P_->acq, &ws, 1, &cb, 1, &P_->done};
+    VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &P_->done, 1, &W.sc, &idx, NULL};
+    pthread_mutex_lock(&g_qmu); vkQueueSubmit(g_q, 1, &si, P_->fence); r = vkQueuePresentKHR(g_q, &pi); pthread_mutex_unlock(&g_qmu);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) W.gen = -1;
+    front_window_lock(0);
+}
+int dm_vk_prewarm(void) {   // the front end, before the game's main: 0 when there is nothing to make
+    const char *d = getenv("DM_VK_DIR"); if (!d) return 0;
+    const char *e = getenv("DM_VK_PREWARM"); if (e && !atoi(e)) return 0;
+    char p[1100]; snprintf(p, sizeof p, "%s/../pipeline_keys.bin", d); FILE *f = fopen(p, "rb"); if (!f) return 0;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint32_t n = sz > 0 ? (uint32_t)(sz / (long)sizeof(pso_rec)) : 0;
+    if (!n || !(g_pw_recs = malloc((size_t)n * sizeof *g_pw_recs))) { fclose(f); return 0; }
+    n = (uint32_t)fread(g_pw_recs, sizeof *g_pw_recs, n, f); fclose(f); if (!n) return 0;
+    snprintf(p, sizeof p, "%s/../vk_depth_mode", d); if ((f = fopen(p, "r"))) { int m; if (fscanf(f, "%d", &m) == 1) { g_prewarm_depth = m != 0; g_depth_zero = g_prewarm_depth; } fclose(f); }
+    vk_init(); g_prewarm_ran = 1; g_pw_total = n;
+    long rss0 = 0; char ln[128]; FILE *st = fopen("/proc/self/status", "re"); if (st) { while (fgets(ln, sizeof ln, st)) sscanf(ln, "VmRSS: %ld", &rss0); fclose(st); }
+    uint64_t t0 = now_ns(); int nw = 4; for (int i = 0; i < nw; i++) { pthread_t t; if (!pthread_create(&t, NULL, pw_worker, NULL)) pthread_detach(t); }
+    LOG("vk: shader pre-warm: %u pipelines recorded by earlier runs, %d worker threads%s", n, nw, g_prewarm_depth >= 0 ? (g_prewarm_depth ? ", depth mode near = 0" : ", depth mode GL") : "");
+    while (atomic_load(&g_pw_done) < n && !atomic_load(&g_pw_cancel)) { pw_draw(atomic_load(&g_pw_done), n); usleep(50000); }
+    long rss1 = 0; if ((st = fopen("/proc/self/status", "re"))) { while (fgets(ln, sizeof ln, st)) sscanf(ln, "VmRSS: %ld", &rss1); fclose(st); }
+    LOG("vk: shader pre-warm %s after %.1f s: %u of %u done, %llu pipelines made (%llu compiled, the rest from the driver's cache), %llu already there; %.0f ms loading shaders; RSS %+.0f MB%s",
+        atomic_load(&g_pw_cancel) ? "skipped by a tap" : "finished", (now_ns() - t0) / 1e9, atomic_load(&g_pw_done), n, (unsigned long long)atomic_load(&g_pre_made),
+        (unsigned long long)atomic_load(&g_pre_slow), (unsigned long long)atomic_load(&g_pre_had), atomic_load(&g_sh_ns) / 1e6, (rss1 - rss0) / 1024.0,
+        atomic_load(&g_pw_cancel) ? "; the rest is made in the background" : "");
+    return 1;
+}
 // ADPF (Android's performance hints): a hint session for the thread that records and presents (the game's render thread, which calls this), told each frame's work against a
 // 16.7 ms target, and on Android 15 and later the GPU's part too, so the governors raise the CPU and GPU clocks for a game that keeps missing its target. GameTurbo showed the GPU
 // 12% busy at 30 fps: the GPU clock stayed low, and our GPU timestamps grew with it. Looked up at run time (API 33 / 35 functions)
@@ -2837,8 +2915,11 @@ int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { (void)vsyncs; (void)ti
 uint32_t mtl_present_qos(void) { return 0; }
 void mtl_ub_present(double iv_ms) { (void)iv_ms; }
 void mtl_set_depth_zero(int on) {   // vertex shaders loaded from here on follow it (spv_gl_depth); the games set it once at device init, before their first shader
-    if (on != g_depth_zero && g_nsh) LOG("[RED] vk: depth mode changed to %s after %d shaders were loaded: those keep the other convention", on ? "near = 0" : "GL (near = -w)", g_nsh);
+    if (on != g_depth_zero && g_nsh && g_prewarm_depth < 0) LOG("[RED] vk: depth mode changed to %s after %d shaders were loaded: those keep the other convention", on ? "near = 0" : "GL (near = -w)", g_nsh);
+    if (g_prewarm_depth >= 0 && on != g_prewarm_depth && g_nsh) { static int n; if (on && !n++) LOG("[RED] vk: the game's depth mode (near = 0) differs from the one the shader pre-warm used"); }
     g_depth_zero = on;
+    // kept for the next run's pre-warm (dm_vk_prewarm loads shaders before the game sets it): the last mode the game set
+    const char *d = getenv("DM_VK_DIR"); if (d) { char p[1100]; snprintf(p, sizeof p, "%s/../vk_depth_mode", d); FILE *f = fopen(p, "w"); if (f) { fprintf(f, "%d\n", on); fclose(f); } }
 }
 void mtl_set_origin_lower_left(int on) { g_origin_ll = on; }
 void mtl_set_frame(uint64_t f) { (void)f; }

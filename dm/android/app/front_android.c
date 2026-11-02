@@ -246,9 +246,17 @@ static void input_release_all(void) {
     pads_push_();
     pthread_mutex_unlock(&g_pmu);
 }
+// The shader pre-warm (src_vk/nvn_vk.c dm_vk_prewarm): the pipelines earlier runs made are made again before the game starts, behind a progress screen; a tap skips it
+int dm_vk_prewarm(void) __attribute__((weak)); void dm_vk_prewarm_cancel(void) __attribute__((weak));
+static _Atomic int g_prewarming;
 static int on_input(AInputEvent *e) {
     int32_t type = AInputEvent_getType(e), src = AInputEvent_getSource(e);
     static int seen; if (!seen++) LOG("front end: first input event (type %d, source %#x)", type, src);
+    if (atomic_load(&g_prewarming)) {   // the shader pre-warm screen: the player's tap (or a controller button) skips it
+        if ((type == AINPUT_EVENT_TYPE_MOTION && (AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK) == AMOTION_EVENT_ACTION_DOWN) || (type == AINPUT_EVENT_TYPE_KEY && AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN))
+            if (dm_vk_prewarm_cancel) dm_vk_prewarm_cancel();
+        return 1;
+    }
     int s = dev_slot(AInputEvent_getDeviceId(e));
     if (type == AINPUT_EVENT_TYPE_MOTION && (src & AINPUT_SOURCE_TOUCHSCREEN) == AINPUT_SOURCE_TOUCHSCREEN) { touch_event(e); return 1; }
     // A controller's events carry the gamepad, joystick or D-pad source bits; a keyboard's only the keyboard's (its arrows send the same DPAD keycodes as a pad)
@@ -342,9 +350,11 @@ static void boot_files_check(const char *ext) {
     FILE *m = fopen("/proc/self/mountinfo", "r"); char ln[1024];   // which file system serves the external folder
     if (m) { while (fgets(ln, sizeof ln, m)) if (strstr(ln, "/storage/emulated") || strstr(ln, "Android/data")) fprintf(stderr, "boot: mount %s", ln); fclose(m); }
 }
+// The shader pre-warm (src_vk/nvn_vk.c dm_vk_prewarm): the pipelines earlier runs made are made again before the game starts, behind a progress screen; a tap skips it
 static void *boot_thread(void *a) {
     (void)a;
     static char alt[65536]; stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt}; sigaltstack(&ss, 0);
+    if (dm_vk_prewarm) { atomic_store(&g_prewarming, 1); dm_vk_prewarm(); atomic_store(&g_prewarming, 0); }
     int rc = dm_main(2, g_argv);
     fprintf(stderr, "boot: dm_main returned %d\n", rc);
     game_failed(); ANativeActivity_finish(g_act);   // the host is over: back to the menu, which shows the log's error
