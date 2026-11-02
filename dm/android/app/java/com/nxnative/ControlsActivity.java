@@ -67,22 +67,57 @@ public class ControlsActivity extends Activity {
     private TextView folderLabel; private Button toShared, toLocal; private Runnable afterTree;
     private final List<String> itemNames = new ArrayList<>(); private final List<Boolean> itemShared = new ArrayList<>();   // the profile list: this game's, then the shared folder's
 
+    private LinearLayout profSec, selSec, moreRow; private TextView hint; private boolean panelOpen; private View coach;
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         loadSprites();
+        ed.slop = android.view.ViewConfiguration.get(this).getScaledTouchSlop();
         FrameLayout root = new FrameLayout(this);
         editor = new EditorView(this);
         root.addView(editor, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        // The panel: a bar docked at the top edge, closed at start (the controls stay free to touch), opened and closed only by ☰; its title drags it elsewhere.
-        // A plain view beside the canvas (no dialog, no popup window): touches outside it are the canvas's
-        panel = buildPanel(); panel.setVisibility(View.GONE);
+        // The bar: one compact row docked at the top -- the profile tools while the panel is open (☰ Panel), the selected group's options while one is selected --,
+        // out of the way while a group is dragged or resized. A plain view beside the canvas (no dialog, no popup window): only its own rectangle takes touches
+        panel = buildPanel();
         FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        pl.topMargin = dp(60); root.addView(panel, pl);
-        android.widget.ImageButton toggle = new android.widget.ImageButton(this); toggle.setImageBitmap(UiIcons.icon(this, "menu")); toggle.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
-        toggle.setContentDescription("Panel"); toggle.setBackgroundColor(Color.argb(170, 20, 22, 28)); int tp = dp(8); toggle.setPadding(tp, tp, tp, tp); toggle.setAlpha(0.9f);
-        toggle.setOnClickListener(v -> panel.setVisibility(panel.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
-        root.addView(toggle, new FrameLayout.LayoutParams(dp(52), dp(52), Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+        root.addView(panel, pl);
+        Button toggle = button("menu", "Panel", v -> { panelOpen = !panelOpen; updateBar(); }); toggle.setBackgroundColor(Color.argb(190, 20, 22, 28)); toggle.setTextColor(Color.WHITE);
+        root.addView(toggle, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.START));
+        // A hint at the bottom while nothing is selected; it takes no touches (they pass to the canvas under it)
+        hint = label("Sentuh tombol untuk memilih  ·  geser untuk memindahkan  ·  ☰ Panel: profil & opsi"); hint.setTextSize(14); hint.setBackgroundColor(Color.argb(150, 20, 22, 28));
+        hint.setPadding(dp(12), dp(6), dp(12), dp(6)); hint.setClickable(false); hint.setFocusable(false);
+        FrameLayout.LayoutParams hl = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL); hl.bottomMargin = dp(56);
+        root.addView(hint, hl);
+        if (!getSharedPreferences("controls", MODE_PRIVATE).getBoolean("coach_off", false)) { coach = buildCoach(); root.addView(coach, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)); }
         setContentView(root);
+        updateBar();
+    }
+    // The first-open guide: how the editor works, over everything until a tap; "Jangan tampilkan lagi" keeps it away
+    private View buildCoach() {
+        FrameLayout f = new FrameLayout(this); f.setBackgroundColor(Color.argb(200, 8, 10, 14)); f.setClickable(true);
+        LinearLayout card = new LinearLayout(this); card.setOrientation(LinearLayout.VERTICAL); card.setPadding(dp(24), dp(18), dp(24), dp(18)); card.setBackgroundColor(Color.argb(240, 28, 32, 42));
+        TextView t = label("Cara mengatur tombol"); t.setTextSize(22); card.addView(t);
+        String[][] rows = {{"gesture_tap", "Sentuh tombol untuk memilih"}, {"gesture_drag", "Geser untuk memindahkan"}, {"handle", "Tarik ● kuning atau cubit untuk mengubah ukuran"},
+                           {"gesture_pinch", "Cubit dengan dua jari juga mengubah ukuran"}, {"menu", "☰ Panel: buka / tutup profil dan opsi (tutup dulu bila menghalangi)"}};
+        for (String[] r : rows) { TextView v = iconLabel(r[0], r[1]); v.setTextSize(17); v.setPadding(0, dp(10), 0, 0); android.graphics.drawable.Drawable d = UiIcons.drawable(this, r[0], 34);
+                                  if (d != null) v.setCompoundDrawables(d, null, null, null); v.setCompoundDrawablePadding(dp(14)); card.addView(v); }
+        CheckBox never = new CheckBox(this); never.setText("Jangan tampilkan lagi"); never.setTextColor(Color.WHITE); never.setPadding(0, dp(8), 0, 0); card.addView(never);
+        Button ok = button("save", "Mengerti", v -> closeCoach(never.isChecked())); card.addView(ok);
+        f.setOnClickListener(v -> closeCoach(never.isChecked()));
+        f.addView(card, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        return f;
+    }
+    private void closeCoach(boolean never) {
+        if (never) getSharedPreferences("controls", MODE_PRIVATE).edit().putBoolean("coach_off", true).apply();
+        if (coach != null) { ((ViewGroup) coach.getParent()).removeView(coach); coach = null; }
+    }
+    // The bar's state from the panel switch, the selection and dragging (ControlsEditing.barShown)
+    private void updateBar() {
+        if (panel == null) return;
+        panel.setVisibility(ControlsEditing.barShown(panelOpen, ed.sel, ed.dragging) ? View.VISIBLE : View.GONE);
+        profSec.setVisibility(panelOpen ? View.VISIBLE : View.GONE);
+        selSec.setVisibility(ed.sel >= 0 ? View.VISIBLE : View.GONE);
+        if (!panelOpen) moreRow.setVisibility(View.GONE);
+        hint.setVisibility(ed.sel < 0 && !ed.dragging ? View.VISIBLE : View.GONE);
     }
     @Override protected void onResume() { super.onResume(); immersive(); }
     @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) immersive(); }   // (hidden at resume alone, the status bar stayed on a Xiaomi Pad 8)
@@ -139,10 +174,11 @@ public class ControlsActivity extends Activity {
     private TextView iconLabel(String icon, String t) { TextView v = label(t); android.graphics.drawable.Drawable d = UiIcons.drawable(this, icon, 22); if (d != null) { v.setCompoundDrawables(d, null, null, null); v.setCompoundDrawablePadding(dp(6)); } return v; }
     private TextView label(String t) { TextView v = new TextView(this); v.setText(t); v.setTextColor(Color.WHITE); v.setTextSize(15); v.setPadding(12, 0, 12, 0); return v; }
     private LinearLayout buildPanel() {
-        LinearLayout p = new LinearLayout(this); p.setOrientation(LinearLayout.VERTICAL); p.setPadding(dp(10), dp(4), dp(10), dp(6)); p.setBackgroundColor(Color.argb(225, 20, 22, 28));
-        p.setFocusable(false); p.setClickable(true);   // touches on the panel stay on it; it never takes focus from the canvas
-        TextView title = label("Atur tombol  ⠿"); title.setTextSize(18); p.addView(title);
-        title.setOnTouchListener(new View.OnTouchListener() {   // drag the panel by its title
+        LinearLayout p = new LinearLayout(this); p.setOrientation(LinearLayout.VERTICAL); p.setPadding(dp(6), dp(2), dp(6), dp(2)); p.setBackgroundColor(Color.argb(225, 20, 22, 28));
+        p.setFocusable(false); p.setClickable(true);   // touches inside the bar stay on it; it never takes focus from the canvas
+        LinearLayout bar = new LinearLayout(this); bar.setGravity(Gravity.CENTER_VERTICAL);
+        TextView grip = label("⠿"); grip.setTextSize(20); bar.addView(grip);
+        grip.setOnTouchListener(new View.OnTouchListener() {   // drag the bar elsewhere by its grip
             float tx, ty;
             @Override public boolean onTouch(View v, MotionEvent e) {
                 if (e.getActionMasked() == MotionEvent.ACTION_DOWN) { tx = e.getRawX() - panel.getTranslationX(); ty = e.getRawY() - panel.getTranslationY(); return true; }
@@ -150,9 +186,8 @@ public class ControlsActivity extends Activity {
                 return true;
             }
         });
-        LinearLayout r1 = new LinearLayout(this); r1.setGravity(Gravity.CENTER_VERTICAL);
-        r1.addView(label("Profil"));
-        profiles = new Spinner(this); r1.addView(profiles);
+        profSec = new LinearLayout(this); profSec.setGravity(Gravity.CENTER_VERTICAL);
+        profiles = new Spinner(this); profSec.addView(profiles);
         profiles.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override public void onItemSelected(AdapterView<?> a, View v, int pos, long id) {   // the list also reports itself after a refill: only another profile counts
                 if (filling || pos >= itemNames.size()) return;
@@ -160,47 +195,48 @@ public class ControlsActivity extends Activity {
             }
             @Override public void onNothingSelected(AdapterView<?> a) {}
         });
-        r1.addView(button("profile_new", "Baru", v -> newProfile()));
-        r1.addView(button("delete", "Hapus", v -> deleteProfile()));
-        r1.addView(button("reset", "Default", v -> resetProfile()));
-        r1.addView(button("save", "Simpan & tutup", v -> { save(true); finish(); }));
-        p.addView(hscroll(r1));
-        LinearLayout rs = new LinearLayout(this); rs.setGravity(Gravity.CENTER_VERTICAL); shareRow = rs;
-        rs.addView(button("folder_shared", "Folder bersama", v -> pickTree(null)));
-        folderLabel = label(""); rs.addView(folderLabel);
-        toShared = button("copy_to_shared", "Salin ke bersama", v -> copyToShared()); rs.addView(toShared);
-        toLocal = button("copy_to_local", "Salin ke game ini", v -> copyToLocal()); rs.addView(toLocal);
-        rs.addView(button("import", "Impor", v -> importFile()));
-        rs.addView(button("export", "Ekspor", v -> exportFile()));
-        p.addView(hscroll(rs));
-        LinearLayout r2 = new LinearLayout(this); r2.setGravity(Gravity.CENTER_VERTICAL);
-        r2.addView(iconLabel("opacity", "Transparansi"));
-        opacity = new SeekBar(this); opacity.setMax(90);
-        opacity.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onProgressChanged(SeekBar s, int v, boolean user) { if (filling || !user) return; L().opacity = (10 + v) / 100f; editor.invalidate(); }
-            @Override public void onStartTrackingTouch(SeekBar s) {} @Override public void onStopTrackingTouch(SeekBar s) {}
-        });
-        r2.addView(opacity, new LinearLayout.LayoutParams(360, ViewGroup.LayoutParams.WRAP_CONTENT));
-        p.addView(r2);
-        LinearLayout r3 = new LinearLayout(this); r3.setGravity(Gravity.CENTER_VERTICAL);
-        selLabel = label(""); r3.addView(selLabel);
+        profSec.addView(button("profile_new", "Baru", v -> newProfile()));
+        profSec.addView(button("delete", "Hapus", v -> deleteProfile()));
+        profSec.addView(button("reset", "Default", v -> resetProfile()));
+        profSec.addView(button("folder_shared", "Lainnya", v -> moreRow.setVisibility(moreRow.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE)));
+        profSec.addView(button("save", "Simpan & tutup", v -> { save(true); finish(); }));
+        bar.addView(profSec);
+        selSec = new LinearLayout(this); selSec.setGravity(Gravity.CENTER_VERTICAL);
+        selLabel = label(""); selSec.addView(selLabel);
         hideGroup = new CheckBox(this); hideGroup.setText("Sembunyikan"); hideGroup.setTextColor(Color.WHITE);
         { android.graphics.drawable.Drawable d = UiIcons.drawable(this, "hidden", 22); if (d != null) { hideGroup.setCompoundDrawables(null, null, d, null); hideGroup.setCompoundDrawablePadding(dp(6)); } }
         hideGroup.setOnCheckedChangeListener((v, on) -> { if (filling || ed.sel < 0) return; L().hidden[ed.sel] = on; editor.invalidate(); });
-        r3.addView(hideGroup);
+        selSec.addView(hideGroup);
         fixedStick = new CheckBox(this); fixedStick.setText("Posisi tetap"); fixedStick.setTextColor(Color.WHITE);
         { android.graphics.drawable.Drawable d = UiIcons.drawable(this, "stick_fixed", 22); if (d != null) { fixedStick.setCompoundDrawables(null, null, d, null); fixedStick.setCompoundDrawablePadding(dp(6)); } }   // res_svg/ui/stick_fixed.svg
         fixedStick.setOnCheckedChangeListener((v, on) -> { if (filling || !ControlsLayout.isStick(ed.sel)) return; L().fixed[ed.sel - ControlsLayout.LS] = on; editor.invalidate(); });
-        r3.addView(fixedStick);
-        sizeLabel = label("Ukuran"); r3.addView(sizeLabel);
+        selSec.addView(fixedStick);
+        sizeLabel = label("Ukuran"); selSec.addView(sizeLabel);
         size = new SeekBar(this); size.setMax(270);   // scale 0.3 .. 3.0 of the default size
         size.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar sb, int v, boolean user) { if (filling || !user || ed.sel < 0) return; L().s[ed.sel] = (30 + v) / 100f; editor.invalidate(); }
             @Override public void onStartTrackingTouch(SeekBar sb) {} @Override public void onStopTrackingTouch(SeekBar sb) {}
         });
-        r3.addView(size, new LinearLayout.LayoutParams(dp(180), ViewGroup.LayoutParams.WRAP_CONTENT));
-        p.addView(hscroll(r3));
-        buttonsRow = new LinearLayout(this); buttonsRow.setGravity(Gravity.CENTER_VERTICAL); p.addView(buttonsRow);
+        selSec.addView(size, new LinearLayout.LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT));
+        buttonsRow = new LinearLayout(this); buttonsRow.setGravity(Gravity.CENTER_VERTICAL); selSec.addView(buttonsRow);
+        bar.addView(selSec);
+        p.addView(hscroll(bar));
+        // "Lainnya": the shared folder, copies, import / export, opacity -- a second row, closed unless asked for
+        moreRow = new LinearLayout(this); moreRow.setGravity(Gravity.CENTER_VERTICAL); moreRow.setVisibility(View.GONE); shareRow = moreRow;
+        moreRow.addView(button("folder_shared", "Folder bersama", v -> pickTree(null)));
+        folderLabel = label(""); moreRow.addView(folderLabel);
+        toShared = button("copy_to_shared", "Salin ke bersama", v -> copyToShared()); moreRow.addView(toShared);
+        toLocal = button("copy_to_local", "Salin ke game ini", v -> copyToLocal()); moreRow.addView(toLocal);
+        moreRow.addView(button("import", "Impor", v -> importFile()));
+        moreRow.addView(button("export", "Ekspor", v -> exportFile()));
+        moreRow.addView(iconLabel("opacity", "Transparansi"));
+        opacity = new SeekBar(this); opacity.setMax(90);
+        opacity.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar sb, int v, boolean user) { if (filling || !user) return; L().opacity = (10 + v) / 100f; editor.invalidate(); }
+            @Override public void onStartTrackingTouch(SeekBar sb) {} @Override public void onStopTrackingTouch(SeekBar sb) {}
+        });
+        moreRow.addView(opacity, new LinearLayout.LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT));
+        p.addView(hscroll(moreRow));
         return p;
     }
     private void fillPanel() {   // the panel from the layout and the selection
@@ -224,7 +260,7 @@ public class ControlsActivity extends Activity {
         if (store == null) return;
         filling = true;
         int g = ed.sel;
-        selLabel.setText(g < 0 ? "Sentuh sebuah grup untuk memilihnya" : ControlsLayout.GROUP_LABEL[g] + ":");
+        selLabel.setText(g < 0 ? "" : ControlsLayout.GROUP_LABEL[g] + ":");
         hideGroup.setVisibility(g < 0 ? View.GONE : View.VISIBLE); if (g >= 0) hideGroup.setChecked(L().hidden[g]);
         fixedStick.setVisibility(ControlsLayout.isStick(g) ? View.VISIBLE : View.GONE); if (ControlsLayout.isStick(g)) fixedStick.setChecked(L().fixed[g - ControlsLayout.LS]);
         size.setVisibility(g < 0 ? View.GONE : View.VISIBLE); sizeLabel.setVisibility(g < 0 ? View.GONE : View.VISIBLE); syncSize();
@@ -239,6 +275,7 @@ public class ControlsActivity extends Activity {
             }
         }
         filling = false;
+        updateBar();
         editor.invalidate();
     }
     private static String nice(String n) { switch (n) { case "UP": return "↑"; case "DOWN": return "↓"; case "LEFT": return "←"; case "RIGHT": return "→"; case "MINUS": return "−"; case "PLUS": return "+"; default: return n; } }
@@ -406,8 +443,10 @@ public class ControlsActivity extends Activity {
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN: if (ed.down(l, px, py, w, h, handleR())) fillSelection(); invalidate(); return true;
                 case MotionEvent.ACTION_POINTER_DOWN: if (e.getPointerCount() == 2) ed.secondFinger(l, px, py, span(e), w, h); return true;
-                case MotionEvent.ACTION_MOVE: if (ed.move(l, px, py, e.getPointerCount() >= 2 ? span(e) : 0, e.getPointerCount(), w, h)) { invalidate(); syncSize(); } return true;
-                case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL: ed.up(); return true;
+                case MotionEvent.ACTION_MOVE: { boolean was = ed.dragging;
+                    if (ed.move(l, px, py, e.getPointerCount() >= 2 ? span(e) : 0, e.getPointerCount(), w, h)) { invalidate(); syncSize(); }
+                    if (ed.dragging != was) updateBar(); return true; }   // the bar steps aside while a group is dragged or resized
+                case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL: { boolean was = ed.dragging; ed.up(); if (was) updateBar(); return true; }
                 case MotionEvent.ACTION_POINTER_UP: ed.secondUp(); return true;
             }
             return true;
