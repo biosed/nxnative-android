@@ -10069,10 +10069,16 @@ static void copy_b2t(const p_copy_b2t *c) {
     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb;
     size_t rows = (c->r.height + bh - 1) / bh, img = S.copy_img_stride ? (size_t)S.copy_img_stride : row * rows;   // per layer: SetCopyImageStride, else tightly packed
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
-    PD("C ser=%llu target %d %ux%ux%u format %#x lv%u sl%u region %d,%d,%d %dx%dx%d from %#llx row %zu image %zu", c->tex->serial, c->tex->d.target, c->tex->d.width, c->tex->d.height, c->tex->d.depth,
-       c->tex->d.format, level, layer0, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, (unsigned long long)c->src, row, img);
     void *mb; uint64_t mo;
-    if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(23, "buffer→texture copy source is in no memory pool"); return; }
+    int src_ok = mtl_addr(c->src, img * nz, &mb, &mo);
+    if (passdump()) {   // the source bytes as they are when the copy is replayed: their count, non-zero count and FNV-1a 64 (compared with the Vulkan host's DM_VK_COPYLOG)
+        uint64_t nb = img * nz, nzc = 0, h = 0xcbf29ce484222325ull;
+        if (src_ok) { const uint8_t *s = (const uint8_t *)((__bridge id<MTLBuffer>)mb).contents + mo; for (uint64_t i = 0; i < nb; i++) { nzc += s[i] != 0; h = (h ^ s[i]) * 0x100000001b3ull; } }
+        PD("C ser=%llu target %d %ux%ux%u format %#x lv%u sl%u region %d,%d,%d %dx%dx%d from %#llx row %zu image %zu bytes %llu nonzero %llu fnv %016llx%s", c->tex->serial, c->tex->d.target, c->tex->d.width, c->tex->d.height, c->tex->d.depth,
+           c->tex->d.format, level, layer0, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, (unsigned long long)c->src, row, img,
+           (unsigned long long)nb, (unsigned long long)nzc, (unsigned long long)h, src_ok ? "" : " (source in no pool)");
+    }
+    if (!src_ok) { RED_ONCE(23, "buffer→texture copy source is in no memory pool"); return; }
     // The copy's bytes belong in the texture's storage: written there now from the buffer's, unless the GPU writes the buffer (a copy, fill or update queued in this submission: pend_hits; a shader
     // or a texture→buffer copy of it: sbw_hits; one of a submission still running: gw_live) or a readback into the texture is pending (read back after the copy then)
     int rb = !is3d && tex_storage_dst(c->tex);
