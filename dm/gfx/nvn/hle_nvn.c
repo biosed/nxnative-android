@@ -1172,11 +1172,17 @@ static uint64_t thr_instr(void) { uint64_t c[2] = {0, 0}; thread_selfcounts(1, c
 // Supplementary readings for the submit path (on a real device Metal 4 instruction count is -18% while submit CPU time is +49%; need to tell apart kernel mode, execution efficiency, or frequency throttling):
 // this thread's cycle count (the second item of the same interface), kernel-mode CPU time (THREAD_BASIC_INFO), wall clock
 static void thr_counts(uint64_t *instr, uint64_t *cyc) { uint64_t c[2] = {0, 0}; thread_selfcounts(1, c, sizeof c); *instr = c[0]; *cyc = c[1]; }
+#ifdef __ANDROID__
+#include <sys/resource.h>
+// Android: from getrusage, not thread_info (compat.c reads /proc/self/task/<tid>/stat: an open, read and close twice a submission, 4% of the submit thread's time)
+static uint64_t thr_sys_ns(void) { struct rusage ru; if (getrusage(RUSAGE_THREAD, &ru)) return 0; return (uint64_t)ru.ru_stime.tv_sec * 1000000000ull + (uint64_t)ru.ru_stime.tv_usec * 1000ull; }
+#else
 static uint64_t thr_sys_ns(void) {
     thread_basic_info_data_t bi; mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT; mach_port_t me = mach_thread_self(); uint64_t r = 0;
     if (thread_info(me, THREAD_BASIC_INFO, (thread_info_t)&bi, &n) == KERN_SUCCESS) r = (uint64_t)bi.system_time.seconds * 1000000000ull + (uint64_t)bi.system_time.microseconds * 1000ull;
     mach_port_deallocate(mach_task_self(), me); return r;
 }
+#endif
 static _Atomic uint64_t g_cum_sub_cyc, g_cum_sub_sys_ns, g_cum_sub_wall_ns;
 static int frame_rec(void);
 static _Atomic uint64_t g_nvn_ns;   // Host time spent in submit / present this frame (replay encoding + present), used by the timing instrumentation

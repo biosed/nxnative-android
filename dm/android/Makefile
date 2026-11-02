@@ -42,6 +42,7 @@ gen/vpx/libvpx.a: $(VPX_OBJ)
 $(OUT)/obj/android/%.o: % | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+$(OUT)/obj/android/src_vk/nvn_vk.c.o: CFLAGS += -O2   # the Vulkan replay is the hot path of every frame (index scans, copies, descriptor resolution)
 $(OUT)/obj/host/main.c.o: CFLAGS += -Dmain=dm_main   # the app's front end calls it (app/front_android.c); the adb program's main is in cli/front_cli.c
 $(OUT)/obj/%.o: ../% | profile
 	@mkdir -p $(dir $@)

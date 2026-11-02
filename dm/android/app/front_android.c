@@ -9,13 +9,18 @@
 #include "dm_input.h"
 #include "front.h"
 #include <android/input.h>
+#include <android/log.h>
 #include <android/keycodes.h>
 #include <android/looper.h>
 #include <android/native_activity.h>
 #include <android/native_window.h>
 #include <jni.h>
+#include <malloc.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -278,10 +283,19 @@ static int input_cb(int fd, int events, void *data) {
 }
 
 // ---------- Back to the menu: a flag for the menu, then this process ends ----------
+// <files>/game_running is made when the host boots and removed when the player leaves (− and +, or the activity finished). A game process that dies any other way
+// (a FATAL boot error, a crash: the crash handler ends with _exit, which Android takes for a plain process death) leaves it behind, and Android then starts the activity
+// that was on top again in a new process at once -- the host failed again, a new process every 0.15 s. The new process finds the marker, does not boot, renames it to
+// <files>/game_failed and finishes: the menu (MenuActivity) shows the error from log.txt. The menu's Play removes both before it starts the game
 static char g_files[512];
+static int g_booted;
+static void marker_path(char *p, size_t n, const char *name) { snprintf(p, n, "%s/%s", g_files, name); }
+static void game_left(void) { char p[600]; marker_path(p, sizeof p, "game_running"); unlink(p); }   // the player left: not a failure
+static void game_failed(void) { char a[600], b[600]; marker_path(a, sizeof a, "game_running"); marker_path(b, sizeof b, "game_failed"); if (rename(a, b)) { int fd = open(b, O_WRONLY | O_CREAT, 0600); if (fd >= 0) close(fd); } }
 static void back_to_menu(void) {
     static _Atomic int once; if (atomic_exchange(&once, 1)) return;
     char p[600]; snprintf(p, sizeof p, "%s/show_menu", g_files); FILE *f = fopen(p, "w"); if (f) fclose(f);
+    game_left();
     LOG("front end: − and + held: back to the menu");
     ANativeActivity_finish(g_act);
     dm_host_shutdown("back to the menu");
@@ -308,11 +322,32 @@ static void boot_env(const char *files, const char *ext) {
     chdir(files);
     g_argv[0] = strdup("dmhost"); snprintf(p, sizeof p, "%s/dm", ext); g_argv[1] = strdup(p);
 }
+// The game files as this process sees them (its own view of Android/data: a bind mount of the lower file system or the FUSE one), so a file the host cannot open shows
+// why in the log: owner, group, mode, and the error of an open as the app
+static void boot_files_check(const char *ext) {
+    gid_t g[32]; int ng = getgroups(32, g); char gs[256] = ""; size_t o = 0;
+    for (int i = 0; i < ng && o < sizeof gs - 12; i++) o += snprintf(gs + o, sizeof gs - o, " %u", (unsigned)g[i]);
+    fprintf(stderr, "boot: files as uid %u gid %u groups%s\n", (unsigned)getuid(), (unsigned)getgid(), gs);
+    const char *rel[] = {"", "/dm", "/dm/main.fixups.tsv", "/dm/main.patched.bin", "/romfs", "/vk", "/font"}; int bad = 0;
+    for (size_t i = 0; i < sizeof rel / sizeof *rel; i++) {
+        char p[1024]; snprintf(p, sizeof p, "%s%s", ext, rel[i]); struct stat st;
+        if (stat(p, &st)) { fprintf(stderr, "boot: [RED] %s: stat: %s\n", p, strerror(errno)); bad = 1; continue; }
+        int fd = open(p, O_RDONLY | (S_ISDIR(st.st_mode) ? O_DIRECTORY : 0)), e = errno;
+        if (fd >= 0) close(fd); else bad = 1;
+        int n = -1; if (S_ISDIR(st.st_mode)) { DIR *d = opendir(p); if (d) { n = 0; while (readdir(d)) n++; closedir(d); } }
+        fprintf(stderr, "boot: %s%s: uid %u gid %u mode %o size %lld entries %d, open %s\n", fd < 0 ? "[RED] " : "", p, (unsigned)st.st_uid, (unsigned)st.st_gid,
+                (unsigned)(st.st_mode & 07777), (long long)st.st_size, n, fd >= 0 ? "ok" : strerror(e));
+    }
+    if (!bad) return;
+    FILE *m = fopen("/proc/self/mountinfo", "r"); char ln[1024];   // which file system serves the external folder
+    if (m) { while (fgets(ln, sizeof ln, m)) if (strstr(ln, "/storage/emulated") || strstr(ln, "Android/data")) fprintf(stderr, "boot: mount %s", ln); fclose(m); }
+}
 static void *boot_thread(void *a) {
     (void)a;
     static char alt[65536]; stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt}; sigaltstack(&ss, 0);
     int rc = dm_main(2, g_argv);
     fprintf(stderr, "boot: dm_main returned %d\n", rc);
+    game_failed(); ANativeActivity_finish(g_act);   // the host is over: back to the menu, which shows the log's error
     return NULL;
 }
 
@@ -366,15 +401,19 @@ static void game_service(ANativeActivity *a, const char *method, int arg) {
 static void on_start(ANativeActivity *a) { game_suspend(0); game_service(a, "setSuspended", 0); }
 static void on_stop(ANativeActivity *a) { game_suspend(1); game_service(a, "setSuspended", 1); }
 static void on_resume(ANativeActivity *a) { (void)a; }
+// Android is short of memory (other apps are being killed): free pages go back to the system now, and the graphics backend's rings shrink to their minimum (dm_vk_trim)
+void dm_vk_trim(void) __attribute__((weak));
+static void on_low_memory(ANativeActivity *a) { (void)a; LOG("front end: low memory: freeing what can be freed"); mallopt(M_PURGE, 0); if (dm_vk_trim) dm_vk_trim(); }
 static void on_pause(ANativeActivity *a) { (void)a; dm_focus_set(2); }   // still visible behind something (a dialog, a split screen): out of focus, running
 static void on_focus(ANativeActivity *a, int f) { if (f) immersive(a); else input_release_all(); dm_focus_set(f ? 1 : 2); }
 // Destroyed by the player leaving (− and + held, back_to_menu, finish) the game ends; destroyed by Android while the process stays (to reclaim memory, its activity
 // only), the game stays suspended and a new activity takes over its window (ANativeActivity_onCreate: the host runs once per process)
 static void on_destroy(ANativeActivity *a) {
+    if (!g_booted) return;   // an activity that did not boot (relaunched by Android after the game process died): nothing to end
     JNIEnv *env = a->env;
     jboolean fin = (*env)->CallBooleanMethod(env, a->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "isFinishing", "()Z"));
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); fin = 1; }
-    if (fin) dm_host_shutdown("activity destroyed");
+    if (fin) { game_left(); dm_host_shutdown("activity destroyed"); }
     else LOG("front end: the activity was destroyed by Android, not finished: the game stays suspended");
 }
 
@@ -385,13 +424,22 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     a->callbacks->onNativeWindowResized = on_window_resized;
     a->callbacks->onInputQueueCreated = on_input_created; a->callbacks->onInputQueueDestroyed = on_input_destroyed;
     a->callbacks->onResume = on_resume; a->callbacks->onPause = on_pause; a->callbacks->onWindowFocusChanged = on_focus; a->callbacks->onDestroy = on_destroy;
-    a->callbacks->onStart = on_start; a->callbacks->onStop = on_stop;
+    a->callbacks->onStart = on_start; a->callbacks->onStop = on_stop; a->callbacks->onLowMemory = on_low_memory;
     ANativeActivity_setWindowFlags(a, 0x80 /* KEEP_SCREEN_ON */ | 0x400 /* FULLSCREEN */, 0);
     immersive(a);
-    static int booted; if (booted++) return;   // the activity can be made again (rotation, a return): the host runs once per process
-    game_service(a, "start", 0);   // in the foreground now, as starting a foreground service requires
+    if (g_booted) return;   // the activity can be made again (rotation, a return): the host runs once per process
     snprintf(g_files, sizeof g_files, "%s", a->internalDataPath);
+    mallopt(M_DECAY_TIME, 1);   // freed memory (Unreal's heap runs on host malloc) goes back to the system after about a second instead of being kept
+    char mk[600]; marker_path(mk, sizeof mk, "game_running");
+    if (!access(mk, F_OK)) {   // the last game process died without the player leaving and Android started this activity again by itself: no boot, back to the menu
+        game_failed(); __android_log_print(ANDROID_LOG_WARN, "nxnative", "the game process died at its last run: not booting again, back to the menu");
+        ANativeActivity_finish(a); return;
+    }
+    g_booted = 1;
+    { int fd = open(mk, O_WRONLY | O_CREAT | O_TRUNC, 0600); if (fd >= 0) close(fd); }
+    game_service(a, "start", 0);   // in the foreground now, as starting a foreground service requires
     boot_env(a->internalDataPath, a->externalDataPath);
+    boot_files_check(a->externalDataPath);
     pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 16 << 20);
     pthread_t th; if (pthread_create(&th, &at, boot_thread, NULL)) die("front end: cannot start the host");
     pthread_detach(th);

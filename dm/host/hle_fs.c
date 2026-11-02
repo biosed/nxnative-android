@@ -130,9 +130,11 @@ static int dm_fs_test_fail(const char *pt) {
 static int in_txn_dir(const char *hp) { return save_txn_from_path(hp); }
 static int rm_tree(const char *p);
 // Reads and checks a RomFS image's header and index; NULL (and a red line) when it is not a complete image
+_Atomic uint64_t g_fs_dropped;   // bytes of large reads dropped from the page cache (the graphics memory stats line)
 static romfs_img *img_open(const char *path) {
     romfs_img *m = romfs_image_open(path);
-    if (m) LOG("fs RomFS image %s: %llu entries", path, (unsigned long long)m->n);
+    if (m) { struct stat st; uint64_t idx = 0; if (!fstat(m->fd, &st)) { uint64_t ioff; if (romfs_image_read(m->fd, &ioff, 8, 8)) idx = (uint64_t)st.st_size - ioff; }
+             LOG("fs RomFS image %s: %llu entries; read at mount: its header and index only (%.1f MB), files are read on demand", path, (unsigned long long)m->n, idx / 1048576.0); }
     else LOG("[RED] fs RomFS image %s is not a complete image (copied in part? errno=%d)", path, errno);
     return m;
 }
@@ -226,7 +228,7 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
         // A path that is neither is a stale or mistyped one (an old run command still naming the RomFS folder a rebuild replaced with RomFS.img): stop here, not at the game's
         // first failed read (Echoes of Wisdom crashed 0.3 s after nnMain, GitHub issue #615). Add-on content and system data check their own paths before they mount
         if (stat(dir, &ist) || !(S_ISDIR(ist.st_mode) || S_ISREG(ist.st_mode)))
-            die("the game files %s (%s:) are missing: neither a folder nor a RomFS image (the rom mount is DM_ROMFS, or $DM_ROOT/romfs when DM_ROMFS is unset)", dir, name);
+            die("the game files %s (%s:) are missing (%s): neither a folder nor a RomFS image (the rom mount is DM_ROMFS, or $DM_ROOT/romfs when DM_ROMFS is unset)", dir, name, strerror(errno));
         if (S_ISREG(ist.st_mode) && !(g_mnt[g_nmnt].img = img_open(dir))) die("the game files %s are not a complete RomFS image", dir);
     }
     g_nmnt++;
@@ -777,6 +779,11 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
         got += r;
     }
     *out = got;
+#ifdef __ANDROID__
+    // A large read (the game's packages, movies) is not kept in the page cache once it is in guest memory: across a session the cache of a 9 GB RomFS grew to gigabytes, and
+    // with it the memory pressure under which HyperOS closed other apps (FINAL FANTASY RESONANCE). Small reads (headers, indexes, read again and again) stay cached
+    if (got >= (256u << 10)) { (void)posix_fadvise(fd, (off_t)(base + off), (off_t)got, POSIX_FADV_DONTNEED); atomic_fetch_add(&g_fs_dropped, got); }
+#endif
     if (g_fslog) { pthread_mutex_lock(&g_fslog_lock);
         static int hash_on = -1; if (hash_on < 0) hash_on = getenv("DM_FSLOG_HASH") != NULL;   // DM_FSLOG_HASH=1: append a column with the FNV-1a 64 of the content read (to compare whether the bytes read from two resource packs match)
         uint64_t fh = 0xcbf29ce484222325ull; if (hash_on) for (size_t i = 0; i < got; i++) fh = (fh ^ ((uint8_t *)buf)[i]) * 0x100000001b3ull;

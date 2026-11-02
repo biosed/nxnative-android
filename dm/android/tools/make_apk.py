@@ -31,8 +31,9 @@ MANIFEST = '''<?xml version="1.0" encoding="utf-8"?>
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
-  <application android:label="{label}" android:icon="@mipmap/icon" android:hasCode="true" android:extractNativeLibs="true" android:isGame="true"
+  <application android:label="{label}" android:icon="@mipmap/icon" android:hasCode="true" android:extractNativeLibs="true" android:isGame="true" android:allowNativeHeapPointerTagging="false"
                android:appCategory="game" android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+    <profileable android:shell="true"/>
     <activity android:name="com.nxnative.MenuActivity" android:exported="true" android:screenOrientation="sensorLandscape"
               android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode|screenLayout|smallestScreenSize">
       <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
@@ -146,6 +147,9 @@ def deploy(a):
             run('adb', 'push', src[d], f'{tmp}/{d}', stdout=subprocess.DEVNULL)
             run('adb', 'shell', f'rm -rf {ext}/{d} && cp -r {tmp}/{d} {ext}/{d} && rm -rf {tmp}/{d}')
         run('adb', 'shell', f'rm -rf {tmp}')
+    # Files the shell writes into Android/data/<package> are the shell's (group ext_data_rw, modes 2770 / 660); the game process, the app's own user and not in that group,
+    # gets EACCES on them (FINAL FANTASY RESONANCE on a Xiaomi Pad 8, Android 16). Readable by others: the app's own files/ folder (2770, the app's) keeps other apps out
+    run('adb', 'shell', f'chmod -R o+rX ' + ' '.join(f'{ext}/{d}' for d in ('romfs', 'dm', 'vk', 'font')))
     print(f'game files in {ext}')
 
 ap = argparse.ArgumentParser()
