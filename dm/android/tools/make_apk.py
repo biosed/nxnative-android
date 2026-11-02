@@ -11,7 +11,7 @@
 # Tools: Homebrew's android-commandlinetools (build-tools 34, platform 33) and openjdk@21; the key is <NSP folder>/../android-debug.keystore (made once, kept so updates install over)
 import argparse, glob, hashlib, os, re, shutil, struct, subprocess, sys, tempfile, zipfile
 HERE = os.path.dirname(os.path.abspath(__file__)); ANDROID = os.path.dirname(HERE)
-sys.path.insert(0, HERE); import controls_atlas   # the on-screen controls' sprite atlas, rasterized from app/res_svg into the APK's assets/controls (never into git)
+sys.path.insert(0, HERE); import controls_atlas   # the app's graphics, rasterized from the SVG masters in app/res_svg into the APK's assets (never into git)
 SDK = os.environ.get('ANDROID_SDK', '/opt/homebrew/share/android-commandlinetools')
 def _sdk_dir(kind, want):   # the wanted build-tools / platform, else the newest one the SDK has (Android Studio's SDK may hold only newer ones)
     p = os.path.join(SDK, kind, want)
@@ -75,8 +75,8 @@ def build(a):
         z.write(lib, 'lib/arm64-v8a/libdmhost.so')
         z.write(boot, 'lib/arm64-v8a/libdmboot.so')
         if a.cheats: z.write(a.cheats, 'assets/cheats.txt')
-        png, txt = controls_atlas.build(os.path.join(w, 'controls'))
-        z.write(png, 'assets/controls/atlas.png', zipfile.ZIP_STORED); z.write(txt, 'assets/controls/atlas.txt')   # stored: the PNG is compressed already
+        for name, f in controls_atlas.build_all(os.path.join(w, 'gfx')).items():   # every graphic, rasterized from the SVG masters (app/res_svg); PNGs stored, compressed already
+            z.write(f, name, zipfile.ZIP_STORED if name.endswith('.png') else zipfile.ZIP_DEFLATED)
         if a.save:
             for root, _, fs in os.walk(a.save):
                 for f in sorted(fs):

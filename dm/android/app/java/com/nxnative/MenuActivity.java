@@ -308,6 +308,7 @@ public class MenuActivity extends Activity {
         skip.setChecked(prefs.getBoolean("skip", false)); col.addView(skip);
         Button controls = new Button(this); controls.setText("Atur tombol (on-screen controls)"); controls.setTextSize(16); controls.setAllCaps(false);   // ControlsActivity: the layout editor
         controls.setOnClickListener(v -> startActivity(new Intent(this, ControlsActivity.class)));
+        { android.graphics.drawable.Drawable d = UiIcons.drawable(this, "gear", 24); if (d != null) { controls.setCompoundDrawables(d, null, null, null); controls.setCompoundDrawablePadding(12); } }   // res_svg/ui/gear.svg
         LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT); cl.topMargin = 20;
         col.addView(controls, cl);
         Button play = playButton = new Button(this); play.setText("Play (START)"); play.setTextSize(20);

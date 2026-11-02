@@ -1,4 +1,5 @@
-// "Atur tombol": the on-screen controls' layout editor, opened from the launcher's menu. The controls are drawn over a plain background from the same sprite atlas the
+// "Atur tombol": the on-screen controls' layout editor (every graphic in it -- the controls, the icons, the handle, the background -- is rasterized from the SVG masters
+// in app/res_svg at APK build time: UiIcons), opened from the launcher's menu. The controls are drawn over a plain background from the same sprite atlas the
 // game draws them from (assets/controls), where the game puts them (ControlsLayout's geometry). Touch a group to select it (A B X Y, D-pad, L + ZL, R + ZR, − +,
 // either stick), drag it to move it, and drag the round handle at its corner or pinch with two fingers to resize it. A floating stick is edited as its zone (where a
 // finger that comes down starts it), a fixed one as its base. The panel (☰ shows and hides it, so what is under it can be reached too): the profile (choose, new,
@@ -68,9 +69,10 @@ public class ControlsActivity extends Activity {
         panel = buildPanel();
         FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
         root.addView(panel, pl);
-        Button toggle = new Button(this); toggle.setText("☰"); toggle.setTextSize(18); toggle.setAlpha(0.85f);
+        android.widget.ImageButton toggle = new android.widget.ImageButton(this); toggle.setImageBitmap(UiIcons.icon(this, "menu")); toggle.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+        toggle.setContentDescription("Panel"); toggle.setBackgroundColor(Color.argb(170, 20, 22, 28)); int tp = dp(8); toggle.setPadding(tp, tp, tp, tp); toggle.setAlpha(0.9f);
         toggle.setOnClickListener(v -> panel.setVisibility(panel.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
-        root.addView(toggle, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL));
+        root.addView(toggle, new FrameLayout.LayoutParams(dp(52), dp(52), Gravity.TOP | Gravity.CENTER_HORIZONTAL));
         setContentView(root);
     }
     @Override protected void onResume() {
@@ -80,16 +82,7 @@ public class ControlsActivity extends Activity {
     }
     @Override protected void onPause() { super.onPause(); save(false); }
 
-    private void loadSprites() {   // the atlas and its cell names (dm/android/tools/controls_atlas.py)
-        try (InputStream in = getAssets().open("controls/atlas.png"); BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open("controls/atlas.txt"), StandardCharsets.UTF_8))) {
-            Bitmap atlas = BitmapFactory.decodeStream(in); int cell = 0, cols = 0; String l;
-            while ((l = r.readLine()) != null) {
-                String[] f = l.trim().split("\\s+"); if (f.length < 2 || f[0].startsWith("#")) continue;
-                if (f[0].equals("cell")) { cell = Integer.parseInt(f[1]); cols = Integer.parseInt(f[2]); continue; }
-                int i = Integer.parseInt(f[1]); if (cell > 0) sprites.put(f[0], Bitmap.createBitmap(atlas, (i % cols) * cell, (i / cols) * cell, cell, cell));
-            }
-        } catch (Exception e) { /* no atlas: the editor draws plain circles */ }
-    }
+    private void loadSprites() { sprites.putAll(UiIcons.atlas(this, "controls")); }   // the controls' atlas, as the game draws them (no atlas: plain circles)
 
     // ---- Files ----
     private File json() { return new File(getFilesDir(), "controls.json"); }
@@ -113,7 +106,13 @@ public class ControlsActivity extends Activity {
     private ControlsLayout L() { return store.current(); }
 
     // ---- The panel ----
-    private Button button(String t, View.OnClickListener l) { Button b = new Button(this); b.setText(t); b.setAllCaps(false); b.setOnClickListener(l); return b; }
+    private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+    private Button button(String icon, String t, View.OnClickListener l) {   // an icon from the SVG masters (UiIcons) beside the text
+        Button b = new Button(this); b.setText(t); b.setAllCaps(false); b.setOnClickListener(l);
+        android.graphics.drawable.Drawable d = UiIcons.drawable(this, icon, 22); if (d != null) { b.setCompoundDrawables(d, null, null, null); b.setCompoundDrawablePadding(dp(6)); }
+        return b;
+    }
+    private TextView iconLabel(String icon, String t) { TextView v = label(t); android.graphics.drawable.Drawable d = UiIcons.drawable(this, icon, 22); if (d != null) { v.setCompoundDrawables(d, null, null, null); v.setCompoundDrawablePadding(dp(6)); } return v; }
     private TextView label(String t) { TextView v = new TextView(this); v.setText(t); v.setTextColor(Color.WHITE); v.setTextSize(15); v.setPadding(12, 0, 12, 0); return v; }
     private LinearLayout buildPanel() {
         LinearLayout p = new LinearLayout(this); p.setOrientation(LinearLayout.VERTICAL); p.setPadding(24, 16, 24, 16); p.setBackgroundColor(Color.argb(215, 20, 22, 28));
@@ -125,13 +124,13 @@ public class ControlsActivity extends Activity {
             @Override public void onItemSelected(AdapterView<?> a, View v, int pos, long id) { if (filling) return; store.active = (String) a.getItemAtPosition(pos); editor.sel = -1; fillPanel(); }
             @Override public void onNothingSelected(AdapterView<?> a) {}
         });
-        r1.addView(button("Baru", v -> newProfile()));
-        r1.addView(button("Hapus", v -> deleteProfile()));
-        r1.addView(button("Default", v -> resetProfile()));
-        r1.addView(button("Simpan & tutup", v -> { save(true); finish(); }));
+        r1.addView(button("profile_new", "Baru", v -> newProfile()));
+        r1.addView(button("delete", "Hapus", v -> deleteProfile()));
+        r1.addView(button("reset", "Default", v -> resetProfile()));
+        r1.addView(button("save", "Simpan & tutup", v -> { save(true); finish(); }));
         p.addView(r1);
         LinearLayout r2 = new LinearLayout(this); r2.setGravity(Gravity.CENTER_VERTICAL);
-        r2.addView(label("Transparansi"));
+        r2.addView(iconLabel("opacity", "Transparansi"));
         opacity = new SeekBar(this); opacity.setMax(90);
         opacity.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar s, int v, boolean user) { if (filling || !user) return; L().opacity = (10 + v) / 100f; editor.invalidate(); }
@@ -142,6 +141,7 @@ public class ControlsActivity extends Activity {
         LinearLayout r3 = new LinearLayout(this); r3.setGravity(Gravity.CENTER_VERTICAL);
         selLabel = label(""); r3.addView(selLabel);
         hideGroup = new CheckBox(this); hideGroup.setText("Sembunyikan"); hideGroup.setTextColor(Color.WHITE);
+        { android.graphics.drawable.Drawable d = UiIcons.drawable(this, "hidden", 22); if (d != null) { hideGroup.setCompoundDrawables(null, null, d, null); hideGroup.setCompoundDrawablePadding(dp(6)); } }
         hideGroup.setOnCheckedChangeListener((v, on) -> { if (filling || editor.sel < 0) return; L().hidden[editor.sel] = on; editor.invalidate(); });
         r3.addView(hideGroup);
         fixedStick = new CheckBox(this); fixedStick.setText("Posisi tetap"); fixedStick.setTextColor(Color.WHITE);
@@ -164,7 +164,7 @@ public class ControlsActivity extends Activity {
         fixedStick.setVisibility(ControlsLayout.isStick(g) ? View.VISIBLE : View.GONE); if (ControlsLayout.isStick(g)) fixedStick.setChecked(L().fixed[g - ControlsLayout.LS]);
         buttonsRow.removeAllViews();
         if (g >= 0 && !ControlsLayout.isStick(g)) {
-            buttonsRow.addView(label("Tampilkan:"));
+            buttonsRow.addView(iconLabel("visible", "Tampilkan:"));
             for (ControlsLayout.Btn btn : ControlsLayout.BUTTONS) {
                 if (btn.group != g) continue;
                 CheckBox c = new CheckBox(this); c.setText(nice(btn.name)); c.setTextColor(Color.WHITE); c.setChecked(!L().hiddenButtons.contains(btn.name));
@@ -210,8 +210,10 @@ public class ControlsActivity extends Activity {
             pCross.setColor(Color.rgb(255, 90, 90)); pCross.setStrokeWidth(7); pCross.setStrokeCap(Paint.Cap.ROUND);
             pHandle.setColor(Color.rgb(255, 214, 64));
         }
+        private Bitmap bg;
         @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
-            pBg.setShader(new LinearGradient(0, 0, 0, h, Color.rgb(44, 52, 66), Color.rgb(18, 20, 26), Shader.TileMode.CLAMP));
+            if (bg == null) bg = UiIcons.background(ControlsActivity.this, "editor_bg");   // res_svg/bg/editor_bg.svg
+            pBg.setColor(Color.rgb(24, 27, 34));
             if (store == null) load(w, h);
         }
         private RectF rf(float[] b) { return new RectF(b[0], b[1], b[0] + b[2], b[1] + b[3]); }
@@ -220,9 +222,13 @@ public class ControlsActivity extends Activity {
             if (bm != null) c.drawBitmap(bm, null, rf(box), pSpr);
             else { Paint p = new Paint(Paint.ANTI_ALIAS_FLAG); p.setColor(Color.argb(Math.round(255 * alpha), 90, 96, 108)); c.drawOval(rf(box), p); }
         }
-        private void cross(Canvas c, float[] b) { c.drawLine(b[0] + b[2] * 0.2f, b[1] + b[3] * 0.2f, b[0] + b[2] * 0.8f, b[1] + b[3] * 0.8f, pCross); c.drawLine(b[0] + b[2] * 0.8f, b[1] + b[3] * 0.2f, b[0] + b[2] * 0.2f, b[1] + b[3] * 0.8f, pCross); }
+        private void cross(Canvas c, float[] b) {   // a hidden control: the hidden mark (res_svg/ui/hidden_mark.svg) over its middle
+            Bitmap m = UiIcons.icon(ControlsActivity.this, "hidden_mark"); float s = Math.min(b[2], b[3]) * 0.55f, cx = b[0] + b[2] / 2, cy = b[1] + b[3] / 2;
+            if (m != null) { pSpr.setAlpha(255); c.drawBitmap(m, null, new RectF(cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2), pSpr); }
+            else { c.drawLine(b[0] + b[2] * 0.2f, b[1] + b[3] * 0.2f, b[0] + b[2] * 0.8f, b[1] + b[3] * 0.8f, pCross); c.drawLine(b[0] + b[2] * 0.8f, b[1] + b[3] * 0.2f, b[0] + b[2] * 0.2f, b[1] + b[3] * 0.8f, pCross); }
+        }
         @Override protected void onDraw(Canvas c) {
-            float w = getWidth(), h = getHeight(); c.drawRect(0, 0, w, h, pBg);
+            float w = getWidth(), h = getHeight(); if (bg != null) c.drawBitmap(bg, null, new RectF(0, 0, w, h), pSpr); else c.drawRect(0, 0, w, h, pBg);
             if (store == null) return;
             ControlsLayout l = L(); float a = l.opacity;
             for (int k = 0; k < 2; k++) {   // the sticks: a floating one's zone, its base shown in the middle; a fixed one's base
@@ -236,9 +242,11 @@ public class ControlsActivity extends Activity {
                 ControlsLayout.Btn b = ControlsLayout.BUTTONS[i]; boolean off = l.hidden[b.group] || l.hiddenButtons.contains(b.name); float[] box = l.buttonBox(i, w, h);
                 sprite(c, b.sprite, box, a * (off ? 0.2f : 1)); if (off) cross(c, box);
             }
-            if (sel >= 0) { float[] gb = l.groupBox(sel, w, h); RectF r = rf(gb); r.inset(-10, -10); c.drawRect(r, pSel); c.drawCircle(r.right, r.bottom, handleR(), pHandle); }
+            if (sel >= 0) { float[] gb = l.groupBox(sel, w, h); RectF r = rf(gb); r.inset(-10, -10); c.drawRect(r, pSel);
+                            Bitmap hb = UiIcons.icon(ControlsActivity.this, "handle"); float hr = handleR();   // res_svg/ui/handle.svg
+                            if (hb != null) { pSpr.setAlpha(255); c.drawBitmap(hb, null, new RectF(r.right - hr, r.bottom - hr, r.right + hr, r.bottom + hr), pSpr); } else c.drawCircle(r.right, r.bottom, hr, pHandle); }
         }
-        private float handleR() { return getHeight() * 0.025f; }
+        private float handleR() { return getHeight() * 0.032f; }
         private int hit(float px, float py) {   // the group under the finger: buttons first, then fixed sticks, then zones
             ControlsLayout l = L(); float w = getWidth(), h = getHeight();
             for (int g = 0; g < ControlsLayout.LS; g++) { float[] b = l.groupBox(g, w, h); if (px >= b[0] && px <= b[0] + b[2] && py >= b[1] && py <= b[1] + b[3]) return g; }
