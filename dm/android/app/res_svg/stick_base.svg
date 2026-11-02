@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- on-screen stick base: dark translucent well, light rim, four direction marks; original artwork -->
+  <defs>
+    <radialGradient id="sb_fill" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#1b1d22" stop-opacity="0.35"/><stop offset="1" stop-color="#1b1d22" stop-opacity="0.75"/></radialGradient>
+  </defs>
+  <circle cx="128" cy="128" r="120" fill="url(#sb_fill)" stroke="#ffffff" stroke-opacity="0.55" stroke-width="6"/>
+  <circle cx="128" cy="128" r="84" fill="none" stroke="#ffffff" stroke-opacity="0.18" stroke-width="4"/>
+  <g fill="#ffffff" fill-opacity="0.6">
+    <path d="M128 18 L140 36 L116 36 Z"/><path d="M128 238 L140 220 L116 220 Z"/><path d="M18 128 L36 116 L36 140 Z"/><path d="M238 128 L220 116 L220 140 Z"/>
+  </g>
+</svg>

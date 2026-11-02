@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- on-screen D-pad up: neutral grey rounded key, white arrow; original artwork -->
+  <defs>
+    <linearGradient id="dup_fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6a6f7a"/><stop offset="1" stop-color="#2f333b"/></linearGradient>
+  </defs>
+  <rect x="24" y="32" width="208" height="208" rx="46" fill="#000000" fill-opacity="0.35"/>
+  <rect x="24" y="22" width="208" height="208" rx="46" fill="url(#dup_fill)" stroke="#15171b" stroke-width="7"/>
+  <path d="M60 44 H196" fill="none" stroke="#ffffff" stroke-opacity="0.3" stroke-width="8" stroke-linecap="round"/>
+  <path d="M128 78 L174 156 L82 156 Z" fill="#ffffff" stroke="#ffffff" stroke-width="10" stroke-linejoin="round"/>
+</svg>
