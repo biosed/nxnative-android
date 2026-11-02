@@ -155,6 +155,7 @@ DM_NVN_SHDUMP	diagnostic	`=<dir>` saves programs missing from the shader map as 
 DM_NVN_SHMAP	path	The shader map (`shader_map.tsv`); `c1_full.tsv` and `pso_manifest.tsv` are taken from the same folder. Default: the game profile's folder on the Mac; the iOS app sets it
 DM_NVN_SHOT	diagnostic	`=<frame>[,<frame>…]:<path>` saves the swapchain texture as an image at those frames (`%d` in the path = frame number)
 DM_NVN_SHOT_OUT	diagnostic	`=<W>x<H>` makes `DM_NVN_SHOT` capture the picture as the present pass upscales it to that size, the crop included, instead of the raw swapchain texture
+DM_NVN_SKIP_DRAW	diagnostic	`=<fragment key>#<n>[,<n>…]` drops the n-th draws (from 1) of that fragment shader in each frame, or `=<fragment key>%<count>[,<count>…]` the draws with that vertex / index count, to tell a shader's draws apart on screen; with `DM_CTL` `env` it takes effect at once, as `DM_NVN_SKIP_FS` does; the picture is wrong
 DM_NVN_SKIP_FS	diagnostic	`=<fragment key>[,…]` (up to 16) drops all draws of those fragment shaders, to measure their GPU cost or bisect a wrong draw; the picture is wrong
 DM_NVN_SKIP_SMALL	diagnostic	`=<width>` drops all draws whose target width is at most that, to measure the cost of tiny render passes; the picture is wrong
 DM_NVN_SLICE_MERGE	switch	`0` keeps passes into other layers of one array or cube texture level apart (on by default: they run as one layered pass)

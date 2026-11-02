@@ -67,6 +67,11 @@ public class ControlsEditingTest {
         check(ControlsEditing.toCanvas(bar, false, 1600, 50), "a touch where a hidden bar would be is the canvas's");
         float[] aB = centre(m.buttonBox(0, W, H));
         check(ControlsEditing.toCanvas(bar, true, aB[0], aB[1]), "A, below the bar, is reachable with the bar open");
+        // The double-tap stick click: on by default, also for a file written before the key existed; carried in the JSON and in the game's lines
+        check(ControlsLayout.defaults(W, H).stickDoubleTap, "double tap on a stick = L3 / R3: on by default");
+        check(ControlsLayout.Store.parse("{\"active\":\"A\",\"profiles\":[{\"name\":\"A\",\"opacity\":0.5}]}", W, H).current().stickDoubleTap, "an older file without the key: on");
+        ControlsLayout off = ControlsLayout.defaults(W, H); off.stickDoubleTap = false;
+        check(!ControlsLayout.fromJson(off.toJson()).stickDoubleTap && off.toNative().contains("stickclick 0\n"), "switched off: kept through the JSON, and the game's lines say stickclick 0");
         System.out.println(fails == 0 ? "all passed" : fails + " failed"); System.exit(fails == 0 ? 0 : 1);
     }
 }
