@@ -754,7 +754,12 @@ static uint64_t g_evicted, g_remade;   // textures evicted / made again from the
 static int tex_remake(vtex *v, const tex_t *t);
 static uint64_t g_pkg_up, g_pkg_reup;   // textures uploaded from their storage when made / again after the game wrote it (the packaged textures line, mtl_pkg_stats)
 static uint64_t g_bvgen;   // the submission's number (bview, the linear texture hashes)
+static uint64_t g_tex_dead, g_treg_dead;   // lookups of a texture object that is no longer one (tex_get) / registrations of one (mtl_reg_tex)
 static vtex *tex_get(const tex_t *t, int for_rt) {
+    // A texture object that is no longer one -- finalized, its memory reused for other data -- is never made into an image (as nvn_mtl.m tex_mtl_ checks the magic): FINAL
+    // FANTASY RESONANCE registers texture objects whose memory holds half-float constants by then (serial 0x3c003c003c003c00), and their slots and image bindings stay bound.
+    // An unknown format used to stop them by chance; a plausible one would have made an image of garbage size from a garbage storage pointer
+    if (!t || t->magic != MAGIC('T', 'E', 'X', 0)) { if (t) g_tex_dead++; return NULL; }
     pthread_mutex_lock(&g_rmu); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
     if (v && v->lcpu && !v->gpu && !for_rt && v->lhash_gen != g_bvgen) {   // a CPU-written linear texture (Unreal's Slate font atlas, a glyph cache): the GPU reads it in place on the Switch
         v->lhash_gen = g_bvgen; uint64_t h = mem_hash(t->mem, t->L.size);
@@ -980,7 +985,10 @@ void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
     pthread_mutex_lock(&g_rmu);
     if (id >= g_ntreg) { int n = id + 1024; g_treg = realloc(g_treg, n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
     g_treg[id].t = *t; g_treg[id].ok = 1; g_treg[id].has_v = v != NULL; if (v) g_treg[id].v = *v;
+    int dead = t->magic != MAGIC('T', 'E', 'X', 0); if (dead) g_treg_dead++;   // kept as the game registered it; tex_get never makes an image of it (the slot reads the black stand-in, as on the Metal host)
     pthread_mutex_unlock(&g_rmu);
+    if (dead) { static int n; if (n++ < 4) { const uint64_t *q = (const uint64_t *)t; LOG("vk: texture ID %d registered with an object that is not a texture (finalized or reused memory; starts %016llx %016llx): its slot reads black, as on the Metal host",
+                                                                                    id, (unsigned long long)q[0], (unsigned long long)q[1]); } }
 }
 void mtl_reg_samp(int id, const samp_par *p) {
     if (id < 0) return;
@@ -2982,8 +2990,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0) { uint64_t live = 0, held = 0; int nb = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) { nb++; held += g_blk[i].size; live += g_blk[i].live; } pthread_mutex_unlock(&g_blkmu);
                         LOG("vk: image memory: %d blocks of 64 MB (%.0f MB, %llu live images in them), big images %.0f MB now; rings %.0f MB extra", nb, held / 1048576.0, (unsigned long long)live, atomic_load(&g_big_bytes) / 1048576.0, atomic_load(&g_extra_ring_bytes) / 1048576.0); }
     if (n % 600 == 0 && g_fb_copies) LOG("vk: same-pass feedback snapshots so far: %llu", (unsigned long long)g_fb_copies);
-    if (n % 600 == 0) LOG("vk: texture slots read as black so far: no handle %llu, handle not registered %llu, texture not created %llu, no view %llu", (unsigned long long)g_tex_miss[0],
-                          (unsigned long long)g_tex_miss[1], (unsigned long long)g_tex_miss[2], (unsigned long long)g_tex_miss[3]);
+    if (n % 600 == 0) LOG("vk: texture slots read as black so far: no handle %llu, handle not registered %llu, texture not created %llu, no view %llu; lookups of a dead texture object %llu (registrations of one %llu)", (unsigned long long)g_tex_miss[0],
+                          (unsigned long long)g_tex_miss[1], (unsigned long long)g_tex_miss[2], (unsigned long long)g_tex_miss[3], (unsigned long long)g_tex_dead, (unsigned long long)g_treg_dead);
     if (n % 600 == 0) { extern uint64_t g_nsub_stat; static uint64_t ls;
         LOG("vk: recording per frame over the last 600: draws %.2f ms (descriptor sets %.2f ms, %.0f%% reused), dispatches %.2f ms, texture uploads %.2f ms (%.1f MB), vkQueueSubmit %.2f ms; %.1f submissions a frame;"
             " GPU-written data of a running submission used in place %llu times, copied %llu times, waited for %llu times (%.2f ms a frame; indirect draws %llu, partial ranges %llu, misfits in-submission %llu); copies from GPU-written bytes: into textures %llu, buffers %llu; dispatch write-backs %.1f KB of %.1f KB looked at",
