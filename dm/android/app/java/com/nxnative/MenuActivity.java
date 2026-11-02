@@ -65,6 +65,7 @@ public class MenuActivity extends Activity {
     @Override protected void onResume() {
         super.onResume();
         playKeyDown = false;
+        SharedLayouts.refreshActive(this);   // a shared on-screen controls profile: the game takes what the shared folder holds now
         if (launched && new File(getFilesDir(), "show_menu").delete()) launched = false;   // back from the game with − and +
         if (showFailure()) launched = false;
     }
