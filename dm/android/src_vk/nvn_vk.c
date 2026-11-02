@@ -3476,7 +3476,8 @@ void mtl_hib_readback(void) {   // inside a submission (hle_nvn.c dm_hib_nvn_pre
         if (dup || !t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER
             || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || t->has_layout) continue;
         pthread_mutex_lock(&g_rmu); vtex *v = tex_find(t->serial); int cpu = cpu_written(t->serial); pthread_mutex_unlock(&g_rmu);
-        if (!v || !v->img || v->evicted || cpu || v->f.dec || v->f.depth || !(v->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || (v->uploaded && !v->gpu && !v->copied && !(v->gpu_lv & ~v->mir_lv))) continue;   // copied levels whose bytes reached the storage too (mir_lv) need nothing   // not made, uploaded from its storage, or not its storage's format
+        if (!v || v->dead || !v->img || v->evicted || cpu ||   // released: kept findable until freed (mtl_tex_release), its storage may be another's now
+            v->f.dec || v->f.depth || !(v->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || (v->uploaded && !v->gpu && !v->copied && !(v->gpu_lv & ~v->mir_lv))) continue;   // copied levels whose bytes reached the storage too (mir_lv) need nothing   // not made, uploaded from its storage, or not its storage's format
         int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); if (!bpb) continue;
         for (unsigned lv = 0; lv < v->levels && lv < 16; lv++) {
             uint32_t w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1, dz = t->d.target == NVN_TEXTURE_TARGET_3D ? (v->d >> lv ? v->d >> lv : 1) : 1;
