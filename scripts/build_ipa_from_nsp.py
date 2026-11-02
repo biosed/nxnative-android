@@ -1305,6 +1305,21 @@ def decode_ue_shaders(repo, dirs, pkg_ver, patched, work, env, logs, g):
     PROG.end(f'{total:,} shaders in {hms(time.time() - t0)}')
 
 
+def engine_pso_list(py, repo, d, patched, work, env, logs, g):
+    """An Unreal game's bundled pipeline cache (Content/PipelineCaches/<platform>/*.upipelinecache in its paks) as a prewarm list beside the shader map, pso_engine.tsv
+    (dm/gfx/tools/ue_psocache.py; the host reads it after pso_manifest.tsv, the packers copy it). Made again when its inputs change; a game without one gets none. Never stops the build"""
+    dst = g.table('pso_engine.tsv'); key = work / 'shader/pso_engine.key'
+    k = fingerprint(('files', [repo / 'dm/gfx/tools/ue_psocache.py', g.table('shader_map.tsv')]), ('stat', d / 'ue_shaders'), str(rfs.source(d)))
+    if dst.is_file() and reused(key, k) is not None: return
+    log = logs / 'pso_engine.log'
+    try:
+        host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
+        run([py, repo / 'dm/gfx/tools/ue_psocache.py', rfs.source(d), d / 'ue_shaders', g.table('shader_map.tsv'), dst], log,
+            env=dict(env, DM_OODLE_HOST=str(host), DM_OODLE_MODULES=str(patched)))
+        key.write_text(f'{k}\n'); say(f'the game\'s pipeline list: ' + (log.read_text(errors='replace').strip().splitlines() or [''])[-1] + f' ({dst})')
+    except Exception as e: say(f'[RED] no prewarm list from the game\'s pipeline cache ({e}; {log})')
+
+
 CAPTURE_SECS = 120   # the longest run-time shader capture: Super Mario Galaxy creates its 3,089 Vulkan modules within 6 s of its first one (about 15 s after boot on an M4 Pro)
 # Run-time shader captures, by graphics API: the host's switch, the profile's table of the keys a capture must hold, and a capture file's name → its key (None: not a whole file;
 # the host writes each under a temporary name and renames it). Vulkan: <16 hex>.spv (dm/gfx/vk/hle_vk.m); GL: <16 hex>.vert / .frag (dm/gfx/gl/hle_gl.m sh_capture)
@@ -2445,6 +2460,7 @@ def main(args=None):
         derive_compute = (lambda: derive_shader_tables('the reader decoded additional compute kernels from this registered build')) if not own else None
         pkey = split_shaders(py, repo, [rfs.source(dirs[v]) for v in sv], [dirs[v] / 'ExeFS/main' for v in sv], sh / 'pkg', env, logs, g, own, oodle, dlc_roms, derive_dlc, derive_compute)
         ios = build_shaders(py, repo, sh, xlate, env, logs, g, pkey, mac)
+        if uedec: engine_pso_list(py, repo, dirs[pkg_ver], patched, work, env, logs, g)
     icon = next((d / 'icon.jpg' for d in (game, base) if (d / 'icon.jpg').exists()), None)   # the game icon nx_extract saved from the control data (English, icon.jpg); the packed version's first, then the base game's
     motion = MOTION if args.motion is None else args.motion
     env_file = build_env_file(work, args.env_file or DM_ENV_FILE, motion)

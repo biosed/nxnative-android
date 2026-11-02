@@ -7,6 +7,8 @@ __pycache__/
 # Made from each shader build's Mac outputs (c1_guard.py, cb_extent.py; the NSP script makes them), not committed
 dm/games/*/c1_full.tsv
 dm/games/*/cb_extent.tsv
+# The game's bundled Unreal pipeline cache as a prewarm list (ue_psocache.py; the NSP script makes it from the game files), not committed
+dm/games/*/pso_engine.tsv
 # coverage.py data and its JSON report (pyproject.toml, [tool.coverage.run])
 .coverage
 .coverage.*

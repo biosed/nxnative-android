@@ -6652,6 +6652,9 @@ static void warm_start(void) {
     } else {
         NSString *seed = [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_manifest.tsv"];
         NSMutableArray<NSString *> *all = [NSMutableArray arrayWithObject:seed];
+        // The game's own pipeline list (an Unreal game's bundled pipeline cache, dm/gfx/tools/ue_psocache.py), made by the build beside the shader map: after the seed list, before the user's
+        NSString *engine = [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_engine.tsv"];
+        if ([NSFileManager.defaultManager fileExistsAtPath:engine]) [all addObject:engine];
         NSString *user = pso_user_path();
         if (user && [NSFileManager.defaultManager fileExistsAtPath:user]) [all addObject:user];
         else MLOG("pipeline prewarm: this device's user list %s%s", user ? "does not exist yet: " : "has no path (neither DM_PSO_USER nor DM_SAVE is set)", user ? user.UTF8String : "");
