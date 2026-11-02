@@ -22,7 +22,10 @@ Status: brought up on the Mac: the first-boot brightness screen, the title, a ne
 
 - **Current:** 60 fps (30 on the Switch). The engine's Switch device profile sets `rhi.syncinterval=2` (`BaseSwitchDeviceProfiles.ini`), so the game asks for present interval 2; the game sets no `t.MaxFPS`. The host writes `rhi.SyncInterval` 1 into its console variable (`hle_fpslock.c`) whenever the game sets it back (at level loads), so the game asks for present interval 1 itself.
 - Unreal steps the game by the time that really passed: `DM_NVN_REGLUM` traces of the same keys from the same save at 30 and 60 fps (59.8 fps, frame time p99 18 ms on the Mac) match from the load through a 3 s walk (thumbnail difference ≤ 0.006).
+- **Current (2026-11-02, an M1 MacBook Pro, 8-core GPU, docked):** the field runs at 60 fps at the first view (the game's dynamic resolution renders it at 1040x584; GPU 11.2 ms) and about 55 near the event area (GPU 16 ms); a battle renders at 1384x780 and runs at about 52 fps (GPU p50 17.15 ms, frame p50 19.1 ms), GPU-bound on the game's own work: G-buffer 5.5 ms (158 draws, one pass since [A SetRenderTargets detour keeps the pass open](../../../docs/reference/rendering.md#a-setrendertargets-detour-keeps-the-pass-open)), six deferred-light passes 4.2 ms (each samples scene depth while depth is attached, so they stay separate), compute 1.4 ms. Handheld (`DM_OPMODE=0`, 1024x576) runs a battle at 60 (GPU 11.0 ms). Faster Macs reach 60 docked.
 - `DM_FPS_TARGET=30` (`Documents/env.txt` on the iPhone) keeps the game's 30 and saves power.
+
+- **Current: prewarm.** `pso_manifest.tsv` (1,725 lines) was recorded with prewarm off from an empty save over the brightness screen, the title, a new game (Normal), the opening, the first field and its two battles (every skill, the first Limit Burst), the second field and its boss (the first esper summon) and the cutscene after it. FFR's real vertex / pixel pairs are in no pair table (`shader_pairs.tsv` holds only the depth-only cover pairs), so a first draw has no hybrid stand-in: without a list the first Limit Burst stalled 1.0 s (17 pipelines) and a first spell 0.5-0.6 s; with the manifest a first Blizzaga's worst frame went from 493 to 132 ms. The game's own pipeline cache (`Content/PipelineCaches/Switch/FFRS_SF_GLSL_SWITCH.stable.upipelinecache`) holds 757 pipelines, all compute; the build turns it into `pso_engine.tsv` (`dm/gfx/tools/ue_psocache.py`).
 
 ## Memory
 
@@ -69,6 +72,8 @@ General host changes first needed here; each applies to every game:
 - **Rewriter:** text before the first FDE as one function (`func_of`) and long functions analysed in pieces (`pieces`): [Code before the first unwind entry is one function](../../../docs/reference/rewriter.md#code-before-the-first-unwind-entry-is-one-function), [Long functions analysed in pieces](../../../docs/reference/rewriter.md#long-functions-analysed-in-pieces).
 - **Bindless reads through a phi that also carries non-handle values** (the vendored translator's `TryTableHandle`): [Bindless reads whose handle phi also carries other values](../../../docs/reference/shaders.md#bindless-reads-whose-handle-phi-also-carries-other-values).
 - **Buffer texture views below the 16-byte alignment read through an aligned copy** (`tbuf_shadow`): [Buffer textures at offsets below 16 bytes](../../../docs/reference/rendering.md#buffer-textures-at-offsets-below-16-bytes).
+- **A SetRenderTargets detour keeps the open pass** (`rt_hold_scan`, `DM_NVN_RT_HOLD`): [A SetRenderTargets detour keeps the pass open](../../../docs/reference/rendering.md#a-setrendertargets-detour-keeps-the-pass-open).
+- **The game's bundled Unreal pipeline cache as a prewarm list** (`dm/gfx/tools/ue_psocache.py`, `pso_engine.tsv`).
 
 ## Open
 

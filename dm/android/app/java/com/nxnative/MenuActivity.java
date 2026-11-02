@@ -63,6 +63,7 @@ public class MenuActivity extends Activity {
         buildUi();
         if (needsUnpack()) { if (pendingData() != null) askData(null); else unpack(); return; }
         boolean forced = new File(getFilesDir(), "show_menu").delete();
+        if (showFailure()) return;   // the last game process died: the error, not the game again (with "do not show again" on, it would start straight back into it)
         if (((prefs.getBoolean("skip", false) && b == null) || resume) && !forced && gameFilesPresent()) play();
     }
     @Override protected void onPause() { super.onPause(); if (mode != null) save(); }   // choices are kept also when the menu is left without playing
@@ -71,6 +72,28 @@ public class MenuActivity extends Activity {
         playKeyDown = false;
         SharedLayouts.refreshActive(this);   // a shared on-screen controls profile: the game takes what the shared folder holds now
         if (launched && new File(getFilesDir(), "show_menu").delete()) launched = false;   // back from the game with − and +
+        if (showFailure()) launched = false;
+    }
+
+    // The game process died without the player leaving (app/front_android.c: <files>/game_failed, made by the activity Android started again after the death, which then
+    // does not boot): the reason from the game's log -- its FATAL line, else its CRASH line -- in red above the options. Play removes the flag
+    private boolean showFailure() {
+        if (!new File(getFilesDir(), "game_failed").exists() || unpacking) return false;
+        String fatal = null, crash = null, l; boolean graceful = false;
+        File log = new File(getExternalFilesDir(null), "log.txt");
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(new java.io.FileInputStream(log), StandardCharsets.UTF_8))) {
+            while ((l = r.readLine()) != null) {
+                int k = l.indexOf("FATAL "); if (k >= 0 && fatal == null) fatal = l.substring(k + 6).trim();
+                if (l.contains("CRASH sig=") && crash == null) crash = l.replace("[dm] ", "").trim();
+                if (l.contains("graceful exit")) graceful = true;
+            }
+        } catch (Exception e) { /* no log */ }
+        // the game ended itself, or Android closed it (its low-memory killer, in the background): no error to show, and "do not show again" starts the game as usual
+        if (fatal == null && crash == null) { new File(getFilesDir(), "game_failed").delete(); return false; }
+        String why = fatal != null ? fatal : crash != null ? crash : "its process ended without an error in its log (Android may have closed it while it was in the background)";
+        status.setVisibility(View.VISIBLE); status.setTextColor(Color.rgb(255, 120, 120));
+        status.setText("The game stopped: " + why + "\nThe full log is " + log + ". Fix the cause, then press Play to try again.");
+        return true;
     }
 
     // The bundled save goes in only when the app has none yet (never over progress made here); the cheat file always follows the APK
@@ -221,6 +244,17 @@ public class MenuActivity extends Activity {
             });
         }).start();
     }
+    // The first game file this app cannot read, or null: files pushed by adb into Android/data/<package> are the shell's (group ext_data_rw, 2770 / 660), and the app's
+    // user, outside that group, gets EACCES on them -- the game then stopped at its first file (FINAL FANTASY RESONANCE on Android 16). Folders are checked by listing or
+    // access (vk holds about 150,000 files: access only), and a file of dm/ is opened
+    private String unreadableGameFiles() {
+        File ext = getExternalFilesDir(null);
+        for (String d : new String[]{"dm", "vk", "font"}) { File f = new File(ext, d); if (f.exists() && !(f.canRead() && f.canExecute())) return d + "/"; }
+        File romfs = new File(ext, "romfs"); if (!romfs.canRead()) return "romfs";
+        String[] dm = new File(ext, "dm").list(); if (dm == null) return "dm/";
+        for (String n : dm) if (n.endsWith(".fixups.tsv")) { try (InputStream in = new java.io.FileInputStream(new File(ext, "dm/" + n))) { in.read(); } catch (Exception e) { return "dm/" + n; } break; }
+        return null;
+    }
     // DM_HIBERNATE=<n> with n > 0 in the settings (the menu's "Resume after the app is closed") or in the diagnostics file <external>/env.txt (which wins), as the game reads them (app/front_android.c boot_env)
     private boolean hibernationOn() {
         String v = null;
@@ -282,6 +316,11 @@ public class MenuActivity extends Activity {
         if (!gameFilesPresent() && !bundled()) {
             TextView w = text("The game files are missing in " + getExternalFilesDir(null) + " (romfs, dm, vk). Copy them from the computer and open the app again.", 15, true);
             w.setTextColor(Color.rgb(255, 120, 120)); col.addView(w);
+        } else if (gameFilesPresent() && unreadableGameFiles() != null) {
+            File ext = getExternalFilesDir(null);
+            TextView w = text("The game cannot read its files (" + unreadableGameFiles() + "): they were copied in by adb and belong to the shell, not to this app. On the computer run:\n"
+                              + "adb shell chmod -R o+rX " + ext + "/romfs " + ext + "/dm " + ext + "/vk " + ext + "/font", 15, true);
+            w.setTextColor(Color.rgb(255, 120, 120)); w.setTextIsSelectable(true); col.addView(w);
         }
         mode = spinner(col, "Console mode", new String[]{"Handheld (smoother)", "Docked (TV, higher resolution)"}, prefs.getInt("opmode", 0) == 1 ? 1 : 0);
         fps = spinner(col, "Frame rate", new String[]{"60 (default)", "30 (saves battery)"}, prefs.getInt("fps", 60) == 30 ? 1 : 0);
@@ -343,6 +382,8 @@ public class MenuActivity extends Activity {
     private void play() {
         if (unpacking) return;
         if (!new File(getFilesDir(), "settings.env").exists()) save();
+        new File(getFilesDir(), "game_failed").delete(); new File(getFilesDir(), "game_running").delete();   // the player starts it: not a restart after a death
+        if (status != null && !unpacking) status.setVisibility(View.GONE);
         launched = true;
         Intent i = new Intent(); i.setClassName(this, "android.app.NativeActivity");
         startActivity(i);

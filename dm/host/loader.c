@@ -227,7 +227,7 @@ static void force_check(void) {
 static void read_layout(module_t *m, const char *dir) {
     char path[1024]; snprintf(path, sizeof path, "%s/%s.fixups.tsv", dir, m->name);
     FILE *f = fopen(path, "r");
-    if (!f) die("open %s", path);
+    if (!f) die("open %s: %s", path, strerror(errno));
     static const char *kn[KEY_N] = {"K18", "KTLS", "KTLR", "KGATE"};
     char line[256], key[48]; unsigned long v; unsigned seen = 0;
     while (fgets(line, sizeof line, f)) {
@@ -620,7 +620,7 @@ static void map_image(module_t *m, const char *dir) {
 #else
 static uint8_t *slurp(const char *path, size_t *n) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) die("open %s", path);
+    if (fd < 0) die("open %s: %s", path, strerror(errno));
     struct stat st; fstat(fd, &st);
     uint8_t *p = malloc(st.st_size);
     if (read(fd, p, st.st_size) != st.st_size) die("read %s", path);

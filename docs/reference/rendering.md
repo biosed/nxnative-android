@@ -372,6 +372,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** lazy clears (`DM_NVN_LAZY_CLEAR`) fold clear-only passes into the pass that follows.
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md): the four clear-only passes before the G-buffer fold into its first pass (about 30 MB less loaded and stored a frame at 1600x900).
 
+### A SetRenderTargets detour keeps the pass open
+
+- **Symptom:** a G-buffer drawn in several Metal passes in one submission, each loading every attachment and storing it again (`gpuprof` lines with `loads 7` on the same targets); the pass dump's `N` lines say `SetRenderTargets ends the pass ... (first difference 1)`.
+- **Cause:** Unreal's parallel base pass starts each of its command lists by setting other render targets (another target count) and then its own again, with only state changes in between. The replay ended the open pass at the detour; the same-target continuation does not see through it (and needs `DM_NVN_TBDR=1`).
+- **Fix:** `rt_hold_scan` looks ahead in replay order (called lists, the caller, the submission's remaining handles) from a SetRenderTargets that would end the pass; when only state ops lie between it and a SetRenderTargets back to the open pass's targets, the detour is not replayed and the pass goes on as a continued one, so a draw that samples an attachment still ends it first. Anything that draws, clears, copies, dispatches, orders or signals ends the scan. `DM_NVN_RT_HOLD=0` turns it off.
+- **Found on:** [FINAL FANTASY RESONANCE](../../dm/games/0100606026F12000/README.md): the battle G-buffer (6 targets + depth at 1384x780) went from 3 passes to 1, GPU p50 17.7 → 17.1 ms on an M1.
+
 ### A channel mask that covers every channel is a whole clear
 
 - **Symptom:** `texture clear case not implemented … mask 0x1`.

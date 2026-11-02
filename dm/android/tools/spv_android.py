@@ -10,7 +10,7 @@
 #        spv_android.py --xlate <job.json> <dir>   (the wrapper dmsh_build.py calls; SPV_KEEP names the folder that keeps the SPIR-V)
 import collections, glob, json, os, shutil, struct, subprocess, sys, tempfile
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
-XLATE = os.path.join(REPO, 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate')
+XLATE = os.path.join(REPO, 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate'); HERE = os.path.dirname(os.path.abspath(__file__))
 
 if sys.argv[1] == '--xlate':
     if sys.argv[2:] == ['--source-sha']: os.execv(XLATE, [XLATE, '--source-sha'])   # dmsh_chain's check of the translator answers for the real one
@@ -98,8 +98,21 @@ for f in os.listdir(os.path.dirname(XLATE)):
     if f != 'dmsh_xlate': os.symlink(os.path.join(os.path.dirname(XLATE), f), os.path.join(xd, f))
 wrapper = os.path.join(xd, 'dmsh_xlate'); open(wrapper, 'w').write(f'#!/bin/sh\nexec "{sys.executable}" "{os.path.abspath(__file__)}" --xlate "$@"\n'); os.chmod(wrapper, 0o755)
 env = dict(os.environ, XLATE=wrapper, SPV_KEEP=keep, DMSH_CAS=os.path.join(w, 'cas'), DMSH_PREFILL=cache, WORK=w)
+# DMSH_SKIP_METAL=1: no Metal compile at all (the SPIR-V and the reflection come from the translation alone); for a game whose Mac libraries were built by another chain
+# (dmsh_build.py is left as it is, so the chain version stays: an xcrun first on PATH answers the compile and link with a placeholder library and passes every other call on)
+if os.environ.get('DMSH_SKIP_METAL') == '1':
+    env.pop('DMSH_PREFILL'); env['DM_ALLOW_OTHER_METAL'] = '1'
+    bd = os.path.join(w, 'bin'); os.makedirs(bd); xc = os.path.join(bd, 'xcrun')
+    open(xc, 'w').write('#!/bin/sh\n# metal -c / metallib with -o: a placeholder output\n'
+                        'case " $* " in *" metal -c "*|*" metallib "*) out=; prev=; for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done\n'
+                        '  if [ -n "$out" ]; then printf DMSH_SKIP_METAL > "$out"; exit 0; fi;; esac\nexec /usr/bin/xcrun "$@"\n')
+    os.chmod(xc, 0o755); env['PATH'] = bd + os.pathsep + env.get('PATH', '')
 # through own_compilers.py, as the NSP script builds them: DM_ALLOW_OTHER_METAL=1 accepts this Mac's Metal compiler when it is not the lock's (the SPIR-V does not depend on it)
-r = subprocess.run([sys.executable, os.path.join(REPO, 'dm/gfx/tools/own_compilers.py'), pkg, os.path.join(w, 'cache')], env=env, capture_output=True, text=True)
+# SPV_KEYS=<file>: only the keys it lists (one per line), a partial build (for timing or a rebuild of some shaders)
+only = [l.split()[0] for l in open(os.environ['SPV_KEYS']) if l.strip()] if os.environ.get('SPV_KEYS') else []
+# with DMSH_SKIP_METAL=1 through spv_boot.py: the placeholder compile in Python instead of the xcrun above (no process per library) and posix_spawn for the rest
+boot = [os.path.join(HERE, 'spv_boot.py')] if os.environ.get('DMSH_SKIP_METAL') == '1' else [os.path.join(REPO, 'dm/gfx/tools/own_compilers.py')]
+r = subprocess.run([sys.executable, *boot, pkg, os.path.join(w, 'cache'), *only], env=env, capture_output=True, text=True)
 print(r.stdout[-3000:], r.stderr[-2000:])
 b = glob.glob(os.path.join(w, 'cache', 'b-*'))
 if r.returncode or not b: sys.exit('[RED] the shader build failed')

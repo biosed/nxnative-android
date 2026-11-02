@@ -226,8 +226,28 @@ CFIndex CFDictionaryGetCount(CFMutableDictionaryRef d) { return (CFIndex)d->n; }
 void CFDictionaryGetKeysAndValues(CFMutableDictionaryRef d, const void **keys, const void **values) {   // in table order, as CoreFoundation gives no order either
     size_t n = 0; for (size_t i = 0; i < d->cap; i++) if (d->k[i] && d->k[i] != CF_TOMB) { if (keys) keys[n] = d->k[i]; if (values) values[n] = d->v[i]; n++; }
 }
+// The mapping that holds *addr, else the first one after it, from /proc/self/maps: its start, length and protection (VM_REGION_BASIC_INFO_64 only). Neighbouring mappings
+// with the same protection count as one region, as one malloc'd block may span two (hle_uemalloc.c dm_ue_heap_owns asks whether a thread stack lies inside one region).
+// The pointer's top byte is a tag on Android (heap pointer tagging), not part of the address
 kern_return_t vm_region_64(mach_port_t task, vm_address_t *addr, vm_size_t *size, int flavor, vm_region_info_t info, mach_msg_type_number_t *cnt, mach_port_t *obj) {
-    (void)task; (void)addr; (void)size; (void)flavor; (void)info; (void)cnt; (void)obj; return KERN_FAILURE;
+    (void)task; (void)flavor;
+    if (!addr || !size || !info || !cnt || *cnt < VM_REGION_BASIC_INFO_COUNT_64) return KERN_FAILURE;
+    uint64_t want = (uint64_t)*addr & 0x00FFFFFFFFFFFFFFull, lo = 0, hi = 0; int prot = -1;
+    FILE *f = fopen("/proc/self/maps", "re"); if (!f) return KERN_FAILURE;
+    char ln[512];
+    while (fgets(ln, sizeof ln, f)) {
+        unsigned long long s, e; char perm[8];
+        if (sscanf(ln, "%llx-%llx %7s", &s, &e, perm) != 3) continue;
+        int p = (perm[0] == 'r' ? VM_PROT_READ : 0) | (perm[1] == 'w' ? VM_PROT_WRITE : 0) | (perm[2] == 'x' ? VM_PROT_EXECUTE : 0);
+        if (prot >= 0) { if (s == hi && p == prot) { hi = e; continue; } break; }   // found: extend it over equal neighbours
+        if (e > want) { lo = s; hi = e; prot = p; }
+    }
+    fclose(f);
+    if (prot < 0) return KERN_FAILURE;
+    vm_region_basic_info_data_64_t *bi = (vm_region_basic_info_data_64_t *)info; memset(bi, 0, sizeof *bi);
+    bi->protection = prot; bi->max_protection = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
+    *addr = (vm_address_t)lo; *size = (vm_size_t)(hi - lo); *cnt = VM_REGION_BASIC_INFO_COUNT_64; if (obj) *obj = 0;
+    return KERN_SUCCESS;
 }
 kern_return_t thread_policy_get(mach_port_t th, thread_policy_flavor_t f, thread_policy_t p, mach_msg_type_number_t *cnt, boolean_t *def) { (void)th; (void)f; (void)p; (void)cnt; (void)def; return KERN_FAILURE; }
 // Darwin's per-thread performance counters (libsyscall): not available, the caller's zeros stay

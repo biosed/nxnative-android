@@ -115,6 +115,8 @@ void mtl_ubp_why(uint64_t w[5]) { memset(w, 0, 5 * sizeof *w); }
 void mtl_ubp_stats(uint64_t *a, uint64_t *b, uint64_t *c) { *a = *b = *c = 0; }
 void mtl_ubd_stats(uint64_t *a, uint64_t *b) { *a = *b = 0; }
 void mtl_res_stats(char *out, size_t n) { if (n) snprintf(out, n, "null graphics"); }
+int mtl_pd_on(void) { return 0; }
+void mtl_pd_note(const char *what, uint64_t v) { (void)what; (void)v; }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = *reuploads = 0; }
 uint64_t mtl_pkg_miss(void) { return 0; }
 void mtl_mem_stat(unsigned long long a, unsigned long long b) { (void)a; (void)b; }
