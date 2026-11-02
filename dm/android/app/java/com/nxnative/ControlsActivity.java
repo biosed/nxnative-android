@@ -59,6 +59,8 @@ public class ControlsActivity extends Activity {
     private CheckBox hideGroup, fixedStick;
     private boolean filling;   // the panel is being filled from the layout: its listeners change nothing
     private final Map<String, Bitmap> sprites = new HashMap<>();
+    private LinearLayout shareRow;
+    private static final int REQ_EXPORT = 11, REQ_IMPORT = 12;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -129,6 +131,10 @@ public class ControlsActivity extends Activity {
         r1.addView(button("reset", "Default", v -> resetProfile()));
         r1.addView(button("save", "Simpan & tutup", v -> { save(true); finish(); }));
         p.addView(r1);
+        LinearLayout rs = new LinearLayout(this); rs.setGravity(Gravity.CENTER_VERTICAL); shareRow = rs;
+        rs.addView(button("import", "Impor", v -> importFile()));
+        rs.addView(button("export", "Ekspor", v -> exportFile()));
+        p.addView(rs);
         LinearLayout r2 = new LinearLayout(this); r2.setGravity(Gravity.CENTER_VERTICAL);
         r2.addView(iconLabel("opacity", "Transparansi"));
         opacity = new SeekBar(this); opacity.setMax(90);
@@ -193,6 +199,44 @@ public class ControlsActivity extends Activity {
         new AlertDialog.Builder(this).setMessage("Kembalikan \"" + store.active + "\" ke tata letak default?")
             .setPositiveButton("Ya", (d, w) -> { ControlsLayout n = ControlsLayout.defaults(editor.getWidth(), editor.getHeight()); n.name = store.active; store.profiles.put(store.active, n); editor.sel = -1; fillPanel(); })
             .setNegativeButton("Batal", null).show();
+    }
+
+    // ---- Import / export: a profile as a file anywhere the system's file picker reaches (no storage permission) ----
+    private void exportFile() {
+        android.content.Intent i = new android.content.Intent(android.content.Intent.ACTION_CREATE_DOCUMENT).addCategory(android.content.Intent.CATEGORY_OPENABLE).setType("application/json")
+            .putExtra(android.content.Intent.EXTRA_TITLE, safeFileName(store.active) + ".json");
+        try { startActivityForResult(i, REQ_EXPORT); } catch (Exception e) { Toast.makeText(this, "Tidak ada pemilih berkas di perangkat ini", Toast.LENGTH_LONG).show(); }
+    }
+    private void importFile() {
+        android.content.Intent i = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT).addCategory(android.content.Intent.CATEGORY_OPENABLE).setType("*/*")
+            .putExtra(android.content.Intent.EXTRA_MIME_TYPES, new String[]{"application/json", "text/plain", "application/octet-stream"});
+        try { startActivityForResult(i, REQ_IMPORT); } catch (Exception e) { Toast.makeText(this, "Tidak ada pemilih berkas di perangkat ini", Toast.LENGTH_LONG).show(); }
+    }
+    static String safeFileName(String n) { String s = n.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_").trim(); return s.isEmpty() ? "layout" : s; }
+    static String readAll(InputStream in) throws java.io.IOException {   // (InputStream.readAllBytes is Android 13 and later)
+        java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream(); byte[] buf = new byte[8192]; int n; while ((n = in.read(buf)) > 0) o.write(buf, 0, n);
+        return new String(o.toByteArray(), StandardCharsets.UTF_8);
+    }
+    // Profiles read from a file go in as this game's own, renamed where a name is taken; the last one becomes the active one
+    private void addImported(String json, String from) {
+        List<ControlsLayout> got = ControlsLayout.readProfiles(json, editor.getWidth(), editor.getHeight());
+        if (got == null) { Toast.makeText(this, from + ": bukan tata letak tombol", Toast.LENGTH_LONG).show(); return; }
+        for (ControlsLayout l : got) { l.name = ControlsLayout.uniqueName(store.profiles.keySet(), l.name); store.profiles.put(l.name, l); store.active = l.name; }
+        int v = ControlsLayout.versionOf(json);
+        Toast.makeText(this, got.size() + " profil diimpor" + (v > ControlsLayout.VERSION ? " (berkas versi lebih baru: bagian yang tidak dikenal dilewati)" : ""), Toast.LENGTH_LONG).show();
+        editor.sel = -1; fillPanel(); save(false);
+    }
+    @Override protected void onActivityResult(int req, int res, android.content.Intent data) {
+        super.onActivityResult(req, res, data);
+        if (res != RESULT_OK || data == null || data.getData() == null || store == null) return;
+        android.net.Uri u = data.getData();
+        if (req == REQ_EXPORT) {
+            try (java.io.OutputStream o = getContentResolver().openOutputStream(u, "wt")) { o.write(L().toJson().getBytes(StandardCharsets.UTF_8)); Toast.makeText(this, "Profil \"" + store.active + "\" diekspor", Toast.LENGTH_SHORT).show(); }
+            catch (Exception e) { Toast.makeText(this, "Ekspor gagal: " + e.getMessage(), Toast.LENGTH_LONG).show(); }
+        } else if (req == REQ_IMPORT) {
+            try (InputStream in = getContentResolver().openInputStream(u)) { addImported(readAll(in), "Berkas"); }
+            catch (Exception e) { Toast.makeText(this, "Impor gagal: " + e.getMessage(), Toast.LENGTH_LONG).show(); }
+        }
     }
 
     // ---- The preview: the screen as the game has it, its controls where the game puts them ----

@@ -78,9 +78,13 @@ public final class ControlsLayout {
         return b.toString();
     }
 
-    // ---- JSON (the editor's file) ----
+    // ---- JSON: the editor's file, and a profile on its own (export, import, the shared folder) ----
+    // Versioned and the same for every game: groups by their ids (face, dpad, lzl, rzr, mp, ls, rs), positions as fractions of the screen, scales of the default
+    // sizes, the opacity, the hidden groups and buttons, the sticks' modes and zones. A reader takes what it knows and leaves the rest (unknown keys, groups or
+    // buttons; a newer version), and anything a file leaves out keeps its default, so a layout made in one game loads in another
+    public static final String FORMAT = "nxnative-controls"; public static final int VERSION = 1;
     public String toJson() {
-        StringBuilder b = new StringBuilder("{\"name\":").append(Json.str(name)).append(String.format(Locale.ROOT, ",\"opacity\":%.3f,\"groups\":{", opacity));
+        StringBuilder b = new StringBuilder("{\"format\":\"" + FORMAT + "\",\"version\":" + VERSION + ",\"name\":").append(Json.str(name)).append(String.format(Locale.ROOT, ",\"opacity\":%.3f,\"groups\":{", opacity));
         for (int g = 0; g < NG; g++) b.append(g > 0 ? "," : "").append('"').append(GROUPS[g]).append('"')
                 .append(String.format(Locale.ROOT, ":{\"x\":%.5f,\"y\":%.5f,\"s\":%.4f,\"hidden\":%b}", x[g], y[g], s[g], hidden[g]));
         b.append("},\"sticks\":{");
@@ -110,6 +114,21 @@ public final class ControlsLayout {
         return l;
     }
     static float clamp(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+    // The profiles in a file someone picked: one profile on its own, or a whole editor file (every profile in it); null when it holds no layout
+    @SuppressWarnings("unchecked")
+    public static List<ControlsLayout> readProfiles(String json, float w, float h) {
+        Object o; try { o = Json.parse(json); } catch (RuntimeException e) { return null; }
+        if (!(o instanceof Map)) return null;
+        Map<String, Object> m = (Map<String, Object>) o; List<ControlsLayout> out = new ArrayList<>();
+        if (m.get("profiles") instanceof List) { for (Object p : (List<Object>) m.get("profiles")) if (p instanceof Map) out.add(from(p, defaults(w, h))); }
+        else if (m.get("groups") instanceof Map || m.get("sticks") instanceof Map || FORMAT.equals(m.get("format"))) out.add(from(m, defaults(w, h)));
+        return out.isEmpty() ? null : out;
+    }
+    public static int versionOf(String json) { try { Object v = ((Map<?, ?>) Json.parse(json)).get("version"); return v instanceof Number ? ((Number) v).intValue() : 0; } catch (RuntimeException e) { return 0; } }
+    public static String uniqueName(java.util.Collection<String> taken, String base) {   // base, else "base (2)", "base (3)" ...
+        String n = base == null || base.trim().isEmpty() ? "Profil" : base.trim(); if (!taken.contains(n)) return n;
+        for (int k = 2; ; k++) if (!taken.contains(n + " (" + k + ")")) return n + " (" + k + ")";
+    }
 
     // ---- Profiles: the editor's file holds them all and names the active one ----
     public static final class Store {
