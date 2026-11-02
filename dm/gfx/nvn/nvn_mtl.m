@@ -6334,6 +6334,7 @@ static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
 }
 // DM_PSO_PREBUILD=tool: the prebuild alone (the host's other environment as for a run: DM_NVN_SHMAP, DM_MSL_DIR, DM_SAVE or DM_PSO_ARCHIVE), then exit; DM_PSO_PREBUILD_DEPTH=zero for
 // a game that sets the near=0 depth mode, DM_PSO_PREBUILD_THREADS=<n> workers (default: the performance cores less one). Returns 0 when not asked for
+static void prebuild_lists_tool(void);
 int mtl_pso_prebuild_tool(void) {
     const char *e = getenv("DM_PSO_PREBUILD"); if (!e || strcmp(e, "tool")) return 0;
     setenv("DM_PSO_MANIFEST", "off", 1);   // no prewarm (loading the shader map starts it)
@@ -6341,6 +6342,7 @@ int mtl_pso_prebuild_tool(void) {
     int threads = getenv("DM_PSO_PREBUILD_THREADS") ? atoi(getenv("DM_PSO_PREBUILD_THREADS")) : 0;
     if (threads <= 0) { int pc = 0; size_t sz = sizeof pc; if (sysctlbyname("hw.perflevel0.physicalcpu", &pc, &sz, NULL, 0) || pc <= 1) pc = 4; threads = pc - 1; }
     if (pso_prebuild(threads, 1, QOS_CLASS_USER_INITIATED) < 0) MLOG("pipeline prebuild: nothing to do (no archive, no shader_pairs.tsv, prebuilt.tsv says it is done, or the archive bundled with the app holds every base)");
+    @autoreleasepool { prebuild_lists_tool(); }
     return 1;
 }
 static int prepare_on(void);
@@ -6642,6 +6644,23 @@ static void prepare_prebuild(void) {
     int left = atomic_load(&g_pre_running) ? n - (int)g_pre_done : 0;   // a worker's last compile can still be under way
     if (left > 0) MLOG("pipeline prepare: every shader pair handed out after %.1f s; %d compiles still under way finish in the background", (bp_now() - t0) / 1e9, left);
     if (shown) front_progress(NULL, n, n);
+}
+// The prebuild tool's second part (DM_PSO_PREBUILD=tool): the bases of every line of the shipped lists (the profile's pso_manifest.tsv and the build's pso_engine.tsv beside the shader map,
+// not a device's pso_user.tsv) are compiled into the archive too, so a first start only loads them (FINAL FANTASY RESONANCE: 402 bases, 26 MB, under 5 s on an M1 with a warm Metal
+// cache; the first start's prepare step then took 0.25 s). DM_PSO_PREBUILD_LISTS=0 leaves them to the first start
+static void prebuild_lists_tool(void) {
+    const char *e = getenv("DM_PSO_PREBUILD_LISTS"); if (e && !strcmp(e, "0")) return;
+    if (!g_shmap_path) return;
+    NSString *dir = g_shmap_path.stringByDeletingLastPathComponent; NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSString *n in @[@"pso_manifest.tsv", @"pso_engine.tsv"]) { NSString *f = [dir stringByAppendingPathComponent:n]; if ([NSFileManager.defaultManager fileExistsAtPath:f]) [paths addObject:f]; }
+    if (!paths.count) return;
+    if (!g_warm_items) g_warm_items = [NSMutableArray array];
+    g_warm_dict = [NSMutableDictionary dictionary]; g_warm_t0 = bp_now(); atomic_store(&g_warm_running, 1);
+    long lines = 0; NSArray<WarmTask *> *tasks = warm_parse(paths, &lines);
+    if (lines) warm_prepare(tasks, lines);
+    atomic_store(&g_warm_running, 0);
+    arch_flush_wait();
+    MLOG("pipeline prebuild: the shipped lists' %ld lines built into the archive (%llu bases compiled, %llu already archived)", lines, (unsigned long long)g_pb_built, (unsigned long long)g_pb_archived);
 }
 static void warm_start(void) {
     if (g_warm_started++) return;
