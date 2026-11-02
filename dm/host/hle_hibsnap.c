@@ -363,7 +363,11 @@ int dm_hib_save(void) { return dm_hib_save_ex(0); }
 // snapshot, stale from then on, is removed
 int dm_hib_freeze(void) {
     if (g_frozen) { LOG("hibernate: already frozen"); return 0; }
-    g_freeze_req = 1; int rc = dm_hib_save_ex(0); g_freeze_req = 0;
+    // what stands in the way passes (a cutscene's movie decoder, a directory being listed): waited for, up to two minutes
+    for (int t = 0; t < 240; t++) { const char *no = policy(); if (!no) break; if (!t) LOG("hibernate: freeze waits: %s", no); usleep(500000); }
+    g_freeze_req = 1; int rc = dm_hib_save_ex(0);
+    for (int k = 0; rc && k < 3 && !g_frozen; k++) { usleep(1000000); rc = dm_hib_save_ex(0); }   // a thread that did not park in time, or a movie that started meanwhile: tried again
+    g_freeze_req = 0;
     if (rc) LOG("[RED] hibernate: not frozen: no snapshot (above); the game goes on");
     return rc;
 }
