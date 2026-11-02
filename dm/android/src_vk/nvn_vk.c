@@ -1435,7 +1435,9 @@ static void lin_writeback(vtex *v) {
     else post_add((post_t){3, (void *)v->mem, 0, 0, 0, 0, C->ringp + o, n});
     if (!g_lin_wb++) LOG("vk: linear render target %ux%u format %d goes back to its storage after each pass (serial %llu)", v->w, v->h, (int)v->f.f, (unsigned long long)v->serial);
 }
+static const uint8_t *g_rt_hold;   // see rt_hold_scan
 static void pass_end(void) {
+    g_rt_hold = NULL;
     if (!P.open) { int pend = P.clr_d || P.clr_s; for (int i = 0; i < 8; i++) pend |= P.clr_c[i]; if (pend) pass_begin(); }   // clears with no draw after them still happen
     if (P.open) {
         rp_end(C->cb); P.open = 0; gpu_mark(0, 1);
@@ -1451,6 +1453,7 @@ static void pass_end(void) {
     }
 }
 static int g_pass_open_(void) { return P.open; }
+static uint64_t g_npass, g_nheld, g_nsame;   // render passes begun / SetRenderTargets detours held / same-target SetRenderTargets kept (the GPU line)
 static int pass_begin(void) {
     if (P.open) return 1;
     if (!P.n && !P.dt) return 0;
@@ -1473,12 +1476,64 @@ static int pass_begin(void) {
     if (g_plog) { char b[512]; int o = 0; for (int i = 0; i < P.n; i++) o += snprintf(b + o, sizeof b - o, " c%d=%llu/%d%s", i, P.ct[i] ? (unsigned long long)P.ct[i]->serial : 0ull, (int)d.cf[i], d.cl[i] == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "");
                   if (P.dt) snprintf(b + o, sizeof b - o, " d=%llu/%d%s%s", (unsigned long long)P.dt->serial, (int)d.df, d.dl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "", d.sl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/sclr" : "");
                   LOG("plog: pass %ux%u%s", P.w, P.h, b); }
-    gpu_mark(0, 0);
+    gpu_mark(0, 0); g_npass++;
     VkFramebuffer fb = rp_begin(C->cb, &d); P.open = 1;
     if (fb) { if (C->nfb == C->cfb) { C->cfb = C->cfb ? 2 * C->cfb : 256; C->fb = realloc(C->fb, C->cfb * sizeof *C->fb); } C->fb[C->nfb++] = fb; }
     return 1;
 }
-static void set_rt(const p_set_rt *r) {
+// Render targets held across a detour (as nvn_mtl.m rt_hold_scan, DM_VK_RT_HOLD=0 turns it off): Unreal's parallel base pass begins each of its command lists by setting other
+// render targets (another count) and then the six G-buffer targets again, with only state changes in between (FINAL FANTASY RESONANCE's battle: the G-buffer drawn in three passes a
+// frame, each storing six 1384x780 targets and depth and loading them again, a full tile load and store on the Adreno). A SetRenderTargets that would end the open pass looks ahead in
+// replay order -- called lists, the callers after a list ends, the submission's remaining command handles: when only state changes lie between it and a SetRenderTargets back to the open
+// pass's targets, the open pass goes on and the SetRenderTargets in between are not replayed. Anything that draws, clears, copies, dispatches, writes, waits, orders or signals ends the
+// scan (the pass ends as before). The same targets set again keep the open pass too. A draw sampling an attachment of the pass is served as before (same-pass feedback, fb_prepare)
+static int rt_hold_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RT_HOLD"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_RT_HOLD=0: every SetRenderTargets ends the open pass"); } return v; }
+static int view_eq(uint8_t ha, const view_t *a, uint8_t hb, const view_t *b) { return ha == hb && (!ha || !memcmp(a, b, sizeof *a)); }
+static int rt_same(const p_set_rt *a, const p_set_rt *b) {   // the same attachments: count, textures (by serial) and views
+    if (!a || !b || a->n != b->n || !a->depth != !b->depth || (a->depth && a->depth->serial != b->depth->serial) || !view_eq(a->has_dview, &a->dview, b->has_dview, &b->dview)) return 0;
+    for (int k = 0; k < a->n && k < 8; k++) { if (!a->color[k] != !b->color[k] || (a->color[k] && a->color[k]->serial != b->color[k]->serial)) return 0;
+                                              if (a->color[k] && !view_eq(a->has_cview[k], &a->cview[k], b->has_cview[k], &b->cview[k])) return 0; }
+    return 1;
+}
+static const uint8_t *g_rs[32]; static int g_nrs;   // the replay's return points: after each CALL being replayed (mtl_exec_)
+static const uint64_t *g_rest; static int g_nrest;   // the submission's command handles after the one being replayed (mtl_exec_rest)
+static const uint8_t *rt_hold_scan(const uint8_t *p, const p_set_rt *open) {   // p: the op after the detour's SetRenderTargets; the SetRenderTargets back to `open`, or NULL
+    if (g_nrs > 32) return NULL;   // calls nested deeper than the return points kept
+    const uint8_t *stk[16]; int ns = 0, outer = g_nrs, ri = 0;
+    for (int guard = 0; guard < 4096; guard++) {
+        op_hdr h; memcpy(&h, p, sizeof h); const uint8_t *a = p + 8;
+        switch (h.op) {
+            case OP_END:
+                if (ns) { p = stk[--ns]; continue; }
+                if (outer > 0) { p = g_rs[--outer]; continue; }
+                if (ri < g_nrest && g_rest && g_rest[ri]) { p = (const uint8_t *)(uintptr_t)g_rest[ri++]; continue; }
+                return NULL;
+            case OP_JUMP: memcpy(&p, a, 8); continue;
+            case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); if (ns >= 16) return NULL; stk[ns++] = p + h.size; p = t; continue; }
+            case OP_SET_RT: if (rt_same(open, (const p_set_rt *)a)) return p; break;   // another detour target: still only state
+            case OP_BEGIN: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
+            case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_STENCIL: case OP_POLY_OFFSET: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_COPY_STRIDE:
+            case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BIND_TEX1: case OP_PRIM_RESTART: case OP_BIND_UBO_SMALL: case OP_BIND_VBUF1: case OP_ALPHA_REF: case OP_LINE_WIDTH: break;
+            default: return NULL;
+        }
+        p += h.size;
+    }
+    return NULL;
+}
+static void set_rt_(const p_set_rt *r);
+static void set_rt(const uint8_t *op, const p_set_rt *r, uint32_t size) {
+    if (g_rt_hold) {   // inside a held detour: its SetRenderTargets are not replayed; the one back to the open pass's targets ends it
+        if (op == g_rt_hold) { g_rt_hold = NULL; P.rt = r; }
+        return;
+    }
+    if (P.open && rt_hold_on() && P.rt) {
+        if (rt_same(P.rt, r)) { P.rt = r; g_nsame++; return; }   // the same targets again: the pass goes on
+        const uint8_t *back = rt_hold_scan(op + size, P.rt);
+        if (back) { static int logged; g_rt_hold = back; g_nheld++; if (!logged++) LOG("vk: render targets held across a SetRenderTargets detour (first case; DM_VK_RT_HOLD=0 turns it off)"); return; }
+    }
+    set_rt_(r);
+}
+static void set_rt_(const p_set_rt *r) {
     pass_end();
     memset(&P, 0, sizeof P);
     P.n = r->n > 8 ? 8 : r->n; P.w = P.h = 0x7fffffff; P.rt = r;
@@ -2475,7 +2530,7 @@ void mtl_sub_begin(void) {
     C->ntq = 0;
 }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
-void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
+void mtl_exec_rest(const uint64_t *handles, int n) { g_rest = handles; g_nrest = n; }   // the handles after the one replayed next (rt_hold_scan)
 // A buffer copy is made on the CPU as the command list is walked (the in-order writes, wlog). Where the source holds bytes the GPU wrote and has not put back in guest memory
 // yet (gw_find), the copy is made on the GPU from them into the ring instead, and the destination becomes a GPU-written range like the source (gw_add, back at completion)
 static int gw_any(uint64_t a, uint64_t n) { int r = 0; pthread_mutex_lock(&g_gwmu); for (int i = 0; i < g_ngw && !r; i++) r = a < g_gw[i].addr + g_gw[i].size && g_gw[i].addr < a + n; pthread_mutex_unlock(&g_gwmu); return r; }
@@ -2510,7 +2565,7 @@ static void mtl_exec_(const uint8_t *p) {
         switch (h.op) {
             case OP_END: return;
             case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
-            case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); mtl_exec_(t); break; }
+            case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); if (g_nrs < 32) g_rs[g_nrs] = p + h.size; g_nrs++; mtl_exec_(t); g_nrs--; break; }   // g_rs: where the replay returns (rt_hold_scan)
             case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) occ_report(ad); else mtl_sub_counter(ad, (uint32_t)t); break; }
             case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) occ_reset(); break; }
@@ -2518,7 +2573,7 @@ static void mtl_exec_(const uint8_t *p) {
             case OP_CLEAR_BUF: { const p_clear_buf *cb = (const p_clear_buf *)a; for (uint64_t o = 0; o + 4 <= cb->size; o += 4) memcpy((uint8_t *)cb->addr + o, &cb->value, 4); wlog_add(cb->addr, cb->size); break; }
             case OP_COPY_B2B: { uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s, d, n); break; }
             case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); memcpy((void *)d, a + 16, n); wlog_add(d, n); break; }
-            case OP_SET_RT: set_rt((const p_set_rt *)a); break;
+            case OP_SET_RT: set_rt(p, (const p_set_rt *)a, h.size); break;
             case OP_CLEAR_COLOR: clear_color((const p_clear_color *)a); break;
             case OP_CLEAR_DS: clear_ds((const p_clear_ds *)a); break;
             case OP_DRAW: { uint64_t t0 = now_ns(); p_draw t; draw(draw_rec(a, h.size, &t), NULL); g_t_draw += now_ns() - t0; break; }
@@ -3017,7 +3072,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0) LOG("vk: texel buffer slots read as zeros so far: nothing bound %llu, not a buffer texture %llu, format not usable %llu", (unsigned long long)g_tbuf_miss[0],
                           (unsigned long long)g_tbuf_miss[1], (unsigned long long)g_tbuf_miss[2]);
     if (n % 600 == 0) { uint64_t gp = atomic_exchange(&g_gpu_kind_ns[0], 0), gd = atomic_exchange(&g_gpu_kind_ns[1], 0), gc = atomic_exchange(&g_gpu_kind_ns[2], 0);
-                        LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them)", gp / 600e6, gd / 600e6, gc / 600e6); }
+                        LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame",
+                            gp / 600e6, gd / 600e6, gc / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; }
     if (n % 600 == 0) { LOG("vk: waiting for a free submission context per frame: %.2f ms for its own submission, %.2f ms for a later one still reading its ring (%d contexts)",
                         atomic_exchange(&g_wait_fence_ns, 0) / 600e6, atomic_exchange(&g_wait_hold_ns, 0) / 600e6, NCTX); }
     if (n % 600 == 0) { LOG("vk: per frame over the last 600: GPU %.2f ms, recording %.2f ms, waiting for the GPU %.2f ms, present waiting %.2f ms", atomic_exchange(&g_gpu_ns, 0) / 600e6,
