@@ -60,7 +60,10 @@ public class ControlsActivity extends Activity {
     private boolean filling;   // the panel is being filled from the layout: its listeners change nothing
     private final Map<String, Bitmap> sprites = new HashMap<>();
     private LinearLayout shareRow;
-    private static final int REQ_EXPORT = 11, REQ_IMPORT = 12;
+    private static final int REQ_EXPORT = 11, REQ_IMPORT = 12, REQ_TREE = 13;
+    private final Map<String, android.net.Uri> sharedDocs = new HashMap<>();   // the shared profiles' files (SharedLayouts)
+    private TextView folderLabel; private Button toShared, toLocal; private Runnable afterTree;
+    private final List<String> itemNames = new ArrayList<>(); private final List<Boolean> itemShared = new ArrayList<>();   // the profile list: this game's, then the shared folder's
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -95,10 +98,22 @@ public class ControlsActivity extends Activity {
             s = new String(o.toByteArray(), StandardCharsets.UTF_8);
         } catch (Exception e) { /* none yet: the defaults */ }
         store = ControlsLayout.Store.parse(s, w, h);
+        loadShared(w, h);
         fillPanel();
+    }
+    private void loadShared(float w, float h) {   // the shared folder's profiles, when one is picked and still reachable
+        store.shared.clear(); sharedDocs.clear();
+        android.net.Uri t = SharedLayouts.tree(this); if (t == null) return;
+        for (SharedLayouts.Entry e : SharedLayouts.list(this, t, w, h)) { String n = ControlsLayout.uniqueName(store.shared.keySet(), e.name); e.layout.name = n; store.shared.put(n, e.layout); sharedDocs.put(n, e.doc); }
     }
     private void save(boolean say) {
         if (store == null) return;
+        if (store.activeShared && store.shared.containsKey(store.active)) {   // a shared profile goes back into its own file in the folder
+            android.net.Uri t = SharedLayouts.tree(this);
+            if (t == null) Toast.makeText(this, "Folder bersama tidak bisa diakses: pilih lagi", Toast.LENGTH_LONG).show();
+            else try { sharedDocs.put(store.active, SharedLayouts.write(this, t, L(), sharedDocs.get(store.active))); }
+                 catch (Exception e) { Toast.makeText(this, "Tidak tersimpan di folder bersama: " + e.getMessage(), Toast.LENGTH_LONG).show(); }
+        }
         try (FileOutputStream o = new FileOutputStream(json())) { o.write(store.toJson().getBytes(StandardCharsets.UTF_8)); }
         catch (Exception e) { Toast.makeText(this, "Tidak tersimpan: " + e.getMessage(), Toast.LENGTH_LONG).show(); return; }
         try (FileOutputStream o = new FileOutputStream(new File(getFilesDir(), "controls_active.txt"))) { o.write(store.current().toNative().getBytes(StandardCharsets.UTF_8)); }
@@ -108,6 +123,7 @@ public class ControlsActivity extends Activity {
     private ControlsLayout L() { return store.current(); }
 
     // ---- The panel ----
+    private View hscroll(View row) { android.widget.HorizontalScrollView h = new android.widget.HorizontalScrollView(this); h.addView(row); return h; }   // a row wider than a phone's screen scrolls
     private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
     private Button button(String icon, String t, View.OnClickListener l) {   // an icon from the SVG masters (UiIcons) beside the text
         Button b = new Button(this); b.setText(t); b.setAllCaps(false); b.setOnClickListener(l);
@@ -123,18 +139,22 @@ public class ControlsActivity extends Activity {
         r1.addView(label("Profil"));
         profiles = new Spinner(this); r1.addView(profiles);
         profiles.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override public void onItemSelected(AdapterView<?> a, View v, int pos, long id) { if (filling) return; store.active = (String) a.getItemAtPosition(pos); editor.sel = -1; fillPanel(); }
+            @Override public void onItemSelected(AdapterView<?> a, View v, int pos, long id) { if (filling || pos >= itemNames.size()) return; store.active = itemNames.get(pos); store.activeShared = itemShared.get(pos); editor.sel = -1; fillPanel(); }
             @Override public void onNothingSelected(AdapterView<?> a) {}
         });
         r1.addView(button("profile_new", "Baru", v -> newProfile()));
         r1.addView(button("delete", "Hapus", v -> deleteProfile()));
         r1.addView(button("reset", "Default", v -> resetProfile()));
         r1.addView(button("save", "Simpan & tutup", v -> { save(true); finish(); }));
-        p.addView(r1);
+        p.addView(hscroll(r1));
         LinearLayout rs = new LinearLayout(this); rs.setGravity(Gravity.CENTER_VERTICAL); shareRow = rs;
+        rs.addView(button("folder_shared", "Folder bersama", v -> pickTree(null)));
+        folderLabel = label(""); rs.addView(folderLabel);
+        toShared = button("copy_to_shared", "Salin ke bersama", v -> copyToShared()); rs.addView(toShared);
+        toLocal = button("copy_to_local", "Salin ke game ini", v -> copyToLocal()); rs.addView(toLocal);
         rs.addView(button("import", "Impor", v -> importFile()));
         rs.addView(button("export", "Ekspor", v -> exportFile()));
-        p.addView(rs);
+        p.addView(hscroll(rs));
         LinearLayout r2 = new LinearLayout(this); r2.setGravity(Gravity.CENTER_VERTICAL);
         r2.addView(iconLabel("opacity", "Transparansi"));
         opacity = new SeekBar(this); opacity.setMax(90);
@@ -160,9 +180,15 @@ public class ControlsActivity extends Activity {
     private void fillPanel() {   // the panel from the layout and the selection
         if (store == null) return;
         filling = true;
-        List<String> names = new ArrayList<>(store.profiles.keySet());
-        profiles.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, names));
-        profiles.setSelection(names.indexOf(store.active));
+        L();   // (a shared active profile no longer in the folder falls back to one of this game's)
+        itemNames.clear(); itemShared.clear(); int at = 0;
+        for (String n : store.profiles.keySet()) { if (!store.activeShared && n.equals(store.active)) at = itemNames.size(); itemNames.add(n); itemShared.add(false); }
+        for (String n : store.shared.keySet()) { if (store.activeShared && n.equals(store.active)) at = itemNames.size(); itemNames.add(n); itemShared.add(true); }
+        profiles.setAdapter(new ProfileAdapter());
+        profiles.setSelection(at);
+        android.net.Uri tree = SharedLayouts.tree(this);
+        folderLabel.setText(tree == null ? "(belum dipilih)" : "(" + SharedLayouts.folderName(this, tree) + ")");
+        toShared.setVisibility(store.activeShared ? View.GONE : View.VISIBLE); toLocal.setVisibility(store.activeShared ? View.VISIBLE : View.GONE);
         opacity.setProgress(Math.round(L().opacity * 100) - 10);
         int g = editor.sel;
         selLabel.setText(g < 0 ? "Sentuh sebuah grup untuk memilihnya" : ControlsLayout.GROUP_LABEL[g] + ":");
@@ -186,10 +212,18 @@ public class ControlsActivity extends Activity {
         EditText e = new EditText(this); int k = store.profiles.size() + 1; while (store.profiles.containsKey("Profil " + k)) k++; e.setText("Profil " + k);
         new AlertDialog.Builder(this).setTitle("Profil baru (salinan dari \"" + store.active + "\")").setView(e)
             .setPositiveButton("Buat", (d, w) -> { String n = e.getText().toString().trim(); if (n.isEmpty() || store.profiles.containsKey(n)) { Toast.makeText(this, "Nama sudah dipakai atau kosong", Toast.LENGTH_SHORT).show(); return; }
-                                                 store.profiles.put(n, L().copy(n)); store.active = n; editor.sel = -1; fillPanel(); })
+                                                 store.profiles.put(n, L().copy(n)); store.active = n; store.activeShared = false; editor.sel = -1; fillPanel(); })
             .setNegativeButton("Batal", null).show();
     }
     private void deleteProfile() {
+        if (store.activeShared) {   // a shared one: its file goes from the folder, for every game
+            new AlertDialog.Builder(this).setMessage("Hapus profil bersama \"" + store.active + "\" dari folder? Semua game yang memakai folder ini kehilangan profil ini.")
+                .setPositiveButton("Hapus", (d, w) -> { android.net.Uri doc = sharedDocs.get(store.active);
+                    if (doc != null && !SharedLayouts.delete(this, doc)) { Toast.makeText(this, "Tidak bisa dihapus", Toast.LENGTH_LONG).show(); return; }
+                    store.shared.remove(store.active); sharedDocs.remove(store.active); store.activeShared = false; store.active = store.profiles.keySet().iterator().next(); editor.sel = -1; fillPanel(); save(false); })
+                .setNegativeButton("Batal", null).show();
+            return;
+        }
         if (store.profiles.size() < 2) { Toast.makeText(this, "Profil terakhir tidak bisa dihapus", Toast.LENGTH_SHORT).show(); return; }
         new AlertDialog.Builder(this).setMessage("Hapus profil \"" + store.active + "\"?")
             .setPositiveButton("Hapus", (d, w) -> { store.profiles.remove(store.active); store.active = store.profiles.keySet().iterator().next(); editor.sel = -1; fillPanel(); })
@@ -197,8 +231,47 @@ public class ControlsActivity extends Activity {
     }
     private void resetProfile() {
         new AlertDialog.Builder(this).setMessage("Kembalikan \"" + store.active + "\" ke tata letak default?")
-            .setPositiveButton("Ya", (d, w) -> { ControlsLayout n = ControlsLayout.defaults(editor.getWidth(), editor.getHeight()); n.name = store.active; store.profiles.put(store.active, n); editor.sel = -1; fillPanel(); })
+            .setPositiveButton("Ya", (d, w) -> { ControlsLayout n = ControlsLayout.defaults(editor.getWidth(), editor.getHeight()); n.name = store.active; (store.activeShared ? store.shared : store.profiles).put(store.active, n); editor.sel = -1; fillPanel(); })
             .setNegativeButton("Batal", null).show();
+    }
+
+    // ---- The shared folder (SharedLayouts): picked once per game app; every game app that picked it shares its profiles ----
+    private void pickTree(Runnable then) {
+        new AlertDialog.Builder(this).setTitle("Folder layout bersama")
+            .setMessage("Pilih (atau buat) folder Documents/NxNative/layouts. Setiap game yang memilih folder yang sama memakai profil tombol yang sama, juga setelah game dipasang ulang.")
+            .setPositiveButton("Pilih folder", (d, w) -> {
+                android.content.Intent i = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT_TREE).putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI, SharedLayouts.SUGGESTED)
+                    .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION | android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                afterTree = then;
+                try { startActivityForResult(i, REQ_TREE); } catch (Exception e) { Toast.makeText(this, "Tidak ada pemilih folder di perangkat ini", Toast.LENGTH_LONG).show(); }
+            }).setNegativeButton("Batal", null).show();
+    }
+    private void copyToShared() {
+        android.net.Uri t = SharedLayouts.tree(this); if (t == null) { pickTree(this::copyToShared); return; }
+        ControlsLayout c = L().copy(ControlsLayout.uniqueName(store.shared.keySet(), store.active));
+        try { sharedDocs.put(c.name, SharedLayouts.write(this, t, c, null)); store.shared.put(c.name, c); Toast.makeText(this, "\"" + c.name + "\" disalin ke folder bersama", Toast.LENGTH_SHORT).show(); }
+        catch (Exception e) { Toast.makeText(this, "Salin gagal: " + e.getMessage(), Toast.LENGTH_LONG).show(); }
+        fillPanel();
+    }
+    private void copyToLocal() {
+        ControlsLayout c = L().copy(ControlsLayout.uniqueName(store.profiles.keySet(), store.active));
+        store.profiles.put(c.name, c); store.active = c.name; store.activeShared = false; editor.sel = -1; fillPanel(); save(false);
+        Toast.makeText(this, "\"" + c.name + "\" disalin ke game ini", Toast.LENGTH_SHORT).show();
+    }
+    // The profile list: a shared profile carries the shared badge (res_svg/ui/shared_badge.svg)
+    private final class ProfileAdapter extends android.widget.BaseAdapter {
+        @Override public int getCount() { return itemNames.size(); }
+        @Override public Object getItem(int i) { return itemNames.get(i); }
+        @Override public long getItemId(int i) { return i; }
+        private View row(int i, View v, ViewGroup parent, boolean drop) {
+            TextView t = v instanceof TextView ? (TextView) v : new TextView(ControlsActivity.this);
+            boolean sh = itemShared.get(i); t.setText(itemNames.get(i) + (sh ? "  (bersama)" : "")); t.setTextSize(16); t.setPadding(dp(12), dp(drop ? 12 : 6), dp(12), dp(drop ? 12 : 6));
+            t.setTextColor(drop ? Color.BLACK : Color.WHITE);
+            android.graphics.drawable.Drawable d = sh ? UiIcons.drawable(ControlsActivity.this, "shared_badge", 20) : null; t.setCompoundDrawables(d, null, null, null); t.setCompoundDrawablePadding(dp(8));
+            return t;
+        }
+        @Override public View getView(int i, View v, ViewGroup p) { return row(i, v, p, false); }
+        @Override public View getDropDownView(int i, View v, ViewGroup p) { return row(i, v, p, true); }
     }
 
     // ---- Import / export: a profile as a file anywhere the system's file picker reaches (no storage permission) ----
@@ -221,7 +294,7 @@ public class ControlsActivity extends Activity {
     private void addImported(String json, String from) {
         List<ControlsLayout> got = ControlsLayout.readProfiles(json, editor.getWidth(), editor.getHeight());
         if (got == null) { Toast.makeText(this, from + ": bukan tata letak tombol", Toast.LENGTH_LONG).show(); return; }
-        for (ControlsLayout l : got) { l.name = ControlsLayout.uniqueName(store.profiles.keySet(), l.name); store.profiles.put(l.name, l); store.active = l.name; }
+        for (ControlsLayout l : got) { l.name = ControlsLayout.uniqueName(store.profiles.keySet(), l.name); store.profiles.put(l.name, l); store.active = l.name; store.activeShared = false; }
         int v = ControlsLayout.versionOf(json);
         Toast.makeText(this, got.size() + " profil diimpor" + (v > ControlsLayout.VERSION ? " (berkas versi lebih baru: bagian yang tidak dikenal dilewati)" : ""), Toast.LENGTH_LONG).show();
         editor.sel = -1; fillPanel(); save(false);
@@ -233,6 +306,11 @@ public class ControlsActivity extends Activity {
         if (req == REQ_EXPORT) {
             try (java.io.OutputStream o = getContentResolver().openOutputStream(u, "wt")) { o.write(L().toJson().getBytes(StandardCharsets.UTF_8)); Toast.makeText(this, "Profil \"" + store.active + "\" diekspor", Toast.LENGTH_SHORT).show(); }
             catch (Exception e) { Toast.makeText(this, "Ekspor gagal: " + e.getMessage(), Toast.LENGTH_LONG).show(); }
+        } else if (req == REQ_TREE) {
+            try { SharedLayouts.setTree(this, u); } catch (Exception e) { Toast.makeText(this, "Folder tidak bisa dipakai: " + e.getMessage(), Toast.LENGTH_LONG).show(); return; }
+            loadShared(editor.getWidth(), editor.getHeight()); fillPanel();
+            Toast.makeText(this, store.shared.size() + " profil bersama di folder ini", Toast.LENGTH_SHORT).show();
+            Runnable r = afterTree; afterTree = null; if (r != null) r.run();
         } else if (req == REQ_IMPORT) {
             try (InputStream in = getContentResolver().openInputStream(u)) { addImported(readAll(in), "Berkas"); }
             catch (Exception e) { Toast.makeText(this, "Impor gagal: " + e.getMessage(), Toast.LENGTH_LONG).show(); }

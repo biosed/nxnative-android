@@ -133,21 +133,28 @@ public final class ControlsLayout {
     // ---- Profiles: the editor's file holds them all and names the active one ----
     public static final class Store {
         public String active = "Default";
-        public final LinkedHashMap<String, ControlsLayout> profiles = new LinkedHashMap<>();
-        public ControlsLayout current() { return profiles.get(active); }
+        public boolean activeShared;   // the active profile is one in the shared folder (SharedLayouts), not one of this game's own
+        public final LinkedHashMap<String, ControlsLayout> profiles = new LinkedHashMap<>();   // this game's own (controls.json)
+        public final LinkedHashMap<String, ControlsLayout> shared = new LinkedHashMap<>();     // the shared folder's, read when the editor opens (each its own file)
+        public ControlsLayout current() {
+            if (activeShared && shared.containsKey(active)) return shared.get(active);
+            if (!profiles.containsKey(active)) { activeShared = false; active = profiles.keySet().iterator().next(); }
+            return profiles.get(active);
+        }
         public static Store parse(String json, float w, float h) {   // w, h: the screen, for the defaults of anything missing
             Store st = new Store();
             try {
                 @SuppressWarnings("unchecked") Map<String, Object> m = (Map<String, Object>) Json.parse(json);
                 if (m.get("profiles") instanceof List) for (Object p : (List<?>) m.get("profiles")) { ControlsLayout l = from(p, defaults(w, h)); st.profiles.put(l.name, l); }
                 if (m.get("active") instanceof String) st.active = (String) m.get("active");
+                st.activeShared = Boolean.TRUE.equals(m.get("activeShared"));
             } catch (RuntimeException e) { st.profiles.clear(); }
             if (st.profiles.isEmpty()) { ControlsLayout d = defaults(w, h); st.profiles.put(d.name, d); }
-            if (!st.profiles.containsKey(st.active)) st.active = st.profiles.keySet().iterator().next();
+            if (!st.activeShared && !st.profiles.containsKey(st.active)) st.active = st.profiles.keySet().iterator().next();   // a shared one is checked once the folder is read (current)
             return st;
         }
         public String toJson() {
-            StringBuilder b = new StringBuilder("{\"version\":1,\"active\":").append(Json.str(active)).append(",\"profiles\":[\n");
+            StringBuilder b = new StringBuilder("{\"format\":\"" + FORMAT + "-store\",\"version\":" + VERSION + ",\"active\":").append(Json.str(active)).append(",\"activeShared\":").append(activeShared).append(",\"profiles\":[\n");
             int i = 0; for (ControlsLayout l : profiles.values()) b.append(i++ > 0 ? ",\n" : "").append(l.toJson());
             return b.append("\n]}\n").toString();
         }
