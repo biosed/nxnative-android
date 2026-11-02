@@ -3050,7 +3050,8 @@ static uint16_t glyph(char c) {   // rows top to bottom, 3 bits each
                                     "7111001001001001", "8111101111101111", "9111101111001111", "A010101111101101", "B110101110101110", "X101101010101101", "Y101101010010010",
                                     "L100100100100111", "R110101110101101", "Z111001010100111", "+000010111010000", "-000000111000000",
                                     "M101111111101101", "E111100111100111", "N110101101101101", "I111010010010111", "P110101110100100", "K101101110101101", "S111100111001111",
-                                    "H101101111101101", "D110101101101110", "T111010010010010", "U101101101101111", "W101101111111101", "/001001010100100", ".000000000000010"};
+                                    "H101101111101101", "D110101101101110", "T111010010010010", "U101101101101111", "W101101111111101", "/001001010100100", ".000000000000010",
+                                    "J001001001101111"};
     for (size_t i = 0; i < sizeof G / sizeof *G; i++) if (G[i][0] == c) { uint16_t g = 0; for (int k = 1; k <= 15; k++) g = (uint16_t)(g << 1 | (G[i][k] == '1')); return g; }
     return 0;
 }
@@ -3164,7 +3165,18 @@ static void *pw_worker(void *a) {
     for (uint32_t i; (i = atomic_fetch_add(&g_pw_next, 1)) < g_pw_total;) { pso_precreate_one(&g_pw_recs[i]); atomic_fetch_add(&g_pw_done, 1); }
     return NULL;
 }
+static void screen_draw(const char *t1, const char *t2, uint32_t done, uint32_t total);
 static void pw_draw(uint32_t done, uint32_t total) {   // one frame of the pre-warm screen
+    char t1[64]; snprintf(t1, sizeof t1, "MENYIAPKAN SHADER %u / %u", done, total);
+    screen_draw(t1, "KETUK UNTUK LEWATI", done, total);
+}
+// The hibernation restore's screen (app/front_android.c, before the host reads the snapshot): drawn until the game's first frame replaces it
+void dm_vk_message(const char *t1, const char *t2) {
+    vk_init();
+    int gen; for (int i = 0; i < 40; i++) { front_window_lock(1); ANativeWindow *aw = front_native_window(&gen); front_window_lock(0); if (aw) break; usleep(50000); }
+    for (int i = 0; i < 3; i++) screen_draw(t1, t2, 0, 0);
+}
+static void screen_draw(const char *t1, const char *t2, uint32_t done, uint32_t total) {   // one frame: t1 large, t2 small, a progress bar when total > 0
     int gen; front_window_lock(1); ANativeWindow *aw = front_native_window(&gen);
     if (!aw || gen != W.gen) { win_drop(); W.gen = gen; if (aw) win_make(aw); }
     if (!aw || !W.sc) { front_window_lock(0); return; }
@@ -3184,15 +3196,13 @@ static void pw_draw(uint32_t done, uint32_t total) {   // one frame of the pre-w
     rp_desc d = {.n = 1, .cv = {W.view[idx]}, .cf = {W.fmt}, .cl = {VK_ATTACHMENT_LOAD_OP_LOAD}, .w = W.ext.width, .h = W.ext.height, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     P_->fb = rp_begin(cb, &d);
     static VkClearRect tr[2048]; uint32_t nt = 0, ww = W.ext.width, hh = W.ext.height, cell = hh / 90 ? hh / 90 : 2;
-    char t1[64]; snprintf(t1, sizeof t1, "MENYIAPKAN SHADER %u / %u", done, total);
-    const char *t2 = "KETUK UNTUK LEWATI";
     nt = text_rects(tr, nt, 2048, t1, (int32_t)((ww - strlen(t1) * 4 * cell) / 2), (int32_t)(hh / 2 - 9 * cell), cell);
     uint32_t c2 = cell * 2 / 3 ? cell * 2 / 3 : 1; nt = text_rects(tr, nt, 2048, t2, (int32_t)((ww - strlen(t2) * 4 * c2) / 2), (int32_t)(hh / 2 + 8 * cell), c2);
     uint32_t bw = ww * 6 / 10, bx = (ww - bw) / 2, by = hh / 2, bh = cell * 3, fw = total ? (uint32_t)((uint64_t)bw * done / total) : 0;
     VkClearRect outline = {{{(int32_t)bx, (int32_t)by}, {bw, bh}}, 0, 1}, fill = {{{(int32_t)bx, (int32_t)by}, {fw ? fw : 1, bh}}, 0, 1};
     VkClearAttachment white = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.85f, 0.85f, 0.9f, 1}}}}, dark = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.2f, 0.22f, 0.3f, 1}}}},
                       bar = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.35f, 0.7f, 1.0f, 1}}}};
-    ovl_clear(cb, &dark, 1, &outline); if (fw) ovl_clear(cb, &bar, 1, &fill);
+    if (total) { ovl_clear(cb, &dark, 1, &outline); if (fw) ovl_clear(cb, &bar, 1, &fill); }
     if (nt) ovl_clear(cb, &white, nt, tr);
     rp_end(cb);
     img_barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);

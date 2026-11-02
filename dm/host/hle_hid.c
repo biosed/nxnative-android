@@ -218,6 +218,8 @@ static void *ctl_main(void *arg) {
                 size_t n = strlen(line); if (!n || line[n - 1] != '\n') break;   // a line still being written: read it next time
                 off += (long)n; line[--n] = 0; if (n && line[n - 1] == '\r') line[--n] = 0;
                 if (!n || line[0] == '#') continue;
+                { static int hib_only = -1; if (hib_only < 0) hib_only = getenv("DM_CTL_HIB_ONLY") != NULL;   // Android's hib_ctl.txt (app/front_android.c): hibernation commands only
+                  if (hib_only && strncmp(line, "hib ", 4)) { LOG("[RED] DM_CTL: only hib commands are taken here: %s", line); continue; } }
                 if (!strcmp(line, "dump")) { crash_dump_now("DM_CTL dump"); continue; }
                 if (!strncmp(line, "hib ", 4)) { if (dm_hib_ctl_hook) dm_hib_ctl_hook(line + 4); continue; }   // hibernation (hle_hib.c)
                 if (!strncmp(line, "shot ", 5)) { dm_gfx_shot_at(1, line + 5); LOG("DM_CTL: screenshot of the next frame → %s", line + 5); continue; }

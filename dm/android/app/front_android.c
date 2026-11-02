@@ -348,7 +348,7 @@ static void input_release_all(void) {
     pthread_mutex_unlock(&g_pmu);
 }
 // The shader pre-warm (src_vk/nvn_vk.c dm_vk_prewarm): the pipelines earlier runs made are made again before the game starts, behind a progress screen; a tap skips it
-int dm_vk_prewarm(void) __attribute__((weak)); void dm_vk_prewarm_cancel(void) __attribute__((weak));
+int dm_vk_prewarm(void) __attribute__((weak)); void dm_vk_prewarm_cancel(void) __attribute__((weak)); void dm_vk_message(const char *t1, const char *t2) __attribute__((weak));
 static _Atomic int g_prewarming;
 static int on_input(AInputEvent *e) {
     int32_t type = AInputEvent_getType(e), src = AInputEvent_getSource(e);
@@ -444,6 +444,12 @@ static void boot_env(const char *files, const char *ext) {
         setenv("DM_HIB_RESTORE", p, 0); dm_hib_refused_hook = hib_refused;   // a snapshot the host refuses (another build, damaged) is removed, and the menu shows
         fprintf(stderr, "boot: hibernate: snapshot %s found, DM_HIBERNATE on: restoring it\n", p);
     } else fprintf(stderr, "boot: hibernate: %s, %s: no restore\n", hib_on ? "DM_HIBERNATE on" : "DM_HIBERNATE off", snap ? "a snapshot exists (left as it is)" : "no snapshot");
+    // With hibernation, <external>/hib_ctl.txt takes DM_CTL's "hib" commands from adb (dm/android/tools/hib_install.sh writes "hib freeze" before an update installs over the
+    // game): made by the app, so that the shell's appends reach it (a file adb makes there is the shell's, and the app cannot read it). Other DM_CTL commands are not taken from it
+    if (hib_on && !getenv("DM_CTL")) {
+        snprintf(p, sizeof p, "%s/hib_ctl.txt", ext); FILE *c = fopen(p, "w");
+        if (c) { fclose(c); chmod(p, 0666); setenv("DM_CTL", p, 1); setenv("DM_CTL_HIB_ONLY", "1", 1); fprintf(stderr, "boot: hibernate: control file %s (hib commands only)\n", p); }
+    }
     chdir(files);
     g_argv[0] = strdup("dmhost"); snprintf(p, sizeof p, "%s/dm", ext); g_argv[1] = strdup(p);
 }
@@ -472,6 +478,7 @@ static void *boot_thread(void *a) {
     (void)a;
     static char alt[65536]; stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt}; sigaltstack(&ss, 0);
     if (dm_vk_prewarm) { atomic_store(&g_prewarming, 1); dm_vk_prewarm(); atomic_store(&g_prewarming, 0); }
+    if (getenv("DM_HIB_RESTORE") && dm_vk_message) dm_vk_message("MELANJUTKAN...", "DARI HIBERNASI");   // the snapshot takes seconds to read: the player sees why the screen waits
     int rc = dm_main(2, g_argv);
     fprintf(stderr, "boot: dm_main returned %d\n", rc);
     game_failed(); ANativeActivity_finish(g_act);   // the host is over: back to the menu, which shows the log's error
