@@ -1482,6 +1482,7 @@ static struct {
 static int g_depth_zero = 1, g_origin_ll;
 static struct {   // the current render targets and the open dynamic rendering; clears that come before the pass's first draw become its load actions (a tiler then never reads the old contents)
     int n; vtex *ct[8]; VkImageView cv[8]; vtex *dt; VkImageView dv; uint32_t w, h; int open;
+    int merged;   // the open pass went on across a SetRenderTargets (rt_hold_scan, or the same targets again): a draw sampling one of its attachments ends it first (draw_reads_rt)
     uint32_t clv[8], cly[8]; uint8_t cwr[8], cdrawn[8];   // each colour attachment's level and layer, and whether a draw wrote it since its last same-pass snapshot (fb_prepare)
     uint8_t clr_c[8], clr_d, clr_s; VkClearColorValue cc[8]; float cd; uint32_t cs;
     // Layered rendering: a draw whose vertex (or geometry) shader writes the layer runs in a pass over every layer of the attachments (3D: their depth slices) from the attached one on,
@@ -1545,7 +1546,7 @@ static int pass_begin(void) {
     if (g_plog) { char b[512]; int o = 0; for (int i = 0; i < P.n; i++) o += snprintf(b + o, sizeof b - o, " c%d=%llu/%d%s", i, P.ct[i] ? (unsigned long long)P.ct[i]->serial : 0ull, (int)d.cf[i], d.cl[i] == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "");
                   if (P.dt) snprintf(b + o, sizeof b - o, " d=%llu/%d%s%s", (unsigned long long)P.dt->serial, (int)d.df, d.dl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "", d.sl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/sclr" : "");
                   LOG("plog: pass %ux%u%s", P.w, P.h, b); }
-    gpu_mark(0, 0); g_npass++;
+    gpu_mark(0, 0); g_npass++; P.merged = 0;
     VkFramebuffer fb = rp_begin(C->cb, &d); P.open = 1;
     if (fb) { if (C->nfb == C->cfb) { C->cfb = C->cfb ? 2 * C->cfb : 256; C->fb = realloc(C->fb, C->cfb * sizeof *C->fb); } C->fb[C->nfb++] = fb; }
     return 1;
@@ -1592,11 +1593,11 @@ static const uint8_t *rt_hold_scan(const uint8_t *p, const p_set_rt *open) {   /
 static void set_rt_(const p_set_rt *r);
 static void set_rt(const uint8_t *op, const p_set_rt *r, uint32_t size) {
     if (g_rt_hold) {   // inside a held detour: its SetRenderTargets are not replayed; the one back to the open pass's targets ends it
-        if (op == g_rt_hold) { g_rt_hold = NULL; P.rt = r; }
+        if (op == g_rt_hold) { g_rt_hold = NULL; P.rt = r; P.merged = 1; }
         return;
     }
     if (P.open && rt_hold_on() && P.rt) {
-        if (rt_same(P.rt, r)) { P.rt = r; g_nsame++; return; }   // the same targets again: the pass goes on
+        if (rt_same(P.rt, r)) { P.rt = r; P.merged = 1; g_nsame++; return; }   // the same targets again: the pass goes on
         const uint8_t *back = rt_hold_scan(op + size, P.rt);
         if (back) { static int logged; g_rt_hold = back; g_nheld++; if (!logged++) LOG("vk: render targets held across a SetRenderTargets detour (first case; DM_VK_RT_HOLD=0 turns it off)"); return; }
     }
@@ -2174,6 +2175,33 @@ static void vk_ctl(uint64_t n) {
     if (lo != g_skip_lo || hi != g_skip_hi || nk != g_nskip_key) LOG("vk: control file: skipping draws %u-%u%s, %d shader key prefixes (frame %llu)", lo, hi, lo > hi ? " (none)" : "", nk, (unsigned long long)n);
     g_skip_lo = lo; g_skip_hi = hi; g_nskip_key = nk;
 }
+// A pass kept open across a SetRenderTargets (the hold) joins work the game drew into separate passes; a draw that samples one of the pass's attachments -- the scene depth a
+// contact-shadow or ambient-occlusion term reads, a colour target -- would read it while the pass still holds it in tile memory (undefined: FINAL FANTASY RESONANCE's castle
+// corridor, the contact shadow along the wall flickering frame to frame). Such a draw ends the pass first, as the Metal host does (nvn_mtl.m draw_samples_rt). Every texture
+// binding of the draw's shaders is looked at: slots, handles from uniform buffers, dynamic slot arrays
+static uint64_t g_nsplit;
+static int rt_serial(uint64_t h, uint64_t *ser) {
+    int tid = (int)(h & 0xfffff); if (!tid) return 0;
+    pthread_mutex_lock(&g_rmu); int ok = tid < g_ntreg && g_treg[tid].ok; if (ok) *ser = g_treg[tid].t.serial; pthread_mutex_unlock(&g_rmu);
+    return ok;
+}
+static int is_attachment(uint64_t ser) {
+    if (P.dt && P.dt->serial == ser) return 1;
+    for (int i = 0; i < P.n; i++) if (P.ct[i] && P.ct[i]->serial == ser) return 1;
+    return 0;
+}
+static int shader_reads_rt(shader_t *s, int stage) {
+    if (!s) return 0;
+    for (int i = 0; i < s->nb; i++) {
+        const sbind *b = &s->b[i]; if (b->type != BT_CIS && b->type != BT_TEX) continue;
+        uint32_t cnt = b->count ? b->count : 1; uint64_t ser;
+        if (s->dyn && cnt > 1 && b->reg < 0) { for (uint32_t e = 0; e < cnt && e < 128; e++) if (rt_serial(dyn_slot(stage, (int)e), &ser) && is_attachment(ser)) return 1; continue; }
+        if (b->kind == K_TEXU && cnt == 1) { if (rt_serial(texu_slot(stage, b), &ser) && is_attachment(ser)) return 1; continue; }
+        if (b->kind == K_TEX && b->reg >= 0) for (uint32_t e = 0; e < cnt && b->reg + (int)e < NTEX; e++) if (rt_serial(S.tex[stage][b->reg + e], &ser) && is_attachment(ser)) return 1;
+    }
+    return 0;
+}
+static int draw_reads_rt(shader_t *vs, shader_t *fs, shader_t *gs) { return shader_reads_rt(vs, 0) || shader_reads_rt(fs, 1) || shader_reads_rt(gs, 2); }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!S.bst[0]) SKIP(0);
     uint32_t didx = g_frame_draw++;   // this draw's number within the frame (the live control file's skip ranges)
@@ -2220,6 +2248,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     { int lay = vs->layer_out || (gs && gs->layer_out);   // a layered pass for a shader that writes the layer; a pass opened the other way is ended first
       if (P.open && ((lay && !P.layered && !(P.lok && P.nlayers <= 1)) || (!lay && P.layered))) pass_end();
       P.want_layered = lay; }
+    if (P.open && P.merged && draw_reads_rt(vs, fs, gs)) { pass_end(); g_nsplit++; }   // what was drawn into it is stored first, then read (as the pass the hold joined would have)
     if (!pass_begin()) SKIP(2);
     if (ind_b && (dw ? dw->prim : di->prim) == NVN_DRAW_PRIMITIVE_QUADS) { RED_ONCE(30, "a GPU-written indirect draw of quads is not implemented"); SKIP(3); }
     if (ind_b && di && di->itype == 0 && !g_has_u8) { RED_ONCE(37, "a GPU-written indirect draw with 8-bit indices needs VK_EXT_index_type_uint8"); SKIP(3); }
@@ -3237,8 +3266,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0) LOG("vk: texel buffer slots read as zeros so far: nothing bound %llu, not a buffer texture %llu, format not usable %llu", (unsigned long long)g_tbuf_miss[0],
                           (unsigned long long)g_tbuf_miss[1], (unsigned long long)g_tbuf_miss[2]);
     if (n % 600 == 0) { uint64_t gp = atomic_exchange(&g_gpu_kind_ns[0], 0), gd = atomic_exchange(&g_gpu_kind_ns[1], 0), gc = atomic_exchange(&g_gpu_kind_ns[2], 0);
-                        LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame",
-                            gp / 600e6, gd / 600e6, gc / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; }
+                        LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame",
+                            gp / 600e6, gd / 600e6, gc / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; }
     if (n % 600 == 0) { LOG("vk: waiting for a free submission context per frame: %.2f ms for its own submission, %.2f ms for a later one still reading its ring (%d contexts)",
                         atomic_exchange(&g_wait_fence_ns, 0) / 600e6, atomic_exchange(&g_wait_hold_ns, 0) / 600e6, NCTX); }
     if (n % 600 == 0) { LOG("vk: per frame over the last 600: GPU %.2f ms, recording %.2f ms, waiting for the GPU %.2f ms, present waiting %.2f ms", atomic_exchange(&g_gpu_ns, 0) / 600e6,
