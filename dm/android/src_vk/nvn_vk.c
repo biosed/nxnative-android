@@ -102,7 +102,7 @@ static void img_mem_free(int blk, VkDeviceMemory m, VkDeviceSize off, VkDeviceSi
 }
 
 // ---------- Submission contexts: command buffers, ring buffer, descriptor pool, the writes that wait for completion ----------
-#define NCTX 24   // ~2.5 frames of Unreal's ~9 submissions: with 8 the CPU could not get one frame ahead, and reusing a context whose ring a later submission still read (its hold) drained the GPU first: CPU and GPU took turns (recording 12.7 + waiting 12.5 ms a frame) // submissions in flight: Unreal submits several command buffers a frame, and with 3 the CPU could not record a frame ahead of the GPU
+#define NCTX 12   // ~1.3 frames of Unreal's ~9 submissions (24 bought nothing on a GPU-bound frame and cost ring memory): with 8 the CPU could not get one frame ahead, and reusing a context whose ring a later submission still read (its hold) drained the GPU first: CPU and GPU took turns (recording 12.7 + waiting 12.5 ms a frame) // submissions in flight: Unreal submits several command buffers a frame, and with 3 the CPU could not record a frame ahead of the GPU
 #define NOQ 4096   // occlusion queries per submission
 #define NTQ 1024   // GPU timestamps per submission (512 regions)
 // Ring sizes: each context's own ring starts at RING_MIN and follows what its submissions use (ring_fit: grown to the peak, up to RING_MAX; halved after a stretch that used less
@@ -111,6 +111,7 @@ static void img_mem_free(int blk, VkDeviceMemory m, VkDeviceSize off, VkDeviceSi
 #define RING_MIN (4u << 20)
 #define RING_MAX (64u << 20)
 #define RING_XMAX (256u << 20)
+#define RING_CAP (160ull << 20)   // all contexts' own rings together: past it a ring does not grow, and a submission that outgrows it takes extra rings (freed when it is done)
 typedef struct { int kind; void *dst; uint32_t mode, v; uint64_t addr; uint32_t type; const uint8_t *src; size_t n; } post_t;   // kind 1 event, 2 counter, 3 copy ring → guest, 4 samples-passed report (src: n query indices; n == SIZE_MAX: unknown, reported visible)
 typedef struct vtex vtex;
 typedef struct {
@@ -188,15 +189,27 @@ static VkDeviceSize ring_put(const void *src, VkDeviceSize n, VkDeviceSize align
 // A read over [addr, addr + size) that earlier submissions still running wrote parts of (Unreal binds its whole GPU-scene buffer; a dispatch updated a few records of it): the guest's
 // bytes copied into the ring, then each written part copied over them from its submission's ring at the start of this submission, oldest first (the upload command buffer; those
 // submissions are done by then). Each source ring is held until this submission is done. Parts this submission itself writes are not in it (no such case met). Caller holds g_gwmu
+static void pass_end(void); static int pass_begin(void); static int g_pass_open_(void);
 static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align) {
-    for (int i = 0; i < g_ngw; i++) { const gw_t *e = &g_gw[i];   // a part this submission writes: not composable here
-        if (e->fence == g_fence + 1 && addr < e->addr + e->size && e->addr < addr + size) return VK_WHOLE_SIZE; }
     VkDeviceSize ro = ring_put((const void *)(uintptr_t)addr, size, align); if (ro == VK_WHOLE_SIZE) return ro;
-    for (int i = 0; i < g_ngw; i++) {
+    int cur = 0;
+    for (int i = 0; i < g_ngw; i++) {   // earlier submissions' parts, oldest first: copied at the start of this one (they are complete by then)
         const gw_t *e = &g_gw[i]; if (addr >= e->addr + e->size || e->addr >= addr + size) continue;
+        if (e->fence == g_fence + 1) { cur = 1; continue; }
         uint64_t lo = e->addr > addr ? e->addr : addr, hi = e->addr + e->size < addr + size ? e->addr + e->size : addr + size;
         VkBufferCopy bc = {e->off + (lo - e->addr), ro + (lo - addr), hi - lo}; vkCmdCopyBuffer(C->up, e->buf, C->ring, 1, &bc); C->up_used = 1;
         ctx_t *o = &g_ctx[e->ci]; if (o->hold < g_fence + 1) o->hold = g_fence + 1;
+    }
+    if (cur) {   // parts this submission's own dispatches wrote: copied here, in order, after them (outside a render pass: the open one is ended and begun again)
+        int was_open = g_pass_open_(); if (was_open) pass_end();
+        for (int i = 0; i < g_ngw; i++) {
+            const gw_t *e = &g_gw[i]; if (e->fence != g_fence + 1 || addr >= e->addr + e->size || e->addr >= addr + size) continue;
+            uint64_t lo = e->addr > addr ? e->addr : addr, hi = e->addr + e->size < addr + size ? e->addr + e->size : addr + size;
+            VkBufferCopy bc = {e->off + (lo - e->addr), ro + (lo - addr), hi - lo}; vkCmdCopyBuffer(C->cb, e->buf, C->ring, 1, &bc);
+        }
+        { VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+          vkCmdPipelineBarrier(C->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL); }   // the copies, for what reads the result
+        if (was_open) pass_begin();
     }
     return ro;
 }
@@ -223,7 +236,10 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
                 *buf = C->ring; *off = ro; if (p) *p = C->ringp + ro; g_gw_ci = g_ci; hit = 1; atomic_fetch_add(&g_gw_copied, 1); break;
             }
             atomic_fetch_add(&g_gw_held, 1);
-        } else if (!fits) { why = 2; atomic_fetch_add(&g_gw_why[2], 1); RED_ONCE(63, "a read overlaps a GPU-written buffer range of this submission without fitting in it: read from guest memory, which is stale until the write completes"); break; }
+        } else if (!fits) {   // this submission's own write, not covering the read (or at an offset the binding cannot take): composed (gw_compose)
+            if (may_hold) { VkDeviceSize ro = gw_compose(addr, size, align < 16 ? 16 : align);
+                            if (ro != VK_WHOLE_SIZE) { *buf = C->ring; *off = ro; if (p) *p = C->ringp + ro; g_gw_ci = g_ci; hit = 1; atomic_fetch_add(&g_gw_copied, 1); break; } }
+            why = 2; atomic_fetch_add(&g_gw_why[2], 1); RED_ONCE(63, "a read overlaps a GPU-written buffer range of this submission without fitting in it: read from guest memory, which is stale until the write completes"); break; }
         *buf = e->buf; *off = e->off + (addr - e->addr); if (p) *p = e->p + (addr - e->addr); g_gw_ci = e->ci; hit = 1;
     }
     pthread_mutex_unlock(&g_gwmu);
@@ -1414,6 +1430,7 @@ static void pass_end(void) {
         if (wb) barrier_all(C->cb);
     }
 }
+static int g_pass_open_(void) { return P.open; }
 static int pass_begin(void) {
     if (P.open) return 1;
     if (!P.n && !P.dt) return 0;
@@ -2366,7 +2383,8 @@ static void ring_fit(ctx_t *c) {
     c->last_total = c->total; if (c->total > c->win_max) c->win_max = c->total;
     VkDeviceSize want = c->ring0_size; uint64_t tg = atomic_load(&g_trim_gen);
     if (c->trim_seen != tg) { c->trim_seen = tg; want = RING_MIN; c->win_max = 0; c->nwin = 0; }
-    else if (c->last_total > c->ring0_size && c->ring0_size < RING_MAX) { while (want < c->last_total && want < RING_MAX) want *= 2; }
+    else if (c->last_total > c->ring0_size && c->ring0_size < RING_MAX) { while (want < c->last_total && want < RING_MAX) want *= 2;
+                                                                         if (atomic_load(&g_ring0_bytes) + (want - c->ring0_size) > RING_CAP) want = c->ring0_size; }
     else if (++c->nwin >= 120) { if (c->win_max * 4 < c->ring0_size && c->ring0_size > RING_MIN) want = c->ring0_size / 2; c->win_max = 0; c->nwin = 0; }
     if (want == c->ring0_size) return;
     vkDestroyBuffer(g_dev, c->ring0, NULL); vkFreeMemory(g_dev, c->ringm0, NULL); atomic_fetch_sub(&g_ring0_bytes, c->ring0_size);
