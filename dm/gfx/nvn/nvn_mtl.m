@@ -10107,12 +10107,14 @@ static void copy_b2t(const p_copy_b2t *c) {
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
     void *mb; uint64_t mo;
     int src_ok = mtl_addr(c->src, img * nz, &mb, &mo);
-    if (passdump()) {   // the source bytes as they are when the copy is replayed: their count, non-zero count and FNV-1a 64 (compared with the Vulkan host's DM_VK_COPYLOG)
+    static int copylog = -1; if (copylog < 0) { const char *e = getenv("DM_NVN_COPYLOG"); copylog = e && atoi(e) ? 1 : 0; }
+    if (passdump() || copylog) {   // the source bytes as they are when the copy is replayed: their count, non-zero count and FNV-1a 64 (compared with the Vulkan host's DM_VK_COPYLOG); DM_NVN_COPYLOG=1 logs these lines without the pass dump
         uint64_t nb = img * nz, nzc = 0, h = 0xcbf29ce484222325ull;
         if (src_ok) { const uint8_t *s = (const uint8_t *)((__bridge id<MTLBuffer>)mb).contents + mo; for (uint64_t i = 0; i < nb; i++) { nzc += s[i] != 0; h = (h ^ s[i]) * 0x100000001b3ull; } }
-        PD("C ser=%llu target %d %ux%ux%u format %#x lv%u sl%u region %d,%d,%d %dx%dx%d from %#llx row %zu image %zu bytes %llu nonzero %llu fnv %016llx%s", c->tex->serial, c->tex->d.target, c->tex->d.width, c->tex->d.height, c->tex->d.depth,
+        flockfile(stderr); fprintf(stderr, "[pass] F%llu C ser=%llu target %d %ux%ux%u format %#x lv%u sl%u region %d,%d,%d %dx%dx%d from %#llx row %zu image %zu bytes %llu nonzero %llu fnv %016llx%s\n", (unsigned long long)atomic_load(&g_cur_frame),
+           c->tex->serial, c->tex->d.target, c->tex->d.width, c->tex->d.height, c->tex->d.depth,
            c->tex->d.format, level, layer0, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, (unsigned long long)c->src, row, img,
-           (unsigned long long)nb, (unsigned long long)nzc, (unsigned long long)h, src_ok ? "" : " (source in no pool)");
+           (unsigned long long)nb, (unsigned long long)nzc, (unsigned long long)h, src_ok ? "" : " (source in no pool)"); funlockfile(stderr);
     }
     if (!src_ok) { RED_ONCE(23, "buffer→texture copy source is in no memory pool"); return; }
     // The copy's bytes belong in the texture's storage: written there now from the buffer's, unless the GPU writes the buffer (a copy, fill or update queued in this submission: pend_hits; a shader
