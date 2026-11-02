@@ -56,7 +56,7 @@ public class ControlsActivity extends Activity {
     private Spinner profiles;
     private SeekBar opacity;
     private TextView selLabel;
-    private CheckBox hideGroup, fixedStick;
+    private CheckBox hideGroup, fixedStick, stickClick;
     private boolean filling;   // the panel is being filled from the layout: its listeners change nothing
     private final Map<String, Bitmap> sprites = new HashMap<>();
     private final ControlsEditing ed = new ControlsEditing();   // the canvas's selection and dragging (plain Java, checked on a computer: tools/ControlsEditingTest.java)
@@ -211,6 +211,10 @@ public class ControlsActivity extends Activity {
         { android.graphics.drawable.Drawable d = UiIcons.drawable(this, "stick_fixed", 22); if (d != null) { fixedStick.setCompoundDrawables(null, null, d, null); fixedStick.setCompoundDrawablePadding(dp(6)); } }   // res_svg/ui/stick_fixed.svg
         fixedStick.setOnCheckedChangeListener((v, on) -> { if (filling || !ControlsLayout.isStick(ed.sel)) return; L().fixed[ed.sel - ControlsLayout.LS] = on; editor.invalidate(); });
         selSec.addView(fixedStick);
+        stickClick = new CheckBox(this); stickClick.setText("Ketuk 2x stik = L3/R3"); stickClick.setTextColor(Color.WHITE);   // per profile, both sticks
+        { android.graphics.drawable.Drawable d = UiIcons.drawable(this, "stick_click", 22); if (d != null) { stickClick.setCompoundDrawables(null, null, d, null); stickClick.setCompoundDrawablePadding(dp(6)); } }   // res_svg/ui/stick_click.svg
+        stickClick.setOnCheckedChangeListener((v, on) -> { if (filling) return; L().stickDoubleTap = on; });
+        selSec.addView(stickClick);
         sizeLabel = label("Ukuran"); selSec.addView(sizeLabel);
         size = new SeekBar(this); size.setMax(270);   // scale 0.3 .. 3.0 of the default size
         size.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
@@ -263,6 +267,7 @@ public class ControlsActivity extends Activity {
         selLabel.setText(g < 0 ? "" : ControlsLayout.GROUP_LABEL[g] + ":");
         hideGroup.setVisibility(g < 0 ? View.GONE : View.VISIBLE); if (g >= 0) hideGroup.setChecked(L().hidden[g]);
         fixedStick.setVisibility(ControlsLayout.isStick(g) ? View.VISIBLE : View.GONE); if (ControlsLayout.isStick(g)) fixedStick.setChecked(L().fixed[g - ControlsLayout.LS]);
+        stickClick.setVisibility(ControlsLayout.isStick(g) ? View.VISIBLE : View.GONE); stickClick.setChecked(L().stickDoubleTap);
         size.setVisibility(g < 0 ? View.GONE : View.VISIBLE); sizeLabel.setVisibility(g < 0 ? View.GONE : View.VISIBLE); syncSize();
         buttonsRow.removeAllViews();
         if (g >= 0 && !ControlsLayout.isStick(g)) {
