@@ -782,6 +782,7 @@ struct vtex {
     uint32_t gpu_lv;   // levels a copy wrote on the GPU (texture or buffer copies into one level): an upload from storage leaves them alone, the rest still follows the game's writes   // lcpu: a linear texture in a pool the CPU writes (a glyph cache): its storage hashed once a submission, uploaded again when it changed
     int storage;   // made with VK_IMAGE_USAGE_STORAGE_BIT (an NVN image texture whose format Vulkan can store to)
     uint8_t late;   // made before the game wrote its storage, watched for that (late_fill)
+    uint32_t mir_lv;   // levels a GPU copy wrote whose bytes were written into the storage too (copy_b2t / copy_t2t mirror): the storage holds them, as the image does
     uint32_t linrow, linbpb;   // a linear 2D texture (LINEAR / LINEAR_RENDER_TARGET) the CPU can read: its row pitch and bytes per texel; what passes render into it goes back to its storage (lin_writeback)
 };
 static vtex **g_gb; static int g_ngb, g_cgb; static pthread_mutex_t g_gbmu = PTHREAD_MUTEX_INITIALIZER;
@@ -845,6 +846,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
         if (h != v->lhash) { v->lhash = h; tex_upload(v, t); }
     }
     if (v) {
+        if (v->dead && v->dead < g_fence + 1) v->dead = g_fence + 1;   // released, still named by a command recorded before: kept until this submission is done
         v->last_frame = atomic_load(&g_presents); v->last_fence = g_fence + 1;
         if (v->evicted && !tex_remake(v, t)) return NULL;   // evicted while unused (tex_evict): made again from its storage
         if (for_rt) v->gpu = 1;
@@ -935,7 +937,7 @@ static void tex_evict(uint64_t trim_gen) {
     int nev = 0;
     pthread_mutex_lock(&g_rmu);
     for (int hh = 0; hh < NHASH; hh++) for (vtex *v = g_tex[hh]; v; v = v->next) {
-        if (v->evicted || !v->packaged || v->gpu || v->gpu_lv || v->dirty || !v->img || v->last_fence > done || n - v->last_frame < age) continue;
+        if (v->dead || v->evicted || !v->packaged || v->gpu || v->gpu_lv || v->dirty || !v->img || v->last_fence > done || n - v->last_frame < age) continue;
         for (int k = 0; k < v->nviews; k++) vkDestroyImageView(g_dev, v->views[k].v, NULL);
         free(v->views); v->views = NULL; v->nviews = 0;
         vkDestroyImage(g_dev, v->img, NULL); img_mem_free(v->blk, v->m, v->moff, v->msize); v->img = VK_NULL_HANDLE; v->evicted = 1; nev++;
@@ -998,6 +1000,9 @@ static void garbage_free(uint64_t done) {
     for (int i = 0; i < g_ngb;) {
         vtex *v = g_gb[i];
         if (v->dead > done) { i++; continue; }
+        pthread_mutex_lock(&g_rmu);   // out of the table now (mtl_tex_release left it there)
+        for (vtex **pp = &g_tex[v->serial % NHASH]; *pp; pp = &(*pp)->next) if (*pp == v) { *pp = v->next; break; }
+        pthread_mutex_unlock(&g_rmu);
         for (int k = 0; k < v->nviews; k++) vkDestroyImageView(g_dev, v->views[k].v, NULL);
         if (!v->evicted) { vkDestroyImage(g_dev, v->img, NULL); img_mem_free(v->blk, v->m, v->moff, v->msize); }   // an evicted one gave its image and memory back already
         free(v->views); free(v);
@@ -1089,10 +1094,14 @@ void mtl_reg_samp(int id, const samp_par *p) {
 }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 void mtl_tex_init(const tex_t *t) { (void)t; }
+// Released by the game (TextureFinalize): it stays findable by its serial until it is freed (garbage_free), as commands recorded before the release and replayed after it -- an
+// Unreal mip-streaming copy out of the texture being replaced -- still name it. Taken out of the table at once, such a copy found no image, made a new one from the texture's
+// storage, which lacks what GPU copies put into the image, and copied black into the new texture's lower levels (FINAL FANTASY RESONANCE's corridor: dark columns at a distance)
 void mtl_tex_release(tex_t *t) {
     pthread_mutex_lock(&g_rmu);
-    for (vtex **pp = &g_tex[t->serial % NHASH]; *pp; pp = &(*pp)->next) if ((*pp)->serial == t->serial) { vtex *v = *pp; *pp = v->next; pthread_mutex_unlock(&g_rmu); tex_free(v); return; }
+    vtex *v = tex_find(t->serial); int fresh = v && !v->dead;
     pthread_mutex_unlock(&g_rmu);
+    if (fresh) tex_free(v);
 }
 void mtl_tex_cpu_written(const tex_t *t) {
     pthread_mutex_lock(&g_rmu);
@@ -2507,6 +2516,18 @@ static int copylog_on(void) {   // DM_VK_COPYLOG=<n>: log the first n buffer-to-
     if (left <= 0) return 0;
     left--; return 1;
 }
+// A GPU copy's bytes also go into the destination's storage when the texture takes its content from there (as nvn_mtl.m tex_storage_dst / nvn_tex_mirror_*): any later upload
+// from the storage -- the texture made again after the game released it, a new texture object over the same storage, an eviction -- then has the copied levels too. The level
+// stays the GPU's for this image (gpu_lv); the storage now holds the same bytes (mir_lv)
+int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);   // hle_nvn.c
+int nvn_tex_mirror_t2t(const tex_t *s, unsigned sl, unsigned ss, const NVNcopyRegion *sr, const tex_t *d, unsigned dl, unsigned ds, const NVNcopyRegion *dr);
+static uint64_t g_mir_b2t, g_mir_t2t;
+static int storage_backed(const tex_t *t, const vtex *v) {
+    if (!t->mem || !t->pool || (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) || t->d.samples > 1) return 0;
+    if (t->d.target == NVN_TEXTURE_TARGET_BUFFER || t->d.target == NVN_TEXTURE_TARGET_3D || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_IMAGE))) return 0;
+    return v && !v->gpu;
+}
+static int storage_holds(const vtex *v, unsigned lv) { return v && !v->gpu && lv < 32 && ((v->packaged && !(v->gpu_lv >> lv & 1)) || (v->mir_lv >> lv & 1)); }   // the level's bytes are in the storage
 static void copy_b2t(const p_copy_b2t *c) {
     if (vk_skip() & SK_B2T) return;
     if (g_plog) LOG("plog:  b2t serial %llu fmt %#x %dx%d at %d,%d,%d", (unsigned long long)c->tex->serial, c->tex->d.format, c->r.width, c->r.height, c->r.xoffset, c->r.yoffset, c->r.zoffset);
@@ -2528,6 +2549,7 @@ static void copy_b2t(const p_copy_b2t *c) {
             (unsigned long long)nb, (unsigned long long)nz, (unsigned long long)hh); }
     uint32_t lv = c->has_view && c->view.set_levels ? c->view.base_level : 0, ly = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     if (lv < 32) v->gpu_lv |= 1u << lv;   // this level's content now comes from copies (see copy_t2t)
+    if (!from_gpu && storage_backed(c->tex, v) && !nvn_tex_mirror_b2t(c->tex, lv, ly, r, (const uint8_t *)(uintptr_t)c->src, row, img)) { if (lv < 32) v->mir_lv |= 1u << lv; g_mir_b2t++; }
     int is3d = v->target == NVN_TEXTURE_TARGET_3D;
     if (!lvl_fits(v, lv, is3d ? 0 : ly + (uint32_t)r->zoffset, is3d ? 1 : d, r->xoffset, r->yoffset, is3d ? r->zoffset : 0, w, h, is3d ? d : 1)) {
         static int n; if (n++ < 8) LOG("[RED] vk: buffer-to-texture copy %dx%dx%d at %d,%d,%d level %u outside the %ux%ux%u texture (%u levels, %u layers): skipped", (int)w, (int)h, (int)d, r->xoffset, r->yoffset, r->zoffset, lv, v->w, v->h, v->d, v->levels, v->layers);
@@ -2548,6 +2570,8 @@ static void copy_t2t(const p_copy_t2t *c) {
     pass_end();
     uint32_t sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     if (dl < 32) d->gpu_lv |= 1u << dl;
+    if (storage_backed(c->dst, d) && storage_holds(s, sl) && c->sr.width == c->dr.width && c->sr.height == c->dr.height
+        && !nvn_tex_mirror_t2t(c->src, sl, (unsigned)c->sr.zoffset, &c->sr, c->dst, dl, (unsigned)c->dr.zoffset, &c->dr)) { if (dl < 32) d->mir_lv |= 1u << dl; g_mir_t2t++; }
     if (copylog_on()) LOG("copylog: frame %llu t2t serial %llu (fmt %#x, level %u, %s) %dx%d at %d,%d -> serial %llu (fmt %#x, level %u) at %d,%d", (unsigned long long)atomic_load(&g_presents),
                           (unsigned long long)c->src->serial, c->src->d.format, sl, s->gpu ? "rendered" : s->gpu_lv ? "copied into" : "from its storage", c->sr.width, c->sr.height, c->sr.xoffset, c->sr.yoffset,
                           (unsigned long long)c->dst->serial, c->dst->d.format, dl, c->dr.xoffset, c->dr.yoffset);
@@ -3279,9 +3303,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         long cached = 0, avail = 0; if ((f = fopen("/proc/meminfo", "re"))) { while (fgets(ln, sizeof ln, f)) { sscanf(ln, "Cached: %ld", &cached); sscanf(ln, "MemAvailable: %ld", &avail); } fclose(f); }
         extern _Atomic uint64_t g_fs_dropped;
         LOG("vk: memory: process RSS %.0f MB (anonymous %.0f MB), PSS %.0f MB; Vulkan rings %.0f MB + extra %.0f MB, image blocks %d x 64 MB, big images %.0f MB, %d descriptor pools;"
-            " system: available %.0f MB, page cache %.0f MB; game file reads dropped from the page cache so far %.0f MB; textures evicted %llu, made again %llu; drawn before their data came and filled when it did %llu of %llu",
+            " system: available %.0f MB, page cache %.0f MB; game file reads dropped from the page cache so far %.0f MB; textures evicted %llu, made again %llu; drawn before their data came and filled when it did %llu of %llu; GPU copies written into storage too: buffer %llu, texture %llu",
             rss / 1024.0, anon / 1024.0, pss / 1024.0, atomic_load(&g_ring0_bytes) / 1048576.0, atomic_load(&g_extra_ring_bytes) / 1048576.0, nb, atomic_load(&g_big_bytes) / 1048576.0, atomic_load(&g_ndp_total),
-            avail / 1024.0, cached / 1024.0, atomic_load(&g_fs_dropped) / 1048576.0, (unsigned long long)g_evicted, (unsigned long long)g_remade, (unsigned long long)g_late_fill, (unsigned long long)g_late_watch);
+            avail / 1024.0, cached / 1024.0, atomic_load(&g_fs_dropped) / 1048576.0, (unsigned long long)g_evicted, (unsigned long long)g_remade, (unsigned long long)g_late_fill, (unsigned long long)g_late_watch, (unsigned long long)g_mir_b2t, (unsigned long long)g_mir_t2t);
     }
     if (n % 600 == 0) LOG("vk: occlusion queries so far: %llu samples-passed reports, %llu resets, %llu draws counted", (unsigned long long)g_occ_nrep, (unsigned long long)g_occ_nrst, (unsigned long long)g_occ_ndraw);
     if (n % 600 == 0) LOG("vk: texel buffer slots read as zeros so far: nothing bound %llu, not a buffer texture %llu, format not usable %llu", (unsigned long long)g_tbuf_miss[0],
