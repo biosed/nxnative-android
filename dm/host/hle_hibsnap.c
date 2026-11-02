@@ -218,6 +218,7 @@ int dm_hib_movie_defer_thread(int set);
 size_t dm_hib_nvn_save(uint8_t **out); int dm_hib_nvn_restore(const uint8_t *b, size_t n); const char *dm_hib_nvn_refuse(void);
 size_t dm_hib_hid_save(uint8_t **out); int dm_hib_hid_restore(const uint8_t *b, size_t n);
 size_t dm_hib_fs_save(uint8_t **out); int dm_hib_fs_restore(const uint8_t *b, size_t n);
+size_t dm_hib_ueheap_save(uint8_t **out); int dm_hib_ueheap_restore(const uint8_t *b, size_t n);
 size_t dm_hib_audio_save(uint8_t **out); int dm_hib_audio_restore(const uint8_t *b, size_t n); int dm_hib_audio_host_outputs(void);
 // The host statics the guest uses as its own objects (hle.h HLE_HIB_STATIC): their bytes, in section order
 static size_t statics_save(uint8_t **out) {
@@ -243,6 +244,7 @@ static const struct { const char *name; size_t (*save)(uint8_t **); int (*restor
     {"kernel", dm_hib_kernel_save, NULL},   // restored with the thread records (dm_hib_restore_prepare)
     {"svc", dm_hib_svc_save, dm_hib_svc_restore},
     {"arena", dm_hib_arena_save, dm_hib_arena_restore_state},
+    {"ueheap", dm_hib_ueheap_save, dm_hib_ueheap_restore},
     {"statics", statics_save, statics_restore},
     {"oe", dm_hib_oe_save, dm_hib_oe_restore},
     {"fs", dm_hib_fs_save, dm_hib_fs_restore},
