@@ -1296,8 +1296,10 @@ NVN(nvnWindowBuilderSetTextures, void, NVNwindowBuilder *b, int n, NVNtexture *c
     WB(b)->ntex = n; for (int i = 0; i < n; i++) WB(b)->tex[i] = t[i];
 }
 NVN(nvnWindowBuilderSetPresentInterval, void, NVNwindowBuilder *b, int v) { WB(b)->interval = v; }
+static win_t *g_hwin[8]; static int g_nhwin;   // hibernation: the windows the game made (their pacing times are this process's clock)
 NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
     const win_builder_t *s = (const win_builder_t *)b; win_t *o = (win_t *)w;
+    { int k = 0; while (k < g_nhwin && g_hwin[k] != o) k++; if (k == g_nhwin && g_nhwin < 8) g_hwin[g_nhwin++] = o; }
     memset(o, 0, sizeof *o); o->magic = MAGIC('W', 'I', 'N', 'D'); o->native = s->native; o->ntex = s->ntex; o->interval = s->interval;
     memcpy(o->tex, s->tex, sizeof o->tex);
     for (int i = 0; i < o->ntex; i++) if (o->tex[i]) mtl_xv_window_tex(CTX(o->tex[i])->serial);
@@ -2634,3 +2636,74 @@ int nvn_host_signal_sync(void *nvnsync) {
     o->fence = 0; o->fenced = 1; return 0;
 }
 NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }   // unified memory + dirty page tracking: nothing to flush
+
+// ---------- Hibernation (dm/host/hle_hibsnap.c): this layer's state in a snapshot ----------
+// The serial counter, the descriptor pools' bases, the programs' shader keys (computed from control sections that are only valid during ProgramSetShaders), the textures the CPU
+// may fill (flush tracking) and the flushed ranges; then the replay layer's own (nvn_mtl.m mtl_hib_save). Sparse virtual pools and host command segments are not kept: no snapshot
+// is written while one exists (dm_hib_nvn_refuse)
+#ifdef __APPLE__
+size_t mtl_hib_save(uint8_t **out); int mtl_hib_restore(const uint8_t *b, size_t n);
+#else   // the Android Vulkan backend has no hibernation state yet: its snapshot holds none, and a restore fails there
+__attribute__((weak)) size_t mtl_hib_save(uint8_t **out); __attribute__((weak)) int mtl_hib_restore(const uint8_t *b, size_t n);
+#endif
+// Before the snapshot, every guest thread parked and the GPU drained: GPU-filled textures read back into their storage (nvn_mtl.m mtl_hib_readback), in a submission of its own
+#ifdef __APPLE__
+void mtl_hib_readback(void);
+#else
+__attribute__((weak)) void mtl_hib_readback(void);
+#endif
+void dm_hib_nvn_prepare(void) {
+    if (!mtl_hib_readback) return;
+    pthread_mutex_lock(&g_sub_mu);
+    mtl_sub_begin(); mtl_hib_readback(); mtl_sub_commit();
+    pthread_mutex_unlock(&g_sub_mu);
+    mtl_finish();   // the readbacks land in guest memory before it is written
+}
+const char *dm_hib_nvn_refuse(void) {
+    pthread_mutex_lock(&g_vp_mu); int nvp = g_nvp; pthread_mutex_unlock(&g_vp_mu);
+    if (nvp) return "a sparse virtual memory pool exists";
+    pthread_mutex_lock(&g_hostseg_mu); int busy = 0; for (int i = 0; i < g_nhostseg; i++) busy += g_hostseg[i].busy; pthread_mutex_unlock(&g_hostseg_mu);
+    if (busy) return "a command buffer has overflowed into host memory";
+    return NULL;
+}
+typedef struct { uint64_t serial; int32_t ntpb, nspb, tnext, snext, npk, nft, nfl, nwin; uint64_t mtl_len, win[8]; } hib_nvn;
+typedef struct { uint64_t prog; uint8_t key[6][8]; uint8_t ok, pad[7]; } hib_pk;
+size_t dm_hib_nvn_save(uint8_t **out) {
+    uint8_t *mb = NULL; size_t mn = mtl_hib_save ? mtl_hib_save(&mb) : 0;
+    hib_nvn h = {atomic_load(&g_serial), 0, 0, 0, 0, 0, 0, 0, g_nhwin, mn, {0}};
+    for (int i = 0; i < g_nhwin; i++) h.win[i] = (uint64_t)(uintptr_t)g_hwin[i];
+    pthread_mutex_lock(&g_dpool_mu); h.ntpb = g_ntpb; h.nspb = g_nspb; h.tnext = g_tnext; h.snext = g_snext; pthread_mutex_unlock(&g_dpool_mu);
+    pthread_mutex_lock(&g_pk_mu); h.npk = g_pk ? (int)CFDictionaryGetCount(g_pk) : 0;
+    const void **ks = calloc((size_t)h.npk + 1, sizeof *ks), **vs = calloc((size_t)h.npk + 1, sizeof *vs); if (g_pk) CFDictionaryGetKeysAndValues(g_pk, ks, vs);
+    pthread_mutex_unlock(&g_pk_mu);
+    pthread_mutex_lock(&g_ft_mu); h.nft = (int)g_nft; pthread_mutex_unlock(&g_ft_mu);
+    pthread_mutex_lock(&g_fl_mu); h.nfl = (int)g_nfl; pthread_mutex_unlock(&g_fl_mu);
+    size_t n = sizeof h + 2 * NDPOOL * sizeof(struct dpool_base) + (size_t)h.npk * sizeof(hib_pk) + (size_t)h.nft * sizeof(tex_t) + (size_t)h.nfl * sizeof(fl_span) + mn;
+    uint8_t *b = calloc(1, n), *p = b; memcpy(p, &h, sizeof h); p += sizeof h;
+    pthread_mutex_lock(&g_dpool_mu); memcpy(p, g_tpb, sizeof g_tpb); p += sizeof g_tpb; memcpy(p, g_spb, sizeof g_spb); p += sizeof g_spb; pthread_mutex_unlock(&g_dpool_mu);
+    for (int i = 0; i < h.npk; i++) { hib_pk e = {(uint64_t)(uintptr_t)ks[i], {{0}}, 0, {0}}; const prog_keys_t *k = vs[i]; memcpy(e.key, k->key, sizeof e.key); e.ok = k->ok; memcpy(p, &e, sizeof e); p += sizeof e; }
+    free(ks); free(vs);
+    pthread_mutex_lock(&g_ft_mu); for (size_t i = 0; i < (size_t)h.nft; i++) { memcpy(p, &g_ft[i].t, sizeof(tex_t)); p += sizeof(tex_t); } pthread_mutex_unlock(&g_ft_mu);
+    pthread_mutex_lock(&g_fl_mu); memcpy(p, g_fl, (size_t)h.nfl * sizeof(fl_span)); p += (size_t)h.nfl * sizeof(fl_span); pthread_mutex_unlock(&g_fl_mu);
+    memcpy(p, mb, mn); free(mb);
+    *out = b; return n;
+}
+int dm_hib_nvn_restore(const uint8_t *b, size_t n) {
+    hib_nvn h; if (n < sizeof h) return -1; memcpy(&h, b, sizeof h);
+    if (h.ntpb > NDPOOL || h.nspb > NDPOOL || n != sizeof h + 2 * NDPOOL * sizeof(struct dpool_base) + (size_t)h.npk * sizeof(hib_pk) + (size_t)h.nft * sizeof(tex_t) + (size_t)h.nfl * sizeof(fl_span) + h.mtl_len) return -1;
+    const uint8_t *p = b + sizeof h;
+    atomic_store(&g_serial, h.serial);
+    pthread_mutex_lock(&g_dpool_mu); memcpy(g_tpb, p, sizeof g_tpb); p += sizeof g_tpb; memcpy(g_spb, p, sizeof g_spb); p += sizeof g_spb;
+    g_ntpb = h.ntpb; g_nspb = h.nspb; g_tnext = h.tnext; g_snext = h.snext; pthread_mutex_unlock(&g_dpool_mu);
+    for (int i = 0; i < h.npk; i++) { hib_pk e; memcpy(&e, p, sizeof e); p += sizeof e; prog_keys_t *k = pk_get((const void *)(uintptr_t)e.prog, 1); memcpy(k->key, e.key, sizeof k->key); k->ok = e.ok; }
+    const tex_t *ft = (const tex_t *)p; p += (size_t)h.nft * sizeof(tex_t);
+    pthread_mutex_lock(&g_fl_mu); g_nfl = g_cfl = (size_t)h.nfl; g_fl = malloc(g_cfl * sizeof *g_fl + 1); memcpy(g_fl, p, g_nfl * sizeof *g_fl); p += g_nfl * sizeof *g_fl; pthread_mutex_unlock(&g_fl_mu);
+    if (!mtl_hib_restore || mtl_hib_restore(p, h.mtl_len)) return -1;   // the pools first: flush tracking below protects their pages
+    for (int i = 0; i < h.nft; i++) ft_add(&ft[i]);
+    g_nhwin = h.nwin < 8 ? h.nwin : 8;
+    for (int i = 0; i < g_nhwin; i++) {   // the windows' pacing times were the old process's clock: every texture is free now, pacing starts over
+        win_t *o = g_hwin[i] = (win_t *)(uintptr_t)h.win[i];
+        if (o->magic == MAGIC('W', 'I', 'N', 'D')) { memset(o->avail, 0, sizeof o->avail); o->pace = 0; }
+    }
+    return 0;
+}

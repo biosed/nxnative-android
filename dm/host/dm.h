@@ -91,6 +91,37 @@ static inline void *dm_slot_get(pthread_key_t k) { void **tp; __asm__ volatile("
 #define dm_slot_get pthread_getspecific
 #endif
 
+// Hibernation (hle_hib.c, DM_HIBERNATE): host objects that guest memory points to come from the host arena, at fixed addresses. hle_hib.c sets the hooks before main;
+// they are weak definitions so that a unit test links any one host file alone. dm_hib_calloc gives zeroed arena memory, or NULL with hibernation off (the caller allocates
+// as before); dm_hib_free takes back what dm_hib_calloc gave and returns 1, 0 for any other pointer (the caller frees it)
+__attribute__((weak)) void *(*dm_hib_alloc_hook)(size_t size) = 0;
+__attribute__((weak)) int (*dm_hib_free_hook)(void *p) = 0;
+static inline void *dm_hib_calloc(size_t size) { return dm_hib_alloc_hook ? dm_hib_alloc_hook(size) : NULL; }
+static inline int dm_hib_free(void *p) { return p && dm_hib_free_hook && dm_hib_free_hook(p); }
+// The other hooks of hibernation, set by hle_hib.c / hle_thread.c before main: the guest address space's fixed place (hle_svc.c), module memory (loader.c), what the guest gets
+// instead of a host function (resolve_import, force_lookup), DM_CTL "hib" lines (hle_hid.c), a host-created thread's body through a restartable stub (hle_guestthread.c), and
+// the point a restartable call's wait stops at while parked (hle_oe.c)
+__attribute__((weak)) void *(*dm_hib_guest_as_hook)(size_t len) = 0;
+__attribute__((weak)) void *(*dm_hib_module_map_hook)(size_t len) = 0;
+__attribute__((weak)) void *(*dm_hib_thunk_hook)(void *fn) = 0;
+__attribute__((weak)) void (*dm_hib_ctl_hook)(const char *cmd) = 0;
+__attribute__((weak)) void (*dm_hib_call_hook)(void (*fn)(void *), void *arg) = 0;
+__attribute__((weak)) void (*dm_hib_native_hold_hook)(pthread_mutex_t *held) = 0;
+static inline void dm_hib_hold_here(pthread_mutex_t *held) { if (dm_hib_native_hold_hook) dm_hib_native_hold_hook(held); }
+// The front ends' suspend sequence: on=1 at its end (the snapshot is written meanwhile, on a thread of its own), on=0 at the start of the resume (waits for that write)
+__attribute__((weak)) void (*dm_hib_suspend_hook)(int on) = 0;
+__attribute__((weak)) void (*dm_hib_kick_hook)(void) = 0;
+// The front ends' side: dm_hib_forget_hook (hle_hibsnap.c) drops the snapshot and writes no more (the player ends the game: Android's − and + held); dm_hib_refused_hook, set by a
+// front end that started the game to resume it (Android's auto-resume), is called when the snapshot it found is refused (another build, damaged): back to its menu
+__attribute__((weak)) void (*dm_hib_forget_hook)(void) = 0;
+__attribute__((weak)) void (*dm_hib_flush_hook)(void) = 0;   // waits for a snapshot being written (the process is about to end: the snapshot stays)
+__attribute__((weak)) void (*dm_hib_refused_hook)(void) = 0;
+// A restored thread goes back to where it stopped (hle_hib.c, does not return): mode 0 dispatches the gate frame (the SVC runs from the start), 1 returns to the guest from it, 2 calls
+// a restartable host call again from its entry frame
+__attribute__((weak)) void (*dm_hib_resume_frame_hook)(const uint64_t *frame, int mode) = 0;   // wakes host waits that look at dm_hib_parking_now (hle_os.c guest_clock_kick)
+static inline void dm_hib_suspend(int on) { if (dm_hib_suspend_hook) dm_hib_suspend_hook(on); }
+// Set while hibernation parks every guest thread (hle_thread.c dm_guest_park_all): gates are where threads stop
+__attribute__((weak)) _Atomic int dm_hib_parking_now = 0;
 void load_modules(const char *dir, const char **names, int n);
 const char *dm_module_dir(void);   // the folder load_modules read the modules and the rewriter's tables from (the cheat engine reads main.changed.tsv there)
 void run_module_inits(void);

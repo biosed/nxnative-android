@@ -30,7 +30,13 @@ VPX := ../third_party/libvpx
 VPX_OBJ := $(patsubst $(VPX)/%.c,gen/vpx/%.o,$(sort $(shell find $(VPX) -name '*.c')))
 # dmhost: the same host as a command-line program for adb (cli/front_cli.c: no window), run from /data/local/tmp as on the Mac: dmhost <module dir> [modules]
 CLI_OBJ := $(patsubst %,$(OUT)/obj/android/%.o,cli/front_cli.c)
-.DEFAULT_GOAL := $(OUT)/libdmhost.so
+.DEFAULT_GOAL := all
+.PHONY: all
+all: $(OUT)/libdmhost.so $(OUT)/libdmboot.so
+# libdmboot.so, the app's NativeActivity library: loads libdmhost.so at a fixed address for hibernation (boot/boot.c), then hands the activity to it
+$(OUT)/libdmboot.so: boot/boot.c
+	@mkdir -p $(dir $@)
+	$(CC) -shared -fPIC -O2 -fvisibility=hidden -Wall -o $@ $< -Wl,--no-undefined -Wl,-z,max-page-size=16384 -landroid -llog -ldl
 .PHONY: profile clean
 profile:
 	$(MAKE) -C $(HOST) GAME=$(GAME) game_profile

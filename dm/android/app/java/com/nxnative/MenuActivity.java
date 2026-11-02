@@ -40,7 +40,7 @@ import java.util.Set;
 public class MenuActivity extends Activity {
     private SharedPreferences prefs;
     private Spinner mode, fps, fit, lang;
-    private CheckBox showFps, skip;
+    private CheckBox showFps, skip, hibernate;
     private final List<CheckBox> cheatBoxes = new ArrayList<>();
     private boolean launched;
     private Button playButton;
@@ -50,16 +50,21 @@ public class MenuActivity extends Activity {
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        // The notification that keeps a suspended game in memory (GameService) needs the notification permission from Android 13 on; asked once, the game runs without it too
-        if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
-            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
         prefs = getSharedPreferences("menu", MODE_PRIVATE);
+        // A game the process left in hibernation (DM_HIBERNATE: its snapshot in <files>/hibernate) resumes at once, as a Switch wakes; the menu is the − and + hold away.
+        // Also when Android made this activity again after closing the app's processes (b != null): that is the case hibernation is for. A snapshot the game cannot take
+        // (another version, damaged) is removed by the game, which then comes back here (show_menu)
+        boolean resume = new File(getFilesDir(), "hibernate/snap.bin").exists() && hibernationOn() && !new File(getFilesDir(), "show_menu").exists();
+        // The notification that keeps a suspended game in memory (GameService) needs the notification permission from Android 13 on; asked once, the game runs without it too.
+        // Not on a start that goes straight back into the game: the system dialog would open over it (asked at the next start that shows the menu)
+        if (!resume && android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
         seedFiles();
         buildUi();
         if (needsUnpack()) { if (pendingData() != null) askData(null); else unpack(); return; }
         boolean forced = new File(getFilesDir(), "show_menu").delete();
         if (showFailure()) return;   // the last game process died: the error, not the game again (with "do not show again" on, it would start straight back into it)
-        if (prefs.getBoolean("skip", false) && !forced && b == null && gameFilesPresent()) play();
+        if (((prefs.getBoolean("skip", false) && b == null) || resume) && !forced && gameFilesPresent()) play();
     }
     @Override protected void onPause() { super.onPause(); if (mode != null) save(); }   // choices are kept also when the menu is left without playing
     @Override protected void onResume() {
@@ -250,6 +255,16 @@ public class MenuActivity extends Activity {
         for (String n : dm) if (n.endsWith(".fixups.tsv")) { try (InputStream in = new java.io.FileInputStream(new File(ext, "dm/" + n))) { in.read(); } catch (Exception e) { return "dm/" + n; } break; }
         return null;
     }
+    // DM_HIBERNATE=<n> with n > 0 in the settings (the menu's "Resume after the app is closed") or in the diagnostics file <external>/env.txt (which wins), as the game reads them (app/front_android.c boot_env)
+    private boolean hibernationOn() {
+        String v = null;
+        for (File f : new File[] { new File(getFilesDir(), "settings.env"), new File(getExternalFilesDir(null), "env.txt") }) {
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(new java.io.FileInputStream(f), StandardCharsets.UTF_8))) {
+                String l; while ((l = r.readLine()) != null) if (l.startsWith("DM_HIBERNATE=")) v = l.substring(13).trim();
+            } catch (Exception e) { /* not there */ }
+        }
+        try { return v != null && Integer.parseInt(v) > 0; } catch (NumberFormatException e) { return false; }
+    }
     private boolean gameFilesPresent() {
         File ext = getExternalFilesDir(null);
         return ext != null && new File(ext, "romfs").exists() && new File(ext, "dm").isDirectory() && new File(ext, "vk").isDirectory();   // romfs: a folder, or a RomFS image (hle_fs.c)
@@ -326,6 +341,9 @@ public class MenuActivity extends Activity {
                 cheatBoxes.add(c); col.addView(c);
             }
         }
+        // Hibernation (DM_HIBERNATE, dm/host/hle_hibsnap.c): leaving the game writes it to storage, and opening the app after Android closed it goes back there. Off by default while it is tested
+        hibernate = new CheckBox(this); hibernate.setText("Resume after the app is closed (beta): leaving the game saves where you are, opening the app goes back there");
+        hibernate.setTextColor(Color.WHITE); hibernate.setChecked(prefs.getBoolean("hibernate", false)); col.addView(hibernate);
         skip = new CheckBox(this); skip.setText("Do not show this menu again (− and + during the game open it again)"); skip.setTextColor(Color.WHITE);
         skip.setChecked(prefs.getBoolean("skip", false)); col.addView(skip);
         Button controls = new Button(this); controls.setText("Atur tombol (on-screen controls)"); controls.setTextSize(16); controls.setAllCaps(false);   // ControlsActivity: the layout editor
@@ -354,11 +372,11 @@ public class MenuActivity extends Activity {
         String[] langs = {"es-419", "en-US", "system"};
         prefs.edit().putInt("opmode", mode.getSelectedItemPosition() == 1 ? 1 : 0).putInt("fps", fps.getSelectedItemPosition() == 1 ? 30 : 60)
              .putBoolean("stretch", fit.getSelectedItemPosition() == 1).putString("lang", langs[lang.getSelectedItemPosition()])
-             .putBoolean("showfps", showFps.isChecked()).putStringSet("cheats", on).putBoolean("skip", skip.isChecked()).apply();
+             .putBoolean("showfps", showFps.isChecked()).putStringSet("cheats", on).putBoolean("skip", skip.isChecked()).putBoolean("hibernate", hibernate.isChecked()).apply();
         String l = langs[lang.getSelectedItemPosition()]; if (l.equals("system")) l = systemLang();
         String env = "DM_OPMODE=" + (mode.getSelectedItemPosition() == 1 ? 1 : 0) + "\nDM_FPS=" + (fps.getSelectedItemPosition() == 1 ? 30 : 60)
                    + "\nDM_SCREEN_FIT=" + (fit.getSelectedItemPosition() == 1 ? "stretch" : "keep") + "\nDM_LANG=" + l + "\nDM_SHOW_FPS=" + (showFps.isChecked() ? 1 : 0)
-                   + "\nDM_CHEATS_ON=" + list + "\n";
+                   + "\nDM_CHEATS_ON=" + list + "\nDM_HIBERNATE=" + (hibernate.isChecked() ? 1 : 0) + "\n";
         try (OutputStream o = new FileOutputStream(new File(getFilesDir(), "settings.env"))) { o.write(env.getBytes(StandardCharsets.UTF_8)); } catch (Exception e) { /* the defaults apply */ }
     }
     private void play() {

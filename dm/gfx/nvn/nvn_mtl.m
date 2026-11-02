@@ -12033,3 +12033,109 @@ void mtl_wait_state_dump(void) {
 void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_alloc_waits; *grown = g_alloc_grown; *n = g_alloc_n; }   // Main submit allocator pool: how many times it waited, how many times it grew, how many exist now
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
 #pragma clang attribute pop
+// ---------- Hibernation (dm/host/hle_hibsnap.c): the replay layer's lasting state in a snapshot ----------
+// Everything else here is a cache filled from guest memory as draws need it (textures' Metal objects and uploads, views, pipelines, residency). What the game set up through NVN
+// calls is kept: the memory pools (their zero-copy buffers are made again over the same guest pages), the live texture serials with the descriptions of image-shaped ones and
+// which ones the CPU writes, the texture and sampler descriptor tables, the window's textures, the origin and depth modes, and the fence counter (sync objects in guest memory
+// hold fence values: the shared event starts again at the last committed one, everything before it complete). The GPU-only content of render targets is not kept
+// GPU-only content: a texture the GPU filled (a copy into it, a render pass) has its content only in its Metal texture. Before the snapshot, every registered texture with a Metal texture
+// of its own that is not uploaded from its storage is read back into its storage in guest memory (mirror_readback, as a copy's readback is), and the snapshot lists it as written by
+// the CPU: the restored process uploads it from there. Single-sampled colour 2D, array and cube textures; depth, multisampled, 3D, buffer and linear ones are left (a linear texture
+// lives on its pool's buffer already). Run inside a submission (hle_nvn.c dm_hib_nvn_prepare), every guest thread parked
+typedef struct { uint64_t serial, pool; } hib_mcpu;
+static hib_mcpu *g_hib_rb; static uint32_t g_hib_nrb;
+void mtl_hib_readback(void) {
+    free(g_hib_rb); g_hib_rb = NULL; g_hib_nrb = 0;
+    os_unfair_lock_lock(&g_rmu);
+    tex_t *ts = malloc(((size_t)g_ntreg + 1) * sizeof *ts); int nt = 0;
+    for (int i = 0; i < g_ntreg; i++) if (g_treg[i].ok && !g_treg[i].gone && g_treg[i].t.serial) ts[nt++] = g_treg[i].t;
+    os_unfair_lock_unlock(&g_rmu);
+    g_hib_rb = malloc(((size_t)nt + 1) * sizeof *g_hib_rb);
+    uint64_t bytes = 0; int skipped = 0;
+    for (int i = 0; i < nt; i++) {
+        const tex_t *t = &ts[i]; int dup = 0;
+        for (uint32_t k = 0; k < g_hib_nrb && !dup; k++) dup = g_hib_rb[k].serial == t->serial;
+        if (dup) continue;
+        if (!t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER || t->d.target == NVN_TEXTURE_TARGET_3D
+            || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) continue;
+        pthread_mutex_lock(&g_cpu_tex_mu); int cpu = nvn_hm_get(&g_cpu_tex, &t->serial) != NULL; pthread_mutex_unlock(&g_cpu_tex_mu);
+        if (cpu) continue;
+        id o = tex_get(t->serial);
+        if (!o || ![o conformsToProtocol:@protocol(MTLTexture)]) continue;   // not made yet, or uploaded from its storage (a packaged texture)
+        id<MTLTexture> mt = o;
+        if (mtl_fmt_depth(mt.pixelFormat) || mt.pixelFormat == MTLPixelFormatStencil8 || mt.sampleCount > 1) { skipped++; continue; }
+        unsigned layers = (unsigned)(mt.textureType == MTLTextureTypeCube ? 6 : mt.textureType == MTLTextureTypeCubeArray ? 6 * mt.arrayLength : mt.arrayLength);
+        for (unsigned lv = 0; lv < mt.mipmapLevelCount && lv < t->d.levels; lv++) {
+            NVNcopyRegion r = {0, 0, 0, (int)MAX(mt.width >> lv, 1u), (int)MAX(mt.height >> lv, 1u), (int)(layers ? layers : 1)};
+            mirror_readback(t, mt, lv, 0, &r, "hibernate", 0);
+            bytes += (uint64_t)r.width * r.height * r.depth * 4;
+        }
+        g_hib_rb[g_hib_nrb++] = (hib_mcpu){t->serial, (uint64_t)(uintptr_t)t->pool};
+    }
+    free(ts);
+    MLOG("hibernate: %u GPU-filled textures read back into their storage (about %.1f MB), %d depth or multisampled ones left", g_hib_nrb, bytes / 1048576.0, skipped);
+}
+typedef struct { uint32_t npool, nlive, nimg, ncpu, ncpur, ntreg, nsreg, tpool_n, nxv; int32_t origin_ll, queue_origin_ll, depth_zero; uint64_t fence, pq_in; } hib_mtl;
+typedef struct { uint64_t mem, size; } hib_mpool;
+typedef struct { int32_t idx, has_v, gone, pad; tex_t t; view_t v; } hib_mtreg;
+typedef struct { int32_t idx, pad; samp_par p; } hib_msreg;
+static void hm_keys(const nvn_hmap *m, uint64_t *out, uint32_t *n) { for (uint32_t i = 0; i < m->cap; i++) if (m->vals[i]) memcpy(&out[(*n)++], m->keys + (size_t)i * m->klen, 8); }
+size_t mtl_hib_save(uint8_t **out) {
+    hib_mtl h = {0};
+    pthread_mutex_lock(&g_mu); h.npool = (uint32_t)g_npool; pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_smu); h.nlive = g_tex_live.n; h.nimg = g_image_desc.n; pthread_mutex_unlock(&g_smu);
+    pthread_mutex_lock(&g_cpu_tex_mu); h.ncpu = g_cpu_tex.n + g_hib_nrb; h.ncpur = g_cpu_tex_retired.n; pthread_mutex_unlock(&g_cpu_tex_mu);
+    os_unfair_lock_lock(&g_rmu); for (int i = 0; i < g_ntreg; i++) h.ntreg += g_treg[i].ok != 0; for (int i = 0; i < g_nsreg; i++) h.nsreg += g_sreg_ok[i] != 0; os_unfair_lock_unlock(&g_rmu);
+    h.tpool_n = (uint32_t)g_tpool_n; h.nxv = (uint32_t)g_xv_npresent; h.origin_ll = atomic_load(&g_origin_ll); h.queue_origin_ll = g_queue_origin_ll; h.depth_zero = atomic_load(&g_depth_zero); h.fence = atomic_load(&g_fence);
+    pthread_mutex_lock(&g_pq_mu); h.pq_in = g_pq_in; pthread_mutex_unlock(&g_pq_mu);
+    size_t n = sizeof h + h.npool * sizeof(hib_mpool) + h.nlive * 8 + h.nimg * sizeof(tex_t) + (h.ncpu + h.ncpur) * sizeof(hib_mcpu) + h.ntreg * sizeof(hib_mtreg) + h.nsreg * sizeof(hib_msreg) + h.nxv * 8;
+    uint8_t *b = calloc(1, n), *p = b + sizeof h;
+    pthread_mutex_lock(&g_mu);
+    for (uint32_t i = 0; i < h.npool; i++) { hib_mpool e = {(uint64_t)(uintptr_t)g_pools[i].key, g_pools[i].hi - g_pools[i].lo}; memcpy(p, &e, sizeof e); p += sizeof e; }
+    pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_smu);
+    uint32_t k = 0; hm_keys(&g_tex_live, (uint64_t *)p, &k); p += (size_t)h.nlive * 8;
+    for (uint32_t i = 0; i < g_image_desc.cap; i++) if (g_image_desc.vals[i]) { memcpy(p, g_image_desc.vals[i], sizeof(tex_t)); p += sizeof(tex_t); }
+    pthread_mutex_unlock(&g_smu);
+    pthread_mutex_lock(&g_cpu_tex_mu);
+    memcpy(p, g_hib_rb, (size_t)g_hib_nrb * sizeof *g_hib_rb); p += (size_t)g_hib_nrb * sizeof *g_hib_rb;   // read back for the snapshot: uploaded from their storage when restored
+    free(g_hib_rb); g_hib_rb = NULL; g_hib_nrb = 0;
+    for (int m = 0; m < 2; m++) { nvn_hmap *hm = m ? &g_cpu_tex_retired : &g_cpu_tex;
+        for (uint32_t i = 0; i < hm->cap; i++) if (hm->vals[i]) { hib_mcpu e; memcpy(&e.serial, hm->keys + (size_t)i * 8, 8); e.pool = (uint64_t)(uintptr_t)hm->vals[i]; memcpy(p, &e, sizeof e); p += sizeof e; } }
+    pthread_mutex_unlock(&g_cpu_tex_mu);
+    os_unfair_lock_lock(&g_rmu);
+    for (int i = 0; i < g_ntreg; i++) if (g_treg[i].ok) { hib_mtreg e = {i, g_treg[i].has_v, g_treg[i].gone, 0, g_treg[i].t, g_treg[i].v}; memcpy(p, &e, sizeof e); p += sizeof e; }
+    for (int i = 0; i < g_nsreg; i++) if (g_sreg_ok[i]) { hib_msreg e = {i, 0, g_sreg[i]}; memcpy(p, &e, sizeof e); p += sizeof e; }
+    os_unfair_lock_unlock(&g_rmu);
+    memcpy(p, g_xv_present, (size_t)h.nxv * 8);
+    memcpy(b, &h, sizeof h);
+    *out = b; return n;
+}
+void nvn_dirty_add_range(const void *mem, size_t size);
+int mtl_hib_restore(const uint8_t *b, size_t n) {
+    hib_mtl h; if (n < sizeof h) return -1; memcpy(&h, b, sizeof h);
+    if (n != sizeof h + h.npool * sizeof(hib_mpool) + h.nlive * 8 + h.nimg * sizeof(tex_t) + (h.ncpu + h.ncpur) * sizeof(hib_mcpu) + h.ntreg * sizeof(hib_mtreg) + h.nsreg * sizeof(hib_msreg) + h.nxv * 8) return -1;
+    const uint8_t *p = b + sizeof h;
+    mtl_init();
+    for (uint32_t i = 0; i < h.npool; i++) { hib_mpool e; memcpy(&e, p, sizeof e); p += sizeof e; mtl_pool_add((const void *)(uintptr_t)e.mem, e.size); nvn_dirty_add_range((const void *)(uintptr_t)e.mem, e.size); }
+    pthread_mutex_lock(&g_smu);
+    for (uint32_t i = 0; i < h.nlive; i++) { uint64_t s; memcpy(&s, p, 8); p += 8; nvn_hm_put(&g_tex_live, &s, (void *)1); }
+    for (uint32_t i = 0; i < h.nimg; i++) { tex_t *d = malloc(sizeof *d); memcpy(d, p, sizeof *d); p += sizeof *d; free(nvn_hm_put(&g_image_desc, &d->serial, d)); }
+    pthread_mutex_unlock(&g_smu);
+    pthread_mutex_lock(&g_cpu_tex_mu);
+    for (uint32_t i = 0; i < h.ncpu + h.ncpur; i++) { hib_mcpu e; memcpy(&e, p, sizeof e); p += sizeof e; nvn_hm_put(i < h.ncpu ? &g_cpu_tex : &g_cpu_tex_retired, &e.serial, (void *)(uintptr_t)e.pool); }
+    pthread_mutex_unlock(&g_cpu_tex_mu);
+    for (uint32_t i = 0; i < h.ntreg; i++) {
+        hib_mtreg e; memcpy(&e, p, sizeof e); p += sizeof e;
+        mtl_reg_tex(e.idx, &e.t, e.has_v ? &e.v : NULL);
+        if (e.gone) mtl_reg_tex_gone(e.idx);
+    }
+    for (uint32_t i = 0; i < h.nsreg; i++) { hib_msreg e; memcpy(&e, p, sizeof e); p += sizeof e; mtl_reg_samp(e.idx, &e.p); }
+    g_xv_npresent = 0; for (uint32_t i = 0; i < h.nxv && i < 128; i++) { uint64_t s; memcpy(&s, p, 8); p += 8; g_xv_present[g_xv_npresent++] = s; }
+    g_tpool_n = (int)h.tpool_n; atomic_store(&g_origin_ll, h.origin_ll); g_queue_origin_ll = h.queue_origin_ll; mtl_set_depth_zero(h.depth_zero);
+    atomic_store(&g_fence, h.fence); g_ev.signaledValue = h.fence;   // every fence the snapshot's syncs hold is complete
+    pthread_mutex_lock(&g_mu); g_done = h.fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_pq_mu); g_pq_in = g_pq_done = g_pq_read = h.pq_in; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);   // every present ticket a window holds is done
+    MLOG("hibernate: replay state restored: %u pools, %u live textures, %u texture and %u sampler descriptors, fence %llu", h.npool, h.nlive, h.ntreg, h.nsreg, (unsigned long long)h.fence);
+    return 0;
+}

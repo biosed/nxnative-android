@@ -13,11 +13,12 @@ static void *need(const char *n) { void *p = guest_sym(n); if (!p) die("host gue
 typedef struct { void (*fn)(void *); void *arg; } spawn_arg;
 typedef struct { _Alignas(16) uint8_t tt[0x200]; void *stack_alloc; } host_thread;
 void dm_thread_mark_host(void);
-static void spawn_tramp(void *p) { spawn_arg a = *(spawn_arg *)p; free(p); dm_thread_mark_host(); a.fn(a.arg); }
+static void spawn_tramp(void *p) { spawn_arg a = *(spawn_arg *)p; free(p); dm_thread_mark_host(); if (dm_hib_call_hook) dm_hib_call_hook(a.fn, a.arg); else a.fn(a.arg); }   // hibernation: through a restartable stub (hle_hib.c)
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size) {
     spawn_arg *sa = malloc(sizeof *sa); if (!sa) die("host guest thread: allocation failed"); sa->fn = fn; sa->arg = arg; fn = spawn_tramp; arg = sa;
     stack_size = (stack_size + 0xfff) & ~(size_t)0xfff;
-    host_thread *t = calloc(1, sizeof *t);                       // ThreadType is first, 0x1c0 bytes with headroom
+    // ThreadType is first, 0x1c0 bytes with headroom. The SDK links it into its thread list, so with hibernation it comes from the host arena (dm.h dm_hib_calloc)
+    host_thread *t = dm_hib_calloc(sizeof *t); if (!t) t = calloc(1, sizeof *t);
     if (!t) die("host guest thread: allocation failed");
     // CreateThread borrows this range through MapMemory. Host malloc has no
     // guest backing/state (the audio worker failed here in Tears of the Kingdom).
@@ -35,7 +36,7 @@ void dm_guest_thread_join(void *tt) {
     ((tt_fn)need("_ZN2nn2os13DestroyThreadEPNS0_10ThreadTypeE"))(tt);
     host_thread *t = tt;
     ((void (*)(void *))need("free"))(t->stack_alloc);
-    free(t);
+    if (!dm_hib_free(t)) free(t);
 }
 
 static struct { int malloc_ok, lock_owned, handle; } g_st;
