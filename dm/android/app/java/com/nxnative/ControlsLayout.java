@@ -36,6 +36,7 @@ public final class ControlsLayout {
     public final boolean[] fixed = new boolean[2];             // ls, rs: fixed (true) or floating in their zone
     public final float[][] zone = new float[2][4];             // ls, rs: the floating stick's zone, x y w h as fractions of the screen
     public final Set<String> hiddenButtons = new LinkedHashSet<>();
+    public boolean stickDoubleTap = true;                      // a double tap on a stick presses its click (L3 / R3); a file without the key: on
 
     // Today's layout on a w x h screen (app/front_android.c, before the editor existed)
     public static ControlsLayout defaults(float w, float h) {
@@ -75,6 +76,7 @@ public final class ControlsLayout {
         for (int g = 0; g < NG; g++) b.append(String.format(Locale.ROOT, "group %s %.5f %.5f %.4f %d\n", GROUPS[g], x[g], y[g], s[g], hidden[g] ? 1 : 0));
         for (int k = 0; k < 2; k++) b.append(String.format(Locale.ROOT, "stick %s %d %.5f %.5f %.5f %.5f\n", GROUPS[LS + k], fixed[k] ? 1 : 0, zone[k][0], zone[k][1], zone[k][2], zone[k][3]));
         for (String n : hiddenButtons) b.append("hide ").append(n).append('\n');
+        b.append("stickclick ").append(stickDoubleTap ? 1 : 0).append('\n');
         return b.toString();
     }
 
@@ -90,7 +92,7 @@ public final class ControlsLayout {
         b.append("},\"sticks\":{");
         for (int k = 0; k < 2; k++) b.append(k > 0 ? "," : "").append('"').append(GROUPS[LS + k]).append('"')
                 .append(String.format(Locale.ROOT, ":{\"fixed\":%b,\"zone\":[%.5f,%.5f,%.5f,%.5f]}", fixed[k], zone[k][0], zone[k][1], zone[k][2], zone[k][3]));
-        b.append("},\"hiddenButtons\":[");
+        b.append("},\"stickDoubleTap\":").append(stickDoubleTap).append(",\"hiddenButtons\":[");
         int i = 0; for (String n : hiddenButtons) b.append(i++ > 0 ? "," : "").append(Json.str(n));
         return b.append("]}").toString();
     }
@@ -109,6 +111,7 @@ public final class ControlsLayout {
         if (st instanceof Map) for (int k = 0; k < 2; k++) { Object e = ((Map<String, Object>) st).get(GROUPS[LS + k]); if (!(e instanceof Map)) continue; Map<String, Object> q = (Map<String, Object>) e;
             if (q.get("fixed") instanceof Boolean) l.fixed[k] = (Boolean) q.get("fixed");
             if (q.get("zone") instanceof List && ((List<Object>) q.get("zone")).size() == 4) for (int i = 0; i < 4; i++) l.zone[k][i] = ((Number) ((List<Object>) q.get("zone")).get(i)).floatValue(); }
+        if (m.get("stickDoubleTap") instanceof Boolean) l.stickDoubleTap = (Boolean) m.get("stickDoubleTap");
         Object hb = m.get("hiddenButtons");
         if (hb instanceof List) { l.hiddenButtons.clear(); for (Object n : (List<Object>) hb) if (n instanceof String) l.hiddenButtons.add((String) n); }
         return l;
