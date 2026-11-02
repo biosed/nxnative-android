@@ -781,6 +781,7 @@ struct vtex {
     VkImageCreateInfo ci; uint8_t packaged, evicted; uint64_t last_frame, last_fence;   // texture eviction (tex_evict): how it was made, whether its content comes from its storage, when it was last used
     uint32_t gpu_lv;   // levels a copy wrote on the GPU (texture or buffer copies into one level): an upload from storage leaves them alone, the rest still follows the game's writes   // lcpu: a linear texture in a pool the CPU writes (a glyph cache): its storage hashed once a submission, uploaded again when it changed
     int storage;   // made with VK_IMAGE_USAGE_STORAGE_BIT (an NVN image texture whose format Vulkan can store to)
+    uint8_t late;   // made before the game wrote its storage, watched for that (late_fill)
     uint32_t linrow, linbpb;   // a linear 2D texture (LINEAR / LINEAR_RENDER_TARGET) the CPU can read: its row pitch and bytes per texel; what passes render into it goes back to its storage (lin_writeback)
 };
 static vtex **g_gb; static int g_ngb, g_cgb; static pthread_mutex_t g_gbmu = PTHREAD_MUTEX_INITIALIZER;
@@ -811,6 +812,20 @@ static int init_fill(const tex_t *t, const fmt_t *f) {
     if (!no_cpu && !uncached && (!flush_fill || !nvn_flushed(t->mem, t->L.size))) return 0;
     return mem_any(t->mem, t->L.size);
 }
+// A texture init_fill would take from its storage, but whose storage is still all zero at its first use: the game's loader has not written it yet (FINAL FANTASY RESONANCE's
+// castle materials on the Xiaomi Pad 8, whose file reads are slower than the Mac's: drawn before their data arrived). It used to stay a cleared GPU texture that nothing
+// watched, and when the data came the material stayed black (a black albedo under the usual specular: dark, glossy columns and panels). Now its storage is watched from that
+// first use and it is uploaded once the game writes it (tex_get), as a texture made from storage is. Not for render targets, images or CPU_NO_ACCESS pools (the CPU writes none).
+// DM_VK_LATE_FILL=0 leaves it out
+static uint64_t g_late_watch, g_late_fill;
+static int late_fill(const tex_t *t, const fmt_t *f) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_LATE_FILL"); on = !e || atoi(e) != 0; }
+    if (!on || !t->mem || !t->pool || (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) || t->has_layout) return 0;
+    if (t->d.samples > 1 || f->depth || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    if (t->d.flags & (NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 0;
+    if ((t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) && !fmt_block(f->f) && !f->dec) return 0;   // COMPRESSIBLE marks a render target, except on a block-compressed format
+    return !mem_any(t->mem, t->L.size);
+}
 static uint64_t mem_hash(const uint8_t *p, uint64_t n) { uint64_t h = 0x9e3779b97f4a7c15ull, x, i = 0; for (; i + 8 <= n; i += 8) { memcpy(&x, p + i, 8); h = (h ^ x) * 0x100000001b3ull; } for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull; return h; }
 static int g_occ_over;
 static _Atomic uint64_t g_presents;   // frames presented (mtl_present)
@@ -833,7 +848,8 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
         v->last_frame = atomic_load(&g_presents); v->last_fence = g_fence + 1;
         if (v->evicted && !tex_remake(v, t)) return NULL;   // evicted while unused (tex_evict): made again from its storage
         if (for_rt) v->gpu = 1;
-        else if (!v->gpu && t->mem && (v->dirty || (v->span && nvn_dirty_since_span(v->span, t->mem, t->L.size, v->stamp)))) { v->dirty = 0; tex_upload(v, t); g_pkg_reup++; }   // never over what the GPU drew: a flush of the pool range around a render target is not new content
+        else if (!v->gpu && t->mem && (v->dirty || (v->span && nvn_dirty_since_span(v->span, t->mem, t->L.size, v->stamp)))) { v->dirty = 0; tex_upload(v, t); g_pkg_reup++;
+            if (v->late) { v->late = 0; v->packaged = 1; g_late_fill++; } }   // a texture whose data came after its first use (late_fill): from its storage from now on   // never over what the GPU drew: a flush of the pool range around a render target is not new content
         return v;
     }
     fmt_t f = fmt_of(t->d.format);
@@ -879,6 +895,11 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
     if (v->lcpu && packaged) { v->lhash = mem_hash(t->mem, t->L.size); v->lhash_gen = g_bvgen; }
     v->ci = ii; v->packaged = packaged && !for_rt; v->last_frame = atomic_load(&g_presents); v->last_fence = g_fence + 1;
     if (packaged) { tex_upload(v, t); g_pkg_up++; }
+    else if (!for_rt && late_fill(t, &f) && nvn_dirty_tracked(t->mem, t->L.size)) {   // still empty: cleared now, watched, uploaded when the game writes it (late_fill)
+        v->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size); v->span = nvn_dirty_span(t->mem, t->L.size); v->late = 1; g_late_watch++;
+        VkClearColorValue z = {{0}}; VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        if (!fmt_block(f.f) && (u & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) { vkCmdClearColorImage(C->up, v->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rr); C->up_used = 1; }
+    }
     else {   // contents come from the GPU (copies, render passes): start cleared, as a new texture's storage would read on hardware after a clear. Render targets too: a pass that
              // loads one before anything drew into it, or a window texture presented with nothing drawn (FINAL FANTASY XII THE ZODIAC AGE's first frames; magenta on the Metal host
              // until it zero-filled them), would read Vulkan's undefined content
@@ -3258,9 +3279,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         long cached = 0, avail = 0; if ((f = fopen("/proc/meminfo", "re"))) { while (fgets(ln, sizeof ln, f)) { sscanf(ln, "Cached: %ld", &cached); sscanf(ln, "MemAvailable: %ld", &avail); } fclose(f); }
         extern _Atomic uint64_t g_fs_dropped;
         LOG("vk: memory: process RSS %.0f MB (anonymous %.0f MB), PSS %.0f MB; Vulkan rings %.0f MB + extra %.0f MB, image blocks %d x 64 MB, big images %.0f MB, %d descriptor pools;"
-            " system: available %.0f MB, page cache %.0f MB; game file reads dropped from the page cache so far %.0f MB; textures evicted %llu, made again %llu",
+            " system: available %.0f MB, page cache %.0f MB; game file reads dropped from the page cache so far %.0f MB; textures evicted %llu, made again %llu; drawn before their data came and filled when it did %llu of %llu",
             rss / 1024.0, anon / 1024.0, pss / 1024.0, atomic_load(&g_ring0_bytes) / 1048576.0, atomic_load(&g_extra_ring_bytes) / 1048576.0, nb, atomic_load(&g_big_bytes) / 1048576.0, atomic_load(&g_ndp_total),
-            avail / 1024.0, cached / 1024.0, atomic_load(&g_fs_dropped) / 1048576.0, (unsigned long long)g_evicted, (unsigned long long)g_remade);
+            avail / 1024.0, cached / 1024.0, atomic_load(&g_fs_dropped) / 1048576.0, (unsigned long long)g_evicted, (unsigned long long)g_remade, (unsigned long long)g_late_fill, (unsigned long long)g_late_watch);
     }
     if (n % 600 == 0) LOG("vk: occlusion queries so far: %llu samples-passed reports, %llu resets, %llu draws counted", (unsigned long long)g_occ_nrep, (unsigned long long)g_occ_nrst, (unsigned long long)g_occ_ndraw);
     if (n % 600 == 0) LOG("vk: texel buffer slots read as zeros so far: nothing bound %llu, not a buffer texture %llu, format not usable %llu", (unsigned long long)g_tbuf_miss[0],
