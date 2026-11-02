@@ -9542,11 +9542,25 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     // Draws that cannot draw anything (both faces culled, empty scissor) return before the render pass is opened: otherwise the render pass is already open and on TBDR the whole attachment is loaded and stored for nothing
     // (Mac character select page: 3 render passes are opened only because of such draws, all loaded, zero draws)
     // Diagnostic switch for measuring an upper bound DM_NVN_SKIP_FS=<fragment key>[,<fragment key>...] (none by default): drops all draws of these fragment shaders (the picture will be wrong; only used in real-device ABA to measure "how much GPU time this class of draws is worth in total")
-    { static char sk[16][20]; static int nsk = -1;
+    { static char sk[16][20]; static int nsk = -1; static unsigned sk_gen; extern unsigned dm_ctl_env_gen; unsigned gen = __atomic_load_n(&dm_ctl_env_gen, __ATOMIC_ACQUIRE);
+      if (gen != sk_gen) { sk_gen = gen; nsk = -1; }   // DM_CTL "env DM_NVN_SKIP_FS=..." takes effect at once (bisecting a draw by its fragment shader in one run)
       if (nsk < 0) { nsk = 0; for (const char *q = getenv("DM_NVN_SKIP_FS"); q && *q && nsk < 16; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 16) n = 16; memcpy(sk[nsk], q, n); sk[nsk++][n] = 0; }
                      if (nsk) MLOG("DM_NVN_SKIP_FS: dropping the draws of %d fragment shaders (diagnostic; the picture is wrong)", nsk); }
       if (g_ub_n > 0 && pr->sh[1] && !g_defer_replaying && ub_skip(pr->sh[1]->key)) return;   // In-process alternating measurement: this phase drops this class
       if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) return;
+      // DM_NVN_SKIP_DRAW=<fragment key>#<n> (diagnostic, DM_CTL "env" takes effect at once): drops only the n-th draw (from 1) of that fragment shader in each frame, to tell its draws apart on screen
+      { static char dk[20]; static uint64_t dmask; static long dcounts[8]; static int dcount; static unsigned dgen = ~0u; static uint64_t dfr; static long dcnt; extern unsigned dm_ctl_env_gen; unsigned gen = __atomic_load_n(&dm_ctl_env_gen, __ATOMIC_ACQUIRE);
+        if (gen != dgen) { dgen = gen; dmask = 0; const char *e = getenv("DM_NVN_SKIP_DRAW"); const char *h = e ? strchr(e, '#') : NULL;   // <key>#<n>[,<n>...] (n from 1 to 64)
+          const char *pc = e ? strchr(e, '%') : NULL; dcount = 0;   // <key>%<index count>[,<count>...]: by the draw's vertex / index count instead (stable when the draw order is not)
+          if (pc && pc > e) { size_t n = (size_t)(pc - e); if (n > 16) n = 16; memcpy(dk, e, n); dk[n] = 0; for (const char *q = pc + 1; *q && dcount < 8; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) dcounts[dcount++] = atol(q);
+            MLOG("DM_NVN_SKIP_DRAW: dropping the draws of fragment shader %s with count %s (diagnostic)", dk, pc + 1); h = NULL; }
+          if (h && h > e) { size_t n = (size_t)(h - e); if (n > 16) n = 16; memcpy(dk, e, n); dk[n] = 0;
+            for (const char *q = h + 1; *q; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { long v = atol(q); if (v >= 1 && v <= 64) dmask |= 1ull << (v - 1); }
+            MLOG("DM_NVN_SKIP_DRAW: dropping draws %s of fragment shader %s each frame (diagnostic)", h + 1, dk); } }
+        if (dcount && pr->sh[1] && !g_defer_replaying && !strncmp(pr->sh[1]->key, dk, strlen(dk))) { long c = di ? di->count : dw ? dw->count : -1;
+          for (int i = 0; i < dcount; i++) if (c == dcounts[i]) { PD("Z %llu draw skipped: DM_NVN_SKIP_DRAW %s%%%ld", g_stat_pass, dk, c); return; } }
+        if (dmask && pr->sh[1] && !g_defer_replaying && !strncmp(pr->sh[1]->key, dk, strlen(dk))) { uint64_t f = atomic_load(&g_cur_frame); if (f != dfr) { dfr = f; dcnt = 0; }
+          long c = ++dcnt; if (c <= 64 && (dmask >> (c - 1) & 1)) { PD("Z %llu draw skipped: DM_NVN_SKIP_DRAW %s#%ld", g_stat_pass, dk, c); return; } } }
       if (ms_draw(pr)) return; }
     // Similar diagnostic DM_NVN_SKIP_SMALL=<width>: drop all draws whose target width (by the attached level) is <= this value -- measures how much "dropping tiny render passes in bulk" is worth under the parallel pipeline (fixed per-pass overhead)
     { static int small = -1; if (small < 0) { const char *e = getenv("DM_NVN_SKIP_SMALL"); small = e ? atoi(e) : 0; if (small) MLOG("DM_NVN_SKIP_SMALL: dropping draws whose target width is ≤ %d (diagnostic; the picture is wrong)", small); }
