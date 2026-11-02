@@ -59,6 +59,8 @@ public class ControlsActivity extends Activity {
     private CheckBox hideGroup, fixedStick;
     private boolean filling;   // the panel is being filled from the layout: its listeners change nothing
     private final Map<String, Bitmap> sprites = new HashMap<>();
+    private final ControlsEditing ed = new ControlsEditing();   // the canvas's selection and dragging (plain Java, checked on a computer: tools/ControlsEditingTest.java)
+    private SeekBar size; private TextView sizeLabel;
     private LinearLayout shareRow;
     private static final int REQ_EXPORT = 11, REQ_IMPORT = 12, REQ_TREE = 13;
     private final Map<String, android.net.Uri> sharedDocs = new HashMap<>();   // the shared profiles' files (SharedLayouts)
@@ -71,18 +73,21 @@ public class ControlsActivity extends Activity {
         FrameLayout root = new FrameLayout(this);
         editor = new EditorView(this);
         root.addView(editor, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        panel = buildPanel();
-        FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
-        root.addView(panel, pl);
+        // The panel: a bar docked at the top edge, closed at start (the controls stay free to touch), opened and closed only by ☰; its title drags it elsewhere.
+        // A plain view beside the canvas (no dialog, no popup window): touches outside it are the canvas's
+        panel = buildPanel(); panel.setVisibility(View.GONE);
+        FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        pl.topMargin = dp(60); root.addView(panel, pl);
         android.widget.ImageButton toggle = new android.widget.ImageButton(this); toggle.setImageBitmap(UiIcons.icon(this, "menu")); toggle.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
         toggle.setContentDescription("Panel"); toggle.setBackgroundColor(Color.argb(170, 20, 22, 28)); int tp = dp(8); toggle.setPadding(tp, tp, tp, tp); toggle.setAlpha(0.9f);
         toggle.setOnClickListener(v -> panel.setVisibility(panel.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
         root.addView(toggle, new FrameLayout.LayoutParams(dp(52), dp(52), Gravity.TOP | Gravity.CENTER_HORIZONTAL));
         setContentView(root);
     }
-    @Override protected void onResume() {
-        super.onResume();
-        WindowInsetsController c = getWindow().getInsetsController();   // the whole screen, as the game has it (immersive)
+    @Override protected void onResume() { super.onResume(); immersive(); }
+    @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) immersive(); }   // (hidden at resume alone, the status bar stayed on a Xiaomi Pad 8)
+    private void immersive() {   // the whole screen, as the game has it
+        WindowInsetsController c = getWindow().getInsetsController();
         if (c != null) { c.hide(WindowInsets.Type.systemBars()); c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE); }
     }
     @Override protected void onPause() { super.onPause(); save(false); }
@@ -123,6 +128,7 @@ public class ControlsActivity extends Activity {
     private ControlsLayout L() { return store.current(); }
 
     // ---- The panel ----
+    private void syncSize() { if (size != null && ed.sel >= 0 && store != null) { boolean f = filling; filling = true; size.setProgress(Math.round(L().s[ed.sel] * 100) - 30); filling = f; } }
     private View hscroll(View row) { android.widget.HorizontalScrollView h = new android.widget.HorizontalScrollView(this); h.addView(row); return h; }   // a row wider than a phone's screen scrolls
     private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
     private Button button(String icon, String t, View.OnClickListener l) {   // an icon from the SVG masters (UiIcons) beside the text
@@ -133,13 +139,25 @@ public class ControlsActivity extends Activity {
     private TextView iconLabel(String icon, String t) { TextView v = label(t); android.graphics.drawable.Drawable d = UiIcons.drawable(this, icon, 22); if (d != null) { v.setCompoundDrawables(d, null, null, null); v.setCompoundDrawablePadding(dp(6)); } return v; }
     private TextView label(String t) { TextView v = new TextView(this); v.setText(t); v.setTextColor(Color.WHITE); v.setTextSize(15); v.setPadding(12, 0, 12, 0); return v; }
     private LinearLayout buildPanel() {
-        LinearLayout p = new LinearLayout(this); p.setOrientation(LinearLayout.VERTICAL); p.setPadding(24, 16, 24, 16); p.setBackgroundColor(Color.argb(215, 20, 22, 28));
-        TextView title = label("Atur tombol"); title.setTextSize(20); p.addView(title);
+        LinearLayout p = new LinearLayout(this); p.setOrientation(LinearLayout.VERTICAL); p.setPadding(dp(10), dp(4), dp(10), dp(6)); p.setBackgroundColor(Color.argb(225, 20, 22, 28));
+        p.setFocusable(false); p.setClickable(true);   // touches on the panel stay on it; it never takes focus from the canvas
+        TextView title = label("Atur tombol  ⠿"); title.setTextSize(18); p.addView(title);
+        title.setOnTouchListener(new View.OnTouchListener() {   // drag the panel by its title
+            float tx, ty;
+            @Override public boolean onTouch(View v, MotionEvent e) {
+                if (e.getActionMasked() == MotionEvent.ACTION_DOWN) { tx = e.getRawX() - panel.getTranslationX(); ty = e.getRawY() - panel.getTranslationY(); return true; }
+                if (e.getActionMasked() == MotionEvent.ACTION_MOVE) { panel.setTranslationX(e.getRawX() - tx); panel.setTranslationY(e.getRawY() - ty); return true; }
+                return true;
+            }
+        });
         LinearLayout r1 = new LinearLayout(this); r1.setGravity(Gravity.CENTER_VERTICAL);
         r1.addView(label("Profil"));
         profiles = new Spinner(this); r1.addView(profiles);
         profiles.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override public void onItemSelected(AdapterView<?> a, View v, int pos, long id) { if (filling || pos >= itemNames.size()) return; store.active = itemNames.get(pos); store.activeShared = itemShared.get(pos); editor.sel = -1; fillPanel(); }
+            @Override public void onItemSelected(AdapterView<?> a, View v, int pos, long id) {   // the list also reports itself after a refill: only another profile counts
+                if (filling || pos >= itemNames.size()) return;
+                if (ed.pickProfile(store, itemNames.get(pos), itemShared.get(pos))) fillPanel();
+            }
             @Override public void onNothingSelected(AdapterView<?> a) {}
         });
         r1.addView(button("profile_new", "Baru", v -> newProfile()));
@@ -168,13 +186,20 @@ public class ControlsActivity extends Activity {
         selLabel = label(""); r3.addView(selLabel);
         hideGroup = new CheckBox(this); hideGroup.setText("Sembunyikan"); hideGroup.setTextColor(Color.WHITE);
         { android.graphics.drawable.Drawable d = UiIcons.drawable(this, "hidden", 22); if (d != null) { hideGroup.setCompoundDrawables(null, null, d, null); hideGroup.setCompoundDrawablePadding(dp(6)); } }
-        hideGroup.setOnCheckedChangeListener((v, on) -> { if (filling || editor.sel < 0) return; L().hidden[editor.sel] = on; editor.invalidate(); });
+        hideGroup.setOnCheckedChangeListener((v, on) -> { if (filling || ed.sel < 0) return; L().hidden[ed.sel] = on; editor.invalidate(); });
         r3.addView(hideGroup);
         fixedStick = new CheckBox(this); fixedStick.setText("Posisi tetap"); fixedStick.setTextColor(Color.WHITE);
         { android.graphics.drawable.Drawable d = UiIcons.drawable(this, "stick_fixed", 22); if (d != null) { fixedStick.setCompoundDrawables(null, null, d, null); fixedStick.setCompoundDrawablePadding(dp(6)); } }   // res_svg/ui/stick_fixed.svg
-        fixedStick.setOnCheckedChangeListener((v, on) -> { if (filling || !ControlsLayout.isStick(editor.sel)) return; L().fixed[editor.sel - ControlsLayout.LS] = on; editor.invalidate(); });
+        fixedStick.setOnCheckedChangeListener((v, on) -> { if (filling || !ControlsLayout.isStick(ed.sel)) return; L().fixed[ed.sel - ControlsLayout.LS] = on; editor.invalidate(); });
         r3.addView(fixedStick);
-        p.addView(r3);
+        sizeLabel = label("Ukuran"); r3.addView(sizeLabel);
+        size = new SeekBar(this); size.setMax(270);   // scale 0.3 .. 3.0 of the default size
+        size.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar sb, int v, boolean user) { if (filling || !user || ed.sel < 0) return; L().s[ed.sel] = (30 + v) / 100f; editor.invalidate(); }
+            @Override public void onStartTrackingTouch(SeekBar sb) {} @Override public void onStopTrackingTouch(SeekBar sb) {}
+        });
+        r3.addView(size, new LinearLayout.LayoutParams(dp(180), ViewGroup.LayoutParams.WRAP_CONTENT));
+        p.addView(hscroll(r3));
         buttonsRow = new LinearLayout(this); buttonsRow.setGravity(Gravity.CENTER_VERTICAL); p.addView(buttonsRow);
         return p;
     }
@@ -182,19 +207,27 @@ public class ControlsActivity extends Activity {
         if (store == null) return;
         filling = true;
         L();   // (a shared active profile no longer in the folder falls back to one of this game's)
-        itemNames.clear(); itemShared.clear(); int at = 0;
-        for (String n : store.profiles.keySet()) { if (!store.activeShared && n.equals(store.active)) at = itemNames.size(); itemNames.add(n); itemShared.add(false); }
-        for (String n : store.shared.keySet()) { if (store.activeShared && n.equals(store.active)) at = itemNames.size(); itemNames.add(n); itemShared.add(true); }
-        profiles.setAdapter(new ProfileAdapter());
-        profiles.setSelection(at);
+        List<String> nn = new ArrayList<>(); List<Boolean> ns = new ArrayList<>(); int at = 0;
+        for (String n : store.profiles.keySet()) { if (!store.activeShared && n.equals(store.active)) at = nn.size(); nn.add(n); ns.add(false); }
+        for (String n : store.shared.keySet()) { if (store.activeShared && n.equals(store.active)) at = nn.size(); nn.add(n); ns.add(true); }
+        if (!nn.equals(itemNames) || !ns.equals(itemShared) || profiles.getAdapter() == null) {   // a new list only when it changed (a refill makes the widget report a selection again)
+            itemNames.clear(); itemNames.addAll(nn); itemShared.clear(); itemShared.addAll(ns); profiles.setAdapter(new ProfileAdapter()); }
+        if (profiles.getSelectedItemPosition() != at) profiles.setSelection(at, false);
         android.net.Uri tree = SharedLayouts.tree(this);
         folderLabel.setText(tree == null ? "(belum dipilih)" : "(" + SharedLayouts.folderName(this, tree) + ")");
         toShared.setVisibility(store.activeShared ? View.GONE : View.VISIBLE); toLocal.setVisibility(store.activeShared ? View.VISIBLE : View.GONE);
         opacity.setProgress(Math.round(L().opacity * 100) - 10);
-        int g = editor.sel;
+        filling = false;
+        fillSelection();
+    }
+    private void fillSelection() {   // the selected group's part of the panel (hide, stick mode, size, single buttons)
+        if (store == null) return;
+        filling = true;
+        int g = ed.sel;
         selLabel.setText(g < 0 ? "Sentuh sebuah grup untuk memilihnya" : ControlsLayout.GROUP_LABEL[g] + ":");
         hideGroup.setVisibility(g < 0 ? View.GONE : View.VISIBLE); if (g >= 0) hideGroup.setChecked(L().hidden[g]);
         fixedStick.setVisibility(ControlsLayout.isStick(g) ? View.VISIBLE : View.GONE); if (ControlsLayout.isStick(g)) fixedStick.setChecked(L().fixed[g - ControlsLayout.LS]);
+        size.setVisibility(g < 0 ? View.GONE : View.VISIBLE); sizeLabel.setVisibility(g < 0 ? View.GONE : View.VISIBLE); syncSize();
         buttonsRow.removeAllViews();
         if (g >= 0 && !ControlsLayout.isStick(g)) {
             buttonsRow.addView(iconLabel("visible", "Tampilkan:"));
@@ -213,7 +246,7 @@ public class ControlsActivity extends Activity {
         EditText e = new EditText(this); int k = store.profiles.size() + 1; while (store.profiles.containsKey("Profil " + k)) k++; e.setText("Profil " + k);
         new AlertDialog.Builder(this).setTitle("Profil baru (salinan dari \"" + store.active + "\")").setView(e)
             .setPositiveButton("Buat", (d, w) -> { String n = e.getText().toString().trim(); if (n.isEmpty() || store.profiles.containsKey(n)) { Toast.makeText(this, "Nama sudah dipakai atau kosong", Toast.LENGTH_SHORT).show(); return; }
-                                                 store.profiles.put(n, L().copy(n)); store.active = n; store.activeShared = false; editor.sel = -1; fillPanel(); })
+                                                 store.profiles.put(n, L().copy(n)); store.active = n; store.activeShared = false; ed.sel = -1; fillPanel(); })
             .setNegativeButton("Batal", null).show();
     }
     private void deleteProfile() {
@@ -221,18 +254,18 @@ public class ControlsActivity extends Activity {
             new AlertDialog.Builder(this).setMessage("Hapus profil bersama \"" + store.active + "\" dari folder? Semua game yang memakai folder ini kehilangan profil ini.")
                 .setPositiveButton("Hapus", (d, w) -> { android.net.Uri doc = sharedDocs.get(store.active);
                     if (doc != null && !SharedLayouts.delete(this, doc)) { Toast.makeText(this, "Tidak bisa dihapus", Toast.LENGTH_LONG).show(); return; }
-                    store.shared.remove(store.active); sharedDocs.remove(store.active); store.activeShared = false; store.active = store.profiles.keySet().iterator().next(); editor.sel = -1; fillPanel(); save(false); })
+                    store.shared.remove(store.active); sharedDocs.remove(store.active); store.activeShared = false; store.active = store.profiles.keySet().iterator().next(); ed.sel = -1; fillPanel(); save(false); })
                 .setNegativeButton("Batal", null).show();
             return;
         }
         if (store.profiles.size() < 2) { Toast.makeText(this, "Profil terakhir tidak bisa dihapus", Toast.LENGTH_SHORT).show(); return; }
         new AlertDialog.Builder(this).setMessage("Hapus profil \"" + store.active + "\"?")
-            .setPositiveButton("Hapus", (d, w) -> { store.profiles.remove(store.active); store.active = store.profiles.keySet().iterator().next(); editor.sel = -1; fillPanel(); })
+            .setPositiveButton("Hapus", (d, w) -> { store.profiles.remove(store.active); store.active = store.profiles.keySet().iterator().next(); ed.sel = -1; fillPanel(); })
             .setNegativeButton("Batal", null).show();
     }
     private void resetProfile() {
         new AlertDialog.Builder(this).setMessage("Kembalikan \"" + store.active + "\" ke tata letak default?")
-            .setPositiveButton("Ya", (d, w) -> { ControlsLayout n = ControlsLayout.defaults(editor.getWidth(), editor.getHeight()); n.name = store.active; (store.activeShared ? store.shared : store.profiles).put(store.active, n); editor.sel = -1; fillPanel(); })
+            .setPositiveButton("Ya", (d, w) -> { ControlsLayout n = ControlsLayout.defaults(editor.getWidth(), editor.getHeight()); n.name = store.active; (store.activeShared ? store.shared : store.profiles).put(store.active, n); ed.sel = -1; fillPanel(); })
             .setNegativeButton("Batal", null).show();
     }
 
@@ -256,7 +289,7 @@ public class ControlsActivity extends Activity {
     }
     private void copyToLocal() {
         ControlsLayout c = L().copy(ControlsLayout.uniqueName(store.profiles.keySet(), store.active));
-        store.profiles.put(c.name, c); store.active = c.name; store.activeShared = false; editor.sel = -1; fillPanel(); save(false);
+        store.profiles.put(c.name, c); store.active = c.name; store.activeShared = false; ed.sel = -1; fillPanel(); save(false);
         Toast.makeText(this, "\"" + c.name + "\" disalin ke game ini", Toast.LENGTH_SHORT).show();
     }
     // The profile list: a shared profile carries the shared badge (res_svg/ui/shared_badge.svg)
@@ -298,7 +331,7 @@ public class ControlsActivity extends Activity {
         for (ControlsLayout l : got) { l.name = ControlsLayout.uniqueName(store.profiles.keySet(), l.name); store.profiles.put(l.name, l); store.active = l.name; store.activeShared = false; }
         int v = ControlsLayout.versionOf(json);
         Toast.makeText(this, got.size() + " profil diimpor" + (v > ControlsLayout.VERSION ? " (berkas versi lebih baru: bagian yang tidak dikenal dilewati)" : ""), Toast.LENGTH_LONG).show();
-        editor.sel = -1; fillPanel(); save(false);
+        ed.sel = -1; fillPanel(); save(false);
     }
     @Override protected void onActivityResult(int req, int res, android.content.Intent data) {
         super.onActivityResult(req, res, data);
@@ -320,9 +353,6 @@ public class ControlsActivity extends Activity {
 
     // ---- The preview: the screen as the game has it, its controls where the game puts them ----
     final class EditorView extends View {
-        int sel = -1;
-        private int mode;   // 0 nothing, 1 moving, 2 resizing (the handle), 3 pinching
-        private float dx, dy, s0, d0, fx0, fy0; private final float[] z0 = new float[4];
         private final Paint pBg = new Paint(), pSpr = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG), pSel = new Paint(Paint.ANTI_ALIAS_FLAG), pZone = new Paint(), pZoneEdge = new Paint(Paint.ANTI_ALIAS_FLAG),
                             pText = new Paint(Paint.ANTI_ALIAS_FLAG), pCross = new Paint(Paint.ANTI_ALIAS_FLAG), pHandle = new Paint(Paint.ANTI_ALIAS_FLAG);
         EditorView(Context c) {
@@ -365,59 +395,22 @@ public class ControlsActivity extends Activity {
                 ControlsLayout.Btn b = ControlsLayout.BUTTONS[i]; boolean off = l.hidden[b.group] || l.hiddenButtons.contains(b.name); float[] box = l.buttonBox(i, w, h);
                 sprite(c, b.sprite, box, a * (off ? 0.2f : 1)); if (off) cross(c, box);
             }
-            if (sel >= 0) { float[] gb = l.groupBox(sel, w, h); RectF r = rf(gb); r.inset(-10, -10); c.drawRect(r, pSel);
+            if (ed.sel >= 0) { float[] gb = l.groupBox(ed.sel, w, h); RectF r = rf(gb); r.inset(-10, -10); c.drawRect(r, pSel);
                             Bitmap hb = UiIcons.icon(ControlsActivity.this, "handle"); float hr = handleR();   // res_svg/ui/handle.svg
                             if (hb != null) { pSpr.setAlpha(255); c.drawBitmap(hb, null, new RectF(r.right - hr, r.bottom - hr, r.right + hr, r.bottom + hr), pSpr); } else c.drawCircle(r.right, r.bottom, hr, pHandle); }
         }
         private float handleR() { return getHeight() * 0.032f; }
-        private int hit(float px, float py) {   // the group under the finger: buttons first, then fixed sticks, then zones
-            ControlsLayout l = L(); float w = getWidth(), h = getHeight();
-            for (int g = 0; g < ControlsLayout.LS; g++) { float[] b = l.groupBox(g, w, h); if (px >= b[0] && px <= b[0] + b[2] && py >= b[1] && py <= b[1] + b[3]) return g; }
-            for (int k = 0; k < 2; k++) if (l.fixed[k]) { float[] b = l.stickBox(k, w, h); if (px >= b[0] && px <= b[0] + b[2] && py >= b[1] && py <= b[1] + b[3]) return ControlsLayout.LS + k; }
-            for (int k = 0; k < 2; k++) if (!l.fixed[k]) { float[] b = l.zoneBox(k, w, h); if (px >= b[0] && px <= b[0] + b[2] && py >= b[1] && py <= b[1] + b[3]) return ControlsLayout.LS + k; }
-            return -1;
-        }
-        private boolean isZone(int g) { return ControlsLayout.isStick(g) && !L().fixed[g - ControlsLayout.LS]; }
-        @Override public boolean onTouchEvent(MotionEvent e) {
+        @Override public boolean onTouchEvent(MotionEvent e) {   // every touch on the canvas is the canvas's: the panel is only ever opened and closed by its ☰ button
             if (store == null) return true;
             ControlsLayout l = L(); float w = getWidth(), h = getHeight(), px = e.getX(), py = e.getY();
             switch (e.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN: {
-                    mode = 0;
-                    if (sel >= 0) { float[] gb = l.groupBox(sel, w, h); if (Math.hypot(px - (gb[0] + gb[2] + 10), py - (gb[1] + gb[3] + 10)) < 2.2f * handleR()) { mode = 2; start(px, py); return true; } }
-                    int g = hit(px, py); if (g != sel) { sel = g; fillPanel(); }
-                    if (sel >= 0) { mode = 1; start(px, py); }
-                    invalidate(); return true;
-                }
-                case MotionEvent.ACTION_POINTER_DOWN:
-                    if (sel >= 0 && e.getPointerCount() == 2) { mode = 3; start(px, py); d0 = span(e); }
-                    return true;
-                case MotionEvent.ACTION_MOVE: {
-                    if (sel < 0 || mode == 0) return true;
-                    int g = sel; float[] z = isZone(g) ? l.zone[g - ControlsLayout.LS] : null;
-                    if (mode == 1) {
-                        if (z != null) { z[0] = ControlsLayout.clamp(z0[0] + (px - fx0) / w, 0, 1 - z[2]); z[1] = ControlsLayout.clamp(z0[1] + (py - fy0) / h, 0, 1 - z[3]); }
-                        else { l.x[g] = ControlsLayout.clamp((px - dx) / w, 0, 1); l.y[g] = ControlsLayout.clamp((py - dy) / h, 0, 1); }
-                    } else if (mode == 2) {
-                        if (z != null) { z[2] = ControlsLayout.clamp(z0[2] + (px - fx0) / w, 0.1f, 1 - z[0]); z[3] = ControlsLayout.clamp(z0[3] + (py - fy0) / h, 0.1f, 1 - z[1]); }
-                        else { float cx = l.x[g] * w, cy = l.y[g] * h, a = (float) Math.hypot(fx0 - cx, fy0 - cy), b = (float) Math.hypot(px - cx, py - cy); if (a > 1) l.s[g] = ControlsLayout.clamp(s0 * b / a, 0.3f, 3); }
-                    } else if (mode == 3 && e.getPointerCount() >= 2 && d0 > 1) {
-                        float f = span(e) / d0;
-                        if (z != null) { float cx = z0[0] + z0[2] / 2, cy = z0[1] + z0[3] / 2; z[2] = ControlsLayout.clamp(z0[2] * f, 0.1f, 1); z[3] = ControlsLayout.clamp(z0[3] * f, 0.1f, 1);
-                                         z[0] = ControlsLayout.clamp(cx - z[2] / 2, 0, 1 - z[2]); z[1] = ControlsLayout.clamp(cy - z[3] / 2, 0, 1 - z[3]); }
-                        else l.s[g] = ControlsLayout.clamp(s0 * f, 0.3f, 3);
-                    }
-                    invalidate(); return true;
-                }
-                case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL: mode = 0; return true;
-                case MotionEvent.ACTION_POINTER_UP: if (mode == 3) mode = 0; return true;
+                case MotionEvent.ACTION_DOWN: if (ed.down(l, px, py, w, h, handleR())) fillSelection(); invalidate(); return true;
+                case MotionEvent.ACTION_POINTER_DOWN: if (e.getPointerCount() == 2) ed.secondFinger(l, px, py, span(e), w, h); return true;
+                case MotionEvent.ACTION_MOVE: if (ed.move(l, px, py, e.getPointerCount() >= 2 ? span(e) : 0, e.getPointerCount(), w, h)) { invalidate(); syncSize(); } return true;
+                case MotionEvent.ACTION_UP: case MotionEvent.ACTION_CANCEL: ed.up(); return true;
+                case MotionEvent.ACTION_POINTER_UP: ed.secondUp(); return true;
             }
             return true;
-        }
-        private void start(float px, float py) {
-            ControlsLayout l = L(); int g = sel; fx0 = px; fy0 = py; s0 = l.s[g];
-            dx = px - l.x[g] * getWidth(); dy = py - l.y[g] * getHeight();
-            if (ControlsLayout.isStick(g)) System.arraycopy(l.zone[g - ControlsLayout.LS], 0, z0, 0, 4);
         }
         private float span(MotionEvent e) { return (float) Math.hypot(e.getX(0) - e.getX(1), e.getY(0) - e.getY(1)); }
     }
