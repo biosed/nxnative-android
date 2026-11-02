@@ -2294,6 +2294,11 @@ static int lvl_fits(const vtex *v, uint32_t lv, uint32_t layer, uint32_t nlayers
     return v->target == NVN_TEXTURE_TARGET_3D || (uint64_t)layer + nlayers <= v->layers;
 }
 static VkFormatFeatureFlags fmt_feat(VkFormat f) { VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(g_pd, f, &fp); return fp.optimalTilingFeatures; }
+static int copylog_on(void) {   // DM_VK_COPYLOG=<n>: log the first n buffer-to-texture and texture copies
+    static int left = -1; if (left < 0) { const char *e = getenv("DM_VK_COPYLOG"); left = e ? atoi(e) : 0; if (left) LOG("DM_VK_COPYLOG=%d: copies into textures are logged", left); }
+    if (left <= 0) return 0;
+    left--; return 1;
+}
 static void copy_b2t(const p_copy_b2t *c) {
     if (vk_skip() & SK_B2T) return;
     if (g_plog) LOG("plog:  b2t serial %llu fmt %#x %dx%d at %d,%d,%d", (unsigned long long)c->tex->serial, c->tex->d.format, c->r.width, c->r.height, c->r.xoffset, c->r.yoffset, c->r.zoffset);
@@ -2305,9 +2310,14 @@ static void copy_b2t(const p_copy_b2t *c) {
     pass_end();
     // The source as the GPU will hold it: what a dispatch or a texture-to-buffer copy wrote there (this submission's, or an earlier one's still running) is only in a ring until
     // its submission completes, and the guest's bytes are stale until then; else the guest's bytes
-    VkBuffer sb = C->ring; VkDeviceSize o;
-    if (!gw_find(c->src, img * d, 16, &sb, &o, NULL)) { sb = C->ring; o = copy_in(c->src, img * d, 16); if (o == VK_WHOLE_SIZE) return; }
+    VkBuffer sb; VkDeviceSize o; uint8_t *sp = NULL; int from_gpu = gw_find(c->src, img * d, 16, &sb, &o, &sp);
+    if (!from_gpu) { o = copy_in(c->src, img * d, 16); if (o == VK_WHOLE_SIZE) return; sb = C->ring; sp = C->ringp + o; }   // the ring after copy_in: a full one is replaced by an extra ring
     else atomic_fetch_add(&g_gw_b2t, 1);
+    if (copylog_on()) {   // diagnostics (DM_VK_COPYLOG=<n>): the first n copies into textures, with what the copy reads, to set beside the Metal host's [pass] copy lines
+        uint64_t hh = 0xcbf29ce484222325ull, nz = 0, nb = img * d; if (sp) for (uint64_t i = 0; i < nb; i++) { hh = (hh ^ sp[i]) * 0x100000001b3ull; nz += sp[i] != 0; }
+        LOG("copylog: frame %llu b2t serial %llu fmt %#x %ux%ux%u at %d,%d,%d from %#llx row %zu image %zu, %s, %llu bytes, %llu non-zero, hash %016llx", (unsigned long long)atomic_load(&g_presents),
+            (unsigned long long)c->tex->serial, c->tex->d.format, w, h, d, r->xoffset, r->yoffset, r->zoffset, (unsigned long long)c->src, row, img, from_gpu ? "GPU-written" : "guest memory",
+            (unsigned long long)nb, (unsigned long long)nz, (unsigned long long)hh); }
     uint32_t lv = c->has_view && c->view.set_levels ? c->view.base_level : 0, ly = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     if (lv < 32) v->gpu_lv |= 1u << lv;   // this level's content now comes from copies (see copy_t2t)
     int is3d = v->target == NVN_TEXTURE_TARGET_3D;
@@ -2330,6 +2340,9 @@ static void copy_t2t(const p_copy_t2t *c) {
     pass_end();
     uint32_t sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     if (dl < 32) d->gpu_lv |= 1u << dl;
+    if (copylog_on()) LOG("copylog: frame %llu t2t serial %llu (fmt %#x, level %u, %s) %dx%d at %d,%d -> serial %llu (fmt %#x, level %u) at %d,%d", (unsigned long long)atomic_load(&g_presents),
+                          (unsigned long long)c->src->serial, c->src->d.format, sl, s->gpu ? "rendered" : s->gpu_lv ? "copied into" : "from its storage", c->sr.width, c->sr.height, c->sr.xoffset, c->sr.yoffset,
+                          (unsigned long long)c->dst->serial, c->dst->d.format, dl, c->dr.xoffset, c->dr.yoffset);
     VkImageAspectFlags sa = s->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, da = d->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
     if (!lvl_fits(s, sl, (uint32_t)c->sr.zoffset, 1, c->sr.xoffset, c->sr.yoffset, 0, (uint32_t)c->sr.width, (uint32_t)c->sr.height, 1) ||
         !lvl_fits(d, dl, (uint32_t)c->dr.zoffset, 1, c->dr.xoffset, c->dr.yoffset, 0, (uint32_t)c->dr.width, (uint32_t)c->dr.height, 1) || !c->sr.width || !c->sr.height || !c->dr.width || !c->dr.height) {
