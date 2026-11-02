@@ -822,7 +822,9 @@ void mtl_sub_begin(void) {
     void arena_begin(void); arena_begin();
 }
 
-static void rp_end(void);
+static void rp_end_(int line);
+static const uint8_t *g_rt_hold;   // see rt_hold_scan
+#define rp_end() rp_end_(__LINE__)   // the line that ended the pass, for the pass dump (E lines)
 // DM_NVN_PASSGPU_SERIAL=1 (for measurement): before creating each encoder on the main command buffer, encode 'signal n+1 → wait for signal n+1' - the signal is only raised once all prior work has completed,
 // so the following encoder starts only after the previous one has fully finished; on TBDR passes no longer overlap in the pipeline, and the per-pass start-to-end span of DM_NVN_PASSGPU is that pass's exclusive time (the whole-frame total is inflated; look only at relative cost)
 static void ser_gate(void) {
@@ -2867,6 +2869,8 @@ static inline int passdump(void) {
 // The next n frames' passes, on request (the Mac's DM_CTL "passdump n", hle_hid.c): for a scene that a fixed DM_NVN_PASSDUMP frame range cannot be timed to
 void dm_gfx_passdump_next(long n) { long f = (long)atomic_load(&g_cur_frame); g_pd_a1 = f + n; g_pd_a0 = f + 1; }
 #define PD(...) do { if (passdump()) { flockfile(stderr); fprintf(stderr, "[pass] F%llu ", (unsigned long long)atomic_load(&g_cur_frame)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); funlockfile(stderr); } } while (0)
+// A queue-level event in the pass dump (hle_nvn.c: submission boundaries, fence syncs, waits, flushes, presents): what lies between two render passes the replay could not join
+void mtl_pd_note(const char *what, uint64_t v) { PD("S %llu %s %llu (committed fence %llu)", g_stat_pass, what, (unsigned long long)v, (unsigned long long)g_fence); }
 static void blit_note(void) { if (g_enc) PD("E %llu copy / buffer update ends the render pass", g_stat_pass); }
 __attribute__((weak)) void dm_guest_frame_tick(void) {}   // hle_os.c provides the strong definition (DM_DETCLOCK deterministic guest clock); a no-op when graphics unit tests do not link the host   // diag.c provides the strong definition (DM_TICK_HOLD=E:SHOT unfreeze); a no-op when graphics unit tests do not link the host
 __attribute__((weak)) void dm_cheats_present(void) {}   // hle_cheats.c provides the strong definition (the Atmosphère cheat pass per presented frame); a no-op when graphics unit tests do not link the host
@@ -3220,7 +3224,7 @@ static void rt_mirror_flush(void) {
     }
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
 }
-static void rp_end(void) { if (g_enc) { AP_B;
+static void rp_end_(int line) { g_rt_hold = NULL; if (g_enc) { AP_B; PD("E %llu render pass ended at nvn_mtl.m:%d", g_stat_pass, line);
     if (enc_label_on()) { static uint64_t lf = ~0ull, base; uint64_t f = atomic_load(&g_cur_frame); if (f != lf) { lf = f; base = g_stat_pass - 1; }   // Intra-frame serial: the same pass has the same name every frame, so the table can aggregate by name
         [(id)g_enc setLabel:[NSString stringWithFormat:@"p%02llu %dx%d %s d%d", (unsigned long long)(g_stat_pass - base), g_el_w, g_el_h, g_el_key[0] ? g_el_key : "-", g_el_draws]]; }
 #ifdef NVN_RT_RANGE_TEST
@@ -7999,6 +8003,34 @@ static void rt_sub(const p_set_rt *r, int k, uint64_t *ser, int *lv, int *sl) { 
     const tex_t *t = k == 8 ? r->depth : r->color[k]; const view_t *v = k == 8 ? &r->dview : &r->cview[k]; int hv = k == 8 ? r->has_dview : r->has_cview[k];
     *ser = t ? t->serial : 0; *lv = hv && v->set_levels ? v->base_level : 0; *sl = hv && v->set_layers ? v->min_layer : 0;
 }
+// Render targets held across a detour (DM_NVN_RT_HOLD, on by default): the game sets other targets and then this pass's own again, with only state changes in between (no draw, clear,
+// copy, dispatch, barrier, counter, event or fence): Unreal's parallel base pass does this at the start of each of its command lists (FINAL FANTASY RESONANCE: SetRenderTargets with
+// another target count, then the six G-buffer targets again, three times per frame), and each detour ended the pass, so the next one loaded all six targets and depth again (30 MB a time
+// at 1384x780) and stored them again: 5.7 ms of a 17.5 ms frame on an M1. The open pass is kept and the detour's SetRenderTargets are not replayed; the pass is then a continued one
+// (g_rt_merged), so a draw that samples one of its attachments still ends it first (draw_samples_rt), as for a same-target continuation. The scan follows the replay order: called lists,
+// the caller after a list ends, the submission's remaining handles (defer_cont)
+static const uint8_t *g_rt_hold;      // the SetRenderTargets op that returns to the open pass's targets; the ones before it are not replayed
+static uint64_t g_rt_hold_n;
+static int rt_hold_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RT_HOLD"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_RT_HOLD=0: a SetRenderTargets detour ends the open pass"); } return v; }
+static const uint8_t *defer_cont(int *ci);
+static const uint8_t *rt_hold_scan(const uint8_t *p) {   // p: the op after the detour's SetRenderTargets; returns the op that sets the open pass's targets again, or NULL
+    const uint8_t *stk[16]; int ns = 0, ci = 0;
+    for (int guard = 0; guard < 4096; guard++) {
+        op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
+        switch (h.op) {
+            case OP_END: if (ns) { p = stk[--ns]; continue; } p = defer_cont(&ci); if (!p) return NULL; continue;
+            case OP_JUMP: memcpy(&p, a, 8); continue;
+            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (ns >= 16) return NULL; stk[ns++] = p + h.size; p = (const uint8_t *)t; continue; }
+            case OP_SET_RT: if (rt_same(&R.rt, (const p_set_rt *)a)) return p; break;
+            case OP_BEGIN: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
+            case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_STENCIL: case OP_POLY_OFFSET: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_COPY_STRIDE:
+            case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BIND_TEX1: case OP_PRIM_RESTART: case OP_BIND_UBO_SMALL: case OP_BIND_VBUF1: case OP_ALPHA_REF: case OP_LINE_WIDTH: break;
+            default: return NULL;   // anything that draws, clears, copies, writes, waits or orders ends the detour: the pass is ended as before
+        }
+        p += h.size;
+    }
+    return NULL;
+}
 static void hoist_try(void) {
     if (g_hoist_n || !g_exec_next) return;
     typedef struct { const uint8_t *rt_op; const p_set_rt *rt; uint8_t clear_c[8]; MTLClearColor cc[8]; uint8_t clear_d, clear_s; double cd; uint32_t cs;
@@ -10710,8 +10742,14 @@ void mtl_exec(const uint8_t *p) {
                    n >= 4 ? ((const float *)((const uint8_t *)a + 16))[0] : 0.f, n >= 8 ? ((const float *)((const uint8_t *)a + 16))[1] : 0.f, n >= 12 ? ((const float *)((const uint8_t *)a + 16))[2] : 0.f, n >= 16 ? ((const float *)((const uint8_t *)a + 16))[3] : 0.f); mtl_sub_update((const uint8_t *)a + 16, d, n); break; }
             case OP_SET_RT: {
                 const p_set_rt *r = a;
+                if (g_rt_hold) {   // inside a detour (rt_hold_scan): its SetRenderTargets are not replayed; the last one returns to the held pass's targets
+                    if (p == g_rt_hold) { g_rt_hold = NULL; g_rt_merged = 1; R.rt = *r; PD("M %llu held pass goes on (SetRenderTargets detour skipped)", g_stat_pass); }
+                    break; }
                 if (defer_begin_q(p)) break;
                 int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
+                if (g_enc && !pend && R.has_rt && g_enc_mode != 1 && !rt_same(&R.rt, r) && rt_hold_on() && !g_fz.active && !g_sm_pass && !g_hoist_n && !g_defer_replaying && !defer_has_active() && !g_fz_checking) {
+                    const uint8_t *back = rt_hold_scan(p + h.size);
+                    if (back) { g_rt_hold = back; if (!g_rt_hold_n++) MLOG("render targets held across a SetRenderTargets detour: first case pass %llu (DM_NVN_RT_HOLD)", g_stat_pass); PD("M %llu SetRenderTargets detour: pass held", g_stat_pass); break; } }
                 if (g_enc && !pend && R.has_rt && tbdr_on() && rt_range_same(&R.rt,r)) {
                     g_rt_merged = g_rt_range_active = g_rt_range_pending = 1; R.rt = *r; break; }
                 if (g_enc && g_fz.active && g_fz.phase == 1 && fz_reuse_op(p) && !pend && g_enc_mode != 1 && R.has_rt && tbdr_on() && rt_same(&g_fz.rt1, r)) {
@@ -10721,6 +10759,11 @@ void mtl_exec(const uint8_t *p) {
                 if (g_enc && g_sm_pass && !pend && !g_game_barrier) { int sl;   // another layer of the slice-merged pass's level (sm_scan planned it)
                     if (sm_rt_slice(&R.rt, r, &sl) && sl >= g_sm_lo && sl <= g_sm_hi) { R.rt = *r; g_sm_cur = sl; g_sm_ncont++;
                         { void td_note_layer(id<MTLTexture>, uint64_t, NSUInteger, NSUInteger); td_note_layer(tex_mtl(r->color[0]), r->color[0]->serial, r->cview[0].set_levels ? r->cview[0].base_level : 0, (NSUInteger)sl); } PD("M %llu slice-merged pass goes on in layer %d", g_stat_pass, sl); break; } }
+                if (g_enc && passdump()) {   // why the open pass was not continued (diagnostic)
+                    int why_rt = -1; const p_set_rt *a_ = &R.rt;
+                    if (a_->n != r->n) why_rt = 1; else if (!a_->depth != !r->depth || (a_->depth && a_->depth->serial != r->depth->serial)) why_rt = 2; else if (a_->has_dview != r->has_dview || (a_->has_dview && memcmp(&a_->dview, &r->dview, sizeof a_->dview))) why_rt = 3;
+                    else for (int k = 0; k < a_->n && k < 8 && why_rt < 0; k++) { if (!a_->color[k] != !r->color[k] || (a_->color[k] && a_->color[k]->serial != r->color[k]->serial)) why_rt = 10 + k; else if (a_->has_cview[k] != r->has_cview[k] || (a_->has_cview[k] && memcmp(&a_->cview[k], &r->cview[k], sizeof a_->cview[k]))) why_rt = 20 + k; }
+                    PD("N %llu SetRenderTargets ends the pass: mode %d pending clears %d has_rt %d tbdr %d same %d (first difference %d)", g_stat_pass, g_enc_mode, pend, R.has_rt, tbdr_on(), rt_same(&R.rt, r), why_rt); }
                 if (pend && !g_enc && g_cb && lc_on()) lc_push(); else rp_flush();   // clears with no draw wait for the next pass that attaches their targets (lc_push)
                 sub_cut(); R.rt = *r; R.has_rt = 1; break;
             }
