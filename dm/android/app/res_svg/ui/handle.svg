@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- UI icon handle: resize handle; original artwork -->
+  <circle cx="128" cy="128" r="104" fill="#ffd640" stroke="#7a5a00" stroke-width="8"/><path d="M84 172 L172 84 M84 172 V128 M84 172 H128 M172 84 H128 M172 84 V128" stroke="#1b1d22" stroke-width="20" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>
