@@ -2870,6 +2870,7 @@ static inline int passdump(void) {
 void dm_gfx_passdump_next(long n) { long f = (long)atomic_load(&g_cur_frame); g_pd_a1 = f + n; g_pd_a0 = f + 1; }
 #define PD(...) do { if (passdump()) { flockfile(stderr); fprintf(stderr, "[pass] F%llu ", (unsigned long long)atomic_load(&g_cur_frame)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); funlockfile(stderr); } } while (0)
 // A queue-level event in the pass dump (hle_nvn.c: submission boundaries, fence syncs, waits, flushes, presents): what lies between two render passes the replay could not join
+int mtl_pd_on(void) { return passdump(); }
 void mtl_pd_note(const char *what, uint64_t v) { PD("S %llu %s %llu (committed fence %llu)", g_stat_pass, what, (unsigned long long)v, (unsigned long long)g_fence); }
 static void blit_note(void) { if (g_enc) PD("E %llu copy / buffer update ends the render pass", g_stat_pass); }
 __attribute__((weak)) void dm_guest_frame_tick(void) {}   // hle_os.c provides the strong definition (DM_DETCLOCK deterministic guest clock); a no-op when graphics unit tests do not link the host   // diag.c provides the strong definition (DM_TICK_HOLD=E:SHOT unfreeze); a no-op when graphics unit tests do not link the host
