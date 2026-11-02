@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- UI icon gesture_tap: a fingertip touching, with ripples (the editor's guide: touch to select); original artwork -->
+  <circle cx="128" cy="128" r="30" fill="#ffffff"/>
+  <circle cx="128" cy="128" r="62" stroke="#ffffff" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" fill="none" stroke-opacity="0.7"/>
+  <circle cx="128" cy="128" r="96" stroke="#ffffff" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" fill="none" stroke-opacity="0.35"/>
+</svg>

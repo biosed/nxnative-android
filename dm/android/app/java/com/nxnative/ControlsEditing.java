@@ -6,6 +6,8 @@ package com.nxnative;
 
 public final class ControlsEditing {
     public int sel = -1;
+    public boolean dragging;          // a finger has moved a group past the touch slop (or is pinching): the bar steps aside until it lifts
+    public float slop = 12;           // pixels a finger may wander before a touch becomes a drag (the editor sets Android's touch slop)
     private int mode;   // 0 nothing, 1 moving, 2 resizing (the handle), 3 pinching
     private float dx, dy, s0, d0, fx0, fy0; private final float[] z0 = new float[4];
 
@@ -31,11 +33,12 @@ public final class ControlsEditing {
         return changed;
     }
     public void secondFinger(ControlsLayout l, float px, float py, float span, float w, float h) { if (sel >= 0) { mode = 3; start(l, px, py, w, h); d0 = span; } }
-    public void up() { mode = 0; }
+    public void up() { mode = 0; dragging = false; }
     public void secondUp() { if (mode == 3) mode = 0; }
     // Fingers moved: what the mode does to the selected group. span: the distance between the first two fingers (pinching)
     public boolean move(ControlsLayout l, float px, float py, float span, int fingers, float w, float h) {
         if (sel < 0 || mode == 0) return false;
+        if (!dragging && (mode == 3 || Math.hypot(px - fx0, py - fy0) > slop)) dragging = true;
         int g = sel; float[] z = isZone(l, g) ? l.zone[g - ControlsLayout.LS] : null;
         if (mode == 1) {
             if (z != null) { z[0] = ControlsLayout.clamp(z0[0] + (px - fx0) / w, 0, 1 - z[2]); z[1] = ControlsLayout.clamp(z0[1] + (py - fy0) / h, 0, 1 - z[3]); }
@@ -55,6 +58,10 @@ public final class ControlsEditing {
         int g = sel; fx0 = px; fy0 = py; s0 = l.s[g]; dx = px - l.x[g] * w; dy = py - l.y[g] * h;
         if (ControlsLayout.isStick(g)) System.arraycopy(l.zone[g - ControlsLayout.LS], 0, z0, 0, 4);
     }
+    // The panel bar: shown while the panel is open or a group is selected (its options), out of the way while a group is dragged or resized
+    public static boolean barShown(boolean panelOpen, int sel, boolean dragging) { return (panelOpen || sel >= 0) && !dragging; }
+    // Where a touch goes: the bar when it is shown and the touch is inside its rectangle (left, top, width, height), else the canvas -- never anything else
+    public static boolean toCanvas(float[] bar, boolean barShown, float px, float py) { return !(barShown && bar != null && px >= bar[0] && px < bar[0] + bar[2] && py >= bar[1] && py < bar[1] + bar[3]); }
     // The profile list picked (name, shared): true, and nothing selected, only when that is another profile than the active one
     public boolean pickProfile(ControlsLayout.Store st, String name, boolean shared) {
         if (name == null || (name.equals(st.active) && shared == st.activeShared)) return false;

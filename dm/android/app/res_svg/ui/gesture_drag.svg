@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- UI icon gesture_drag: a fingertip with arrows in four directions (move); original artwork -->
+  <circle cx="128" cy="128" r="26" fill="#ffffff"/>
+  <path d="M128 76 V30 M108 50 L128 30 L148 50 M128 180 V226 M108 206 L128 226 L148 206 M76 128 H30 M50 108 L30 128 L50 148 M180 128 H226 M206 108 L226 128 L206 148" stroke="#ffffff" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>
