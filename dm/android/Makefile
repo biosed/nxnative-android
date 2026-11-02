@@ -52,9 +52,19 @@ $(OUT)/obj/host/main.c.o: CFLAGS += -Dmain=dm_main   # the app's front end calls
 $(OUT)/obj/%.o: ../% | profile
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+# The on-screen controls' shaders (src_vk/ovl.vert / .frag, our own), compiled with the NDK's glslc into C initializers nvn_vk.c includes
+$(OUT)/obj/android/src_vk/nvn_vk.c.o: CFLAGS += -I$(OUT)
+GLSLC := $(NDK)/shader-tools/darwin-x86_64/glslc
+$(OUT)/ovl_vert.inc: src_vk/ovl.vert
+	@mkdir -p $(dir $@)
+	$(GLSLC) -O -mfmt=c -o $@ $<
+$(OUT)/ovl_frag.inc: src_vk/ovl.frag
+	@mkdir -p $(dir $@)
+	$(GLSLC) -O -mfmt=c -o $@ $<
+$(OUT)/obj/android/src_vk/nvn_vk.c.o: $(OUT)/ovl_vert.inc $(OUT)/ovl_frag.inc
 APP_OBJ := $(patsubst %,$(OUT)/obj/android/%.o,app/front_android.c)
 $(OUT)/libdmhost.so: $(OBJ) $(APP_OBJ) gen/vpx/libvpx.a
-	$(CC) -shared -o $@ $(OBJ) $(APP_OBJ) gen/vpx/libvpx.a -Wl,--no-undefined -Wl,--error-limit=0 -Wl,-z,max-page-size=16384 -landroid -llog -laaudio -lvulkan -lmediandk -lm -ldl
+	$(CC) -shared -o $@ $(OBJ) $(APP_OBJ) gen/vpx/libvpx.a -Wl,--no-undefined -Wl,--error-limit=0 -Wl,-z,max-page-size=16384 -landroid -llog -laaudio -lvulkan -lmediandk -ljnigraphics -lm -ldl
 $(OUT)/dmhost: $(OBJ) $(CLI_OBJ) gen/vpx/libvpx.a
 	$(CC) -pie -o $@ $(OBJ) $(CLI_OBJ) gen/vpx/libvpx.a -Wl,--no-undefined -Wl,--error-limit=0 -Wl,-z,max-page-size=16384 -landroid -llog -laaudio -lvulkan -lmediandk -lm -ldl
 dmhost: $(OUT)/dmhost

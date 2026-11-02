@@ -1912,9 +1912,99 @@ static int win_make(ANativeWindow *aw) {
     LOG("vk: swapchain %ux%u, %u images, format %d, %s", W.ext.width, W.ext.height, W.n, W.fmt, mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "fifo");
     return 1;
 }
-// Over the picture: the frame-rate counter and the on-screen controls (front_overlay), drawn as cleared rectangles -- a 3x5 font, button outlines, a filled button while pressed
-typedef struct { float x, y, w, h; int on; char label[3]; } dm_ovl;
+// Over the picture: the frame-rate counter (cleared rectangles, a 3x5 font) and the on-screen controls (front_overlay): sprites from the controls' atlas, textured quads
+// alpha-blended over the picture (ovl_sprites), brighter while pressed; without an atlas (the adb program, an APK without one) button outlines and labels as before
+typedef struct { float x, y, w, h; int on; char label[3]; int sprite; float alpha; } dm_ovl;   // sprite: cell of the atlas, -1 none; alpha: the layout's opacity (app/front_android.c)
 __attribute__((weak)) int front_overlay(dm_ovl *out, int max) { (void)out; (void)max; return 0; }
+// The atlas (app/front_android.c: the APK's assets/controls/atlas.png, decoded premultiplied RGBA; dm/android/tools/controls_atlas.py makes it from the SVG masters in app/res_svg)
+__attribute__((weak)) int front_overlay_atlas(const void **rgba, int *w, int *h, int *cell, int *cols) { (void)rgba; (void)w; (void)h; (void)cell; (void)cols; return 0; }
+__attribute__((weak)) void front_overlay_atlas_release(void) {}
+static const uint32_t OVL_VS[] =
+#include "ovl_vert.inc"
+;
+static const uint32_t OVL_FS[] =
+#include "ovl_frag.inc"
+;
+static struct { int state; VkImage img; VkDeviceMemory mem; VkImageView view; VkSampler samp; VkDescriptorSetLayout dsl; VkDescriptorPool dp; VkDescriptorSet ds; VkPipelineLayout pl;
+                VkPipeline pipe; VkFormat pfmt; int w, h, cell, cols; } G_;   // state: 0 not tried, 1 ready, -1 no atlas
+typedef struct { float rect[4], uv[4], tint[4], scr[4]; } ovl_pc;   // ovl.vert / ovl.frag push constants
+static void ovl_layout(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to, VkAccessFlags sa, VkAccessFlags da, VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, sa, da, from, to, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    vkCmdPipelineBarrier(cb, ss, ds, 0, 0, NULL, 0, NULL, 1, &b);
+}
+static int ovl_init(void) {   // the atlas as a sampled image, once (the first frame with on-screen controls)
+    if (G_.state) return G_.state > 0;
+    G_.state = -1;
+    const void *px = NULL; int w = 0, h = 0, cell = 0, cols = 0;
+    if (!front_overlay_atlas(&px, &w, &h, &cell, &cols) || !px || w <= 0 || h <= 0 || cell <= 0 || cols <= 0) { LOG("vk: on-screen controls: no sprite atlas, drawn as outlines"); return 0; }
+    VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {(uint32_t)w, (uint32_t)h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+                            VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage(g_dev, &ii, NULL, &G_.img) != VK_SUCCESS) { front_overlay_atlas_release(); return 0; }
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_dev, G_.img, &mr); VkDeviceSize off; img_mem(mr, &G_.mem, &off); VKCHECK(vkBindImageMemory(g_dev, G_.img, G_.mem, off));
+    VkDeviceSize n = (VkDeviceSize)w * h * 4; VkDeviceMemory sm; void *map; VkBuffer sb = buf_new(n, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &sm, &map); memcpy(map, px, n);
+    front_overlay_atlas_release();
+    VkCommandBuffer cb = once_begin();
+    ovl_layout(cb, G_.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy bc = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {(uint32_t)w, (uint32_t)h, 1}};
+    vkCmdCopyBufferToImage(cb, sb, G_.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    ovl_layout(cb, G_.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    once_end(cb); vkDestroyBuffer(g_dev, sb, NULL); vkFreeMemory(g_dev, sm, NULL);
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, G_.img, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VKCHECK(vkCreateImageView(g_dev, &vi, NULL, &G_.view));
+    VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, VK_FILTER_LINEAR, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                              VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, 0, VK_FALSE, 1, VK_FALSE, VK_COMPARE_OP_ALWAYS, 0, 0, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, VK_FALSE};
+    VKCHECK(vkCreateSampler(g_dev, &si, NULL, &G_.samp));
+    VkDescriptorSetLayoutBinding lb = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+    VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &lb}; VKCHECK(vkCreateDescriptorSetLayout(g_dev, &li, NULL, &G_.dsl));
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}; VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 1, 1, &ps};
+    VKCHECK(vkCreateDescriptorPool(g_dev, &pi, NULL, &G_.dp));
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, G_.dp, 1, &G_.dsl}; VKCHECK(vkAllocateDescriptorSets(g_dev, &ai, &G_.ds));
+    VkDescriptorImageInfo di = {G_.samp, G_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet wd = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, G_.ds, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &di, NULL, NULL}; vkUpdateDescriptorSets(g_dev, 1, &wd, 0, NULL);
+    VkPushConstantRange pr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ovl_pc)};
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &G_.dsl, 1, &pr}; VKCHECK(vkCreatePipelineLayout(g_dev, &pli, NULL, &G_.pl));
+    G_.w = w; G_.h = h; G_.cell = cell; G_.cols = cols; G_.state = 1;
+    LOG("vk: on-screen controls: sprite atlas %dx%d (cells of %d) ready", w, h, cell);
+    return 1;
+}
+static int ovl_pipe(VkFormat fmt) {   // the sprites' pipeline for the swapchain's format (made again only if a new swapchain has another one; the old one is left, as frames in flight may use it)
+    if (G_.pipe && G_.pfmt == fmt) return 1;
+    VkShaderModule m[2]; VkShaderModuleCreateInfo mi[2] = {{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof OVL_VS, OVL_VS}, {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof OVL_FS, OVL_FS}};
+    VKCHECK(vkCreateShaderModule(g_dev, &mi[0], NULL, &m[0])); VKCHECK(vkCreateShaderModule(g_dev, &mi[1], NULL, &m[1]));
+    VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, m[0], "main", NULL},
+                                             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, m[1], "main", NULL}};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_FALSE};
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_FALSE, VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState ba = {VK_TRUE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD, 0xf};   // premultiplied
+    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_LOGIC_OP_COPY, 1, &ba, {0}};
+    VkDynamicState dy[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR}; VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dy};
+    VkPipelineRenderingCreateInfo prc = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &fmt, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
+    VkAttachmentLoadOp ld = VK_ATTACHMENT_LOAD_OP_LOAD;
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, g_dynrend ? &prc : NULL, 0, 2, st, &vi, &ia, NULL, &vp, &rs, &ms, NULL, &cbs, &ds, G_.pl,
+                                       g_dynrend ? VK_NULL_HANDLE : rp_get(&fmt, &ld, 1, VK_FORMAT_UNDEFINED, 0, ld, ld, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL), 0, VK_NULL_HANDLE, -1};
+    VkPipeline p; VkResult r = vkCreateGraphicsPipelines(g_dev, g_pcache, 1, &ci, NULL, &p);
+    vkDestroyShaderModule(g_dev, m[0], NULL); vkDestroyShaderModule(g_dev, m[1], NULL);
+    if (r != VK_SUCCESS) { RED_ONCE(94, "the on-screen controls' pipeline was not created (%d): drawn as outlines", (int)r); G_.state = -1; return 0; }
+    G_.pipe = p; G_.pfmt = fmt; return 1;
+}
+static void ovl_sprites(VkCommandBuffer cb, const dm_ovl *ov, int nov) {   // inside the overlay's pass: each sprite item a quad
+    VkViewport v = {0, 0, (float)W.ext.width, (float)W.ext.height, 0, 1}; VkRect2D sc = {{0, 0}, W.ext};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, G_.pipe); vkCmdSetViewport(cb, 0, 1, &v); vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, G_.pl, 0, 1, &G_.ds, 0, NULL);
+    float iw = 1.0f / (float)W.ext.width, ih = 1.0f / (float)W.ext.height, rot = 0;   // (this line's swapchain is never made turned: no pre-rotation)
+    for (int i = 0; i < nov; i++) {
+        const dm_ovl *o = &ov[i]; if (o->sprite < 0 || o->alpha <= 0) continue;
+        int col = o->sprite % G_.cols, row = o->sprite / G_.cols;
+        ovl_pc pc = {{o->x, o->y, o->w, o->h}, {((float)(col * G_.cell) + 0.5f) / (float)G_.w, ((float)(row * G_.cell) + 0.5f) / (float)G_.h, (float)(G_.cell - 1) / (float)G_.w, (float)(G_.cell - 1) / (float)G_.h},
+                     {o->on ? 1.25f : 1.0f, o->on ? 0.12f : 0.0f, o->alpha, 0}, {iw, ih, rot, 0}};
+        vkCmdPushConstants(cb, G_.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+        vkCmdDraw(cb, 4, 1, 0, 0);
+    }
+}
 static double g_fps_shown;
 static uint16_t glyph(char c) {   // rows top to bottom, 3 bits each
     static const char *const G[] = {"0111101101101111", "1010010010010010", "2111001111100111", "3111001111001111", "4101101111001001", "5111100111001111", "6111100111101111",
@@ -1942,8 +2032,10 @@ static VkFramebuffer overlay_draw(VkCommandBuffer cb, uint32_t img, int show_fps
         CLIP(cell * 2, cell * 2, (strlen(t) * 4 + 1) * cell, 7 * cell); if (rect.rect.extent.width) bg[nb++] = rect;
         ng = text_rects(fg, ng, MAXR, t, (int32_t)(cell * 3), (int32_t)(cell * 3), cell);
     }
+    int spr = nov && ovl_init() && ovl_pipe(W.fmt);   // sprites: their own pipeline, after the rectangles
     for (int i = 0; i < nov && nl + 4 <= MAXR; i++) {
         const dm_ovl *o = &ov[i]; float t = o->w / 18 > 2 ? o->w / 18 : 2;
+        if (spr && o->sprite >= 0) continue;
         if (o->on) { CLIP(o->x, o->y, o->w, o->h); if (rect.rect.extent.width && nf < MAXR) fills[nf++] = rect; }
         CLIP(o->x, o->y, o->w, t); if (rect.rect.extent.width) lines[nl++] = rect;
         CLIP(o->x, o->y + o->h - t, o->w, t); if (rect.rect.extent.width) lines[nl++] = rect;
@@ -1959,6 +2051,7 @@ static VkFramebuffer overlay_draw(VkCommandBuffer cb, uint32_t img, int show_fps
     if (nf) vkCmdClearAttachments(cb, 1, &grey, nf, fills);
     if (nl) vkCmdClearAttachments(cb, 1, &white, nl, lines);
     if (ng) vkCmdClearAttachments(cb, 1, nov ? &white : &green, ng, fg);
+    if (spr) ovl_sprites(cb, ov, nov);
     rp_end(cb);
     return fb;
 }

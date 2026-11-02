@@ -2,8 +2,8 @@
 // (MenuActivity.java, in the app's main process) writes the player's choices to <files>/settings.env and starts this activity; here the environment is set from it, the
 // host runs on a big-stack thread, the window goes to the Vulkan backend (front_native_window), and controllers -- the console's own and any other, an Xbox one over
 // USB or Bluetooth -- reach the game through dm_pad_set, by position as on the Mac and iOS (bottom B, right A, top X, left Y).
-// Phones without a controller get on-screen controls (front_overlay, drawn by the Vulkan backend over the picture: buttons and floating sticks): they show at the first
-// touch and hide again when a controller is used. Holding − and + together for two seconds goes back to the menu: the game process ends (progress the game has saved is kept) and the menu opens with the options shown.
+// Phones without a controller get on-screen controls (front_overlay, drawn by the Vulkan backend over the picture from the APK's sprite atlas: buttons and sticks, laid
+// out by the launcher's editor): they show at the first touch and hide again when a controller is used. Holding − and + together for two seconds goes back to the menu: the game process ends (progress the game has saved is kept) and the menu opens with the options shown.
 // Game files live in the app's external folder (<external>/romfs, dm, vk, font), the saves in its internal one (<files>/save); the log goes to <external>/log.txt.
 #include "dm.h"
 #include "dm_input.h"
@@ -13,6 +13,8 @@
 #include <android/looper.h>
 #include <android/native_activity.h>
 #include <android/native_window.h>
+#include <android/asset_manager.h>
+#include <android/imagedecoder.h>
 #include <jni.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -120,53 +122,139 @@ static void pads_push_(void) {
     else if (now_ns() - g_combo_since > 2000000000ull) back_to_menu();
 }
 // ---------- On-screen controls ----------
-// Laid out from the window's height h: A B X Y bottom right (by position, as on the Switch), the D-pad as four buttons bottom left, L / ZL and R / ZR in the top corners,
-// − and + top centre. The sticks float, as in mobile games: a finger that comes down anywhere else is a stick, the left one in the left half of the screen and the right one
-// (FINAL FANTASY XII THE ZODIAC AGE's camera) in the right half. Where it came down is the stick's centre, its offset from there the tilt (full at 0.12 h, a small dead
-// zone), and lifting it lets the stick go back; a faint ring and a knob show under the finger while it is down. Each finger keeps to what it started on (a stick, or the
-// buttons it is over), so both sticks and buttons work together
-typedef struct { float x, y, w, h; int on; char label[3]; } dm_ovl;
-enum { NVB = 14, NPTR = 10, RING_DOTS = 16 };
-static struct { const char *label; uint64_t bit; float cx, cy; } g_vb[NVB];
-static _Atomic int g_ovl_show; static _Atomic uint64_t g_ovl_on; static float g_vw, g_vh, g_vr, g_dr;   // g_dr: the D-pad buttons' radius
-// Fingers down (by pointer ID): kind 1 buttons, 2 left stick, 3 right stick; x0 / y0 where it came down, x / y where it is
+// Groups of buttons -- A B X Y bottom right (by position, as on the Switch), the D-pad bottom left, L / ZL and R / ZR in the top corners, − and + top centre -- and two
+// sticks. A stick floats, as in mobile games: a finger that comes down in its zone (by default the left or the right half of the screen), on no button, is that stick,
+// where it came down the stick's centre and its offset from there the tilt (full at the stick's radius, a small dead zone); lifting it lets the stick go back. Or it
+// sits at a fixed place, shown all the time, and a finger that comes down on it moves it. Each finger keeps to what it started on, so sticks and buttons work together.
+// Where everything goes comes from the launcher's layout editor (MenuActivity → ControlsActivity, ControlsLayout.java): <files>/controls_active.txt, the active profile's
+// groups (centre as fractions of the screen, a scale), the sticks' modes and zones, the hidden buttons and the opacity; without it, the layout as it always was.
+// Drawn by the Vulkan backend from the sprite atlas the APK carries (assets/controls, made from the SVG masters in app/res_svg)
+typedef struct { float x, y, w, h; int on; char label[3]; int sprite; float alpha; } dm_ovl;
+enum { NVB = 14, NPTR = 10, NG = 7, G_FACE = 0, G_DPAD, G_LZL, G_RZR, G_MP, G_LS, G_RS };
+static const char *const GNAME[NG] = {"face", "dpad", "lzl", "rzr", "mp", "ls", "rs"};
+// The same table as ControlsLayout.BUTTONS: offset from the group's centre and radius in units of the screen's height at scale 1
+static const struct { const char *name, *sprite, *label; uint64_t bit; int group; float dx, dy, r; } BTN[NVB] = {
+    {"A", "btn_a", "A", DM_BTN_A, G_FACE, 0.12f, 0, 0.065f}, {"B", "btn_b", "B", DM_BTN_B, G_FACE, 0, 0.12f, 0.065f}, {"X", "btn_x", "X", DM_BTN_X, G_FACE, 0, -0.12f, 0.065f},
+    {"Y", "btn_y", "Y", DM_BTN_Y, G_FACE, -0.12f, 0, 0.065f},
+    {"UP", "dpad_up", "", DM_BTN_UP, G_DPAD, 0, -0.1f, 0.05f}, {"DOWN", "dpad_down", "", DM_BTN_DOWN, G_DPAD, 0, 0.1f, 0.05f}, {"LEFT", "dpad_left", "", DM_BTN_LEFT, G_DPAD, -0.1f, 0, 0.05f},
+    {"RIGHT", "dpad_right", "", DM_BTN_RIGHT, G_DPAD, 0.1f, 0, 0.05f},
+    {"L", "btn_l", "L", DM_BTN_L, G_LZL, 0, -0.085f, 0.065f}, {"ZL", "btn_zl", "ZL", DM_BTN_ZL, G_LZL, 0, 0.085f, 0.065f}, {"R", "btn_r", "R", DM_BTN_R, G_RZR, 0, -0.085f, 0.065f},
+    {"ZR", "btn_zr", "ZR", DM_BTN_ZR, G_RZR, 0, 0.085f, 0.065f}, {"MINUS", "btn_minus", "-", DM_BTN_MINUS, G_MP, -0.1f, 0, 0.065f}, {"PLUS", "btn_plus", "+", DM_BTN_PLUS, G_MP, 0.1f, 0, 0.065f}};
+#define STICK_R 0.12f   // a stick's travel (its base's radius) and its knob's radius, in units of the screen's height at scale 1 (ControlsLayout.STICK_R / KNOB_R)
+#define KNOB_R 0.055f
+static struct { float x[NG], y[NG], s[NG]; int hidden[NG], fixed[2]; float zone[2][4]; float opacity; uint64_t hide; } g_ctl;   // the layout, normalised (ctl_layout)
+static struct { float cx, cy, r; int vis; } g_vb[NVB];   // the buttons in window pixels
+static _Atomic int g_ovl_show; static _Atomic uint64_t g_ovl_on; static float g_vw, g_vh;
+// Fingers down (by pointer ID): kind 1 buttons, 2 left stick, 3 right stick; x0 / y0 the stick's centre (where it came down, or the fixed place), x / y where it is
 static struct { int32_t id; int kind; float x0, y0, x, y; } g_ptr[NPTR]; static int g_nptr;
 static struct { int on; float x0, y0, x, y; } g_stick[2];   // what front_overlay draws (copied under g_smu)
 static pthread_mutex_t g_smu = PTHREAD_MUTEX_INITIALIZER;
+static void ctl_defaults(float W_, float H) {   // the layout as it always was (ControlsLayout.defaults)
+    float d[NG][2] = {{(W_ - 0.24f * H) / W_, 0.75f}, {0.22f * H / W_, 0.75f}, {0.11f * H / W_, 0.195f}, {(W_ - 0.11f * H) / W_, 0.195f}, {0.5f, 0.08f}, {0.18f, 0.45f}, {0.82f, 0.45f}};
+    for (int g = 0; g < NG; g++) { g_ctl.x[g] = d[g][0]; g_ctl.y[g] = d[g][1]; g_ctl.s[g] = 1; g_ctl.hidden[g] = 0; }
+    g_ctl.fixed[0] = g_ctl.fixed[1] = 0; g_ctl.opacity = 0.75f; g_ctl.hide = 0;
+    float z[2][4] = {{0, 0, 0.5f, 1}, {0.5f, 0, 0.5f, 1}}; memcpy(g_ctl.zone, z, sizeof z);
+}
+static void ctl_load(void) {   // the launcher's active profile over the defaults
+    char p[1100]; if (!g_act || !g_act->internalDataPath) return;
+    snprintf(p, sizeof p, "%s/controls_active.txt", g_act->internalDataPath);
+    FILE *f = fopen(p, "re"); if (!f) return;
+    char ln[256], nm[32]; int n = 0;
+    while (fgets(ln, sizeof ln, f)) {
+        float a, b, c, d; int h, fx;
+        if (sscanf(ln, "opacity %f", &a) == 1) { g_ctl.opacity = a < 0.1f ? 0.1f : a > 1 ? 1 : a; n++; }
+        else if (sscanf(ln, "group %31s %f %f %f %d", nm, &a, &b, &c, &h) == 5) { for (int g = 0; g < NG; g++) if (!strcmp(nm, GNAME[g])) { g_ctl.x[g] = a; g_ctl.y[g] = b; g_ctl.s[g] = c < 0.3f ? 0.3f : c > 3 ? 3 : c; g_ctl.hidden[g] = h; n++; } }
+        else if (sscanf(ln, "stick %31s %d %f %f %f %f", nm, &fx, &a, &b, &c, &d) == 6) { for (int k = 0; k < 2; k++) if (!strcmp(nm, GNAME[G_LS + k])) { g_ctl.fixed[k] = fx; g_ctl.zone[k][0] = a; g_ctl.zone[k][1] = b; g_ctl.zone[k][2] = c; g_ctl.zone[k][3] = d; n++; } }
+        else if (sscanf(ln, "hide %31s", nm) == 1) { for (int i = 0; i < NVB; i++) if (!strcmp(nm, BTN[i].name)) { g_ctl.hide |= BTN[i].bit; n++; } }
+    }
+    fclose(f);
+    static int logged; if (!logged++) LOG("front end: on-screen controls from %s (%d settings)", p, n);
+}
 static void vb_layout(void) {
     ANativeWindow *w = front_native_window(NULL); if (!w) return;
     float W_ = (float)ANativeWindow_getWidth(w), H = (float)ANativeWindow_getHeight(w);
     if (W_ == g_vw && H == g_vh) return;
-    g_vw = W_; g_vh = H; g_vr = 0.065f * H; g_dr = 0.05f * H; float o = 0.12f * H, fx = W_ - 0.24f * H, fy = H - 0.25f * H, dx = 0.22f * H, dy = H - 0.25f * H, d = 0.1f * H;
-    int i = 0;
-    #define VB(l, b, x, y) g_vb[i++] = (typeof(g_vb[0])){l, b, x, y}
-    VB("A", DM_BTN_A, fx + o, fy); VB("B", DM_BTN_B, fx, fy + o); VB("X", DM_BTN_X, fx, fy - o); VB("Y", DM_BTN_Y, fx - o, fy);
-    VB("L", DM_BTN_L, 0.11f * H, 0.11f * H); VB("ZL", DM_BTN_ZL, 0.11f * H, 0.28f * H); VB("R", DM_BTN_R, W_ - 0.11f * H, 0.11f * H); VB("ZR", DM_BTN_ZR, W_ - 0.11f * H, 0.28f * H);
-    VB("-", DM_BTN_MINUS, W_ / 2 - 0.1f * H, 0.08f * H); VB("+", DM_BTN_PLUS, W_ / 2 + 0.1f * H, 0.08f * H);
-    VB("", DM_BTN_UP, dx, dy - d); VB("", DM_BTN_DOWN, dx, dy + d); VB("", DM_BTN_LEFT, dx - d, dy); VB("", DM_BTN_RIGHT, dx + d, dy);
-    #undef VB
+    g_vw = W_; g_vh = H; ctl_defaults(W_, H); ctl_load();
+    for (int i = 0; i < NVB; i++) { int g = BTN[i].group; float s = g_ctl.s[g];
+        g_vb[i].cx = g_ctl.x[g] * W_ + BTN[i].dx * H * s; g_vb[i].cy = g_ctl.y[g] * H + BTN[i].dy * H * s; g_vb[i].r = BTN[i].r * H * s;
+        g_vb[i].vis = !g_ctl.hidden[g] && !(g_ctl.hide & BTN[i].bit); }
 }
-static float vb_r(int i) { return g_vb[i].bit & (DM_BTN_UP | DM_BTN_DOWN | DM_BTN_LEFT | DM_BTN_RIGHT) ? g_dr : g_vr; }
 static uint64_t vb_hit(float x, float y) {   // the buttons a finger at (x, y) is over
-    uint64_t b = 0; for (int i = 0; i < NVB; i++) if (fabsf(x - g_vb[i].cx) < 1.3f * vb_r(i) && fabsf(y - g_vb[i].cy) < 1.3f * vb_r(i)) b |= g_vb[i].bit;
+    uint64_t b = 0; for (int i = 0; i < NVB; i++) if (g_vb[i].vis && fabsf(x - g_vb[i].cx) < 1.3f * g_vb[i].r && fabsf(y - g_vb[i].cy) < 1.3f * g_vb[i].r) b |= BTN[i].bit;
     return b;
 }
-// What the backend draws over the picture, in window pixels (0 = hidden): a box per button; a ring of dots and a knob per stick held
+static float stick_r(int k) { return STICK_R * g_vh * g_ctl.s[G_LS + k]; }
+static int stick_at(float x, float y, float *x0, float *y0) {   // the stick a finger coming down at (x, y) takes (2 left, 3 right), else 0
+    for (int k = 0; k < 2; k++) {
+        if (g_ctl.hidden[G_LS + k]) continue;
+        if (g_ctl.fixed[k]) { float cx = g_ctl.x[G_LS + k] * g_vw, cy = g_ctl.y[G_LS + k] * g_vh;
+                              if (hypotf(x - cx, y - cy) < 1.35f * stick_r(k)) { *x0 = cx; *y0 = cy; return 2 + k; } continue; }
+        const float *z = g_ctl.zone[k];
+        if (x >= z[0] * g_vw && x < (z[0] + z[2]) * g_vw && y >= z[1] * g_vh && y < (z[1] + z[3]) * g_vh) { *x0 = x; *y0 = y; return 2 + k; }
+    }
+    return 0;
+}
+// The sprite atlas (assets/controls/atlas.png and atlas.txt), decoded once for the backend (premultiplied RGBA), freed after it has made its texture
+static void *g_atlas; static int g_aw, g_ah, g_acell, g_acols, g_spr[NVB], g_spr_base = -1, g_spr_knob = -1, g_atlas_tried;
+static void atlas_names(void) {
+    for (int i = 0; i < NVB; i++) g_spr[i] = -1;
+    AAsset *a = g_act ? AAssetManager_open(g_act->assetManager, "controls/atlas.txt", AASSET_MODE_BUFFER) : NULL; if (!a) return;
+    size_t n = (size_t)AAsset_getLength(a); char *t = malloc(n + 1); if (!t) { AAsset_close(a); return; }
+    memcpy(t, AAsset_getBuffer(a), n); t[n] = 0; AAsset_close(a);
+    for (char *ln = strtok(t, "\n"); ln; ln = strtok(NULL, "\n")) {
+        char nm[48]; int idx, w, h;
+        if (sscanf(ln, "cell %d %d %d %d", &g_acell, &g_acols, &w, &h) == 4) continue;
+        if (sscanf(ln, "%47s %d", nm, &idx) != 2 || nm[0] == '#') continue;
+        for (int i = 0; i < NVB; i++) if (!strcmp(nm, BTN[i].sprite)) g_spr[i] = idx;
+        if (!strcmp(nm, "stick_base")) g_spr_base = idx; else if (!strcmp(nm, "stick_knob")) g_spr_knob = idx;
+    }
+    free(t);
+}
+int front_overlay_atlas(const void **rgba, int *w, int *h, int *cell, int *cols) {
+    if (!g_atlas_tried) {
+        g_atlas_tried = 1; atlas_names();
+        AAsset *a = g_act ? AAssetManager_open(g_act->assetManager, "controls/atlas.png", AASSET_MODE_BUFFER) : NULL;
+        AImageDecoder *d = NULL;
+        if (a && AImageDecoder_createFromAAsset(a, &d) == ANDROID_IMAGE_DECODER_SUCCESS) {
+            const AImageDecoderHeaderInfo *hi = AImageDecoder_getHeaderInfo(d);
+            int aw = AImageDecoderHeaderInfo_getWidth(hi), ah = AImageDecoderHeaderInfo_getHeight(hi);
+            AImageDecoder_setAndroidBitmapFormat(d, ANDROID_BITMAP_FORMAT_RGBA_8888);   // premultiplied: the decoder's default
+            size_t st = AImageDecoder_getMinimumStride(d); void *px = st == (size_t)aw * 4 ? malloc(st * (size_t)ah) : NULL;
+            if (px && AImageDecoder_decodeImage(d, px, st, st * (size_t)ah) == ANDROID_IMAGE_DECODER_SUCCESS) { g_atlas = px; g_aw = aw; g_ah = ah; } else free(px);
+            AImageDecoder_delete(d);
+        }
+        if (a) AAsset_close(a);
+        if (!g_atlas || g_acell <= 0 || g_acols <= 0) { LOG("front end: no on-screen controls atlas in the APK (assets/controls): outlines instead"); free(g_atlas); g_atlas = NULL; }
+    }
+    if (!g_atlas) return 0;
+    *rgba = g_atlas; *w = g_aw; *h = g_ah; *cell = g_acell; *cols = g_acols; return 1;
+}
+void front_overlay_atlas_release(void) { free(g_atlas); g_atlas = NULL; }
+// What the backend draws over the picture, in window pixels (0 = hidden): a sprite per button; per stick its base and its knob (a fixed one always, a floating one while held).
+// Without the atlas's names (an APK without it) the outlines and labels of before, and a ring of dots per stick
 int front_overlay(dm_ovl *out, int max) {
     if (!atomic_load(&g_ovl_show)) return 0;
-    vb_layout(); uint64_t on = atomic_load(&g_ovl_on); int n = 0;
+    vb_layout(); uint64_t on = atomic_load(&g_ovl_on); int n = 0; float al = g_ctl.opacity;
     for (int i = 0; i < NVB && n < max; i++) {
-        dm_ovl *b = &out[n++]; float r = vb_r(i);
-        *b = (dm_ovl){g_vb[i].cx - r, g_vb[i].cy - r, 2 * r, 2 * r, (on & g_vb[i].bit) != 0, ""};
-        snprintf(b->label, sizeof b->label, "%s", g_vb[i].label);
+        if (!g_vb[i].vis) continue;
+        dm_ovl *b = &out[n++]; float r = g_vb[i].r;
+        *b = (dm_ovl){g_vb[i].cx - r, g_vb[i].cy - r, 2 * r, 2 * r, (on & BTN[i].bit) != 0, "", g_spr[i], al};
+        if (g_spr[i] < 0) snprintf(b->label, sizeof b->label, "%s", BTN[i].label);
     }
     typeof(g_stick[0]) st[2]; pthread_mutex_lock(&g_smu); memcpy(st, g_stick, sizeof st); pthread_mutex_unlock(&g_smu);
-    float R = 0.12f * g_vh, dot = 0.008f * g_vh, kr = 0.045f * g_vh;
     for (int k = 0; k < 2; k++) {
-        if (!st[k].on) continue;
-        for (int j = 0; j < RING_DOTS && n < max; j++) { float a = 6.2831853f * j / RING_DOTS; out[n++] = (dm_ovl){st[k].x0 + R * cosf(a) - dot, st[k].y0 + R * sinf(a) - dot, 2 * dot, 2 * dot, 1, ""}; }
-        float ddx = st[k].x - st[k].x0, ddy = st[k].y - st[k].y0, m = hypotf(ddx, ddy); if (m > R) { ddx *= R / m; ddy *= R / m; }
-        if (n < max) out[n++] = (dm_ovl){st[k].x0 + ddx - kr, st[k].y0 + ddy - kr, 2 * kr, 2 * kr, 1, ""};
+        if (g_ctl.hidden[G_LS + k]) continue;
+        float R = stick_r(k), kr = KNOB_R * g_vh * g_ctl.s[G_LS + k], x0 = st[k].x0, y0 = st[k].y0, ddx = 0, ddy = 0;
+        if (g_ctl.fixed[k]) { x0 = g_ctl.x[G_LS + k] * g_vw; y0 = g_ctl.y[G_LS + k] * g_vh; } else if (!st[k].on) continue;
+        if (st[k].on) { ddx = st[k].x - x0; ddy = st[k].y - y0; float m = hypotf(ddx, ddy); if (m > R) { ddx *= R / m; ddy *= R / m; } }
+        if (g_spr_base >= 0 && g_spr_knob >= 0) {
+            if (n < max) out[n++] = (dm_ovl){x0 - R, y0 - R, 2 * R, 2 * R, 0, "", g_spr_base, al};
+            if (n < max) out[n++] = (dm_ovl){x0 + ddx - kr, y0 + ddy - kr, 2 * kr, 2 * kr, st[k].on, "", g_spr_knob, al};
+            continue;
+        }
+        enum { RING_DOTS = 16 }; float dot = 0.008f * g_vh;
+        for (int j = 0; j < RING_DOTS && n < max; j++) { float a = 6.2831853f * j / RING_DOTS; out[n++] = (dm_ovl){x0 + R * cosf(a) - dot, y0 + R * sinf(a) - dot, 2 * dot, 2 * dot, 1, "", -1, al}; }
+        if (n < max) out[n++] = (dm_ovl){x0 + ddx - kr, y0 + ddy - kr, 2 * kr, 2 * kr, 1, "", -1, al};
     }
     return n;
 }
@@ -176,12 +264,12 @@ static void touch_event(AInputEvent *e) {
     size_t ai = (size_t)((act & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
     if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_CANCEL) g_nptr = 0;   // the last finger up: nothing is held
     else {
-        if (kind == AMOTION_EVENT_ACTION_DOWN || kind == AMOTION_EVENT_ACTION_POINTER_DOWN) {   // a new finger: a button, else the stick of its half (one finger per stick)
-            int32_t id = AMotionEvent_getPointerId(e, ai); float x = AMotionEvent_getX(e, ai), y = AMotionEvent_getY(e, ai);
-            int k = vb_hit(x, y) ? 1 : x < g_vw / 2 ? 2 : 3;
+        if (kind == AMOTION_EVENT_ACTION_DOWN || kind == AMOTION_EVENT_ACTION_POINTER_DOWN) {   // a new finger: a button, else the stick whose zone or place it is in (one finger per stick)
+            int32_t id = AMotionEvent_getPointerId(e, ai); float x = AMotionEvent_getX(e, ai), y = AMotionEvent_getY(e, ai), x0 = x, y0 = y;
+            int k = vb_hit(x, y) ? 1 : stick_at(x, y, &x0, &y0);
             for (int i = 0; i < g_nptr && k > 1; i++) if (g_ptr[i].kind == k) k = 0;   // that stick is held already: this finger does nothing
             if (kind == AMOTION_EVENT_ACTION_DOWN) g_nptr = 0;
-            if (g_nptr < NPTR) g_ptr[g_nptr++] = (typeof(g_ptr[0])){id, k, x, y, x, y};
+            if (g_nptr < NPTR) g_ptr[g_nptr++] = (typeof(g_ptr[0])){id, k, x0, y0, x, y};
         }
         if (kind == AMOTION_EVENT_ACTION_POINTER_UP) {
             int32_t id = AMotionEvent_getPointerId(e, ai);
@@ -196,9 +284,9 @@ static void touch_event(AInputEvent *e) {
     for (int i = 0; i < g_nptr; i++) {
         if (g_ptr[i].kind == 1) { btn |= vb_hit(g_ptr[i].x, g_ptr[i].y); continue; }
         if (g_ptr[i].kind < 2) continue;
-        int k = g_ptr[i].kind - 2; float ddx = g_ptr[i].x - g_ptr[i].x0, ddy = g_ptr[i].y - g_ptr[i].y0, m = hypotf(ddx, ddy);
+        int k = g_ptr[i].kind - 2; float ddx = g_ptr[i].x - g_ptr[i].x0, ddy = g_ptr[i].y - g_ptr[i].y0, m = hypotf(ddx, ddy), R = stick_r(k);
         st[k] = (typeof(st[0])){1, g_ptr[i].x0, g_ptr[i].y0, g_ptr[i].x, g_ptr[i].y};
-        if (m > 0.02f * g_vh) { float t = fminf(1.f, m / (0.12f * g_vh)); ax[2 * k] = ddx / m * t; ax[2 * k + 1] = ddy / m * t; }
+        if (m > R / 6) { float t = fminf(1.f, m / R); ax[2 * k] = ddx / m * t; ax[2 * k + 1] = ddy / m * t; }   // the dead zone: a sixth of the travel (0.02 h at scale 1, as before)
     }
     pthread_mutex_lock(&g_smu); memcpy(g_stick, st, sizeof st); pthread_mutex_unlock(&g_smu);
     if (g_touch_slot < 0) g_touch_slot = dev_slot(-1000000);
