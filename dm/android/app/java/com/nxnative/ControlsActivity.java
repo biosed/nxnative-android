@@ -171,6 +171,7 @@ public class ControlsActivity extends Activity {
         hideGroup.setOnCheckedChangeListener((v, on) -> { if (filling || editor.sel < 0) return; L().hidden[editor.sel] = on; editor.invalidate(); });
         r3.addView(hideGroup);
         fixedStick = new CheckBox(this); fixedStick.setText("Posisi tetap"); fixedStick.setTextColor(Color.WHITE);
+        { android.graphics.drawable.Drawable d = UiIcons.drawable(this, "stick_fixed", 22); if (d != null) { fixedStick.setCompoundDrawables(null, null, d, null); fixedStick.setCompoundDrawablePadding(dp(6)); } }   // res_svg/ui/stick_fixed.svg
         fixedStick.setOnCheckedChangeListener((v, on) -> { if (filling || !ControlsLayout.isStick(editor.sel)) return; L().fixed[editor.sel - ControlsLayout.LS] = on; editor.invalidate(); });
         r3.addView(fixedStick);
         p.addView(r3);
