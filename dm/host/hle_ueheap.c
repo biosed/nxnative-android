@@ -95,6 +95,15 @@ void *dm_ueheap_alloc(size_t n, size_t align) {
     }
     return NULL;
 }
+// Whether [a, a + n) lies in the used part of one space (hle_uemalloc.c dm_ue_heap_owns: a thread stack Unreal allocated, moved by svcMapMemory). The region list cannot
+// answer it: a space grows by separate mprotect calls, and a block may span two of the mappings they leave
+int dm_ueheap_owns(uint64_t a, uint64_t n) {
+    if (!g_base || !n) return 0;
+    uint64_t o = a - (uint64_t)(uintptr_t)g_base;
+    if (o >= UEH_N * UEH_SPACE) return 0;
+    int k = (int)(o / UEH_SPACE); uint64_t in = o - (uint64_t)k * UEH_SPACE;
+    return in + n <= atomic_load(&g_hw[k]);
+}
 void dm_ueheap_free(void *p) { if (p) { int k = space_of(p); t_cur = k; mspace_free(g_ms[k], p); } }
 size_t dm_ueheap_size(const void *p) { return p ? mspace_usable_size(p) : 0; }
 // Realloc keeping 16-byte alignment (bigger alignments: hle_uemalloc.c moves the block itself)

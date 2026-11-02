@@ -172,11 +172,14 @@ void dm_hib_layout(uint8_t **win, size_t *win_len, size_t *mod_used, uint8_t **a
     if (arena_used) *arena_used = g_arena_used;
 }
 
-// DM_CTL "hib <command>": "audit <path>" writes the pointer audit (hle_hibaudit.c), "save" writes the snapshot and "verify [path]" checks one (hle_hibsnap.c), "park" / "unpark" stop and start every guest thread
+// DM_CTL "hib <command>": "audit <path>" writes the pointer audit (hle_hibaudit.c), "save" writes the snapshot, "freeze" writes it and keeps the game stopped (before an app update),
+// "thaw" lets a frozen game go on, and "verify [path]" checks one (hle_hibsnap.c), "park" / "unpark" stop and start every guest thread
 void dm_hib_audit(const char *path);
 void dm_hib_ctl(const char *cmd) {
     if (!strncmp(cmd, "audit ", 6)) { dm_hib_audit(cmd + 6); return; }
     if (!strcmp(cmd, "save")) { int dm_hib_save(void); dm_hib_save(); return; }
+    if (!strcmp(cmd, "freeze")) { int dm_hib_freeze(void); dm_hib_freeze(); return; }
+    if (!strcmp(cmd, "thaw")) { void dm_hib_thaw(void); dm_hib_thaw(); return; }
     if (!strncmp(cmd, "verify", 6)) { int dm_hib_verify(const char *); const char *p = cmd + 6; while (*p == ' ') p++; dm_hib_verify(p); return; }
     if (!strcmp(cmd, "park")) { char why[1024]; if (dm_guest_park_all(3000, why, sizeof why)) LOG("[RED] hib park: %s", why); else LOG("hib park: parked"); return; }
     if (!strcmp(cmd, "unpark")) { dm_guest_unpark_all(); LOG("hib unpark: running"); return; }

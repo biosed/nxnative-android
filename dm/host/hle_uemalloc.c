@@ -109,6 +109,7 @@ int dm_ue_heap_owns(uint64_t a, uint64_t n) {
 #ifdef __ANDROID__
     a &= 0x00FFFFFFFFFFFFFFull;   // a heap pointer's top byte is a tag on Android (the app turns tagging off in its manifest; the adb program keeps it)
 #endif
+    if (g_ueh) { int dm_ueheap_owns(uint64_t a, uint64_t n); return dm_ueheap_owns(a, n); }   // the heap in the hibernation layout (hle_ueheap.c)
     int dm_guest_as_contains(uintptr_t a);   // hle_svc.c
     if (dm_guest_as_contains((uintptr_t)a) || dm_guest_as_contains((uintptr_t)(a + n - 1))) return 0;   // inside the guest block: not this heap
     vm_address_t at = (vm_address_t)a; vm_size_t sz = 0; vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;

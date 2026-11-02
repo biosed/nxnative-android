@@ -2594,8 +2594,15 @@ static int mirror_prepare(const tex_t *t, unsigned level, unsigned layer) {   //
 }
 int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
-    if (!t->mem || !bpb || t->d.target == NVN_TEXTURE_TARGET_3D || level >= t->d.levels) return -1;
+    if (!t->mem || !bpb || level >= t->d.levels) return -1;
     int nz = r->depth ? r->depth : 1;
+    if (t->d.target == NVN_TEXTURE_TARGET_3D) {   // a whole level only (hibernation reads back GPU-written volumes such as Unreal's colour grading LUT): every slice at once, rows tightly packed
+        uint32_t w = t->d.width >> level ? t->d.width >> level : 1, h = t->d.height >> level ? t->d.height >> level : 1, d = t->d.depth >> level ? t->d.depth >> level : 1;
+        if (r->xoffset || r->yoffset || r->zoffset || (uint32_t)r->width != w || (uint32_t)r->height != h || (uint32_t)nz != d || layer0
+            || row != (size_t)((w + bw - 1) / bw) * bpb || img != row * ((h + bh - 1) / bh)) return -1;
+        if (mirror_prepare(t, level, 0)) return -1;
+        return nvn_swizzle(&t->d, level, 0, src, row, t->mem) ? -1 : 0;
+    }
     for (int z = 0; z < nz; z++) {
         unsigned layer = layer0 + (unsigned)(r->zoffset + z);
         if (mirror_prepare(t, level, layer) || write_region_bl(t, level, layer, r, src + (size_t)z * img, row, bw, bh, bpb)) return -1;

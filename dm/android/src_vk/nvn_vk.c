@@ -732,7 +732,7 @@ struct vtex {
     VkImageCreateInfo ci; uint8_t packaged, evicted; uint64_t last_frame, last_fence;   // texture eviction (tex_evict): how it was made, whether its content comes from its storage, when it was last used
     uint32_t gpu_lv;   // levels a copy wrote on the GPU (texture or buffer copies into one level): an upload from storage leaves them alone, the rest still follows the game's writes   // lcpu: a linear texture in a pool the CPU writes (a glyph cache): its storage hashed once a submission, uploaded again when it changed
     int storage;   // made with VK_IMAGE_USAGE_STORAGE_BIT (an NVN image texture whose format Vulkan can store to)
-    int copied;   // a GPU copy wrote into it (copy_b2t): hibernation reads it back before a snapshot even when it was uploaded first
+    int copied;   // a GPU copy (copy_b2t) or a shader's image store wrote into it: hibernation reads it back before a snapshot even when it was uploaded first
     uint32_t linrow, linbpb;   // a linear 2D texture (LINEAR / LINEAR_RENDER_TARGET) the CPU can read: its row pitch and bytes per texel; what passes render into it goes back to its storage (lin_writeback)
 };
 static vtex **g_gb; static int g_ngb, g_cgb; static pthread_mutex_t g_gbmu = PTHREAD_MUTEX_INITIALIZER;
@@ -2002,7 +2002,8 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                     pthread_mutex_lock(&g_rmu); treg_t tr = tid && tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
                     vtex *v = tr.ok && tr.t.d.target != NVN_TEXTURE_TARGET_BUFFER ? tex_get(&tr.t, 1) : NULL;
                     VkImageView iv = v && v->storage ? tex_view(v, &tr.t, &tr.v, tr.has_v, -1, 2) : VK_NULL_HANDLE;
-                    if (iv) view = iv; else RED_ONCE(73, "shader %s: image slot %d is not a storage-capable image here: its writes are lost", s->key, b->reg + (int)e);
+                    if (iv) { view = iv; v->copied = 1; }   // written on the GPU: hibernation reads it back (mtl_hib_readback)
+                    else RED_ONCE(73, "shader %s: image slot %d is not a storage-capable image here: its writes are lost", s->key, b->reg + (int)e);
                 }
                 if (b->type == BT_CIS && have) sm = bind_samp(stage, b, th, (int)e);
                 else if (b->type == BT_CIS && dyn && (th >> 20)) { pthread_mutex_lock(&g_rmu); sm = samp_get((int)(th >> 20)); pthread_mutex_unlock(&g_rmu); }
@@ -3330,23 +3331,23 @@ void mtl_hib_readback(void) {   // inside a submission (hle_nvn.c dm_hib_nvn_pre
     tex_t *ts = malloc(((size_t)g_ntreg + 1) * sizeof *ts); int nt = 0;
     for (int i = 0; i < g_ntreg; i++) if (g_treg[i].ok && g_treg[i].t.serial) ts[nt++] = g_treg[i].t;
     pthread_mutex_unlock(&g_rmu);
-    typedef struct { tex_t t; unsigned lv, ly; uint32_t w, h; size_t row, img; VkDeviceSize off; } rb_t;
+    typedef struct { tex_t t; unsigned lv, ly; uint32_t w, h, dz; size_t row, img; VkDeviceSize off; } rb_t;   // dz: a 3D level's slices (one copy of the whole level)
     rb_t *rb = malloc(((size_t)nt * 16 + 1) * sizeof *rb); int nrb = 0; VkDeviceSize total = 0;
     g_hib_rb = malloc(((size_t)nt + 1) * sizeof *g_hib_rb);
     for (int i = 0; i < nt; i++) {
         const tex_t *t = &ts[i]; int dup = 0;
         for (uint32_t k = 0; k < g_hib_nrb && !dup; k++) dup = g_hib_rb[k] == t->serial;
-        if (dup || !t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER || t->d.target == NVN_TEXTURE_TARGET_3D
+        if (dup || !t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER
             || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || t->has_layout) continue;
         pthread_mutex_lock(&g_rmu); vtex *v = tex_find(t->serial); int cpu = cpu_written(t->serial); pthread_mutex_unlock(&g_rmu);
-        if (!v || cpu || v->f.dec || v->f.depth || !(v->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || (v->uploaded && !v->gpu && !v->copied)) continue;   // not made, uploaded from its storage, or not its storage's format
+        if (!v || !v->img || v->evicted || cpu || v->f.dec || v->f.depth || !(v->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || (v->uploaded && !v->gpu && !v->copied && !v->gpu_lv)) continue;   // not made, uploaded from its storage, or not its storage's format
         int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); if (!bpb) continue;
         for (unsigned lv = 0; lv < v->levels && lv < 16; lv++) {
-            uint32_t w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1;
+            uint32_t w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1, dz = t->d.target == NVN_TEXTURE_TARGET_3D ? (v->d >> lv ? v->d >> lv : 1) : 1;
             size_t row = (size_t)((w + bw - 1) / bw) * bpb, img = row * ((h + bh - 1) / bh);
             for (unsigned ly = 0; ly < v->layers; ly++) {
                 rb = realloc(rb, ((size_t)nrb + 1) * sizeof *rb);
-                rb[nrb++] = (rb_t){*t, lv, ly, w, h, row, img, total}; total += (img + 15) & ~(VkDeviceSize)15;
+                rb[nrb++] = (rb_t){*t, lv, ly, w, h, dz, row, img, total}; total += (img * dz + 15) & ~(VkDeviceSize)15;
             }
         }
         g_hib_rb[g_hib_nrb++] = t->serial;
@@ -3358,13 +3359,13 @@ void mtl_hib_readback(void) {   // inside a submission (hle_nvn.c dm_hib_nvn_pre
         vkCmdPipelineBarrier(C->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         for (int i = 0; i < nrb; i++) {
             pthread_mutex_lock(&g_rmu); vtex *v = tex_find(rb[i].t.serial); pthread_mutex_unlock(&g_rmu);
-            VkBufferImageCopy c = {rb[i].off, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, rb[i].lv, rb[i].ly, 1}, {0, 0, 0}, {rb[i].w, rb[i].h, 1}};
+            VkBufferImageCopy c = {rb[i].off, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, rb[i].lv, rb[i].ly, 1}, {0, 0, 0}, {rb[i].w, rb[i].h, rb[i].dz}};
             vkCmdCopyImageToBuffer(C->cb, v->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &c);
         }
         C->used = 1;
         uint64_t f = mtl_sub_commit(); mtl_wait(f, UINT64_MAX);   // the copies done: their bytes into the textures' storage
         for (int i = 0; i < nrb; i++) {
-            NVNcopyRegion r = {0, 0, 0, (int)rb[i].w, (int)rb[i].h, 1};
+            NVNcopyRegion r = {0, 0, 0, (int)rb[i].w, (int)rb[i].h, (int)rb[i].dz};
             if (nvn_tex_mirror_b2t(&rb[i].t, rb[i].lv, rb[i].ly, &r, (const uint8_t *)map + rb[i].off, rb[i].row, rb[i].img)) { static int n; if (n++ < 4) LOG("[RED] hibernate: texture ser=%llu level %u not written into its storage", (unsigned long long)rb[i].t.serial, rb[i].lv); }
         }
         vkDestroyBuffer(g_dev, b, NULL); vkFreeMemory(g_dev, m, NULL);

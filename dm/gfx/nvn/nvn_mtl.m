@@ -10104,6 +10104,23 @@ static void mirror_readback(const tex_t *t, id<MTLTexture> d, unsigned level, un
     defer_obj_release(b);
     mirror_note(0, t, level, from, 1);
 }
+// A 3D texture's whole level (hibernation): every slice into one shared buffer, then into the storage as mirror_readback's are (nvn_tex_mirror_b2t takes whole 3D levels)
+static void mirror_readback3d(const tex_t *t, id<MTLTexture> d, unsigned level) {
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    uint32_t w = MAX(t->d.width >> level, 1u), h = MAX(t->d.height >> level, 1u), nz = MAX(t->d.depth >> level, 1u);
+    if (!bpb || d.sampleCount > 1 || mtl_fmt_depth(d.pixelFormat) || mtl_pf_block_bytes(d.pixelFormat) != (size_t)bpb || d.textureType != MTLTextureType3D) { mirror_note(-1, t, level, "hibernate", 1); return; }
+    size_t row = (size_t)((w + bw - 1) / bw) * bpb, img = row * (size_t)((h + bh - 1) / bh);
+    id<MTLBuffer> b = [g_dev newBufferWithLength:img * nz options:MTLResourceStorageModeShared];
+    if (!b) { mirror_note(-1, t, level, "hibernate", 1); return; }
+    res_add(b);
+    id<MTL4ComputeCommandEncoder> e = blit();
+    enc_b_copy_texture_buffer(e, d, 0, level, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, nz), b, 0, row, img);
+    mirror_rb *m = malloc(sizeof *m); *m = (mirror_rb){*t, level, 0, {0, 0, 0, (int)w, (int)h, (int)nz}, row, img, (void *)CFBridgingRetain(b), NULL, 0};
+    post((post_op){4, NULL, 0, 0, 0, 0, m, 0});
+    mrb_note(t->serial, 1);
+    defer_obj_release(b);
+    mirror_note(0, t, level, "hibernate", 1);
+}
 static void mirror_rb_land(void *p) {   // the submission's completion handler
     mirror_rb *m = p; id<MTLBuffer> b = CFBridgingRelease(m->buf);
     if (m->shift) { int bw, bh; nvn_fmt_bpb(m->t.d.format, &bw, &bh); rb_swap_rows(b.contents, m->row, (size_t)((m->r.height + bh - 1) / bh), (size_t)(m->r.depth ? m->r.depth : 1), m->row, m->img, m->shift); }   // into the guest's order
@@ -12056,14 +12073,23 @@ void mtl_hib_readback(void) {
         const tex_t *t = &ts[i]; int dup = 0;
         for (uint32_t k = 0; k < g_hib_nrb && !dup; k++) dup = g_hib_rb[k].serial == t->serial;
         if (dup) continue;
-        if (!t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER || t->d.target == NVN_TEXTURE_TARGET_3D
-            || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) continue;
+        if (!t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER
+            || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) {
+            id o = tex_get(t->serial);
+            if (o && [o conformsToProtocol:@protocol(MTLTexture)]) { static int nl; if (nl++ < 16) MLOG("hibernate: not read back: ser=%llu target %d format %#x %ux%ux%u levels %u samples %d flags %#x", (unsigned long long)t->serial, t->d.target, t->d.format, t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.samples, t->d.flags); }
+            continue;
+        }
         pthread_mutex_lock(&g_cpu_tex_mu); int cpu = nvn_hm_get(&g_cpu_tex, &t->serial) != NULL; pthread_mutex_unlock(&g_cpu_tex_mu);
         if (cpu) continue;
         id o = tex_get(t->serial);
         if (!o || ![o conformsToProtocol:@protocol(MTLTexture)]) continue;   // not made yet, or uploaded from its storage (a packaged texture)
         id<MTLTexture> mt = o;
-        if (mtl_fmt_depth(mt.pixelFormat) || mt.pixelFormat == MTLPixelFormatStencil8 || mt.sampleCount > 1) { skipped++; continue; }
+        if (mtl_fmt_depth(mt.pixelFormat) || mt.pixelFormat == MTLPixelFormatStencil8 || mt.sampleCount > 1) { skipped++; static int nl; if (nl++ < 16) MLOG("hibernate: not read back (depth/MS): ser=%llu target %d format %#x %ux%u", (unsigned long long)t->serial, t->d.target, t->d.format, t->d.width, t->d.height); continue; }
+        if (t->d.target == NVN_TEXTURE_TARGET_3D) {   // volumes (Unreal's colour grading LUT, made once and kept): whole levels
+            for (unsigned lv = 0; lv < mt.mipmapLevelCount && lv < t->d.levels; lv++) { mirror_readback3d(t, mt, lv); bytes += (uint64_t)MAX(mt.width >> lv, 1u) * MAX(mt.height >> lv, 1u) * MAX(mt.depth >> lv, 1u) * 4; }
+            g_hib_rb[g_hib_nrb++] = (hib_mcpu){t->serial, (uint64_t)(uintptr_t)t->pool};
+            continue;
+        }
         unsigned layers = (unsigned)(mt.textureType == MTLTextureTypeCube ? 6 : mt.textureType == MTLTextureTypeCubeArray ? 6 * mt.arrayLength : mt.arrayLength);
         for (unsigned lv = 0; lv < mt.mipmapLevelCount && lv < t->d.levels; lv++) {
             NVNcopyRegion r = {0, 0, 0, (int)MAX(mt.width >> lv, 1u), (int)MAX(mt.height >> lv, 1u), (int)(layers ? layers : 1)};

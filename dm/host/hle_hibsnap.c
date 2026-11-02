@@ -280,12 +280,13 @@ static const char *policy(void) {
     const char *g = dm_hib_nvn_refuse(); if (g) return g;
     return NULL;
 }
-static int g_saving, g_forgotten;
+static int g_saving, g_forgotten, g_freeze_req, g_frozen;
 // Writes the snapshot. Returns 0 on success; the world runs again afterwards either way (the caller decides whether the process then goes on or stops).
 // gfx_closed: the caller closed the graphics gate already (its suspend sequence): it is opened for the park, so that a thread waiting at it reaches a gate of its own, and closed again
 int dm_hib_save_ex(int gfx_closed) {
     if (!dm_hib_on()) { LOG("[RED] hibernate: not on (DM_HIBERNATE=1 from the start)"); return -1; }
     if (__atomic_load_n(&g_forgotten, __ATOMIC_SEQ_CST)) return -1;   // the game is ending (dm_hib_forget)
+    if (g_frozen) { LOG("hibernate: frozen: the snapshot is written already"); return 0; }
     uint8_t *win, *arena; size_t win_len, mod_used, arena_used; dm_hib_layout(&win, &win_len, &mod_used, &arena, &arena_used);
     if (!win) { LOG("[RED] hibernate: no fixed layout this session"); return -1; }
     if (__atomic_exchange_n(&g_saving, 1, __ATOMIC_SEQ_CST)) { LOG("[RED] hibernate: a snapshot is already being written"); return -1; }
@@ -347,12 +348,31 @@ int dm_hib_save_ex(int gfx_closed) {
         } else { LOG("[RED] hibernate: writing %s failed (errno %d, synced %d)", tmp, w.err, synced); unlink(tmp); }
         free(w.tab); free(w.zbuf);
     }
+    if (rc == 0 && g_freeze_req) {   // hib freeze: the world stays parked and the GPU closed until the process ends (an app update) or hib thaw
+        g_frozen = 1; g_saving = 0;
+        LOG("hibernate: frozen after the snapshot (an update may replace the app now; DM_CTL hib thaw goes on)");
+        return rc;
+    }
     if (!gfx_closed) dm_gfx_suspend(0);
     dm_guest_unpark_all();
     g_saving = 0;
     return rc;
 }
 int dm_hib_save(void) { return dm_hib_save_ex(0); }
+// DM_CTL "hib freeze": a snapshot, then nothing runs on (an app update installs over the process: the next start resumes exactly there). "hib thaw": the game goes on and the
+// snapshot, stale from then on, is removed
+int dm_hib_freeze(void) {
+    if (g_frozen) { LOG("hibernate: already frozen"); return 0; }
+    g_freeze_req = 1; int rc = dm_hib_save_ex(0); g_freeze_req = 0;
+    if (rc) LOG("[RED] hibernate: not frozen: no snapshot (above); the game goes on");
+    return rc;
+}
+void dm_hib_thaw(void) {
+    if (!g_frozen) { LOG("hibernate: not frozen"); return; }
+    g_frozen = 0; dm_gfx_suspend(0); dm_guest_unpark_all();
+    char dir[1024], p[1100]; hib_dir(dir, sizeof dir); snprintf(p, sizeof p, "%s/snap.bin", dir);
+    if (!unlink(p)) LOG("hibernate: thawed: the game goes on, its snapshot is removed");
+}
 // The front ends' suspend sequence (the app leaving the screen): the snapshot is written on a thread of its own after the suspend, and the resume waits for it first
 static pthread_t g_sth; static int g_sth_on;
 static void *suspend_save(void *arg) { (void)arg; dm_hib_save_ex(1); return NULL; }
@@ -374,7 +394,8 @@ void dm_hib_suspend_now(int on) {
     else if (!on && g_sth_on) {
         pthread_join(g_sth, NULL); g_sth_on = 0;
         char dir[1024], p[1100]; hib_dir(dir, sizeof dir); snprintf(p, sizeof p, "%s/snap.bin", dir);
-        if (!unlink(p)) LOG("hibernate: back in the foreground: the snapshot is stale now, removed");
+        if (g_frozen) LOG("hibernate: back in the foreground, still frozen: the snapshot stays");
+        else if (!unlink(p)) LOG("hibernate: back in the foreground: the snapshot is stale now, removed");
     }
 }
 
