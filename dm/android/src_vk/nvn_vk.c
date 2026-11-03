@@ -38,11 +38,19 @@ static VkDeviceMemory mem_alloc(VkMemoryRequirements r, VkMemoryPropertyFlags wa
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, r.size, mem_type(r.memoryTypeBits, want)};
     VkDeviceMemory m; VKCHECK(vkAllocateMemory(g_dev, &ai, NULL, &m)); return m;
 }
+// Host-visible buffers (the rings, the stand-ins): the first HOST_VISIBLE | HOST_COHERENT type, which on the Adreno is uncached (write-combined). The CPU also reads the rings back
+// (a dispatch's storage-range snapshot, the completion's compare of what the GPU changed, ~3.5 MB each a frame in FINAL FANTASY RESONANCE's castle): uncached reads are slow.
+// DM_VK_RING_CACHED=1 takes a HOST_CACHED coherent type where the GPU has one (the Snapdragon's IO coherence). The type taken is logged once
+static int ring_cached(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RING_CACHED"); v = e && atoi(e) != 0; } return v; }
 static VkBuffer buf_new(VkDeviceSize n, VkBufferUsageFlags u, VkDeviceMemory *m, void **map) {
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, u, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
     VkBuffer b; VKCHECK(vkCreateBuffer(g_dev, &bi, NULL, &b));
     VkMemoryRequirements r; vkGetBufferMemoryRequirements(g_dev, b, &r);
-    *m = mem_alloc(r, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (ring_cached()) for (uint32_t i = 0; i < g_memp.memoryTypeCount; i++) if ((r.memoryTypeBits >> i & 1) && (g_memp.memoryTypes[i].propertyFlags & (want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) == (want | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) { want |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT; break; }
+    { static int logged; if (!logged++) { uint32_t t = mem_type(r.memoryTypeBits, want); LOG("vk: host-visible buffers in memory type %u (flags %#x%s); DM_VK_RING_CACHED=%d", t, g_memp.memoryTypes[t].propertyFlags,
+                                                      g_memp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? ", cached" : ", uncached", ring_cached()); } }
+    *m = mem_alloc(r, want);
     VKCHECK(vkBindBufferMemory(g_dev, b, *m, 0));
     if (map) VKCHECK(vkMapMemory(g_dev, *m, 0, VK_WHOLE_SIZE, 0, map));
     return b;
@@ -3681,6 +3689,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                         LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame (left open %.1f: the attachment it samples was not written in the pass)",
                             gp / 600e6, gd / 600e6, gc / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0, g_nsplit_skip / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; g_nsplit_skip = 0; }
     if (n % 600 == 0) gsig_report(600);
+    if (n % 600 == 0) { static long mn0, mj0; struct rusage ru; if (!getrusage(RUSAGE_THREAD, &ru)) { if (mn0 || mj0) LOG("vk: this thread's page faults over the last 600 frames: %.1f minor, %.2f major a frame", (ru.ru_minflt - mn0) / 600.0, (ru.ru_majflt - mj0) / 600.0); mn0 = ru.ru_minflt; mj0 = ru.ru_majflt; } }
     if (n % 600 == 0) { LOG("vk: ADPF over the last 600 frames: %llu reports%s, %llu failed (last error %d), reported CPU %.1f ms and GPU %.1f ms a frame on average (target 16.7 ms)",
                             (unsigned long long)g_adpf_n, g_adpf_v2 ? " with the GPU's work" : "", (unsigned long long)g_adpf_fail, g_adpf_err, g_adpf_n ? g_adpf_cpu / 1e6 / g_adpf_n : 0.0, g_adpf_n ? g_adpf_gpu / 1e6 / g_adpf_n : 0.0);
                         g_adpf_n = g_adpf_fail = g_adpf_cpu = g_adpf_gpu = 0; }
