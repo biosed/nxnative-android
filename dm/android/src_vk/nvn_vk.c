@@ -1910,6 +1910,39 @@ static const uint8_t *rt_hold_scan(const uint8_t *p, const p_set_rt *open) {   /
     }
     return NULL;
 }
+// DM_VK_DISPATCH_DEFER: the barrier Unreal puts between a light's draw and the volume injection's dispatch (and the one back) ended the pass before dispatch() could defer
+// anything (vk19.14's castle run: 0 deferred). A barrier in an open pass is kept from ending it when the next work, past state changes and uniform updates, is a dispatch, or a
+// draw while dispatches are deferred; the pass then counts as merged, so a draw sampling one of its written attachments still ends it first (draw_reads_rt), what a deferred
+// dispatch writes ends it for a draw that reads it (DRAWQ), and anything else -- other targets, a copy, a clear outside the pass -- ends it as before
+static uint64_t g_nbar_kept;
+static int next_work_op(const uint8_t *p) {   // the first op from p that is not a state change, a uniform update or a barrier (following calls and jumps as rt_hold_scan does); -1: unknown
+    if (g_nrs > 32) return -1;
+    const uint8_t *stk[16]; int ns = 0, outer = g_nrs, ri = 0;
+    for (int guard = 0; guard < 4096; guard++) {
+        op_hdr h; memcpy(&h, p, sizeof h); const uint8_t *a = p + 8;
+        switch (h.op) {
+            case OP_END:
+                if (ns) { p = stk[--ns]; continue; }
+                if (outer > 0) { p = g_rs[--outer]; continue; }
+                if (ri < g_nrest && g_rest && g_rest[ri]) { p = (const uint8_t *)(uintptr_t)g_rest[ri++]; continue; }
+                return -1;
+            case OP_JUMP: memcpy(&p, a, 8); continue;
+            case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); if (ns >= 16) return -1; stk[ns++] = p + h.size; p = t; continue; }
+            case OP_BEGIN: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
+            case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_STENCIL: case OP_POLY_OFFSET: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_COPY_STRIDE:
+            case OP_BLEND_COLOR: case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BIND_TEX1: case OP_PRIM_RESTART: case OP_BIND_UBO_SMALL: case OP_BIND_VBUF1: case OP_ALPHA_REF: case OP_LINE_WIDTH:
+            case OP_BARRIER: case OP_UPDATE_UB: break;
+            default: return (int)h.op;
+        }
+        p += h.size;
+    }
+    return -1;
+}
+static int barrier_keeps_pass(const uint8_t *next) {
+    if (!defer_on() || !P.open) return 0;
+    int w = next_work_op(next);
+    return w == OP_DISPATCH || (g_ndefer && (w == OP_DRAW || w == OP_DRAW_IDX));
+}
 static void set_rt_(const p_set_rt *r);
 static void set_rt(const uint8_t *op, const p_set_rt *r, uint32_t size) {
     if (g_rt_hold) {   // inside a held detour: its SetRenderTargets are not replayed; the one back to the open pass's targets ends it
@@ -3089,7 +3122,7 @@ static void mtl_exec_(const uint8_t *p) {
             case OP_COPY_T2T: copy_t2t((const p_copy_t2t *)a); break;
             case OP_COPY_T2B: copy_t2b((const p_copy_t2t *)a); break;
             case OP_CLEAR_TEX: clear_tex((const p_clear_tex *)a); break;
-            case OP_BARRIER: pass_end(); break;
+            case OP_BARRIER: if (barrier_keeps_pass(p + h.size)) { P.merged = 1; g_nbar_kept++; } else pass_end(); break;   // see barrier_keeps_pass
             case OP_SCISSOR: S.sc = *(const p_scissor *)a; S.has_sc = 1; break;
             case OP_BIND_PROGRAM: { const p_bind_program *b = (const p_bind_program *)a; if (b->stages & 0x20) S.cprog = b->prog; for (int st = 0; st < 5; st++) if (b->stages >> st & 1) S.bst[st] = b->prog; break; }
             case OP_BIND_STATE: {
@@ -3706,7 +3739,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0) { LOG("vk: ADPF over the last 600 frames: %llu reports%s, %llu failed (last error %d), reported CPU %.1f ms and GPU %.1f ms a frame on average (target 16.7 ms)",
                             (unsigned long long)g_adpf_n, g_adpf_v2 ? " with the GPU's work" : "", (unsigned long long)g_adpf_fail, g_adpf_err, g_adpf_n ? g_adpf_cpu / 1e6 / g_adpf_n : 0.0, g_adpf_n ? g_adpf_gpu / 1e6 / g_adpf_n : 0.0);
                         g_adpf_n = g_adpf_fail = g_adpf_cpu = g_adpf_gpu = 0; }
-    if (n % 600 == 0 && defer_on()) { LOG("vk: DM_VK_DISPATCH_DEFER: %.1f dispatches a frame recorded after their pass, %.1f passes a frame ended early for a draw reading what one writes", g_ndefer_n / 600.0, g_ndefer_haz / 600.0); g_ndefer_n = g_ndefer_haz = 0; }
+    if (n % 600 == 0 && defer_on()) { LOG("vk: DM_VK_DISPATCH_DEFER: %.1f dispatches a frame recorded after their pass, %.1f passes a frame ended early for a draw reading what one writes, %.1f barriers a frame that kept their pass open", g_ndefer_n / 600.0, g_ndefer_haz / 600.0, g_nbar_kept / 600.0); g_ndefer_n = g_ndefer_haz = 0; g_nbar_kept = 0; }
     if (n % 600 == 0 && (ubwc_on() || pass_barrier_on())) { LOG("vk: DM_VK_UBWC %d: %llu images made with a format list or not mutable so far, %llu views outside the list; DM_VK_PASS_BARRIER %d: %.1f pass ends a frame without vertex shaders, %.1f vertex-shader barriers a frame",
         ubwc_on(), (unsigned long long)g_ubwc_imgs, (unsigned long long)g_ubwc_fallback, pass_barrier_on(), g_nbar_narrow / 600.0, g_nbar_vs / 600.0); g_nbar_narrow = g_nbar_vs = 0; }
     if (n % 600 == 0) { LOG("vk: waiting for a free submission context per frame: %.2f ms for its own submission, %.2f ms for a later one still reading its ring (%d contexts)",
