@@ -2488,10 +2488,37 @@ static VkSampler bind_samp(int stage, const sbind *b, uint64_t th, int el) {
 // shader reading one can take the GPU down (FINAL FANTASY RESONANCE lost the Adreno 825 after about 1,200 frames, its Unreal shaders' texel buffers and sampler arrays unwritten)
 // Descriptor sets of this submission by what they hold (layout and every descriptor): a draw whose bindings resolve to the same resources reuses the set instead of allocating and
 // writing one again -- Unreal's shaders have 60-80 descriptors a stage (32-entry texel buffer and sampler arrays), and writing every one for every draw cost most of the recording time
-static struct { uint64_t key, gen; VkDescriptorSetLayout dsl; VkDescriptorSet ds; } g_dsc[8192];
+static struct { uint64_t key, gen; VkDescriptorSetLayout dsl; VkDescriptorSet ds; uint64_t key2; int nk; uint64_t km[64]; } g_dsc[8192];   // km: the key material (DM_VK_DSET_CACHE2)
 static uint64_t g_dsc_hit, g_dsc_miss;
 static uint64_t g_t_ws, g_t_draw, g_t_disp, g_t_sub;   // time in write_set, in draws (with their write_set), in dispatches, in vkQueueSubmit (the frame stats line)
 static VkDescriptorSet write_set_(shader_t *s, int stage);
+// DM_VK_DSET_CACHE2 (vk19.36, default 1). The descriptor-set cache (g_dsc) keys a set by what its bindings resolved to, and two kinds of binding were put into the ring anew
+// for every draw: the 4 KB driver segment (K_DRVCB: texture / sampler handle tables) and the shader's constant block (K_C1). Each draw then had a new ring offset, so its set
+// never matched an earlier one: a new set, a vkAllocateDescriptorSets and a vkUpdateDescriptorSets (6-7 ms a frame at 400 draws, 25-55% reused). Now those blocks are kept by
+// content for the submission (the ring is not reused before it is done): the same bytes give the same buffer and offset, so the set can match. A memo hit compares the whole
+// block with a host copy (not the ring, which is uncached here). And a set hit compares its whole key material (up to 64 words; past that a second, independent 64-bit hash),
+// where it compared one 64-bit hash before. The per-600 line: block reuse, set hits / misses / rejected on compare, and the time the hits saved (the misses' mean)
+static int dset_cache2(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_DSET_CACHE2"); v = !e || atoi(e) != 0; LOG("vk: DM_VK_DSET_CACHE2=%d", v); } return v; }
+enum { NMEMO = 256, MEMO_MAX = 4096 };
+static struct { uint64_t h, gen; uint32_t len; VkBuffer b; VkDeviceSize off; uint8_t *copy; } g_memo[NMEMO];
+static uint64_t g_memo_hit, g_memo_miss, g_dsc_rej, g_dsc_miss_ns, g_dsc_nmiss_t;
+static VkDeviceSize ring_put_memo(const void *src, uint32_t len, VkDeviceSize align, VkBuffer *buf) {
+    *buf = VK_NULL_HANDLE;
+    if (!dset_cache2() || len > MEMO_MAX) { VkDeviceSize o = ring_put(src, len, align); if (o != VK_WHOLE_SIZE) *buf = C->ring; return o; }
+    uint64_t h = 0xcbf29ce484222325ull, x; uint32_t i = 0;
+    for (; i + 8 <= len; i += 8) { memcpy(&x, (const uint8_t *)src + i, 8); h = (h ^ x) * 0x100000001b3ull; }
+    for (; i < len; i++) h = (h ^ ((const uint8_t *)src)[i]) * 0x100000001b3ull;
+    h ^= len;
+    typeof(g_memo[0]) *m = &g_memo[(h ^ h >> 29) % NMEMO];
+    if (m->gen == g_bvgen && m->h == h && m->len == len && m->off % align == 0 && !memcmp(m->copy, src, len)) { g_memo_hit++; *buf = m->b; return m->off; }
+    VkDeviceSize o = ring_put(src, len, align);
+    if (o == VK_WHOLE_SIZE) return o;
+    *buf = C->ring;
+    if (!m->copy) m->copy = malloc(MEMO_MAX);
+    if (m->copy) { memcpy(m->copy, src, len); m->h = h; m->gen = g_bvgen; m->len = len; m->b = C->ring; m->off = o; }
+    g_memo_miss++;
+    return o;
+}
 static int g_ws_att; static vtex *g_ws_simg[16]; static int g_nws_simg;   // the last compute write_set: whether it reads an attachment of the open pass, the storage images it binds (defer_on)
 static int ws_is_att(const vtex *v) { if (v == P.dt) return 1; for (int i = 0; i < P.n; i++) if (P.ct[i] == v) return 1; return 0; }
 static int g_vs_haz;   // the vertex shader's write_set met a texture a pass wrote with vertex shaders left out of its end barrier (draw_vs_hazard)
@@ -2517,7 +2544,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                 VkBuffer gb; VkDeviceSize go;
                 if (u->addr && n && gw_find(u->addr, n, g_props.limits.minUniformBufferOffsetAlignment ? g_props.limits.minUniformBufferOffsetAlignment : 256, &gb, &go, NULL)) *d = (VkDescriptorBufferInfo){gb, go, n};
                 else if (u->addr && n) { VkDeviceSize o = copy_in(u->addr, n, 256); if (o != VK_WHOLE_SIZE) *d = (VkDescriptorBufferInfo){C->ring, o, n}; }
-            } else if (b->kind == K_C1 && s->c1_len) { VkDeviceSize o = ring_put(s->c1, s->c1_len, 256); if (o != VK_WHOLE_SIZE) *d = (VkDescriptorBufferInfo){C->ring, o, s->c1_len}; }
+            } else if (b->kind == K_C1 && s->c1_len) { VkBuffer rb; VkDeviceSize o = ring_put_memo(s->c1, (uint32_t)s->c1_len, 256, &rb); if (o != VK_WHOLE_SIZE) *d = (VkDescriptorBufferInfo){rb, o, s->c1_len}; }
             else if (b->kind == K_SUPPORT) *d = (VkDescriptorBufferInfo){g_support_buf, 0, 4096};
             else if ((b->kind == K_SBUF || b->kind == K_UBOP) && b->reg >= 0 && b->reg < 16) {   // a copy, or the GPU's own earlier write; a dispatch's are written back (dispatch)
                 const p_bind_buf *u = b->kind == K_SBUF ? &S.ssbo[stage][b->reg] : &S.ubo[stage][b->reg];
@@ -2548,7 +2575,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                     if (base >= 0) for (int r = 0; r < 16; r++) { uint64_t a = S.ssbo[stage][r].addr; uint32_t n = (uint32_t)S.ssbo[stage][r].size; memcpy(seg + base + 16 * r, &a, 8); memcpy(seg + base + 16 * r + 8, &n, 4); }
                     if (stage != 5) { const float mp = 2047.0f; memcpy(seg + 0x610, &mp, 4); }
                 }
-                VkDeviceSize o = ring_put(seg, sizeof seg, 256); if (o != VK_WHOLE_SIZE) *d = (VkDescriptorBufferInfo){C->ring, o, sizeof seg};
+                VkBuffer rb; VkDeviceSize o = ring_put_memo(seg, sizeof seg, 256, &rb); if (o != VK_WHOLE_SIZE) *d = (VkDescriptorBufferInfo){rb, o, sizeof seg};
             }
             x->pBufferInfo = d;
             if (s->dynu[i]) { x->descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; g_dyno[g_ndyno++] = (uint32_t)d->offset; d->offset = 0; }   // the offset goes with the bind
@@ -2615,8 +2642,8 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
         }
         ne += (int)cnt; nw++;
     }
-    uint64_t key = 0xcbf29ce484222325ull;
-    #define HMIX(v) key = (key ^ (uint64_t)(v)) * 0x100000001b3ull
+    uint64_t key = 0xcbf29ce484222325ull, key2 = 0x84222325cbf29ce4ull; enum { KMAX = 64 }; uint64_t km[KMAX]; int nk = 0;
+    #define HMIX(v) do { uint64_t v_ = (uint64_t)(v); key = (key ^ v_) * 0x100000001b3ull; key2 = (key2 + v_) * 0x9E3779B97F4A7C15ull; key2 ^= key2 >> 31; if (nk < KMAX) km[nk] = v_; nk++; } while (0)
     HMIX((uintptr_t)s->dsl);
     for (int k = 0; k < nw; k++) {
         const VkWriteDescriptorSet *x = &w[k]; HMIX(x->dstBinding | (uint64_t)x->descriptorCount << 32); HMIX(x->descriptorType);
@@ -2628,7 +2655,11 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
     }
     #undef HMIX
     typeof(g_dsc[0]) *ce = &g_dsc[key % 8192];
-    if (ce->gen == g_bvgen && ce->key == key && ce->dsl == s->dsl) { g_dsc_hit++; return ce->ds; }
+    if (ce->gen == g_bvgen && ce->key == key && ce->dsl == s->dsl) {
+        if (!dset_cache2() || (ce->key2 == key2 && ce->nk == nk && (nk > KMAX || !memcmp(ce->km, km, (size_t)nk * 8)))) { g_dsc_hit++; return ce->ds; }
+        g_dsc_rej++;   // the same 64-bit hash, other bindings: a new set
+    }
+    uint64_t tm0 = now_ns();
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, C->dps[C->idp], 1, &s->dsl};
     while (vkAllocateDescriptorSets(g_dev, &ai, &ds) != VK_SUCCESS) {   // this pool is full: the next of the chain, made when there is none
         if (++C->idp == C->ndp) { if (C->ndp >= 256) { RED_ONCE(20, "256 descriptor pools in one submission: draws are dropped"); C->idp--; return VK_NULL_HANDLE; }
@@ -2637,7 +2668,8 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
     }
     for (int k = 0; k < nw; k++) w[k].dstSet = ds;
     vkUpdateDescriptorSets(g_dev, (uint32_t)nw, w, 0, NULL);
-    *ce = (typeof(g_dsc[0])){key, g_bvgen, s->dsl, ds}; g_dsc_miss++;
+    ce->key = key; ce->gen = g_bvgen; ce->dsl = s->dsl; ce->ds = ds; ce->key2 = key2; ce->nk = nk; if (nk <= KMAX) memcpy(ce->km, km, (size_t)nk * 8); g_dsc_miss++;
+    g_dsc_miss_ns += now_ns() - tm0; g_dsc_nmiss_t++;
     return ds;
 }
 static _Atomic uint64_t g_wait_ns, g_rec_ns, g_pwait_ns;   // time the submit thread waited for the GPU, spent recording, and the present waited for its slot
@@ -3964,6 +3996,10 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             (unsigned long long)atomic_exchange(&g_gw_gpu_reads, 0), (unsigned long long)atomic_exchange(&g_gw_cpu_fix, 0), (unsigned long long)atomic_exchange(&g_gw_b2t_guest, 0),
             g_t_stale / 600e6, g_stale_bytes / 600.0 / 1048576.0, g_t_patch / 600e6, g_npatch / 600.0, g_patch_regions / 600.0, g_t_split / 600e6, g_vid_push / 600.0, g_vid_nz / 600.0, g_gw_calls / 600.0, g_gw_quick / 600.0, g_gw_walked / 600.0);
         g_wb_words = g_wb_bytes = 0; g_t_stale = g_stale_bytes = 0; g_t_patch = g_patch_regions = g_npatch = 0; g_vid_push = g_vid_nz = 0; g_t_split = 0; g_gw_calls = g_gw_quick = g_gw_walked = 0;
+        { double miss_us = g_dsc_nmiss_t ? g_dsc_miss_ns / 1e3 / g_dsc_nmiss_t : 0;
+          LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame",
+              dset_cache2(), g_dsc_hit / 600.0, g_dsc_miss / 600.0, miss_us, g_dsc_rej / 600.0, g_memo_hit / 600.0, g_memo_miss / 600.0, g_dsc_hit * miss_us / 1e3 / 600.0);
+          g_memo_hit = g_memo_miss = g_dsc_rej = g_dsc_miss_ns = g_dsc_nmiss_t = 0; }
         ls = g_nsub_stat; g_t_draw = g_t_ws = g_t_disp = g_t_up = g_t_sub = 0; g_up_bytes = 0; g_dsc_hit = g_dsc_miss = 0; }
     if (n % 600 == 0) {   // memory: the process (RSS, its anonymous part, PSS) and what the backend holds
         long rss = 0, anon = 0, pss = 0; char ln[256]; FILE *f = fopen("/proc/self/status", "re");

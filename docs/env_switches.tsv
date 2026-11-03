@@ -330,6 +330,7 @@ DM_VK_CTX	test	Android: `=<n>` (4..32, default 20) submission contexts: how far 
 DM_VK_DECODE_POOL	test	Android: `1` decodes CPU-decoded textures (BC / ASTC the GPU cannot sample) through one kept buffer instead of a fresh malloc per level; default 0
 DM_VK_DIR	path	Android: the folder of the shaders' SPIR-V (`<key>.spv`, `<key>.vk.txt` from dm/android/tools/spv_android.py) and the pipeline cache
 DM_VK_DISPATCH_DEFER	test	Android: `1` records a dispatch met inside an open render pass after that pass instead of ending it, when it reads none of the pass's attachments; a draw reading what it writes ends the pass first. Default 0
+DM_VK_DSET_CACHE2	switch	Android: `1` (default) keeps the driver segment and constant blocks put into the ring by content for the submission, so descriptor sets can be reused, and compares a reused set's whole key; `0` as before
 DM_VK_EVICT_AGE	switch	Android: frames a storage-backed texture stays unused before its image is evicted (default 300; made again from its storage at its next use)
 DM_VK_EVICT_FAST	switch	Android: the age in frames (default 30) at which an early trim for fast game-heap growth (DM_MEM_PRETRIM) evicts idle textures; other trims use 60
 DM_VK_GPU_TS	test	Android: `0` gives every counter timestamp of a submission its completion time, as before vk19.14 (now TIMESTAMP_TOP takes the submission's GPU start)
