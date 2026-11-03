@@ -1213,6 +1213,7 @@ typedef struct {
     VkPipelineLayout cpl; VkPipeline cpp;   // compute shaders: their layout and pipeline (dispatch)
     uint8_t dynu[64];   // uniform buffer bindings made dynamic (UNIFORM_BUFFER_DYNAMIC): their ring offset goes with the bind, so a set stays the same while only uniform data changes
     int layer_out;   // writes the Layer builtin (a vertex or geometry shader that picks the attachment layer per primitive): its draws run in a layered pass
+    int vid;   // a vertex shader that reads VertexIndex, patched to add the push constant at offset 0 (spv_vid_bias): its layout has the range, draw() pushes vlo
     uint8_t md[8];   // the key as bytes (shader_get's lookup)
     int dyn;   // dynamic slot arrays (profile key tex_dyn_slots): 32-entry texture / texel buffer / sampler arrays indexed at run time by the IDs the shader reads from c2 (see write_set)
     int ssbo_wr;   // the module stores to or atomically updates a storage buffer (spv_ssbo_writes): only then is a draw's storage buffer a write that gets lost
@@ -1336,6 +1337,63 @@ static uint32_t *spv_point_size(const uint32_t *w, size_t nw, size_t *out_n) {
     if (member_path) { o[n++] = 5u << 16 | OpAccessChain; o[n++] = ptr; o[n++] = ac; o[n++] = var; o[n++] = cidx; o[n++] = 3u << 16 | OpStore; o[n++] = ac; o[n++] = one; }
     else { o[n++] = 3u << 16 | OpStore; o[n++] = var; o[n++] = one; }
     memcpy(o + n, w + at, (nw - at) * 4); n += nw - at;
+    o[3] = bound; *out_n = n; return o;
+}
+// The vertex index a shader reads, as the game gave it. draw() copies only the vertices a draw uses (from vertex vlo on) and shifts the draw's vertex numbers down by vlo,
+// so VertexIndex came out vlo too low. Unreal's vertex shaders here fetch everything but the position from texel buffers by VertexIndex (manual vertex fetch): every mesh
+// section whose indices do not start at 0 took another vertex's UVs and tangents (FINAL FANTASY RESONANCE's castle: the upper walls dark, smeared and lit as if facing down,
+// the grand staircase dark and jagged; the Metal host binds the pool in place, no shift). Every load of the VertexIndex variable gets a 4-byte push constant (offset 0,
+// vertex stage) added, which draw() sets to vlo. Returns a new word array (the caller frees it), NULL when the shader does not read VertexIndex
+// DM_VK_VTXIDX_FIX=0 leaves the shaders as they were (VertexIndex vlo too low). g_vid_push / g_vid_nz: draws that pushed the bias, and those whose bias was not 0 (the recording line)
+static uint64_t g_vid_push, g_vid_nz;
+static int vid_fix_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_VTXIDX_FIX"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_VTXIDX_FIX=0: vertex shaders read VertexIndex shifted by the draw's first vertex copied"); } return v; }
+static uint32_t *spv_vid_bias(const uint32_t *w, size_t nw, size_t *out_n) {
+    enum { OpEntryPoint = 15, OpTypeInt = 21, OpTypeStruct = 30, OpTypePointer = 32, OpConstant = 43, OpFunction = 54, OpVariable = 59, OpLoad = 61, OpAccessChain = 65,
+           OpDecorate = 71, OpMemberDecorate = 72, OpName = 5, OpIAdd = 128, Input = 1, PushConstant = 9, BuiltIn = 11, VertexIndex = 42, Block = 2, Offset = 35 };
+    uint32_t bound = w[3], var = 0, ptr = 0, ty = 0; size_t first_fn = 0, dec_at = 0, ep_at = 0; int nload = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len || i + len > nw) return NULL;
+        if (op == OpDecorate && len >= 4 && w[i + 2] == BuiltIn && w[i + 3] == VertexIndex) { if (var) return NULL; var = w[i + 1]; dec_at = i + len; }
+        else if (op == OpMemberDecorate && len >= 5 && w[i + 3] == BuiltIn && w[i + 4] == VertexIndex) return NULL;   // in an input block: not handled (not seen)
+        else if (op == OpEntryPoint && !ep_at) ep_at = i;
+        else if (op == OpFunction && !first_fn) first_fn = i;
+        i += len;
+    }
+    if (!var || !first_fn || !dec_at || !ep_at) return NULL;
+    for (size_t i = 5; i < nw;) {   // the variable's pointer type and the integer it holds; the translator only ever loads it
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == OpVariable && len >= 4 && w[i + 2] == var && w[i + 3] == Input) ptr = w[i + 1];
+        else if (op == OpLoad && len >= 4 && w[i + 3] == var) nload++;
+        i += len;
+    }
+    for (size_t i = 5; i < first_fn && ptr;) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (op == OpTypePointer && w[i + 1] == ptr) ty = w[i + 3]; i += len; }
+    int is_int = 0; for (size_t i = 5; i < first_fn && ty;) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (op == OpTypeInt && w[i + 1] == ty && w[i + 2] == 32) is_int = 1; i += len; }
+    if (!ptr || !is_int || !nload) return NULL;
+    uint32_t st = bound++, pst = bound++, pvar = bound++, pty = bound++, cz = bound++;
+    int add_if = w[1] >= 0x10400;   // SPIR-V 1.4 on: the entry point lists every global variable it uses
+    uint32_t *o = malloc((nw + 40 + (size_t)nload * 13) * 4); if (!o) return NULL; size_t n = 0;
+    for (size_t i = 0; i < 5; i++) o[n++] = w[i];
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (i == first_fn) {
+            o[n++] = 3u << 16 | OpTypeStruct; o[n++] = st; o[n++] = ty;
+            o[n++] = 4u << 16 | OpTypePointer; o[n++] = pst; o[n++] = PushConstant; o[n++] = st;
+            o[n++] = 4u << 16 | OpVariable; o[n++] = pst; o[n++] = pvar; o[n++] = PushConstant;
+            o[n++] = 4u << 16 | OpTypePointer; o[n++] = pty; o[n++] = PushConstant; o[n++] = ty;
+            o[n++] = 4u << 16 | OpConstant; o[n++] = ty; o[n++] = cz; o[n++] = 0;
+        }
+        if (i == dec_at) { o[n++] = 3u << 16 | OpDecorate; o[n++] = st; o[n++] = Block; o[n++] = 5u << 16 | OpMemberDecorate; o[n++] = st; o[n++] = 0; o[n++] = Offset; o[n++] = 0; }
+        if (op == OpEntryPoint && i == ep_at && add_if) { o[n++] = (len + 1) << 16 | op; memcpy(o + n, w + i + 1, (len - 1) * 4); n += len - 1; o[n++] = pvar; i += len; continue; }
+        if (op == OpLoad && len >= 4 && w[i + 3] == var) {   // r = load(var) becomes t = load(var); b = load(push constant); r = t + b
+            uint32_t r = w[i + 2], t = bound++, ac = bound++, b = bound++;
+            memcpy(o + n, w + i, len * 4); o[n + 2] = t; n += len;
+            o[n++] = 5u << 16 | OpAccessChain; o[n++] = pty; o[n++] = ac; o[n++] = pvar; o[n++] = cz;
+            o[n++] = 4u << 16 | OpLoad; o[n++] = ty; o[n++] = b; o[n++] = ac;
+            o[n++] = 5u << 16 | OpIAdd; o[n++] = ty; o[n++] = r; o[n++] = t; o[n++] = b;
+            i += len; continue;
+        }
+        memcpy(o + n, w + i, len * 4); n += len; i += len;
+    }
     o[3] = bound; *out_n = n; return o;
 }
 static uint32_t *spv_gl_depth(const uint32_t *w, size_t nw, size_t *out_n) {
@@ -1462,6 +1520,7 @@ static shader_t *shader_get_(const uint8_t md[8]) {
     for (size_t i = 5; i + 4 < ns / 4;) { uint32_t op = spv[i] & 0xffff, n = spv[i] >> 16; if (!n) break;   // BuiltIn Layer (9): OpDecorate / OpMemberDecorate
         if ((op == 71 && n >= 4 && spv[i + 2] == 11 && spv[i + 3] == 9) || (op == 72 && n >= 5 && spv[i + 3] == 11 && spv[i + 4] == 9)) s->layer_out = 1;
         i += n; }
+    if (s->stage == 0 && vid_fix_on()) { size_t nn; uint32_t *w2 = spv_vid_bias(spv, ns / 4, &nn); if (w2) { free(spv); spv = w2; ns = nn * 4; s->vid = 1; } }   // VertexIndex as the game gave it (see spv_vid_bias)
     if (s->stage == 0) { size_t nn; uint32_t *w2 = spv_invariant(spv, ns / 4, &nn); if (w2) { free(spv); spv = w2; ns = nn * 4; } }
     if (s->stage == 0) { size_t nn; uint32_t *w2 = spv_point_size(spv, ns / 4, &nn); if (w2) { free(spv); spv = w2; ns = nn * 4; } }
     if (s->stage == 0 && !g_depth_zero) {   // NVN's GL depth convention (see spv_gl_depth)
@@ -1497,7 +1556,8 @@ static VkPipelineLayout layout_get_(shader_t *vs, shader_t *fs, shader_t *gs) {
     for (int i = 0; i < g_npl; i++) if (g_pl[i].vs == vs && g_pl[i].fs == fs && g_pl[i].gs == gs) return g_pl[i].pl;
     if (!g_empty_dsl) { VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; VKCHECK(vkCreateDescriptorSetLayout(g_dev, &li, NULL, &g_empty_dsl)); }
     VkDescriptorSetLayout sl[3] = {vs ? vs->dsl : g_empty_dsl, fs ? fs->dsl : g_empty_dsl, gs ? gs->dsl : g_empty_dsl};
-    VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, gs ? 3 : fs ? 2 : 1, sl, 0, NULL};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_VERTEX_BIT, 0, 4};   // a vertex shader reading VertexIndex: the shift draw() made (spv_vid_bias)
+    VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, gs ? 3 : fs ? 2 : 1, sl, vs && vs->vid ? 1 : 0, vs && vs->vid ? &pr : NULL};
     VkPipelineLayout pl; VKCHECK(vkCreatePipelineLayout(g_dev, &pi, NULL, &pl));
     g_pl = realloc(g_pl, (g_npl + 1) * sizeof *g_pl); g_pl[g_npl++] = (prog_vk){vs, fs, gs, pl};
     return pl;
@@ -2420,7 +2480,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         vkCmdSetStencilCompareMask(cb, ff, S.st_vmask[f]); vkCmdSetStencilWriteMask(cb, ff, S.st_wmask[f]); vkCmdSetStencilReference(cb, ff, S.st_ref[f]);
     }
     // vertex streams: only the vertices this draw reads are copied (games bind whole vertex pools, tens of MB). Per-vertex streams are copied from vertex vlo on and the draw's
-    // vertex numbers shifted down by vlo (a shader reading its vertex index sees the shifted value); per-instance streams from instance 0 up to the last one drawn
+    // vertex numbers shifted down by vlo (a shader reading its vertex index gets vlo added back: spv_vid_bias); per-instance streams from instance 0 up to the last one drawn
     uint32_t inst = dw ? (dw->instances ? (uint32_t)dw->instances : 1) : (di->instances ? (uint32_t)di->instances : 1);
     uint32_t isz = di ? (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4) : 0;
     const uint8_t *isrc = di ? (const uint8_t *)(uintptr_t)di->ibuf : NULL;
@@ -2447,6 +2507,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     }
     if (vhi < vlo) { g_stat_draws++; return; }
     if (vlo < 0) vlo = 0;
+    if (vs->vid) { int32_t bias = (int32_t)vlo; vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 4, &bias); g_vid_push++; if (bias) g_vid_nz++; }   // the shader adds it back to VertexIndex (spv_vid_bias)
     uint32_t used = 0, ext[16] = {0};
     for (int i = 0; i < S.nattr; i++) if (vs->vin_mask >> i & 1) { uint32_t st = S.attr[i].stream, e = S.attr[i].offset + 16; used |= 1u << st; if (e > ext[st]) ext[st] = e; }
     for (int s = 0; s < 16; s++) if (used >> s & 1) {
@@ -3373,14 +3434,14 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                           (unsigned long long)g_tex_miss[1], (unsigned long long)g_tex_miss[2], (unsigned long long)g_tex_miss[3], (unsigned long long)g_tex_dead, (unsigned long long)g_treg_dead);
     if (n % 600 == 0) { extern uint64_t g_nsub_stat; static uint64_t ls;
         LOG("vk: recording per frame over the last 600: draws %.2f ms (descriptor sets %.2f ms, %.0f%% reused), dispatches %.2f ms, texture uploads %.2f ms (%.1f MB), vkQueueSubmit %.2f ms; %.1f submissions a frame;"
-            " GPU-written data of a running submission used in place %llu times, copied %llu times, waited for %llu times (%.2f ms a frame; indirect draws %llu, partial ranges %llu, misfits in-submission %llu); copies from GPU-written bytes: into textures %llu, buffers %llu; dispatch write-backs %.1f KB of %.1f KB looked at; reads of an earlier submission's GPU-written range: its bytes as they are %llu, with the CPU's rewrites since patched in %llu; texture copies from guest memory over a dispatch's range %llu; those compares and patches %.2f ms (%.1f MB compared; patches %.2f ms, %.1f a frame, %.0f copy regions a frame); held-pass sampling checks %.2f ms; GPU-written range lookups %.0f a frame, %.0f answered at once, %.0f entries looked at",
+            " GPU-written data of a running submission used in place %llu times, copied %llu times, waited for %llu times (%.2f ms a frame; indirect draws %llu, partial ranges %llu, misfits in-submission %llu); copies from GPU-written bytes: into textures %llu, buffers %llu; dispatch write-backs %.1f KB of %.1f KB looked at; reads of an earlier submission's GPU-written range: its bytes as they are %llu, with the CPU's rewrites since patched in %llu; texture copies from guest memory over a dispatch's range %llu; those compares and patches %.2f ms (%.1f MB compared; patches %.2f ms, %.1f a frame, %.0f copy regions a frame); held-pass sampling checks %.2f ms; vertex index bias pushed %.1f draws a frame (%.1f not 0); GPU-written range lookups %.0f a frame, %.0f answered at once, %.0f entries looked at",
             g_t_draw / 600e6, g_t_ws / 600e6, g_dsc_hit + g_dsc_miss ? 100.0 * g_dsc_hit / (g_dsc_hit + g_dsc_miss) : 0.0, g_t_disp / 600e6, g_t_up / 600e6, g_up_bytes / 600e6 * 1e3 / 1e3, g_t_sub / 600e6,
             (g_nsub_stat - ls) / 600.0, (unsigned long long)atomic_exchange(&g_gw_held, 0), (unsigned long long)atomic_exchange(&g_gw_copied, 0), (unsigned long long)atomic_exchange(&g_gw_waits, 0), atomic_exchange(&g_gw_wait_ns, 0) / 600e6,
             (unsigned long long)atomic_exchange(&g_gw_why[0], 0), (unsigned long long)atomic_exchange(&g_gw_why[1], 0), (unsigned long long)atomic_exchange(&g_gw_why[2], 0),
             (unsigned long long)atomic_exchange(&g_gw_b2t, 0), (unsigned long long)atomic_exchange(&g_gw_b2b, 0), g_wb_words * 4 / 1024.0, g_wb_bytes / 1024.0,
             (unsigned long long)atomic_exchange(&g_gw_gpu_reads, 0), (unsigned long long)atomic_exchange(&g_gw_cpu_fix, 0), (unsigned long long)atomic_exchange(&g_gw_b2t_guest, 0),
-            g_t_stale / 600e6, g_stale_bytes / 600.0 / 1048576.0, g_t_patch / 600e6, g_npatch / 600.0, g_patch_regions / 600.0, g_t_split / 600e6, g_gw_calls / 600.0, g_gw_quick / 600.0, g_gw_walked / 600.0);
-        g_wb_words = g_wb_bytes = 0; g_t_stale = g_stale_bytes = 0; g_t_patch = g_patch_regions = g_npatch = 0; g_t_split = 0; g_gw_calls = g_gw_quick = g_gw_walked = 0;
+            g_t_stale / 600e6, g_stale_bytes / 600.0 / 1048576.0, g_t_patch / 600e6, g_npatch / 600.0, g_patch_regions / 600.0, g_t_split / 600e6, g_vid_push / 600.0, g_vid_nz / 600.0, g_gw_calls / 600.0, g_gw_quick / 600.0, g_gw_walked / 600.0);
+        g_wb_words = g_wb_bytes = 0; g_t_stale = g_stale_bytes = 0; g_t_patch = g_patch_regions = g_npatch = 0; g_vid_push = g_vid_nz = 0; g_t_split = 0; g_gw_calls = g_gw_quick = g_gw_walked = 0;
         ls = g_nsub_stat; g_t_draw = g_t_ws = g_t_disp = g_t_up = g_t_sub = 0; g_up_bytes = 0; g_dsc_hit = g_dsc_miss = 0; }
     if (n % 600 == 0) {   // memory: the process (RSS, its anonymous part, PSS) and what the backend holds
         long rss = 0, anon = 0, pss = 0; char ln[256]; FILE *f = fopen("/proc/self/status", "re");
