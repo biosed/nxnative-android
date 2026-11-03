@@ -88,6 +88,7 @@ static VkBuffer buf_new(VkDeviceSize n, VkBufferUsageFlags u, VkDeviceMemory *m,
                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | \
                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT)
 
+static _Atomic uint64_t g_xr_peak; static uint64_t g_sub_up_bytes;   // the extra rings' peak since the memory watch's last line; upload bytes in this submission (reup_hold)
 static _Atomic uint64_t g_big_bytes, g_extra_ring_bytes, g_ring0_bytes;   // memory of the big images and of the extra rings now held (the frame stats line)
 // ---------- Image memory: 64 MB blocks, each with a list of its free ranges (first fit; a freed range joins its neighbours; a block with no image left is freed) ----------
 // Thousands of textures would exceed the allocation count (Vulkan promises only 4096). Blocks used to be handed out in order and freed only when their last image was: a game
@@ -221,7 +222,8 @@ static VkDeviceSize ring_alloc(VkDeviceSize n, VkDeviceSize align) {
         VkDeviceSize xs = C->ring0_size > RING_MIN ? C->ring0_size : 16u << 20; while (xs < n) xs *= 2; if (xs > RING_XMAX) xs = RING_XMAX;
         C->extra = realloc(C->extra, (C->nextra + 1) * sizeof *C->extra);
         C->extra[C->nextra].b = xring_get(xs, &xs, &C->extra[C->nextra].m, &C->ringp); C->extra[C->nextra].size = xs; C->ring = C->extra[C->nextra++].b;
-        atomic_fetch_add(&g_extra_ring_bytes, xs); atomic_fetch_add(&g_xring_n, 1); C->ring_size = xs;
+        { uint64_t now_x = atomic_fetch_add(&g_extra_ring_bytes, xs) + xs, pk = atomic_load(&g_xr_peak); while (now_x > pk && !atomic_compare_exchange_weak(&g_xr_peak, &pk, now_x)) {} }
+        atomic_fetch_add(&g_xring_n, 1); C->ring_size = xs;
         C->used = 0; o = 0; g_wgen++; g_nwlog = 0;   // copies cached in the old ring are not reused from the new one
     }
     C->total += o + n - C->used; C->used = o + n; return o;
@@ -975,6 +977,7 @@ struct vtex {
     uint32_t w, h, d, levels, layers; VkImageAspectFlags aspect; int uploaded, gpu;
     int dirty;   // the CPU wrote its storage since the last upload (WriteTexels, a movie frame, a flushed pool range): uploaded again at its next use, unless the GPU renders into it
     const uint8_t *mem; uint64_t len;   // its storage in guest memory
+    uint64_t reup_frame;   // the frame of its last upload (re-uploads at most once a frame, tex_get)
     uint64_t stamp; const void *span;   // uploaded from a dirty-tracked pool (nvn_dirty.c): the write generation then and the tracked range, re-uploaded when the game writes it
     vview *views; int nviews;
     struct vtex *next;
@@ -1004,6 +1007,7 @@ static int g_plog;   // DM_VK_PASSLOG=<frame>[+]: that frame's (or every frame's
 enum { SK_B2T = 1, SK_T2T = 2, SK_T2B = 4, SK_CLEAR = 8, SK_UPLOAD = 16, SK_DRAW = 32, SK_ACLEAR = 64 };
 static int vk_skip(void) { static int m = -1; if (m < 0) { const char *e = getenv("DM_VK_SKIP"); m = e ? (int)strtol(e, NULL, 0) : 0; if (m) LOG("DM_VK_SKIP=%#x: GPU work of those kinds is left out", m); } return m; }
 static void tex_upload(vtex *v, const tex_t *t);
+static void tex_reupload(vtex *v, const tex_t *t, uint64_t since);
 // A texture with no packaged layout in a CPU_NO_ACCESS pool whose storage already holds data takes it as its initial content, as nvn_mtl.m tex_init_fill: games load a file into
 // memory and make a GPU-only pool over it (Metroid Dread's BC6H light probe cubemaps, which sampled as zero and left every lit surface black). The same in a CPU_UNCACHED pool
 // (its writes reach memory unflushed) and for storage the CPU flushed before the texture's first use (nvn_flushed; DM_NVN_FLUSH_FILL=0 leaves it out), with COMPRESSIBLE
@@ -1058,6 +1062,21 @@ static int tex_remake(vtex *v, const tex_t *t);
 static uint64_t g_pkg_up, g_pkg_reup;   // textures uploaded from their storage when made / again after the game wrote it (the packaged textures line, mtl_pkg_stats)
 static uint64_t g_bvgen;   // the submission's number (bview, the linear texture hashes)
 static uint64_t g_tex_dead, g_treg_dead;   // lookups of a texture object that is no longer one (tex_get) / registrations of one (mtl_reg_tex)
+// Re-uploads (vk19.34). FINAL FANTASY RESONANCE streams an area's textures into their pool storage while drawing them: each write brought a re-upload of the whole texture at its
+// next use, up to once per submission (8.7 a frame), 77-289 MB a second through the rings, and the low-memory killer while the system lost memory nobody's resident set showed.
+// Now: only the levels written since the last upload go again (DM_VK_REUP_PARTIAL, default 1); a texture is re-uploaded at most once a frame, and while memory is short
+// (g_mem_low) at most every DM_VK_REUP_FRAMES_LOW frames (default 4) and only until a submission has DM_VK_REUP_CAP_MB (default 16) of uploads; held ones keep their old
+// content until then. First uploads are never held
+static uint64_t g_reup_held, g_reup_lv_skipped; static _Atomic uint64_t g_up_ring_cum;
+static int reup_partial(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_REUP_PARTIAL"); v = !e || atoi(e) != 0; } return v; }
+static int reup_hold(const vtex *v, uint64_t fr) {
+    static long lowf = -1, cap = -1;
+    if (lowf < 0) { const char *e = getenv("DM_VK_REUP_FRAMES_LOW"); lowf = e ? atol(e) : 4; e = getenv("DM_VK_REUP_CAP_MB"); cap = (e ? atol(e) : 16) << 20; }
+    if (!v->reup_frame) return 0;
+    if (fr == v->reup_frame) return 1;   // already uploaded this frame
+    if (g_mem_low && (fr - v->reup_frame < (uint64_t)lowf || (cap > 0 && g_sub_up_bytes >= (uint64_t)cap))) return 1;
+    return 0;
+}
 static vtex *tex_get(const tex_t *t, int for_rt) {
     // A texture object that is no longer one -- finalized, its memory reused for other data -- is never made into an image (as nvn_mtl.m tex_mtl_ checks the magic): FINAL
     // FANTASY RESONANCE registers texture objects whose memory holds half-float constants by then (serial 0x3c003c003c003c00), and their slots and image bindings stay bound.
@@ -1073,8 +1092,11 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
         v->last_frame = atomic_load(&g_presents); v->last_fence = g_fence + 1;
         if (v->evicted && !tex_remake(v, t)) return NULL;   // evicted while unused (tex_evict): made again from its storage
         if (for_rt) v->gpu = 1;
-        else if (!v->gpu && t->mem && (v->dirty || (v->span && nvn_dirty_since_span(v->span, t->mem, t->L.size, v->stamp)))) { v->dirty = 0; tex_upload(v, t); g_pkg_reup++;
-            if (v->late) { v->late = 0; v->packaged = 1; g_late_fill++; } }   // a texture whose data came after its first use (late_fill): from its storage from now on   // never over what the GPU drew: a flush of the pool range around a render target is not new content
+        else if (!v->gpu && t->mem && (v->dirty || (v->span && nvn_dirty_since_span(v->span, t->mem, t->L.size, v->stamp)))) {
+            uint64_t fr = atomic_load(&g_presents);
+            if (!v->dirty && !v->late && reup_hold(v, fr)) g_reup_held++;   // its stamp still says written: the next use tries again
+            else { uint64_t since = v->dirty ? 0 : v->stamp; v->dirty = 0; v->reup_frame = fr; tex_reupload(v, t, since); g_pkg_reup++;
+                   if (v->late) { v->late = 0; v->packaged = 1; g_late_fill++; } } }   // a texture whose data came after its first use (late_fill): from its storage from now on   // never over what the GPU drew: a flush of the pool range around a render target is not new content
         return v;
     }
     fmt_t f = fmt_of(t->d.format);
@@ -1126,7 +1148,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
                               packaged ? " uploaded" : "", for_rt ? " render-target" : ""); }
     if (v->lcpu && packaged) { v->lhash = mem_hash(t->mem, t->L.size); v->lhash_gen = g_bvgen; }
     v->ci = ii; v->packaged = packaged && !for_rt; v->last_frame = atomic_load(&g_presents); v->last_fence = g_fence + 1;
-    if (packaged) { tex_upload(v, t); g_pkg_up++; }
+    if (packaged) { tex_upload(v, t); g_pkg_up++; v->reup_frame = atomic_load(&g_presents); }
     else if (!for_rt && late_fill(t, &f) && nvn_dirty_tracked(t->mem, t->L.size)) {   // still empty: cleared now, watched, uploaded when the game writes it (late_fill)
         v->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size); v->span = nvn_dirty_span(t->mem, t->L.size); v->late = 1; g_late_watch++;
         VkClearColorValue z = {{0}}; VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
@@ -1183,8 +1205,9 @@ static void tex_evict(uint64_t trim_gen) {
 }
 // Packaged texture: each level and layer deswizzled from the pool storage into the ring, then copied into the image by the upload command buffer (it runs before this submission's draws)
 static uint64_t g_t_up, g_up_bytes; uint64_t g_nsub_stat;
-static void tex_upload_(vtex *v, const tex_t *t);
-static void tex_upload(vtex *v, const tex_t *t) { uint64_t t0 = now_ns(); tex_upload_(v, t); g_t_up += now_ns() - t0; g_up_bytes += t->L.size; atomic_fetch_add(&g_up_cum, t->L.size); }
+static void tex_upload_(vtex *v, const tex_t *t, uint64_t since);
+static void tex_upload(vtex *v, const tex_t *t) { uint64_t t0 = now_ns(); tex_upload_(v, t, 0); g_t_up += now_ns() - t0; g_up_bytes += t->L.size; atomic_fetch_add(&g_up_cum, t->L.size); }
+static void tex_reupload(vtex *v, const tex_t *t, uint64_t since) { uint64_t t0 = now_ns(); tex_upload_(v, t, reup_partial() ? since : 0); g_t_up += now_ns() - t0; g_up_bytes += t->L.size; atomic_fetch_add(&g_up_cum, t->L.size); }
 // The compressed texels of a level the CPU decodes (BC / ASTC the GPU cannot sample) were deswizzled into a fresh malloc each time: at that size fresh mapped pages, faulted in on
 // first write. DM_VK_DECODE_POOL=1 keeps one buffer (the largest needed so far, the submit thread's) instead. Default 0: as before
 static uint8_t *g_dec_buf; static size_t g_dec_cap;
@@ -1195,7 +1218,7 @@ static uint8_t *dec_tmp(size_t n) {
     return g_dec_buf;
 }
 static void dec_tmp_done(uint8_t *p) { if (p != g_dec_buf) free(p); }
-static void tex_upload_(vtex *v, const tex_t *t) {
+static void tex_upload_(vtex *v, const tex_t *t, uint64_t since) {
     if (vk_skip() & SK_UPLOAD) return;
     if (g_plog) LOG("plog:  upload %llu fmt %#x %ux%ux%u levels %u layers %u target %d", (unsigned long long)t->serial, t->d.format, v->w, v->h, v->d, v->levels, v->layers, t->d.target);
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
@@ -1204,18 +1227,32 @@ static void tex_upload_(vtex *v, const tex_t *t) {
     // Odyssey's normal maps do; noise until then) brings a new upload at the texture's next use (tex_get). The stamp is taken and the pages protected BEFORE the storage is read
     // (nvn_dirty.h): protected after the read, a write landing while it ran, or on a page a write had already unprotected, was never seen, and the texture kept what it was mid-write
     if (t->mem && !v->gpu && nvn_dirty_tracked(t->mem, t->L.size)) { v->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size); v->span = nvn_dirty_span(t->mem, t->L.size); }
+    else since = 0;
+    // A re-upload (since: the stamp of the last upload) takes only the levels whose storage was written after it, checked after the protect above so that a write racing it
+    // is either seen here or faults again later. A page shared by two levels marks both. Arrays of more than 16 layers go whole
+    uint32_t lvmask = ~0u;
+    if (since && v->levels > 1 && v->levels <= 32 && v->layers <= 16) {
+        lvmask = 0; uint64_t lsize = t->L.layer_size ? t->L.layer_size : t->L.size;
+        for (unsigned lv = 0; lv < v->levels; lv++) {
+            uint64_t a = nvn_tex_level_offset(&t->d, lv), b = lv + 1 < v->levels ? nvn_tex_level_offset(&t->d, lv + 1) : lsize;
+            if (b <= a || b > lsize) { lvmask |= 1u << lv; continue; }
+            for (unsigned ly = 0; ly < v->layers; ly++) if ((uint64_t)ly * lsize + b <= t->L.size && nvn_dirty_since(t->mem + (uint64_t)ly * lsize + a, b - a, since)) { lvmask |= 1u << lv; break; }
+            if (!(lvmask >> lv & 1)) g_reup_lv_skipped++;
+        }
+    }
     // Every level and layer goes in one vkCmdCopyBufferToImage (regions batched while they share a ring): one call per level and layer cost a driver call each, and the Adreno's
     // allocated command memory inside them (kgsl_sharedmem_alloc, a third of the render thread while a stage streamed its textures in)
     enum { NUREG = 64 }; VkBufferImageCopy ureg[NUREG]; uint32_t nureg = 0; VkBuffer ubuf = VK_NULL_HANDLE;
     #define UFLUSH() do { if (nureg) { vkCmdCopyBufferToImage(C->up, ubuf, v->img, VK_IMAGE_LAYOUT_GENERAL, nureg, ureg); nureg = 0; } } while (0)
     for (unsigned lv = 0; lv < v->levels; lv++) {
         if (lv < 32 && (v->gpu_lv >> lv & 1)) continue;   // a copy on the GPU wrote this level: its storage does not hold that
+        if (lv < 32 && !(lvmask >> lv & 1)) continue;     // a re-upload: not written since the last one
         uint32_t w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1, d = v->d >> lv ? v->d >> lv : 1;
         if (t->d.target == NVN_TEXTURE_TARGET_1D_ARRAY) h = 1;
         uint32_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh; size_t pitch = (size_t)bx * bpb, lsz = pitch * by * d;
         for (unsigned ly = 0; ly < v->layers; ly++) {
             size_t out = v->f.dec ? (size_t)w * h * dec_bpp(v->f.dec) * d : lsz;
-            VkDeviceSize o = ring_alloc(out, 16);   // may move to an extra ring: the regions so far stay with theirs (ubuf, flushed below)
+            VkDeviceSize o = ring_alloc(out, 16); g_sub_up_bytes += out; atomic_fetch_add(&g_up_ring_cum, out);   // may move to an extra ring: the regions so far stay with theirs (ubuf, flushed below)
             if (o == VK_WHOLE_SIZE) { UFLUSH(); v->dirty = 1; return; }   // not uploaded: again at the next use (the stamp above would say nothing changed)
             uint8_t *dst = C->ringp + o, *tmp = v->f.dec ? dec_tmp(lsz) : dst;
             int rc = 0;
@@ -3197,9 +3234,12 @@ static void mem_watch(void) {
                 drv / 1048576.0, bud / 1048576.0, g_has_budget ? "" : ", no VK_EXT_memory_budget", all / 1048576.0, (long long)atomic_load(&g_dm_n), blk / 1048576.0, rg / 1048576.0, xr / 1048576.0, kept / 1048576.0,
                 bi / 1048576.0, fb / 1048576.0, (all - blk - rg - xr - kept - bi - fb) / 1048576.0);
         }
-        { static uint64_t pup, ptm; uint64_t up = atomic_load(&g_up_cum), tm = atomic_load(&g_tex_made);
-          if (hbase >= 0 && (up - pup >= (64ull << 20) || drss >= 64) && nline++ < 300) LOG("[mem] last second: texture uploads %.0f MB, %llu textures made", (up - pup) / 1048576.0, (unsigned long long)(tm - ptm));
-          pup = up; ptm = tm; }
+        { static uint64_t pup, ptm, pring, pheld, pskip, pxn; uint64_t up = atomic_load(&g_up_cum), tm = atomic_load(&g_tex_made), rg = atomic_load(&g_up_ring_cum), xn = atomic_load(&g_xring_n);
+          uint64_t pk = atomic_exchange(&g_xr_peak, atomic_load(&g_extra_ring_bytes)), held = g_reup_held, skip = g_reup_lv_skipped;
+          if (hbase >= 0 && (up - pup >= (64ull << 20) || rg - pring >= (64ull << 20) || drss >= 64) && nline++ < 300)
+              LOG("[mem] last second: texture uploads %.0f MB of storage, %.0f MB through the rings, %llu textures made; re-uploads held %llu, levels left out %llu; extra rings made %llu, at most %.0f MB at once",
+                  (up - pup) / 1048576.0, (rg - pring) / 1048576.0, (unsigned long long)(tm - ptm), (unsigned long long)(held - pheld), (unsigned long long)(skip - pskip), (unsigned long long)(xn - pxn), pk / 1048576.0);
+          pup = up; ptm = tm; pring = rg; pheld = held; pskip = skip; pxn = xn; }
         hbase = hu; bbase = dm_ue_heap_big(); prss = rss; pavail = avail; pdrv = drv;
     }
     int is_low = low > 0 && avail > 0 && avail / 1024 < low, over = budget > 0 && ours > budget;
@@ -3244,7 +3284,7 @@ static void ring_fit(ctx_t *c) {
     c->ring0 = buf_new(want, ALL_BUF_USAGE, &c->ringm0, (void **)&c->ringp0); c->ring0_size = want; atomic_fetch_add(&g_ring0_bytes, want);
 }
 void mtl_sub_begin(void) {
-    vk_init();
+    vk_init(); g_sub_up_bytes = 0;
     g_ci = (g_ci + 1) % NCTX; ctx_t *c = &g_ctx[g_ci];
     uint64_t w0 = now_ns();
     pthread_mutex_lock(&g_mu);
