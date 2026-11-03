@@ -21,6 +21,35 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 
+// Every vkAllocateMemory / vkFreeMemory of this file goes through these (vk19.31): the bytes live in all, for the memory lines. The Adreno driver held about 500 MB more GPU memory
+// than the backend's own count (dumpsys gpu --gpumem: 1.07 GB for FINAL FANTASY RESONANCE against 530 MB of blocks and rings), outside the resident memory and against MemAvailable
+static pthread_mutex_t g_dmmu = PTHREAD_MUTEX_INITIALIZER; static struct { uint64_t h, size; } g_dm[8192]; static _Atomic int64_t g_dm_live, g_dm_n;
+static VkResult vk_alloc_counted(VkDevice d, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *a, VkDeviceMemory *m) {
+    VkResult r = vkAllocateMemory(d, ai, a, m); if (r != VK_SUCCESS) return r;
+    uint64_t h = (uint64_t)(uintptr_t)*m; atomic_fetch_add(&g_dm_live, (int64_t)ai->allocationSize); atomic_fetch_add(&g_dm_n, 1);
+    pthread_mutex_lock(&g_dmmu); for (uint32_t i = (uint32_t)(h * 0x9E3779B97F4A7C15ull >> 51), k = 0; k < 8192; k++, i = (i + 1) & 8191) if (!g_dm[i].h || g_dm[i].h == ~0ull) { g_dm[i].h = h; g_dm[i].size = ai->allocationSize; break; }
+    pthread_mutex_unlock(&g_dmmu); return r;
+}
+static void vk_free_counted(VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks *a) {
+    uint64_t h = (uint64_t)(uintptr_t)m;
+    if (h) { pthread_mutex_lock(&g_dmmu); for (uint32_t i = (uint32_t)(h * 0x9E3779B97F4A7C15ull >> 51), k = 0; k < 8192 && g_dm[i].h; k++, i = (i + 1) & 8191)
+                 if (g_dm[i].h == h) { atomic_fetch_sub(&g_dm_live, (int64_t)g_dm[i].size); atomic_fetch_sub(&g_dm_n, 1); g_dm[i].h = ~0ull; break; }   // ~0: a tombstone
+             pthread_mutex_unlock(&g_dmmu); }
+    vkFreeMemory(d, m, a);
+}
+#define vkAllocateMemory vk_alloc_counted
+#define vkFreeMemory vk_free_counted
+static VkPhysicalDevice g_pd;   // (defined with the device below)
+static int g_has_budget;   // VK_EXT_memory_budget: the driver's own count of this process's memory per heap
+static uint64_t gpu_driver_usage(uint64_t *budget) {
+    if (!g_has_budget) { if (budget) *budget = 0; return 0; }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT bp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &bp};
+    vkGetPhysicalDeviceMemoryProperties2(g_pd, &mp);
+    uint64_t u = 0, b = 0; for (uint32_t i = 0; i < mp.memoryProperties.memoryHeapCount; i++) { u += bp.heapUsage[i]; b += bp.heapBudget[i]; }
+    if (budget) *budget = b; return u;
+}
+static _Atomic uint64_t g_fbs_bytes;   // the same-pass feedback snapshots' images (fb_snap_for), never freed
 #define VKCHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) die("Vulkan: %s failed (%d)", #x, (int)r_); } while (0)
 #define RED_ONCE(id, ...) do { static int once_; if (!once_++) LOG("[RED] vk: " __VA_ARGS__); } while (0)
 
@@ -622,7 +651,7 @@ static void vk_init_(void) {
     int has_sc = 0, has_u8 = 0, has_dr = 0;
     for (uint32_t i = 0; i < ne; i++) {
         has_sc |= !strcmp(ep[i].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME); has_u8 |= !strcmp(ep[i].extensionName, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
-        has_dr |= !strcmp(ep[i].extensionName, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+        has_dr |= !strcmp(ep[i].extensionName, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME); g_has_budget |= !strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     }
     {   // Reading an attachment inside its own pass (a held pass's depth sampled by a contact-shadow draw, now a split: vk19.4) needs one of these; logged to see which this GPU has
         static const char *const fl[] = {"VK_EXT_attachment_feedback_loop_layout", "VK_EXT_attachment_feedback_loop_dynamic_state", "VK_KHR_dynamic_rendering_local_read",
@@ -647,7 +676,8 @@ static void vk_init_(void) {
     vkGetPhysicalDeviceFeatures2(g_pd, &f2);
     f13.robustImageAccess = VK_FALSE;
     g_feat = f2.features;
-    const char *ext[4]; uint32_t next = 0;
+    const char *ext[6]; uint32_t next = 0;
+    if (g_has_budget) ext[next++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
     if (has_sc && g_has_surface) ext[next++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     if (has_u8 && u8.indexTypeUint8) { ext[next++] = VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME; g_has_u8 = 1; }
     g_dynrend = dv >= VK_API_VERSION_1_3 ? f13.dynamicRendering : has_dr && dr.dynamicRendering;
@@ -2310,7 +2340,7 @@ static fbsnap_t *fb_snap_for(vtex *v, int i) {   // the snapshot image for attac
         VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, v->f.f, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
         if (vkCreateImage(g_dev, &ii, NULL, &e->img) != VK_SUCCESS) { RED_ONCE(41, "same-pass feedback: snapshot image not created"); return NULL; }
-        VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_dev, e->img, &mr); e->m = mem_alloc(mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); VKCHECK(vkBindImageMemory(g_dev, e->img, e->m, 0));
+        VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_dev, e->img, &mr); e->m = mem_alloc(mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); atomic_fetch_add(&g_fbs_bytes, mr.size); VKCHECK(vkBindImageMemory(g_dev, e->img, e->m, 0));
         VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, e->img, VK_IMAGE_VIEW_TYPE_2D, v->f.f, {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         VKCHECK(vkCreateImageView(g_dev, &vi, NULL, &e->view));
         to_general(C->cb, e->img, VK_IMAGE_ASPECT_COLOR_BIT); g_nfbs++;
@@ -3132,14 +3162,22 @@ static void mem_watch(void) {
     long ours = rss / 1024 + (long)(gpu >> 20);   // the process's resident memory and the backend's device memory, in MB
     int fall = 0;
     if (tick) {
-        int64_t dh = hbase >= 0 ? hu - hbase : 0, db = dm_ue_heap_big() - bbase; long drss = (rss - prss) / 1024, dav = (avail - pavail) / 1024;
+        static int64_t pdrv = -1; static uint64_t last_gl; uint64_t bud = 0; int64_t drv = (int64_t)gpu_driver_usage(&bud);   // the driver's count (VK_EXT_memory_budget), 0 without it
+        int64_t dh = hbase >= 0 ? hu - hbase : 0, db = dm_ue_heap_big() - bbase, ddrv = pdrv >= 0 ? drv - pdrv : 0; long drss = (rss - prss) / 1024, dav = (avail - pavail) / 1024;
         if (hbase >= 0) {
-            fall = pre_mb > 0 && pavail > 0 && avail > 0 && dav <= -2 * pre_mb;
-            if ((dh >= 32 << 20 || dh <= -(64 << 20) || drss >= 64 || dav <= -128) && nline++ < 300)
-                LOG("[mem] last second: game heap %+.0f MB (%.0f MB in use; big blocks %+.0f MB), resident %+ld MB (%ld MB), available %+ld MB (%ld MB), device %llu MB",
-                    dh / 1048576.0, hu / 1048576.0, db / 1048576.0, drss, rss / 1024, dav, avail / 1024, (unsigned long long)(gpu >> 20));
+            fall = pre_mb > 0 && ((pavail > 0 && avail > 0 && dav <= -2 * pre_mb) || ddrv >= (int64_t)pre_mb << 20);   // MemAvailable fell fast, or the driver's GPU memory grew fast
+            if ((dh >= 32 << 20 || dh <= -(64 << 20) || drss >= 64 || dav <= -128 || ddrv >= 64 << 20 || ddrv <= -(64 << 20)) && nline++ < 300)
+                LOG("[mem] last second: game heap %+.0f MB (%.0f MB in use; big blocks %+.0f MB), resident %+ld MB (%ld MB), available %+ld MB (%ld MB), GPU driver %+.0f MB (%.0f MB), device %llu MB",
+                    dh / 1048576.0, hu / 1048576.0, db / 1048576.0, drss, rss / 1024, dav, avail / 1024, ddrv / 1048576.0, drv / 1048576.0, (unsigned long long)(gpu >> 20));
         }
-        hbase = hu; bbase = dm_ue_heap_big(); prss = rss; pavail = avail;
+        if (now - last_gl >= 30000000000ull) {   // every 30 s: the driver's count against the backend's own allocations
+            last_gl = now; int64_t all = atomic_load(&g_dm_live), blk = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) blk += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
+            int64_t rg = atomic_load(&g_ring0_bytes), xr = atomic_load(&g_extra_ring_bytes), bi = atomic_load(&g_big_bytes), fb = atomic_load(&g_fbs_bytes), kept = (int64_t)g_xc_bytes;
+            LOG("[mem] GPU memory: the driver counts %.0f MB (budget %.0f MB%s); the backend's allocations %.0f MB in %lld: image blocks %.0f, rings %.0f, extra rings %.0f (%.0f kept), big images %.0f, feedback snapshots %.0f, the rest %.0f",
+                drv / 1048576.0, bud / 1048576.0, g_has_budget ? "" : ", no VK_EXT_memory_budget", all / 1048576.0, (long long)atomic_load(&g_dm_n), blk / 1048576.0, rg / 1048576.0, xr / 1048576.0, kept / 1048576.0,
+                bi / 1048576.0, fb / 1048576.0, (all - blk - rg - xr - kept - bi - fb) / 1048576.0);
+        }
+        hbase = hu; bbase = dm_ue_heap_big(); prss = rss; pavail = avail; pdrv = drv;
     }
     int is_low = low > 0 && avail > 0 && avail / 1024 < low, over = budget > 0 && ours > budget;
     int near = pre_avail > 0 && avail > 0 && avail / 1024 < pre_avail;
@@ -3160,7 +3198,7 @@ static void mem_watch(void) {
         for (int k = 0; k < g_nxmap; k++) if (g_xmap[k].m == g_xc[g_nxc].m) { g_xmap[k] = g_xmap[--g_nxmap]; break; } } g_xc_bytes = 0; pthread_mutex_unlock(&g_xcmu);
     mallopt(M_PURGE, 0);
     static int nl; if (nl++ < 60) LOG("vk: memory %s (%ld MB available, the process %ld MB resident + %llu MB device, the game heap %.0f MB): idle textures evicted, rings back to their minimum, reuse pools emptied",
-                                      jump ? "early trim: the game heap grew fast" : fall ? "early trim: MemAvailable fell fast" : is_low ? "low" : over ? "over budget" : "near low (early trim)",
+                                      jump ? "early trim: the game heap grew fast" : fall ? "early trim: MemAvailable fell or GPU memory grew fast" : is_low ? "low" : over ? "over budget" : "near low (early trim)",
                                       avail / 1024, rss / 1024, (unsigned long long)(gpu >> 20), hu / 1048576.0);
 }
 void tex_evict_hook(void) { mem_watch(); tex_evict(atomic_load(&g_trim_gen)); }   // the front end's low-memory signal (app/front_android.c): every ring back to RING_MIN at its next use
