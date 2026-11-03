@@ -4,7 +4,10 @@
 // region too, so the snapshot's memory chunks carry the heap whole, and a restored process goes on allocating from it where the old one stopped.
 // The region is cut into UEH_N spaces of UEH_SPACE bytes, one mspace each with a lock of its own: a thread allocates from the space it was given (round robin, the next one when it
 // is full); free and realloc find the space by the address. A space grows from its start (dlmalloc's segment requests, UEH_GRAIN at least) and pages beyond what it has used stay
-// inaccessible, so the snapshot reads only what the heap touched. Memory is never given back to the system (no trim, no direct mappings): Unreal keeps its peak anyway.
+// inaccessible, so the snapshot reads only what the heap touched. The address space is never given back (no trim, no direct mappings), but the pages of free blocks are:
+// dm_ueheap_release (the graphics backend calls it every 10 s and on low memory) gives the whole pages inside free chunks of 64 KB or more back to the system (MADV_DONTNEED; they
+// read zero when used again). Without it the heap's resident memory only ratcheted up to the sum of its four spaces' peaks: the low-memory killer ended FINAL FANTASY RESONANCE
+// on the Xiaomi Pad 8 with the heap at 1.05 GB in use.
 // Host state in a snapshot (section "ueheap"): the spaces' mspace addresses and how far each has grown.
 #include "dm.h"
 #include "hle.h"
@@ -46,6 +49,7 @@ static void *ueh_seg(size_t n) {
 #define DEFAULT_GRANULARITY ((size_t)UEH_GRAIN)
 #define DEFAULT_MMAP_THRESHOLD (~(size_t)0)   // no direct mappings: big blocks come from the space too
 #define DEFAULT_TRIM_THRESHOLD (~(size_t)0)
+#define MALLOC_INSPECT_ALL 1              // mspace_inspect_all: the free chunks, for dm_ueheap_release
 #define NO_MALLINFO 1
 #define NO_MALLOC_STATS 1
 #define LACKS_TIME_H 1
@@ -103,6 +107,19 @@ int dm_ueheap_owns(uint64_t a, uint64_t n) {
     if (o >= UEH_N * UEH_SPACE) return 0;
     int k = (int)(o / UEH_SPACE); uint64_t in = o - (uint64_t)k * UEH_SPACE;
     return in + n <= atomic_load(&g_hw[k]);
+}
+// The whole pages inside the free chunks of at least `min` bytes, given back to the system (MADV_DONTNEED: private anonymous memory, zero when touched again). The chunk's own
+// bookkeeping (its header and free-list links, the next chunk's size word) lies outside the range inspect_all hands over, and each space is walked under its lock. Returns the bytes
+static void rel_cb(void *start, void *end, size_t used, void *arg) {
+    uint64_t *st = arg; if (used || (size_t)((uint8_t *)end - (uint8_t *)start) < st[1]) return;
+    uintptr_t a = ((uintptr_t)start + 4095) & ~(uintptr_t)4095, b = (uintptr_t)end & ~(uintptr_t)4095;
+    if (b > a && !madvise((void *)a, b - a, MADV_DONTNEED)) st[0] += b - a;
+}
+size_t dm_ueheap_release(size_t min) {
+    if (!g_base) return 0;
+    uint64_t st[2] = {0, min < 65536 ? 65536 : min};
+    for (int k = 0; k < UEH_N; k++) if (g_ms[k]) mspace_inspect_all(g_ms[k], rel_cb, st);
+    return (size_t)st[0];
 }
 void dm_ueheap_free(void *p) { if (p) { int k = space_of(p); t_cur = k; mspace_free(g_ms[k], p); } }
 size_t dm_ueheap_size(const void *p) { return p ? mspace_usable_size(p) : 0; }
