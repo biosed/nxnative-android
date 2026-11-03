@@ -441,7 +441,7 @@ static void gsig_report(uint64_t frames) {   // the 10 costliest passes and disp
     for (int i = 0; i < NGSIG; i++) { g_gsig[i].ns = g_gsig[i].n = g_gsig[i].draws = 0; memset(g_gsig[i].ecnt, 0, sizeof g_gsig[i].ecnt); }
     pthread_mutex_unlock(&g_gsigmu);
 }
-static _Atomic uint64_t g_gpu_kind_ns[3];   // GPU time inside render passes, dispatches, copies (gpu_mark); the rest of a submission's span is time between them
+static _Atomic uint64_t g_gpu_kind_ns[3], g_up_gpu_ns;   // g_up_gpu_ns: the upload command buffers' GPU time (texture uploads, ring copies, GPU-written data composed and patched, the start barrier)   // GPU time inside render passes, dispatches, copies (gpu_mark); the rest of a submission's span is time between them
 // Snapshots of dispatch storage ranges (post kind 5: ~3.5 MB a frame in FINAL FANTASY RESONANCE's castle) came from malloc and went back to free: at that size each one was fresh
 // mapped pages, ~400 page faults a frame on the submit thread (12,450 minor faults a second, 14% of its time in the kernel). They come from a pool now: blocks by power-of-two size
 // (4 KB to 64 MB), kept for reuse up to 32 MB in all; the submit thread takes, the completion thread gives back
@@ -467,7 +467,8 @@ static void snap_free(void *p, size_t n) {
 // guest clock when the completion thread saw the fence), the start that minus the submission's GPU span. DM_VK_GPU_TS=0: one time for all, as before
 static int gpu_ts_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GPU_TS"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_GPU_TS=0: counter timestamps all take the completion time"); } return v; }
 static void ctx_complete(ctx_t *c) {
-    uint64_t ts[2], t_end = gpu_ticks(), t_top = t_end;
+    uint64_t ts[3], t_end = gpu_ticks(), t_top = t_end;
+    if (vkGetQueryPoolResults(g_dev, c->qp, 0, 3, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[2] >= ts[0]) atomic_fetch_add(&g_up_gpu_ns, (uint64_t)((double)(ts[2] - ts[0]) * g_props.limits.timestampPeriod));
     if (vkGetQueryPoolResults(g_dev, c->qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0])
         { uint64_t gns = (uint64_t)((double)(ts[1] - ts[0]) * g_props.limits.timestampPeriod); atomic_fetch_add(&g_gpu_ns, gns); atomic_fetch_add(&g_gpu_cum, gns);
           uint64_t dt = gns * 12 / 625; if (gpu_ts_on() && dt < t_end) t_top = t_end - dt; }   // the GPU's 19.2 MHz ticks
@@ -681,7 +682,7 @@ static void vk_init_(void) {
         c->ring = c->ring0 = buf_new(RING_MIN, ALL_BUF_USAGE, &c->ringm, (void **)&c->ringp); c->ringm0 = c->ringm; c->ringp0 = c->ringp;
         c->ring0_size = c->ring_size = RING_MIN; atomic_fetch_add(&g_ring0_bytes, RING_MIN);
         c->dps = malloc(sizeof *c->dps); c->dps[0] = dpool_new(); c->ndp = 1;
-        VkQueryPoolCreateInfo qi2 = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2};
+        VkQueryPoolCreateInfo qi2 = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 3};   // the submission's start, its end, the upload command buffer's end
         VKCHECK(vkCreateQueryPool(g_dev, &qi2, NULL, &c->qp));
         VkQueryPoolCreateInfo qi3 = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_OCCLUSION, NOQ};
         VKCHECK(vkCreateQueryPool(g_dev, &qi3, NULL, &c->oq));
@@ -1890,15 +1891,23 @@ static int pass_begin(void) {
                   if (P.dt) snprintf(b + o, sizeof b - o, " d=%llu/%d%s%s", (unsigned long long)P.dt->serial, (int)d.df, d.dl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "", d.sl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/sclr" : "");
                   LOG("plog: pass %ux%u%s", P.w, P.h, b); }
     {   // this pass's signature for the per-pass GPU times: size, attachments (format, cleared), layered, and whether a held pass's split began it
-        char b[120]; int o = snprintf(b, sizeof b, "%ux%u", P.w, P.h); uint64_t h = 0xcbf29ce484222325ull;
+        uint64_t h = 0xcbf29ce484222325ull;
         #define SMIX(v) h = (h ^ (uint64_t)(v)) * 0x100000001b3ull
         SMIX(P.w); SMIX(P.h); SMIX(P.n); SMIX(d.layers); SMIX(g_after_split);
-        for (int i = 0; i < P.n; i++) { SMIX(d.cf[i]); SMIX(d.cl[i]); if (o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " c%d=%d%s", i, (int)d.cf[i], d.cl[i] == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : ""); }
-        if (P.dt) { SMIX(d.df); SMIX(d.dl); SMIX(d.sl); if (o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " d=%d%s%s", (int)d.df, d.dl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "", d.sl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/sclr" : ""); }
-        if (d.layers > 1 && o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " layers %u", d.layers);
-        if (g_after_split && o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " (after a split)");
+        for (int i = 0; i < P.n; i++) { SMIX(d.cf[i]); SMIX(d.cl[i]); }
+        if (P.dt) { SMIX(d.df); SMIX(d.dl); SMIX(d.sl); }
         #undef SMIX
-        g_tsig_next = h & ~1ull; gsig_name(g_tsig_next, b); g_after_split = 0; g_cur_sig = g_tsig_next;
+        g_tsig_next = h & ~1ull;
+        static uint64_t seen[256]; uint32_t si = (uint32_t)(g_tsig_next >> 7) % 256;
+        if (seen[si] != g_tsig_next) {   // a signature not described lately: its description (the snprintf for every pass was 1% of the render thread)
+            seen[si] = g_tsig_next; char b[120]; int o = snprintf(b, sizeof b, "%ux%u", P.w, P.h);
+            for (int i = 0; i < P.n && o < (int)sizeof b; i++) o += snprintf(b + o, sizeof b - o, " c%d=%d%s", i, (int)d.cf[i], d.cl[i] == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "");
+            if (P.dt && o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " d=%d%s%s", (int)d.df, d.dl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "", d.sl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/sclr" : "");
+            if (d.layers > 1 && o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " layers %u", d.layers);
+            if (g_after_split && o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " (after a split)");
+            gsig_name(g_tsig_next, b);
+        }
+        g_after_split = 0; g_cur_sig = g_tsig_next;
         if (P.n >= 4) { g_scene_w = P.w; g_scene_h = P.h; }
     }
     gpu_mark(0, 0); g_npass++; P.merged = 0;
@@ -3076,6 +3085,23 @@ void dm_vk_trim(void) { atomic_fetch_add(&g_trim_gen, 1); }
 #include <malloc.h>
 size_t dm_ueheap_release(size_t min) __attribute__((weak));   // the hibernation build's game heap (hle_ueheap.c): free chunks' pages back to the system
 static uint64_t g_heap_released;
+// The game heap's release (dm_ueheap_release walks every space under its lock, 5% of the render thread in a profile when it ran here every 10 s) runs on a thread of its own,
+// woken every 60 s and at once on low memory
+static pthread_mutex_t g_hrel_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_hrel_cv = PTHREAD_COND_INITIALIZER; static int g_hrel_req;
+static void *heap_release_thread(void *a) {
+    (void)a; static size_t prev; static int nr;
+    for (;;) {
+        pthread_mutex_lock(&g_hrel_mu); while (!g_hrel_req) pthread_cond_wait(&g_hrel_cv, &g_hrel_mu); g_hrel_req = 0; pthread_mutex_unlock(&g_hrel_mu);
+        size_t r = dm_ueheap_release(65536);
+        if ((r > prev + (16u << 20) || r + (16u << 20) < prev) && nr++ < 40) LOG("vk: game heap: free blocks of 64 KB or more now %.0f MB, their pages given back to the system", r / 1048576.0);
+        prev = r; g_heap_released = r;   // the total of the free blocks walked (pages already given back are counted again: madvise does not say)
+    }
+    return NULL;
+}
+static void heap_release_kick(void) {
+    static int started; if (!started) { started = 1; pthread_t t; if (pthread_create(&t, NULL, heap_release_thread, NULL)) { started = 0; return; } pthread_detach(t); }
+    pthread_mutex_lock(&g_hrel_mu); g_hrel_req = 1; pthread_cond_signal(&g_hrel_cv); pthread_mutex_unlock(&g_hrel_mu);
+}
 static void mem_watch(void) {
     static uint64_t last, last_trim, last_rel; uint64_t now = now_ns(); if (now - last < 1000000000ull) return; last = now;
     static long low = -1, budget = -1;
@@ -3087,9 +3113,7 @@ static void mem_watch(void) {
     long ours = rss / 1024 + (long)(gpu >> 20);   // the process's resident memory and the backend's device memory, in MB
     int is_low = low > 0 && avail > 0 && avail / 1024 < low, over = budget > 0 && ours > budget;
     g_mem_low = is_low || over;
-    if (dm_ueheap_release && (g_mem_low || now - last_rel >= 10000000000ull)) { last_rel = now; size_t r = dm_ueheap_release(65536); static size_t prev; static int nr;
-        if ((r > prev + (16u << 20) || r + (16u << 20) < prev) && nr++ < 40) LOG("vk: game heap: free blocks of 64 KB or more now %.0f MB, their pages given back to the system", r / 1048576.0);
-        prev = r; g_heap_released = r; }   // the total of the free blocks walked (pages already given back are counted again: madvise does not say)
+    if (dm_ueheap_release && (g_mem_low || now - last_rel >= 60000000000ull)) { last_rel = now; heap_release_kick(); }   // on the heap thread, not this one (it walks the heap under its locks)
     if (!g_mem_low || now - last_trim < 5000000000ull) return;
     last_trim = now; atomic_fetch_add(&g_trim_gen, 1);
     pthread_mutex_lock(&g_snapmu); for (int k = 0; k < SNAP_NC; k++) { while (g_snap_n[k]) free(g_snap_free[k][--g_snap_n[k]]); } g_snap_kept = 0; pthread_mutex_unlock(&g_snapmu);
@@ -3136,7 +3160,7 @@ void mtl_sub_begin(void) {
     C->reset_done = 0;
     VKCHECK(vkBeginCommandBuffer(C->cb, &bi)); VKCHECK(vkBeginCommandBuffer(C->up, &bi));
     barrier_all(C->up); g_vbar_epoch++;   // after everything submitted before (see mtl_sub_commit: no semaphore wait between the game's submissions)
-    vkCmdResetQueryPool(C->up, C->qp, 0, 2); vkCmdWriteTimestamp(C->up, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, C->qp, 0);
+    vkCmdResetQueryPool(C->up, C->qp, 0, 3); vkCmdWriteTimestamp(C->up, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, C->qp, 0);
     if (!C->oq_init) { vkCmdResetQueryPool(C->up, C->oq, 0, NOQ); C->oq_init = 1; } else if (C->noq) vkCmdResetQueryPool(C->up, C->oq, 0, C->noq);   // only those used last time
     C->noq = 0; g_occ_over = 0;
     if (!C->tq_init) { vkCmdResetQueryPool(C->up, C->tq, 0, NTQ); C->tq_init = 1; } else if (C->ntq) vkCmdResetQueryPool(C->up, C->tq, 0, C->ntq);
@@ -3243,6 +3267,7 @@ uint64_t mtl_sub_commit(void) {
     pass_end(); occ_flush();
     vkCmdWriteTimestamp(C->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, C->qp, 1);
     barrier_all(C->up);   // the uploads, clears and copies at the start are done and visible before the submission's own work (nothing orders two command buffers of one batch)
+    vkCmdWriteTimestamp(C->up, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, C->qp, 2);   // the upload command buffer's own GPU time (g_up_gpu_ns)
     VKCHECK(vkEndCommandBuffer(C->cb)); VKCHECK(vkEndCommandBuffer(C->up));
     uint64_t fence = ++g_fence; C->fence_val = fence;
     VkCommandBuffer cbs[2] = {C->up, C->cb};
@@ -3808,8 +3833,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0) LOG("vk: texel buffer slots read as zeros so far: nothing bound %llu, not a buffer texture %llu, format not usable %llu", (unsigned long long)g_tbuf_miss[0],
                           (unsigned long long)g_tbuf_miss[1], (unsigned long long)g_tbuf_miss[2]);
     if (n % 600 == 0) { uint64_t gp = atomic_exchange(&g_gpu_kind_ns[0], 0), gd = atomic_exchange(&g_gpu_kind_ns[1], 0), gc = atomic_exchange(&g_gpu_kind_ns[2], 0);
-                        LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame (left open %.1f: the attachment it samples was not written in the pass)",
-                            gp / 600e6, gd / 600e6, gc / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0, g_nsplit_skip / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; g_nsplit_skip = 0; }
+                        LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms, the upload command buffers %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame (left open %.1f: the attachment it samples was not written in the pass)",
+                            gp / 600e6, gd / 600e6, gc / 600e6, atomic_exchange(&g_up_gpu_ns, 0) / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0, g_nsplit_skip / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; g_nsplit_skip = 0; }
     if (n % 600 == 0) gsig_report(600);
     if (n % 600 == 0) {   // the host heap (malloc) and what the backend keeps in it, to attribute the process's native heap (dumpsys meminfo)
         struct mallinfo mi = mallinfo(); int nt = 0, nv = 0, live = 0; uint64_t snap = 0, xc = 0;
