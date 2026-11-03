@@ -322,6 +322,7 @@ DM_VK_MIRROR	test	Android: `0` leaves out vk19.6's mirrors (a GPU copy into a st
 DM_VK_NO_DYNREND	test	Android: `1` uses render passes made per pass even where dynamic rendering is available (the path for Vulkan 1.1 / 1.2 GPUs without it)
 DM_VK_NO_TIMELINE	test	Android: set, submissions are not chained by a timeline semaphore even where the GPU has one
 DM_VK_PASSLOG	diagnostic	Android: `=<frame>[+]` logs that frame's passes, draws, copies and dispatches (targets, clears, shaders, depth / stencil / blend)
+DM_VK_PASS_BARRIER	test	Android: `1` leaves vertex shaders out of each pass end's barrier (the next pass's vertex work may overlap); a vertex shader that samples such a pass's target gets a barrier first. Default 0
 DM_VK_PREWARM_KEEP	test	Android: `0` makes the shader pre-warm destroy each pipeline right after making it (only the driver's pipeline cache stays warm); a pipeline is made again from that cache at its first use. Default 1 keeps them all alive
 DM_VK_RTDUMP	diagnostic	Android: `=<frame>[,<frames>]` writes every render target of that frame (and the next ones) as raw files into DM_VK_SHOT_DIR
 DM_VK_RTDUMP_DEC	diagnostic	Android: with DM_VK_RTDUMP, also writes the textures decoded from BC4-7 on upload
@@ -332,6 +333,7 @@ DM_VK_SHOT_DIR	path	Android: where DM_VK_SHOTS and DM_VK_RTDUMP write (default: 
 DM_VK_SKIP	diagnostic	Android: `=<mask>` leaves out kinds of GPU work (1 buffer→texture, 2 texture→texture, 4 texture→buffer, 8 clears, 16 uploads, 32 draws / dispatches), for bisecting a wrong picture
 DM_VK_STALE_PATCH	test	Android: `0` leaves out vk19.3's stale-read patch: a read of an earlier submission's GPU-written range takes its bytes as they are, without the CPU's later rewrites
 DM_VK_TEXCOUNT	diagnostic	Android: set, every 600 presents logs the live textures by kind and how many share their storage start with an older one
+DM_VK_UBWC	test	Android: `1` makes images whose views never reinterpret the format keep the GPU's compression: a format list (own format and its sRGB / UNORM twin) or not mutable at all; storage images unchanged. Default 0
 DM_VK_VTXIDX_FIX	test	Android: `0` leaves out vk19.10's VertexIndex bias (vertex shaders that read VertexIndex get the draw's first copied vertex added back through a push constant)
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
 DM_WATCH	diagnostic	`=<s>` dumps all threads after that many seconds (SIGALRM) and turns on the stall watchdog; off unless set

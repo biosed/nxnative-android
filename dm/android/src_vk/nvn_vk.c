@@ -19,6 +19,7 @@
 #include <android/native_window.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 
 #define VKCHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) die("Vulkan: %s failed (%d)", #x, (int)r_); } while (0)
 #define RED_ONCE(id, ...) do { static int once_; if (!once_++) LOG("[RED] vk: " __VA_ARGS__); } while (0)
@@ -127,7 +128,7 @@ typedef struct {
     uint64_t fence_val; int up_used;
     VkQueryPool qp;   // GPU timestamps at the start and the end of the submission
     VkQueryPool oq; uint32_t noq; int oq_init;
-    VkQueryPool tq; uint32_t ntq, ntq_prev; int tq_init; uint8_t tkind[NTQ / 2];   // GPU timestamps around each pass / dispatch / copy (gpu_mark): a pair per region, its kind   // occlusion queries of this submission (one per draw made while NVN's samples-passed counter counts), reset at its start
+    VkQueryPool tq; uint32_t ntq, ntq_prev; int tq_init; uint8_t tkind[NTQ / 2]; uint64_t tsig[NTQ / 2]; uint32_t tdraws[NTQ / 2];   // GPU timestamps around each pass / dispatch / copy (gpu_mark): a pair per region, its kind   // occlusion queries of this submission (one per draw made while NVN's samples-passed counter counts), reset at its start
     VkFramebuffer *fb; int nfb, cfb;   // render passes' framebuffers (no dynamic rendering), destroyed when the submission is done
     VkBuffer ring0; VkDeviceMemory ringm0; uint8_t *ringp0;   // the context's own ring; ring / ringp move to extra rings when a submission outgrows it (loading screens upload hundreds of MB)
     VkDeviceSize ring0_size, ring_size, total, last_total, win_max; uint32_t nwin; uint64_t trim_seen;   // ring_size: of the ring in use; total: bytes this submission took from rings
@@ -141,7 +142,8 @@ typedef struct {
     struct trace { char kind, gpu_ind; char a[17], b[17]; uint32_t n0, n1, n2, zero_tb; } tr[48]; uint32_t ntr, ndraw, ndisp, max_groups; struct trace heavy;
 } ctx_t;
 enum { TRN = 48 };
-static _Atomic uint64_t g_gpu_ns;
+static _Atomic uint64_t g_gpu_ns, g_gpu_cum;   // g_gpu_cum: never reset (the long-frame lines)
+static _Atomic uint64_t g_wait_cum, g_gw_wait_cum, g_up_cum, g_xring_n;   // cumulative: context waits, waits on GPU-written data, upload bytes, extra rings made (long frames)
 static ctx_t g_ctx[NCTX_MAX]; static ctx_t *C; static int g_ci;
 static uint64_t g_fence, g_done;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
@@ -156,7 +158,7 @@ static VkDeviceSize ring_alloc(VkDeviceSize n, VkDeviceSize align) {
         VkDeviceSize xs = C->ring0_size > RING_MIN ? C->ring0_size : 16u << 20; while (xs < n) xs *= 2; if (xs > RING_XMAX) xs = RING_XMAX;
         C->extra = realloc(C->extra, (C->nextra + 1) * sizeof *C->extra);
         C->extra[C->nextra].b = buf_new(xs, ALL_BUF_USAGE, &C->extra[C->nextra].m, (void **)&C->ringp); C->extra[C->nextra].size = xs; C->ring = C->extra[C->nextra++].b;
-        atomic_fetch_add(&g_extra_ring_bytes, xs); C->ring_size = xs;
+        atomic_fetch_add(&g_extra_ring_bytes, xs); atomic_fetch_add(&g_xring_n, 1); C->ring_size = xs;
         C->used = 0; o = 0; g_wgen++; g_nwlog = 0;   // copies cached in the old ring are not reused from the new one
     }
     C->total += o + n - C->used; C->used = o + n; return o;
@@ -332,7 +334,7 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
         *buf = e->buf; *off = e->off + (addr - e->addr); if (p) *p = e->p + (addr - e->addr); g_gw_ci = e->ci; hit = 1;
     }
     pthread_mutex_unlock(&g_gwmu);
-    if (wait) { uint64_t t0 = now_ns(); mtl_wait(wait, UINT64_MAX); atomic_fetch_add(&g_gw_wait_ns, now_ns() - t0); atomic_fetch_add(&g_gw_waits, 1); atomic_fetch_add(&g_gw_why[why], 1); }
+    if (wait) { uint64_t t0 = now_ns(); mtl_wait(wait, UINT64_MAX); atomic_fetch_add(&g_gw_wait_ns, now_ns() - t0); atomic_fetch_add(&g_gw_wait_cum, now_ns() - t0); atomic_fetch_add(&g_gw_waits, 1); atomic_fetch_add(&g_gw_why[why], 1); }
     return hit;
 }
 static int gw_find(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off, uint8_t **p) { return gw_find_(addr, size, align, buf, off, p, 1); }
@@ -367,14 +369,42 @@ static void xr_free(uint64_t done) {
     }
     pthread_mutex_unlock(&g_gwmu);
 }
+// GPU time per region signature: what each kind of pass or dispatch costs a frame (registered by the submit thread with its description, timed by the completion thread)
+enum { NGSIG = 1024 };
+static struct { uint64_t sig; uint64_t ns, n, draws; char d[120]; } g_gsig[NGSIG]; static pthread_mutex_t g_gsigmu = PTHREAD_MUTEX_INITIALIZER;
+static int gsig_slot(uint64_t sig) { uint32_t i = (uint32_t)(sig ^ sig >> 29) % NGSIG; for (int k = 0; k < NGSIG; k++, i = (i + 1) % NGSIG) if (g_gsig[i].sig == sig || !g_gsig[i].sig) return (int)i; return -1; }   // caller holds g_gsigmu
+static void gsig_name(uint64_t sig, const char *d) {   // the submit thread: a description for a signature met the first time
+    if (!sig) return; pthread_mutex_lock(&g_gsigmu); int i = gsig_slot(sig);
+    if (i >= 0 && !g_gsig[i].sig) { g_gsig[i].sig = sig; snprintf(g_gsig[i].d, sizeof g_gsig[i].d, "%s", d); }
+    pthread_mutex_unlock(&g_gsigmu);
+}
+static void gsig_add(uint64_t sig, uint64_t ns, uint32_t draws) {
+    if (!sig) return; pthread_mutex_lock(&g_gsigmu); int i = gsig_slot(sig);
+    if (i >= 0 && g_gsig[i].sig == sig) { g_gsig[i].ns += ns; g_gsig[i].n++; g_gsig[i].draws += draws; }
+    pthread_mutex_unlock(&g_gsigmu);
+}
+static void gsig_report(uint64_t frames) {   // the 10 costliest passes and dispatches over the last frames, then the sums start again
+    static int idx[NGSIG]; pthread_mutex_lock(&g_gsigmu);
+    for (int kind = 0; kind < 2; kind++) {
+        int n = 0; uint64_t tot = 0;
+        for (int i = 0; i < NGSIG; i++) if (g_gsig[i].sig && g_gsig[i].n && (int)(g_gsig[i].sig & 1) == kind) { idx[n++] = i; tot += g_gsig[i].ns; }
+        for (int a = 0; a < n; a++) for (int b = a + 1; b < n; b++) if (g_gsig[idx[b]].ns > g_gsig[idx[a]].ns) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+        LOG("vk: costliest %s over the last %llu frames (%d kinds, %.2f ms a frame in all):", kind ? "dispatches" : "render passes", (unsigned long long)frames, n, tot / 1e6 / frames);
+        for (int a = 0; a < n && a < 10; a++) { const typeof(g_gsig[0]) *e = &g_gsig[idx[a]];
+            LOG("vk:   %.2f ms a frame, %.1f a frame, %.0f draws each: %s", e->ns / 1e6 / frames, (double)e->n / frames, e->n ? (double)e->draws / e->n : 0.0, e->d); }
+    }
+    for (int i = 0; i < NGSIG; i++) g_gsig[i].ns = g_gsig[i].n = g_gsig[i].draws = 0;
+    pthread_mutex_unlock(&g_gsigmu);
+}
 static _Atomic uint64_t g_gpu_kind_ns[3];   // GPU time inside render passes, dispatches, copies (gpu_mark); the rest of a submission's span is time between them
 static void ctx_complete(ctx_t *c) {
     uint64_t ts[2];
     if (vkGetQueryPoolResults(g_dev, c->qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0])
-        atomic_fetch_add(&g_gpu_ns, (uint64_t)((double)(ts[1] - ts[0]) * g_props.limits.timestampPeriod));
+        { uint64_t gns = (uint64_t)((double)(ts[1] - ts[0]) * g_props.limits.timestampPeriod); atomic_fetch_add(&g_gpu_ns, gns); atomic_fetch_add(&g_gpu_cum, gns); }
     if (c->ntq >= 2) { static uint64_t t[NTQ]; uint32_t n = c->ntq & ~1u;
         if (vkGetQueryPoolResults(g_dev, c->tq, 0, n, n * 8, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
-            for (uint32_t i = 0; i + 1 < n; i += 2) if (t[i + 1] > t[i]) atomic_fetch_add(&g_gpu_kind_ns[c->tkind[i / 2] % 3], (uint64_t)((double)(t[i + 1] - t[i]) * g_props.limits.timestampPeriod)); }
+            for (uint32_t i = 0; i + 1 < n; i += 2) if (t[i + 1] > t[i]) { uint64_t ns = (uint64_t)((double)(t[i + 1] - t[i]) * g_props.limits.timestampPeriod);
+                atomic_fetch_add(&g_gpu_kind_ns[c->tkind[i / 2] % 3], ns); gsig_add(c->tsig[i / 2], ns, c->tdraws[i / 2]); } }
     for (int i = 0; i < c->npost; i++) {
         post_t *p = &c->post[i];
         if (p->kind == 1) { volatile uint32_t *v = p->dst; if (p->mode == 1) *v += p->v; else *v = p->v; }
@@ -622,7 +652,9 @@ static void once_end(VkCommandBuffer cb) {
     vkFreeCommandBuffers(g_dev, g_opool, 1, &cb);
     pthread_mutex_unlock(&g_qmu);
 }
+static uint64_t g_vbar_epoch;   // barriers that make attachment writes visible to vertex shaders (DM_VK_PASS_BARRIER): a texture marked in an older epoch is safe for them
 static void barrier_all(VkCommandBuffer cb) {
+    if (C && cb == C->cb) g_vbar_epoch++;
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
@@ -636,11 +668,14 @@ static void barrier_all(VkCommandBuffer cb) {
                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT)
 static VkPipelineStageFlags g_consumer_stages;   // CONSUMER_STAGES without the geometry stage on a GPU that has none
 // A timed region: gpu_mark(kind, 0) before it, gpu_mark(kind, 1) after (kind 0 render pass, 1 dispatch, 2 copy / clear)
+// Each region carries a signature (g_tsig_next: a pass's size, attachments and load actions, a dispatch's shader), and its GPU time is summed per signature (gsig_add, on the
+// completion thread): the 600-frame lines name the passes and dispatches that cost the most (gsig_report)
+static uint64_t g_tsig_next;
 static void gpu_mark(int kind, int end) {
     if (C->ntq + 1 >= NTQ && !end) return;
     if (!end && (C->ntq & 1)) return;                       // a region already open
     if (end && !(C->ntq & 1)) return;                       // none open
-    if (!end) C->tkind[C->ntq / 2] = (uint8_t)kind;
+    if (!end) { C->tkind[C->ntq / 2] = (uint8_t)kind; C->tsig[C->ntq / 2] = g_tsig_next; C->tdraws[C->ntq / 2] = 0; g_tsig_next = 0; }
     vkCmdWriteTimestamp(C->cb, end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, C->tq, C->ntq++);
 }
 static void barrier_after(VkCommandBuffer cb, VkPipelineStageFlags src, VkAccessFlags src_access) {   // what src wrote, for everything recorded after it
@@ -836,8 +871,10 @@ struct vtex {
     struct vtex *next;
     uint64_t dead;   // released by the game: freed once the GPU has finished the submission that was being recorded then (fence dead)
     uint64_t lhash, lhash_gen; uint8_t lcpu;
+    VkFormat vfl[2]; uint8_t nvfl; VkImageFormatListCreateInfo fli;   // DM_VK_UBWC: the only formats its views may take (nvfl 0: any, MUTABLE_FORMAT without a list)
     VkImageCreateInfo ci; uint8_t packaged, evicted; uint64_t last_frame, last_fence;   // texture eviction (tex_evict): how it was made, whether its content comes from its storage, when it was last used
     uint32_t gpu_lv;   // levels a copy wrote on the GPU (texture or buffer copies into one level): an upload from storage leaves them alone, the rest still follows the game's writes   // lcpu: a linear texture in a pool the CPU writes (a glyph cache): its storage hashed once a submission, uploaded again when it changed
+    uint64_t vhaz_epoch; uint8_t vhaz;   // DM_VK_PASS_BARRIER: written by a pass whose end barrier left vertex shaders out, in that barrier epoch (see pass_barrier_on)
     int storage;   // made with VK_IMAGE_USAGE_STORAGE_BIT (an NVN image texture whose format Vulkan can store to)
     uint8_t late;   // made before the game wrote its storage, watched for that (late_fill)
     uint32_t mir_lv;   // levels a GPU copy wrote whose bytes were written into the storage too (copy_b2t / copy_t2t mirror): the storage holds them, as the image does
@@ -861,6 +898,23 @@ static void tex_upload(vtex *v, const tex_t *t);
 // (its writes reach memory unflushed) and for storage the CPU flushed before the texture's first use (nvn_flushed; DM_NVN_FLUSH_FILL=0 leaves it out), with COMPRESSIBLE
 // textures too: compression applies to what the GPU renders into one, and at its first use the storage holds plain texels (FINAL FANTASY XII THE ZODIAC AGE sets the flag on
 // every texture, its CPU-written and flushed battle target ring and line art included, which drew with alpha 0 otherwise). Multisample and depth textures stay GPU textures
+// DM_VK_UBWC=1: images whose views never reinterpret their format keep the Adreno's bandwidth compression (UBWC). Every image used to be made MUTABLE_FORMAT with no format list,
+// which the driver may answer by leaving the image uncompressed: every render target, depth buffer and texture read and written at full size. Now an image is MUTABLE_FORMAT
+// only with a format list -- its own format and its sRGB / UNORM sibling -- or not mutable at all where it has no sibling (depth images included: their views keep their format).
+// Storage images stay as they were (any view). A view asking for a format outside the list takes the image's own (counted: g_ubwc_fallback). Default 0 (off) until measured
+static int ubwc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_UBWC=1: images without format reinterpretation keep compression (format lists)"); } return v; }
+static uint64_t g_ubwc_fallback, g_ubwc_imgs;
+static VkFormat fmt_sibling(VkFormat f) {   // the sRGB / UNORM twin of a format, VK_FORMAT_UNDEFINED when it has none
+    static const VkFormat pr[][2] = {{VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB}, {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB}, {VK_FORMAT_A8B8G8R8_UNORM_PACK32, VK_FORMAT_A8B8G8R8_SRGB_PACK32},
+        {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SRGB}, {VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_SRGB}, {VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8_SRGB},
+        {VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_BC1_RGB_SRGB_BLOCK}, {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK}, {VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC2_SRGB_BLOCK},
+        {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}, {VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_BC7_SRGB_BLOCK},
+        {VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK}, {VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK, VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK}, {VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK, VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK},
+        {VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_ASTC_4x4_SRGB_BLOCK}, {VK_FORMAT_ASTC_5x5_UNORM_BLOCK, VK_FORMAT_ASTC_5x5_SRGB_BLOCK}, {VK_FORMAT_ASTC_6x6_UNORM_BLOCK, VK_FORMAT_ASTC_6x6_SRGB_BLOCK},
+        {VK_FORMAT_ASTC_8x8_UNORM_BLOCK, VK_FORMAT_ASTC_8x8_SRGB_BLOCK}};
+    for (size_t i = 0; i < sizeof pr / sizeof *pr; i++) { if (pr[i][0] == f) return pr[i][1]; if (pr[i][1] == f) return pr[i][0]; }
+    return VK_FORMAT_UNDEFINED;
+}
 static int mem_any(const uint8_t *p, uint64_t n) { uint64_t i = 0, x; for (; i + 8 <= n; i += 8) { memcpy(&x, p + i, 8); if (x) return 1; } for (; i < n; i++) if (p[i]) return 1; return 0; }
 int nvn_flushed(const void *p, uint64_t n);   // hle_nvn.c
 static int init_fill(const tex_t *t, const fmt_t *f) {
@@ -933,6 +987,12 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
                             is3d ? VK_IMAGE_TYPE_3D : t->d.target == NVN_TEXTURE_TARGET_1D || t->d.target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D,
                             f.f, {v->w, t->d.target == NVN_TEXTURE_TARGET_1D_ARRAY ? 1 : v->h, v->d}, v->levels, v->layers, sc, VK_IMAGE_TILING_OPTIMAL, u, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     if (sc != VK_SAMPLE_COUNT_1_BIT) ii.mipLevels = 1;
+    if (ubwc_on() && !(u & VK_IMAGE_USAGE_STORAGE_BIT)) {   // see ubwc_on: a format list, or not mutable
+        VkFormat sib = f.depth ? VK_FORMAT_UNDEFINED : fmt_sibling(f.f); v->vfl[0] = f.f; v->nvfl = 1;
+        if (sib != VK_FORMAT_UNDEFINED) { v->vfl[1] = sib; v->nvfl = 2; v->fli = (VkImageFormatListCreateInfo){VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, 2, v->vfl}; ii.pNext = &v->fli; }
+        else ii.flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        g_ubwc_imgs++;
+    }
     VkResult r = vkCreateImage(g_dev, &ii, NULL, &v->img);
     if (r != VK_SUCCESS) { LOG("[RED] vk: image %ux%ux%u x%u levels %u format %#x target %d not created (%d)", v->w, v->h, v->d, v->layers, v->levels, t->d.format, t->d.target, (int)r); free(v); return NULL; }
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_dev, v->img, &mr); VkDeviceSize off;
@@ -1007,7 +1067,7 @@ static void tex_evict(uint64_t trim_gen) {
 // Packaged texture: each level and layer deswizzled from the pool storage into the ring, then copied into the image by the upload command buffer (it runs before this submission's draws)
 static uint64_t g_t_up, g_up_bytes; uint64_t g_nsub_stat;
 static void tex_upload_(vtex *v, const tex_t *t);
-static void tex_upload(vtex *v, const tex_t *t) { uint64_t t0 = now_ns(); tex_upload_(v, t); g_t_up += now_ns() - t0; g_up_bytes += t->L.size; }
+static void tex_upload(vtex *v, const tex_t *t) { uint64_t t0 = now_ns(); tex_upload_(v, t); g_t_up += now_ns() - t0; g_up_bytes += t->L.size; atomic_fetch_add(&g_up_cum, t->L.size); }
 static void tex_upload_(vtex *v, const tex_t *t) {
     if (vk_skip() & SK_UPLOAD) return;
     if (g_plog) LOG("plog:  upload %llu fmt %#x %ux%ux%u levels %u layers %u target %d", (unsigned long long)t->serial, t->d.format, v->w, v->h, v->d, v->levels, v->layers, t->d.target);
@@ -1082,6 +1142,9 @@ static VkImageView tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_v
     if (!f.f || f.dec != v->f.dec || (f.dec && f.f != v->f.f) || fmt_block(f.f) != fmt_block(v->f.f)) f = v->f;   // a block-compressed image is viewed in its own class only
     if (v->f.depth || f.depth) f = v->f;   // a depth-stencil image is viewed in its own format (a STENCIL8 view of a D32S8 one included): the aspect picks depth or stencil
     if (f.dec) f.f = v->f.f;
+    if (v->nvfl && f.f != v->vfl[0] && (v->nvfl < 2 || f.f != v->vfl[1])) {   // outside the image's format list (DM_VK_UBWC): its own format
+        static int nl; if (nl++ < 8) LOG("[RED] vk: a view in format %d of an image made for %d%s (DM_VK_UBWC): viewed in the image's format", (int)f.f, (int)v->vfl[0], v->nvfl > 1 ? " and its sRGB twin" : "");
+        g_ubwc_fallback++; f = v->f; }
     uint8_t swz[4] = {2, 3, 4, 5};
     if (!rt) {
         if (t->set_swz) for (int i = 0; i < 4; i++) swz[i] = (uint8_t)(t->swz >> (3 * i) & 7);
@@ -1654,6 +1717,11 @@ static void lin_writeback(vtex *v) {
     else post_add((post_t){3, (void *)v->mem, 0, 0, 0, 0, C->ringp + o, n});
     if (!g_lin_wb++) LOG("vk: linear render target %ux%u format %d goes back to its storage after each pass (serial %llu)", v->w, v->h, (int)v->f.f, (unsigned long long)v->serial);
 }
+// DM_VK_PASS_BARRIER=1: a pass's end barrier leaves the vertex shaders out of its destination, so the next pass's vertex work (the Adreno's binning) may overlap this pass's
+// fragments instead of every pass end draining the GPU (59 a frame in the castle). A vertex shader that samples a texture written by such a pass, in the same barrier epoch, gets
+// a barrier for it first (draw_vs_hazard: the open pass is ended for it). Submissions still begin with a full barrier. Default 0 (off) until measured
+static uint64_t g_nbar_narrow, g_nbar_vs;
+static int pass_barrier_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PASS_BARRIER"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_PASS_BARRIER=1: pass ends do not wait for vertex shaders (their reads of the pass's targets get a barrier)"); } return v; }
 static const uint8_t *g_rt_hold;   // see rt_hold_scan
 static void pass_end(void) {
     g_rt_hold = NULL;
@@ -1661,10 +1729,15 @@ static void pass_end(void) {
     if (P.open) {
         rp_end(C->cb); P.open = 0; gpu_mark(0, 1);
         // what the pass wrote is read by later passes, samples and copies; their vertex work may start before it ends
+        VkPipelineStageFlags dst = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;   // compute too: a dispatch that reads what the pass drew (Unreal's HZB from depth)
+        if (pass_barrier_on()) {   // vertex shaders left out: the next pass's vertex work may overlap this one's fragments; the attachments written are marked for draw_vs_hazard
+            dst &= ~(VkPipelineStageFlags)VK_PIPELINE_STAGE_VERTEX_SHADER_BIT; g_nbar_narrow++;
+            for (int i = 0; i < P.n; i++) if (P.ct[i] && P.cdrawn[i]) { P.ct[i]->vhaz = 1; P.ct[i]->vhaz_epoch = g_vbar_epoch; }
+            if (P.dt && P.ddrawn) { P.dt->vhaz = 1; P.dt->vhaz_epoch = g_vbar_epoch; }
+        } else g_vbar_epoch++;
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
-        vkCmdPipelineBarrier(C->cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                             VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);   // compute too: a dispatch that reads what the pass drew (Unreal's HZB from depth)
+        vkCmdPipelineBarrier(C->cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, dst, 0, 1, &mb, 0, NULL, 0, NULL);
         int wb = 0;
         for (int i = 0; i < P.n; i++) if (P.ct[i] && P.ct[i]->linrow && P.cdrawn[i] && !P.clv[i] && !P.cly[i]) { lin_writeback(P.ct[i]); wb = 1; }
         memset(P.cdrawn, 0, sizeof P.cdrawn); P.ddrawn = 0;
@@ -1673,6 +1746,7 @@ static void pass_end(void) {
 }
 static int g_pass_open_(void) { return P.open; }
 static uint64_t g_npass, g_nheld, g_nsame;   // render passes begun / SetRenderTargets detours held / same-target SetRenderTargets kept (the GPU line)
+static int g_after_split;   // the next pass begins where a held pass was split (draw_reads_rt): its signature says so
 static int pass_begin(void) {
     if (P.open) return 1;
     if (!P.n && !P.dt) return 0;
@@ -1695,6 +1769,17 @@ static int pass_begin(void) {
     if (g_plog) { char b[512]; int o = 0; for (int i = 0; i < P.n; i++) o += snprintf(b + o, sizeof b - o, " c%d=%llu/%d%s", i, P.ct[i] ? (unsigned long long)P.ct[i]->serial : 0ull, (int)d.cf[i], d.cl[i] == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "");
                   if (P.dt) snprintf(b + o, sizeof b - o, " d=%llu/%d%s%s", (unsigned long long)P.dt->serial, (int)d.df, d.dl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "", d.sl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/sclr" : "");
                   LOG("plog: pass %ux%u%s", P.w, P.h, b); }
+    {   // this pass's signature for the per-pass GPU times: size, attachments (format, cleared), layered, and whether a held pass's split began it
+        char b[120]; int o = snprintf(b, sizeof b, "%ux%u", P.w, P.h); uint64_t h = 0xcbf29ce484222325ull;
+        #define SMIX(v) h = (h ^ (uint64_t)(v)) * 0x100000001b3ull
+        SMIX(P.w); SMIX(P.h); SMIX(P.n); SMIX(d.layers); SMIX(g_after_split);
+        for (int i = 0; i < P.n; i++) { SMIX(d.cf[i]); SMIX(d.cl[i]); if (o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " c%d=%d%s", i, (int)d.cf[i], d.cl[i] == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : ""); }
+        if (P.dt) { SMIX(d.df); SMIX(d.dl); SMIX(d.sl); if (o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " d=%d%s%s", (int)d.df, d.dl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "", d.sl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/sclr" : ""); }
+        if (d.layers > 1 && o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " layers %u", d.layers);
+        if (g_after_split && o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " (after a split)");
+        #undef SMIX
+        g_tsig_next = h & ~1ull; gsig_name(g_tsig_next, b); g_after_split = 0;
+    }
     gpu_mark(0, 0); g_npass++; P.merged = 0;
     VkFramebuffer fb = rp_begin(C->cb, &d); P.open = 1;
     if (fb) { if (C->nfb == C->cfb) { C->cfb = C->cfb ? 2 * C->cfb : 256; C->fb = realloc(C->fb, C->cfb * sizeof *C->fb); } C->fb[C->nfb++] = fb; }
@@ -2147,6 +2232,7 @@ static struct { uint64_t key, gen; VkDescriptorSetLayout dsl; VkDescriptorSet ds
 static uint64_t g_dsc_hit, g_dsc_miss;
 static uint64_t g_t_ws, g_t_draw, g_t_disp, g_t_sub;   // time in write_set, in draws (with their write_set), in dispatches, in vkQueueSubmit (the frame stats line)
 static VkDescriptorSet write_set_(shader_t *s, int stage);
+static int g_vs_haz;   // the vertex shader's write_set met a texture a pass wrote with vertex shaders left out of its end barrier (draw_vs_hazard)
 static uint32_t g_dyno[64]; static uint32_t g_ndyno;   // the dynamic offsets of the last write_set, in binding order (for vkCmdBindDescriptorSets)
 static VkDescriptorSet write_set(shader_t *s, int stage) { uint64_t t0 = now_ns(); VkDescriptorSet d = write_set_(s, stage); g_t_ws += now_ns() - t0; return d; }
 static VkDescriptorSet write_set_(shader_t *s, int stage) {
@@ -2213,6 +2299,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                 if (b->type != BT_SAMP && !simg && (dyn || (b->kind == K_TEX && b->reg >= 0 && b->reg + (int)e < NTEX) || (b->kind == K_TEXU && cnt == 1))) {
                     th = dyn ? dyn_slot(stage, (int)e) : b->kind == K_TEXU ? texu_slot(stage, b) : S.tex[stage][b->reg + e]; have = !dyn;
                     int ok; vtex *tv; view = tex_slot(stage, th, &sm, &ok, &tv);
+                    if (stage == 0 && tv && tv->vhaz && tv->vhaz_epoch == g_vbar_epoch) g_vs_haz = 1;   // written by a pass whose end barrier left vertex shaders out (DM_VK_PASS_BARRIER)
                     if (stage == 1 && tv) for (int q = 0; q < g_fb_n; q++) if (tv == g_fb_src[q]) { view = g_fb_view[q]; break; }   // same-pass feedback: the snapshot (fb_prepare)
                 } else if (simg && b->kind == K_IMG && b->reg >= 0 && b->reg + (int)e < 32) {   // an image a shader writes: a single-level view with no swizzle, of an image made for storage
                     int tid = (int)(S.img[stage][b->reg + e] & 0xfffff);
@@ -2427,8 +2514,9 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     { int lay = vs->layer_out || (gs && gs->layer_out);   // a layered pass for a shader that writes the layer; a pass opened the other way is ended first
       if (P.open && ((lay && !P.layered && !(P.lok && P.nlayers <= 1)) || (!lay && P.layered))) pass_end();
       P.want_layered = lay; }
-    if (P.open && P.merged && draw_reads_rt(vs, fs, gs)) { pass_end(); g_nsplit++; }   // what was drawn into it is stored first, then read (as the pass the hold joined would have)
+    if (P.open && P.merged && draw_reads_rt(vs, fs, gs)) { pass_end(); g_nsplit++; g_after_split = 1; }   // what was drawn into it is stored first, then read (as the pass the hold joined would have)
     if (!pass_begin()) SKIP(2);
+    if (C->ntq & 1) C->tdraws[C->ntq / 2]++;   // draws in the timed pass (its signature's line)
     if (ind_b && (dw ? dw->prim : di->prim) == NVN_DRAW_PRIMITIVE_QUADS) { RED_ONCE(30, "a GPU-written indirect draw of quads is not implemented"); SKIP(3); }
     if (ind_b && di && di->itype == 0 && !g_has_u8) { RED_ONCE(37, "a GPU-written indirect draw with 8-bit indices needs VK_EXT_index_type_uint8"); SKIP(3); }
     int prim = dw ? dw->prim : di->prim;
@@ -2465,7 +2553,15 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (fs && P.n) fb_prepare(fs); else g_fb_n = 0;
     g_ws_zero_tb = 0;
     uint32_t dyno[192], ndyno = 0, gdyno[64], ngdyno = 0;
+    g_vs_haz = 0;
     VkDescriptorSet sets[2]; sets[0] = write_set(vs, 0); memcpy(dyno, g_dyno, g_ndyno * 4); ndyno = g_ndyno;
+    if (g_vs_haz) {   // draw_vs_hazard: the vertex shader samples what a pass wrote with vertex shaders left out of its end barrier: the open pass ends, the barrier, and it begins again
+        int was = P.open; if (was) pass_end();
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(C->cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        g_vbar_epoch++; g_nbar_vs++;
+        if (was && !pass_begin()) SKIP(2);
+    }
     sets[1] = VK_NULL_HANDLE; if (fs) { sets[1] = write_set(fs, 1); memcpy(dyno + ndyno, g_dyno, g_ndyno * 4); ndyno += g_ndyno; }
     g_fb_n = 0;
     VkDescriptorSet gset = VK_NULL_HANDLE; if (gs) { gset = write_set(gs, 2); memcpy(gdyno, g_dyno, g_ndyno * 4); ngdyno = g_ndyno; }
@@ -2609,6 +2705,7 @@ static void dispatch(const p_dispatch *d) {
     if (g_plog) LOG("plog:  dispatch cs %s %ux%ux%u%s, %d storage buffers", cs->key, g[0], g[1], g[2], ib ? " (indirect, GPU-written)" : "", g_nwb);
     vkCmdBindPipeline(C->cb, VK_PIPELINE_BIND_POINT_COMPUTE, cs->cpp);
     vkCmdBindDescriptorSets(C->cb, VK_PIPELINE_BIND_POINT_COMPUTE, cs->cpl, 0, 1, &ds, g_ndyno, g_dyno);
+    { char b[64]; snprintf(b, sizeof b, "cs %s", cs->key); g_tsig_next = fnv(cs->key, strlen(cs->key)) | 1; gsig_name(g_tsig_next, b); }
     gpu_mark(1, 0);
     if (ib) vkCmdDispatchIndirect(C->cb, ib, io); else vkCmdDispatch(C->cb, g[0], g[1], g[2]);
     gpu_mark(1, 1);
@@ -2808,7 +2905,7 @@ void mtl_sub_begin(void) {
       atomic_fetch_add(&g_wait_fence_ns, t2 - t1); atomic_fetch_add(&g_wait_hold_ns, now_ns() - t2); }   // its own submission still running / a later one still reading its ring
     pthread_mutex_unlock(&g_mu);
     pthread_mutex_lock(&g_gwmu); c->hold = 0; pthread_mutex_unlock(&g_gwmu);
-    atomic_fetch_add(&g_wait_ns, now_ns() - w0);
+    atomic_fetch_add(&g_wait_ns, now_ns() - w0); atomic_fetch_add(&g_wait_cum, now_ns() - w0);
     ring_fit(c);
     C = c;
     { void tex_evict_hook(void); tex_evict_hook(); } C->used = 0; C->up_used = 0; g_ndc = 0; g_wgen++; g_nwlog = 0; C->ring = C->ring0; C->ringp = C->ringp0; C->ring_size = C->ring0_size; C->total = 0;
@@ -2820,7 +2917,7 @@ void mtl_sub_begin(void) {
     if (!C->reset_done) VKCHECK(vkResetCommandPool(g_dev, C->pool, 0));   // both command buffers at once, their memory kept; normally done already by the completion thread
     C->reset_done = 0;
     VKCHECK(vkBeginCommandBuffer(C->cb, &bi)); VKCHECK(vkBeginCommandBuffer(C->up, &bi));
-    barrier_all(C->up);   // after everything submitted before (see mtl_sub_commit: no semaphore wait between the game's submissions)
+    barrier_all(C->up); g_vbar_epoch++;   // after everything submitted before (see mtl_sub_commit: no semaphore wait between the game's submissions)
     vkCmdResetQueryPool(C->up, C->qp, 0, 2); vkCmdWriteTimestamp(C->up, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, C->qp, 0);
     if (!C->oq_init) { vkCmdResetQueryPool(C->up, C->oq, 0, NOQ); C->oq_init = 1; } else if (C->noq) vkCmdResetQueryPool(C->up, C->oq, 0, C->noq);   // only those used last time
     C->noq = 0; g_occ_over = 0;
@@ -3413,6 +3510,19 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         static uint64_t lastp, gprev; uint64_t now = now_ns(), g = atomic_load(&g_gpu_ns), gd = g >= gprev ? g - gprev : 0; gprev = g;
         if (lastp && now - lastp < 1000000000ull) adpf_frame(now - lastp, gd < 200000000ull ? gd : 0);
         lastp = now; }
+    {   // a long frame (over 50 ms from the last present): what it held -- new pipelines, draws left out for theirs, waits for a context and for GPU-written data, page faults
+        // (major ones: read back from swap or a file), extra rings, descriptor pools, uploads, GPU time. At most 20 lines every 600 frames
+        static uint64_t lp, c_pso, c_pson, c_skip, c_wait, c_up, c_xr, c_dp, c_gww, c_gpu, win; static long c_mj, c_mn; static int nl;
+        uint64_t now = now_ns(); struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+        uint64_t pso = (uint64_t)g_npso, pson = atomic_load(&g_pso_ns), skip = atomic_load(&g_pso_skipped), wt = atomic_load(&g_wait_cum), up = atomic_load(&g_up_cum),
+                 xr = atomic_load(&g_xring_n), dp = (uint64_t)atomic_load(&g_ndp_total), gww = atomic_load(&g_gw_wait_cum), gpu = atomic_load(&g_gpu_cum);
+        if (n / 600 != win) { win = n / 600; nl = 0; }
+        if (lp && now - lp > 50000000ull && nl < 20) { nl++;
+            LOG("vk: long frame %llu: %.1f ms; new pipelines %llu (%.1f ms), draws left out %llu; waiting for a context %.1f ms, for GPU-written data %.1f ms; page faults %ld major, %ld minor; extra rings %llu, descriptor pools %llu; uploads %.1f MB; GPU %.1f ms",
+                (unsigned long long)n, (now - lp) / 1e6, (unsigned long long)(pso - c_pso), (pson - c_pson) / 1e6, (unsigned long long)(skip - c_skip), (wt - c_wait) / 1e6, (gww - c_gww) / 1e6,
+                ru.ru_majflt - c_mj, ru.ru_minflt - c_mn, (unsigned long long)(xr - c_xr), (unsigned long long)(dp - c_dp), (up - c_up) / 1048576.0, (gpu - c_gpu) / 1e6); }
+        lp = now; c_pso = pso; c_pson = pson; c_skip = skip; c_wait = wt; c_up = up; c_xr = xr; c_dp = dp; c_gww = gww; c_gpu = gpu; c_mj = ru.ru_majflt; c_mn = ru.ru_minflt;
+    }
     if (n == 2) { pthread_t t; if (!pthread_create(&t, NULL, pso_precreate, NULL)) pthread_detach(t); }   // the pipelines earlier runs made, again, behind the game's first frames   // draws are numbered from 0 in each frame; the live control file (vk_ctl)
     {   // pacing for DM_FPS=30 (every frame two vsyncs) and the frame-rate counter's reading
         static uint64_t last, t0, n0; uint64_t now = now_ns();
@@ -3467,6 +3577,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0) { uint64_t gp = atomic_exchange(&g_gpu_kind_ns[0], 0), gd = atomic_exchange(&g_gpu_kind_ns[1], 0), gc = atomic_exchange(&g_gpu_kind_ns[2], 0);
                         LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame (left open %.1f: the attachment it samples was not written in the pass)",
                             gp / 600e6, gd / 600e6, gc / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0, g_nsplit_skip / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; g_nsplit_skip = 0; }
+    if (n % 600 == 0) gsig_report(600);
+    if (n % 600 == 0 && (ubwc_on() || pass_barrier_on())) { LOG("vk: DM_VK_UBWC %d: %llu images made with a format list or not mutable so far, %llu views outside the list; DM_VK_PASS_BARRIER %d: %.1f pass ends a frame without vertex shaders, %.1f vertex-shader barriers a frame",
+        ubwc_on(), (unsigned long long)g_ubwc_imgs, (unsigned long long)g_ubwc_fallback, pass_barrier_on(), g_nbar_narrow / 600.0, g_nbar_vs / 600.0); g_nbar_narrow = g_nbar_vs = 0; }
     if (n % 600 == 0) { LOG("vk: waiting for a free submission context per frame: %.2f ms for its own submission, %.2f ms for a later one still reading its ring (%d contexts)",
                         atomic_exchange(&g_wait_fence_ns, 0) / 600e6, atomic_exchange(&g_wait_hold_ns, 0) / 600e6, NCTX); }
     if (n % 600 == 0) { LOG("vk: per frame over the last 600: GPU %.2f ms, recording %.2f ms, waiting for the GPU %.2f ms, present waiting %.2f ms", atomic_exchange(&g_gpu_ns, 0) / 600e6,
