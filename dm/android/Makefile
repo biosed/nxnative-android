@@ -58,9 +58,9 @@ $(OUT)/obj/%.o: ../% | profile
 	$(CC) $(CFLAGS) -c $< -o $@
 APP_OBJ := $(patsubst %,$(OUT)/obj/android/%.o,app/front_android.c)
 $(OUT)/libdmhost.so: $(OBJ) $(APP_OBJ) gen/vpx/libvpx.a
-	$(CC) -shared -o $@ $(OBJ) $(APP_OBJ) gen/vpx/libvpx.a -Wl,--no-undefined -Wl,--error-limit=0 -Wl,-z,max-page-size=16384 -landroid -llog -laaudio -lvulkan -lmediandk -ljnigraphics -lm -ldl
+	$(CC) -shared -o $@ $(OBJ) $(APP_OBJ) gen/vpx/libvpx.a -Wl,--build-id=sha1 -Wl,--no-undefined -Wl,--error-limit=0 -Wl,-z,max-page-size=16384 -landroid -llog -laaudio -lvulkan -lmediandk -ljnigraphics -lm -ldl
 $(OUT)/dmhost: $(OBJ) $(CLI_OBJ) gen/vpx/libvpx.a
-	$(CC) -pie -o $@ $(OBJ) $(CLI_OBJ) gen/vpx/libvpx.a -Wl,--no-undefined -Wl,--error-limit=0 -Wl,-z,max-page-size=16384 -landroid -llog -laaudio -lvulkan -lmediandk -lm -ldl
+	$(CC) -pie -o $@ $(OBJ) $(CLI_OBJ) gen/vpx/libvpx.a -Wl,--build-id=sha1 -Wl,--no-undefined -Wl,--error-limit=0 -Wl,-z,max-page-size=16384 -landroid -llog -laaudio -lvulkan -lmediandk -lm -ldl
 dmhost: $(OUT)/dmhost
 .PHONY: dmhost
 -include $(shell find gen -name '*.d' 2>/dev/null)
