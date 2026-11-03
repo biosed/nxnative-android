@@ -1109,7 +1109,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
 // from that storage at its next use: half a gigabyte of images in FINAL FANTASY RESONANCE's battles, most of them for places the camera had left. Only textures whose content is
 // their storage (packaged, never rendered into or copied to on the GPU, not written by the CPU since), and only when no submission in flight can use them. While the image memory
 // is above EVICT_FLOOR, those unused for EVICT_AGE frames go; on Android's low-memory signal (dm_vk_trim), those unused for a second
-#define EVICT_FLOOR (192ull << 20)
+#define EVICT_FLOOR (128ull << 20)
 #define EVICT_AGE 900
 static int tex_remake(vtex *v, const tex_t *t) {
     if (vkCreateImage(g_dev, &v->ci, NULL, &v->img) != VK_SUCCESS) { v->img = VK_NULL_HANDLE; RED_ONCE(90, "an evicted texture could not be made again"); return 0; }
@@ -1128,7 +1128,7 @@ static void tex_evict(uint64_t trim_gen) {
     last = n;
     uint64_t held = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) held += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
     if (!trim && held < EVICT_FLOOR) return;
-    static int64_t eage = -1; if (eage < 0) { const char *e = getenv("DM_VK_EVICT_AGE"); eage = e && atoll(e) > 0 ? atoll(e) : 600; }
+    static int64_t eage = -1; if (eage < 0) { const char *e = getenv("DM_VK_EVICT_AGE"); eage = e && atoll(e) > 0 ? atoll(e) : 300; }
     uint64_t age = trim ? 60 : (uint64_t)eage, done; pthread_mutex_lock(&g_mu); done = g_done; pthread_mutex_unlock(&g_mu);
     int nev = 0;
     pthread_mutex_lock(&g_rmu);
@@ -3060,7 +3060,7 @@ static void clear_tex(const p_clear_tex *c) {
 static _Atomic uint64_t g_trim_gen, g_wait_fence_ns, g_wait_hold_ns;
 void dm_vk_trim(void) { atomic_fetch_add(&g_trim_gen, 1); }
 // The low-memory signal (onLowMemory) came too late: the low-memory killer ended the game in the foreground twice (FINAL FANTASY RESONANCE on the Xiaomi Pad 8, RSS 2.4 GB, the
-// system swapping). Every second the backend reads MemAvailable and the process's resident memory; below DM_VK_MEM_LOW_MB (default 1200) available, or past DM_MEM_BUDGET_MB
+// system swapping). Every second the backend reads MemAvailable and the process's resident memory; below DM_VK_MEM_LOW_MB (default 1500) available, or past DM_MEM_BUDGET_MB
 // (default 2000) for the process's resident memory plus the backend's device memory, it trims as for the signal, at most every 5 s: idle textures evicted (60 frames unused), rings
 // back to their minimum, the reuse pools emptied, malloc's free pages given back. The hibernation build's game heap gives its free chunks' pages back every 10 s, and at once then
 #include <malloc.h>
@@ -3069,7 +3069,7 @@ static uint64_t g_heap_released;
 static void mem_watch(void) {
     static uint64_t last, last_trim, last_rel; uint64_t now = now_ns(); if (now - last < 1000000000ull) return; last = now;
     static long low = -1, budget = -1;
-    if (low < 0) { const char *e = getenv("DM_VK_MEM_LOW_MB"); low = e ? atol(e) : 1200; e = getenv("DM_MEM_BUDGET_MB"); budget = e ? atol(e) : 2000; }
+    if (low < 0) { const char *e = getenv("DM_VK_MEM_LOW_MB"); low = e ? atol(e) : 1500; e = getenv("DM_MEM_BUDGET_MB"); budget = e ? atol(e) : 2000; }
     long avail = 0, rss = 0; char ln[128]; FILE *f = fopen("/proc/meminfo", "re"); if (f) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "MemAvailable: %ld", &avail) == 1) break; fclose(f); }
     if ((f = fopen("/proc/self/status", "re"))) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "VmRSS: %ld", &rss) == 1) break; fclose(f); }
     uint64_t gpu = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) gpu += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
