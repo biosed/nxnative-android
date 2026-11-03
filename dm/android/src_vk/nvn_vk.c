@@ -300,7 +300,8 @@ static void gw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDe
 // A read over [addr, addr + size) that earlier submissions still running wrote parts of (Unreal binds its whole GPU-scene buffer; a dispatch updated a few records of it): the guest's
 // bytes copied into the ring, then each written part copied over them from its submission's ring at the start of this submission, oldest first (the upload command buffer; those
 // submissions are done by then). Each source ring is held until this submission is done. Parts this submission itself writes are not in it (no such case met). Caller holds g_gwmu
-static void pass_end(void); static int pass_begin(void); static int g_pass_open_(void);
+static void pass_end_(int line); static int pass_begin(void); static int g_pass_open_(void);
+#define pass_end() pass_end_(__LINE__)   // the line that ends a pass is counted per pass signature (gsig_end: the per-pass table names why its passes end)
 static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align) {
     VkDeviceSize ro = ring_put((const void *)(uintptr_t)addr, size, align); if (ro == VK_WHOLE_SIZE) return ro;
     int cur = 0;
@@ -403,7 +404,9 @@ static void xr_free(uint64_t done) {
 }
 // GPU time per region signature: what each kind of pass or dispatch costs a frame (registered by the submit thread with its description, timed by the completion thread)
 enum { NGSIG = 1024 };
-static struct { uint64_t sig; uint64_t ns, n, draws; char d[120]; } g_gsig[NGSIG]; static pthread_mutex_t g_gsigmu = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint64_t sig; uint64_t ns, n, draws; char d[120]; int eline[4]; uint32_t ecnt[4]; } g_gsig[NGSIG];
+static pthread_mutex_t g_gsigmu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_cur_sig;   // the open pass's signature (pass_begin), for the line that ends it (gsig_end)
 static int gsig_slot(uint64_t sig) { uint32_t i = (uint32_t)(sig ^ sig >> 29) % NGSIG; for (int k = 0; k < NGSIG; k++, i = (i + 1) % NGSIG) if (g_gsig[i].sig == sig || !g_gsig[i].sig) return (int)i; return -1; }   // caller holds g_gsigmu
 static void gsig_name(uint64_t sig, const char *d) {   // the submit thread: a description for a signature met the first time
     if (!sig) return; pthread_mutex_lock(&g_gsigmu); int i = gsig_slot(sig);
@@ -416,6 +419,12 @@ static void gsig_add(uint64_t sig, uint64_t ns, uint32_t draws) {
     pthread_mutex_unlock(&g_gsigmu);
 }
 static uint32_t g_scene_w, g_scene_h;   // the last pass with four or more colour targets (a G-buffer): the resolution the game's dynamic resolution picked (DM_UE_DRS)
+static void gsig_end(uint64_t sig, int line) {   // the submit thread: pass `sig` ended at nvn_vk.c:line
+    if (!sig) return; pthread_mutex_lock(&g_gsigmu); int i = gsig_slot(sig);
+    if (i >= 0 && g_gsig[i].sig == sig) { int k = 0; while (k < 4 && g_gsig[i].ecnt[k] && g_gsig[i].eline[k] != line) k++;
+        if (k < 4) { g_gsig[i].eline[k] = line; g_gsig[i].ecnt[k]++; } }
+    pthread_mutex_unlock(&g_gsigmu);
+}
 static void gsig_report(uint64_t frames) {   // the 10 costliest passes and dispatches over the last frames, then the sums start again
     static int idx[NGSIG]; pthread_mutex_lock(&g_gsigmu);
     for (int kind = 0; kind < 2; kind++) {
@@ -425,9 +434,10 @@ static void gsig_report(uint64_t frames) {   // the 10 costliest passes and disp
         if (!kind) LOG("vk: scene resolution (the last G-buffer pass): %ux%u", g_scene_w, g_scene_h);
         LOG("vk: costliest %s over the last %llu frames (%d kinds, %.2f ms a frame in all):", kind ? "dispatches" : "render passes", (unsigned long long)frames, n, tot / 1e6 / frames);
         for (int a = 0; a < n && a < 10; a++) { const typeof(g_gsig[0]) *e = &g_gsig[idx[a]];
-            LOG("vk:   %.2f ms a frame, %.1f a frame, %.0f draws each: %s", e->ns / 1e6 / frames, (double)e->n / frames, e->n ? (double)e->draws / e->n : 0.0, e->d); }
+            char el[96] = ""; int o = 0; for (int k = 0; k < 4 && e->ecnt[k]; k++) o += snprintf(el + o, sizeof el - o, "%s%d x%.1f", k ? ", " : "; ended at nvn_vk.c:", e->eline[k], (double)e->ecnt[k] / frames);
+            LOG("vk:   %.2f ms a frame, %.1f a frame, %.0f draws each: %s%s", e->ns / 1e6 / frames, (double)e->n / frames, e->n ? (double)e->draws / e->n : 0.0, e->d, el); }
     }
-    for (int i = 0; i < NGSIG; i++) g_gsig[i].ns = g_gsig[i].n = g_gsig[i].draws = 0;
+    for (int i = 0; i < NGSIG; i++) { g_gsig[i].ns = g_gsig[i].n = g_gsig[i].draws = 0; memset(g_gsig[i].ecnt, 0, sizeof g_gsig[i].ecnt); }
     pthread_mutex_unlock(&g_gsigmu);
 }
 static _Atomic uint64_t g_gpu_kind_ns[3];   // GPU time inside render passes, dispatches, copies (gpu_mark); the rest of a submission's span is time between them
@@ -1807,8 +1817,9 @@ static void defer_flush(void) {   // after the pass ended (pass_end): the deferr
 }
 static int pass_barrier_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PASS_BARRIER"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_PASS_BARRIER=1: pass ends do not wait for vertex shaders (their reads of the pass's targets get a barrier)"); } return v; }
 static const uint8_t *g_rt_hold;   // see rt_hold_scan
-static void pass_end(void) {
+static void pass_end_(int line) {
     g_rt_hold = NULL;
+    if (P.open) gsig_end(g_cur_sig, line);
     if (!P.open) { int pend = P.clr_d || P.clr_s; for (int i = 0; i < 8; i++) pend |= P.clr_c[i]; if (pend) pass_begin(); }   // clears with no draw after them still happen
     if (P.open) {
         rp_end(C->cb); P.open = 0; gpu_mark(0, 1);
@@ -1863,7 +1874,7 @@ static int pass_begin(void) {
         if (d.layers > 1 && o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " layers %u", d.layers);
         if (g_after_split && o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " (after a split)");
         #undef SMIX
-        g_tsig_next = h & ~1ull; gsig_name(g_tsig_next, b); g_after_split = 0;
+        g_tsig_next = h & ~1ull; gsig_name(g_tsig_next, b); g_after_split = 0; g_cur_sig = g_tsig_next;
         if (P.n >= 4) { g_scene_w = P.w; g_scene_h = P.h; }
     }
     gpu_mark(0, 0); g_npass++; P.merged = 0;
@@ -3669,16 +3680,17 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         lastp = now; }
     {   // a long frame (over 50 ms from the last present): what it held -- new pipelines, draws left out for theirs, waits for a context and for GPU-written data, page faults
         // (major ones: read back from swap or a file), extra rings, descriptor pools, uploads, GPU time. At most 20 lines every 600 frames
-        static uint64_t lp, c_pso, c_pson, c_skip, c_wait, c_up, c_xr, c_dp, c_gww, c_gpu, win; static long c_mj, c_mn; static int nl;
-        uint64_t now = now_ns(); struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+        static uint64_t lp, c_pso, c_pson, c_skip, c_wait, c_up, c_xr, c_dp, c_gww, c_gpu, win, c_tcpu, c_rec; static long c_mj, c_mn; static int nl;
+        uint64_t now = now_ns(); struct rusage ru, rt; getrusage(RUSAGE_SELF, &ru); getrusage(RUSAGE_THREAD, &rt);
+        uint64_t tcpu = (uint64_t)(rt.ru_utime.tv_sec + rt.ru_stime.tv_sec) * 1000000000ull + (uint64_t)(rt.ru_utime.tv_usec + rt.ru_stime.tv_usec) * 1000ull, rec = atomic_load(&g_rec_ns);
         uint64_t pso = (uint64_t)g_npso, pson = atomic_load(&g_pso_ns), skip = atomic_load(&g_pso_skipped), wt = atomic_load(&g_wait_cum), up = atomic_load(&g_up_cum),
                  xr = atomic_load(&g_xring_n), dp = (uint64_t)atomic_load(&g_ndp_total), gww = atomic_load(&g_gw_wait_cum), gpu = atomic_load(&g_gpu_cum);
         if (n / 600 != win) { win = n / 600; nl = 0; }
         if (lp && now - lp > 50000000ull && nl < 20) { nl++;
-            LOG("vk: long frame %llu: %.1f ms; new pipelines %llu (%.1f ms), draws left out %llu; waiting for a context %.1f ms, for GPU-written data %.1f ms; page faults %ld major, %ld minor; extra rings %llu, descriptor pools %llu; uploads %.1f MB; GPU %.1f ms",
-                (unsigned long long)n, (now - lp) / 1e6, (unsigned long long)(pso - c_pso), (pson - c_pson) / 1e6, (unsigned long long)(skip - c_skip), (wt - c_wait) / 1e6, (gww - c_gww) / 1e6,
+            LOG("vk: long frame %llu: %.1f ms (this thread on the CPU %.1f ms, recording %.1f ms); new pipelines %llu (%.1f ms), draws left out %llu; waiting for a context %.1f ms, for GPU-written data %.1f ms; page faults %ld major, %ld minor; extra rings %llu, descriptor pools %llu; uploads %.1f MB; GPU %.1f ms",
+                (unsigned long long)n, (now - lp) / 1e6, (tcpu - c_tcpu) / 1e6, rec >= c_rec ? (rec - c_rec) / 1e6 : 0.0, (unsigned long long)(pso - c_pso), (pson - c_pson) / 1e6, (unsigned long long)(skip - c_skip), (wt - c_wait) / 1e6, (gww - c_gww) / 1e6,
                 ru.ru_majflt - c_mj, ru.ru_minflt - c_mn, (unsigned long long)(xr - c_xr), (unsigned long long)(dp - c_dp), (up - c_up) / 1048576.0, (gpu - c_gpu) / 1e6); }
-        lp = now; c_pso = pso; c_pson = pson; c_skip = skip; c_wait = wt; c_up = up; c_xr = xr; c_dp = dp; c_gww = gww; c_gpu = gpu; c_mj = ru.ru_majflt; c_mn = ru.ru_minflt;
+        lp = now; c_tcpu = tcpu; c_rec = rec; c_pso = pso; c_pson = pson; c_skip = skip; c_wait = wt; c_up = up; c_xr = xr; c_dp = dp; c_gww = gww; c_gpu = gpu; c_mj = ru.ru_majflt; c_mn = ru.ru_minflt;
     }
     if (n == 2) { pthread_t t; if (!pthread_create(&t, NULL, pso_precreate, NULL)) pthread_detach(t); }   // the pipelines earlier runs made, again, behind the game's first frames   // draws are numbered from 0 in each frame; the live control file (vk_ctl)
     {   // pacing for DM_FPS=30 (every frame two vsyncs) and the frame-rate counter's reading
@@ -3719,7 +3731,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0) {   // memory: the process (RSS, its anonymous part, PSS) and what the backend holds
         long rss = 0, anon = 0, pss = 0; char ln[256]; FILE *f = fopen("/proc/self/status", "re");
         if (f) { while (fgets(ln, sizeof ln, f)) { sscanf(ln, "VmRSS: %ld", &rss); sscanf(ln, "RssAnon: %ld", &anon); } fclose(f); }
-        if ((f = fopen("/proc/self/smaps_rollup", "re"))) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "Pss: %ld", &pss) == 1) break; fclose(f); }
+        static long pss_last; if (n % 6000 == 0 && (f = fopen("/proc/self/smaps_rollup", "re"))) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "Pss: %ld", &pss_last) == 1) break; fclose(f); }   // every 6000 frames: smaps_rollup walks every mapping of the process (the fixed hibernation layout's tens of GB), a 70 ms frame each time it was read every 600
+        pss = pss_last;
         int nb = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) nb++; pthread_mutex_unlock(&g_blkmu);
         long cached = 0, avail = 0; if ((f = fopen("/proc/meminfo", "re"))) { while (fgets(ln, sizeof ln, f)) { sscanf(ln, "Cached: %ld", &cached); sscanf(ln, "MemAvailable: %ld", &avail); } fclose(f); }
         extern _Atomic uint64_t g_fs_dropped;
