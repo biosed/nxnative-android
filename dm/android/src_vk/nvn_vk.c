@@ -162,6 +162,7 @@ static uint32_t g_nwlog;   // writes logged in this generation (wlog_add)
 // Extra rings made and freed every few frames were fresh device memory each time (vkAllocateMemory, mapped: page faults as the CPU first writes them). Freed ones are kept (at most
 // 4, 64 MB in all) and taken again by the next submission that outgrows its ring; the mapping of each live one is remembered by its memory (xring_*)
 static struct { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceSize size; } g_xc[4]; static int g_nxc; static VkDeviceSize g_xc_bytes;
+static int g_mem_low;   // the system is short of memory (mem_watch): nothing is kept for reuse
 static struct { VkDeviceMemory m; void *p; } g_xmap[256]; static int g_nxmap; static pthread_mutex_t g_xcmu = PTHREAD_MUTEX_INITIALIZER; static uint64_t g_xc_reused;
 static VkBuffer xring_get(VkDeviceSize want, VkDeviceSize *size, VkDeviceMemory *m, uint8_t **p) {
     pthread_mutex_lock(&g_xcmu); int best = -1;
@@ -175,7 +176,7 @@ static VkBuffer xring_get(VkDeviceSize want, VkDeviceSize *size, VkDeviceMemory 
 static void xring_put(VkBuffer b, VkDeviceMemory m, VkDeviceSize size) {   // a freed extra ring: kept for reuse, or destroyed
     pthread_mutex_lock(&g_xcmu); void *p = NULL; int k = 0;
     for (; k < g_nxmap; k++) if (g_xmap[k].m == m) { p = g_xmap[k].p; break; }
-    if (p && g_nxc < 4 && g_xc_bytes + size <= (64u << 20)) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); return; }
+    if (p && g_nxc < 4 && g_xc_bytes + size <= (32u << 20) && !g_mem_low) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); return; }
     if (k < g_nxmap) g_xmap[k] = g_xmap[--g_nxmap];
     pthread_mutex_unlock(&g_xcmu);
     vkDestroyBuffer(g_dev, b, NULL); vkFreeMemory(g_dev, m, NULL);
@@ -443,7 +444,7 @@ static void gsig_report(uint64_t frames) {   // the 10 costliest passes and disp
 static _Atomic uint64_t g_gpu_kind_ns[3];   // GPU time inside render passes, dispatches, copies (gpu_mark); the rest of a submission's span is time between them
 // Snapshots of dispatch storage ranges (post kind 5: ~3.5 MB a frame in FINAL FANTASY RESONANCE's castle) came from malloc and went back to free: at that size each one was fresh
 // mapped pages, ~400 page faults a frame on the submit thread (12,450 minor faults a second, 14% of its time in the kernel). They come from a pool now: blocks by power-of-two size
-// (4 KB to 64 MB), kept for reuse up to 128 MB in all; the submit thread takes, the completion thread gives back
+// (4 KB to 64 MB), kept for reuse up to 32 MB in all; the submit thread takes, the completion thread gives back
 enum { SNAP_NC = 15 };   // classes 4 KB << k
 static void *g_snap_free[SNAP_NC][64]; static int g_snap_n[SNAP_NC]; static uint64_t g_snap_kept; static pthread_mutex_t g_snapmu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_snap_hit, g_snap_miss;
@@ -456,7 +457,7 @@ static uint8_t *snap_alloc(size_t n) {
 static void snap_free(void *p, size_t n) {
     int k = snap_class(n); if (k >= SNAP_NC) { free(p); return; }
     pthread_mutex_lock(&g_snapmu);
-    if (g_snap_n[k] < 64 && g_snap_kept + ((size_t)4096 << k) <= (128u << 20)) { g_snap_free[k][g_snap_n[k]++] = p; g_snap_kept += (size_t)4096 << k; p = NULL; }
+    if (g_snap_n[k] < 64 && g_snap_kept + ((size_t)4096 << k) <= (32u << 20)) { g_snap_free[k][g_snap_n[k]++] = p; g_snap_kept += (size_t)4096 << k; p = NULL; }
     pthread_mutex_unlock(&g_snapmu);
     free(p);
 }
@@ -1116,6 +1117,7 @@ static int tex_remake(vtex *v, const tex_t *t) {
     v->blk = img_mem(mr, &v->m, &off); v->moff = off; v->msize = mr.size; VKCHECK(vkBindImageMemory(g_dev, v->img, v->m, off));
     to_general(C->up, v->img, v->aspect); C->up_used = 1;
     v->evicted = 0; g_remade++;
+    v->gpu_lv &= ~v->mir_lv;   // levels a GPU copy wrote come back from the storage they were mirrored into
     tex_upload(v, t);
     return 1;
 }
@@ -1126,11 +1128,12 @@ static void tex_evict(uint64_t trim_gen) {
     last = n;
     uint64_t held = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) held += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
     if (!trim && held < EVICT_FLOOR) return;
-    uint64_t age = trim ? 60 : EVICT_AGE, done; pthread_mutex_lock(&g_mu); done = g_done; pthread_mutex_unlock(&g_mu);
+    static int64_t eage = -1; if (eage < 0) { const char *e = getenv("DM_VK_EVICT_AGE"); eage = e && atoll(e) > 0 ? atoll(e) : 600; }
+    uint64_t age = trim ? 60 : (uint64_t)eage, done; pthread_mutex_lock(&g_mu); done = g_done; pthread_mutex_unlock(&g_mu);
     int nev = 0;
     pthread_mutex_lock(&g_rmu);
     for (int hh = 0; hh < NHASH; hh++) for (vtex *v = g_tex[hh]; v; v = v->next) {
-        if (v->dead || v->evicted || !v->packaged || v->gpu || v->gpu_lv || v->dirty || !v->img || v->last_fence > done || n - v->last_frame < age) continue;
+        if (v->dead || v->evicted || !v->packaged || v->gpu || (v->gpu_lv & ~v->mir_lv) || v->dirty || !v->img || v->last_fence > done || n - v->last_frame < age) continue;   // levels GPU copies wrote count when their bytes were mirrored into the storage (mir_lv)
         for (int k = 0; k < v->nviews; k++) vkDestroyImageView(g_dev, v->views[k].v, NULL);
         free(v->views); v->views = NULL; v->nviews = 0;
         vkDestroyImage(g_dev, v->img, NULL); img_mem_free(v->blk, v->m, v->moff, v->msize); v->img = VK_NULL_HANDLE; v->evicted = 1; nev++;
@@ -3056,7 +3059,24 @@ static void clear_tex(const p_clear_tex *c) {
 // The context's own ring sized to what its submissions take (its previous one is complete, and nothing holds its ring: mtl_sub_begin waited for both)
 static _Atomic uint64_t g_trim_gen, g_wait_fence_ns, g_wait_hold_ns;
 void dm_vk_trim(void) { atomic_fetch_add(&g_trim_gen, 1); }
-void tex_evict_hook(void) { tex_evict(atomic_load(&g_trim_gen)); }   // the front end's low-memory signal (app/front_android.c): every ring back to RING_MIN at its next use
+// The low-memory signal (onLowMemory) came too late: the low-memory killer ended the game in the foreground twice (FINAL FANTASY RESONANCE on the Xiaomi Pad 8, RSS 2.4 GB, the
+// system swapping). Every second the backend reads MemAvailable; below DM_VK_MEM_LOW_MB (default 1200) it trims as for the signal, at most every 5 s: idle textures evicted (60
+// frames unused), rings back to their minimum, the reuse pools emptied, malloc's free pages given back. Logged with what was available
+#include <malloc.h>
+static void mem_watch(void) {
+    static uint64_t last, last_trim; uint64_t now = now_ns(); if (now - last < 1000000000ull) return; last = now;
+    static long low = -1; if (low < 0) { const char *e = getenv("DM_VK_MEM_LOW_MB"); low = e ? atol(e) : 1200; }
+    long avail = 0; char ln[128]; FILE *f = fopen("/proc/meminfo", "re"); if (f) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "MemAvailable: %ld", &avail) == 1) break; fclose(f); }
+    g_mem_low = avail > 0 && avail / 1024 < low;
+    if (!g_mem_low || now - last_trim < 5000000000ull) return;
+    last_trim = now; atomic_fetch_add(&g_trim_gen, 1);
+    pthread_mutex_lock(&g_snapmu); for (int k = 0; k < SNAP_NC; k++) { while (g_snap_n[k]) free(g_snap_free[k][--g_snap_n[k]]); } g_snap_kept = 0; pthread_mutex_unlock(&g_snapmu);
+    pthread_mutex_lock(&g_xcmu); while (g_nxc) { g_nxc--; vkDestroyBuffer(g_dev, g_xc[g_nxc].b, NULL); vkFreeMemory(g_dev, g_xc[g_nxc].m, NULL);
+        for (int k = 0; k < g_nxmap; k++) if (g_xmap[k].m == g_xc[g_nxc].m) { g_xmap[k] = g_xmap[--g_nxmap]; break; } } g_xc_bytes = 0; pthread_mutex_unlock(&g_xcmu);
+    mallopt(M_PURGE, 0);
+    static int nl; if (nl++ < 20) LOG("vk: memory low (%ld MB available, under %ld): idle textures evicted, rings back to their minimum, reuse pools emptied", avail / 1024, low);
+}
+void tex_evict_hook(void) { mem_watch(); tex_evict(atomic_load(&g_trim_gen)); }   // the front end's low-memory signal (app/front_android.c): every ring back to RING_MIN at its next use
 static void ring_fit(ctx_t *c) {
     c->last_total = c->total; if (c->total > c->win_max) c->win_max = c->total;
     VkDeviceSize want = c->ring0_size; uint64_t tg = atomic_load(&g_trim_gen);

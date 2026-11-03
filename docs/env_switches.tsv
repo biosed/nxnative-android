@@ -324,9 +324,11 @@ DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to
 DM_VK_CTX	test	Android: `=<n>` (4..32, default 20) submission contexts: how far the CPU may record ahead of the GPU; each holds a ring (4 MB and up)
 DM_VK_DIR	path	Android: the folder of the shaders' SPIR-V (`<key>.spv`, `<key>.vk.txt` from dm/android/tools/spv_android.py) and the pipeline cache
 DM_VK_DISPATCH_DEFER	test	Android: `1` records a dispatch met inside an open render pass after that pass instead of ending it, when it reads none of the pass's attachments; a draw reading what it writes ends the pass first. Default 0
+DM_VK_EVICT_AGE	switch	Android: frames a storage-backed texture stays unused before its image is evicted (default 600; made again from its storage at its next use)
 DM_VK_GPU_TS	test	Android: `0` gives every counter timestamp of a submission its completion time, as before vk19.14 (now TIMESTAMP_TOP takes the submission's GPU start)
 DM_VK_LATE_FILL	test	Android: `0` leaves out vk19.5's late fill (a texture drawn before the game wrote its storage is watched and uploaded when the data comes)
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
+DM_VK_MEM_LOW_MB	switch	Android: below this MemAvailable (MB, default 1200; 0 off) the Vulkan backend trims every 5 s at most: idle textures evicted, rings to their minimum, reuse pools emptied, malloc's free pages returned
 DM_VK_MIRROR	test	Android: `0` leaves out vk19.6's mirrors (a GPU copy into a storage-backed texture is written into its storage too)
 DM_VK_NO_DYNREND	test	Android: `1` uses render passes made per pass even where dynamic rendering is available (the path for Vulkan 1.1 / 1.2 GPUs without it)
 DM_VK_NO_TIMELINE	test	Android: set, submissions are not chained by a timeline semaphore even where the GPU has one
