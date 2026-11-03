@@ -183,6 +183,7 @@ typedef struct {
 } ctx_t;
 enum { TRN = 48 };
 static _Atomic uint64_t g_gpu_ns, g_gpu_cum;   // g_gpu_cum: never reset (the long-frame lines)
+static _Atomic uint64_t g_tex_made;   // textures made (vtex), for the memory watch's per-second line
 static _Atomic uint64_t g_wait_cum, g_gw_wait_cum, g_up_cum, g_xring_n;   // cumulative: context waits, waits on GPU-written data, upload bytes, extra rings made (long frames)
 static ctx_t g_ctx[NCTX_MAX]; static ctx_t *C; static int g_ci;
 static uint64_t g_fence, g_done;
@@ -1079,6 +1080,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
     fmt_t f = fmt_of(t->d.format);
     if (!f.f) { static int n; if (n++ < 8) LOG("[RED] vk: texture format %#x has no Vulkan format yet (serial %llu)", t->d.format, (unsigned long long)t->serial); return NULL; }
     if (t->d.target == NVN_TEXTURE_TARGET_BUFFER) { RED_ONCE(3, "buffer textures are not implemented yet"); return NULL; }
+    atomic_fetch_add(&g_tex_made, 1);
     v = calloc(1, sizeof *v); v->serial = t->serial; v->f = f; v->nvn_fmt = t->d.format; v->target = t->d.target; v->mem = t->mem; v->len = t->L.size;
     v->w = t->d.width ? t->d.width : 1; v->h = t->d.height ? t->d.height : 1; v->levels = t->d.levels ? t->d.levels : 1;
     int is3d = t->d.target == NVN_TEXTURE_TARGET_3D, cube = t->d.target == NVN_TEXTURE_TARGET_CUBEMAP || t->d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
@@ -3145,6 +3147,19 @@ static void heap_release_kick(void) {
 // (no longer every second while memory is low: the walk takes the heap's locks while the game allocates hardest). A line each second the heap, the resident memory or MemAvailable
 // moved a lot ([mem] last second), at most 300
 int64_t dm_ue_heap_used(void), dm_ue_heap_big(void);   // hle_uemalloc.c
+// IO back-pressure (vk19.33): the memory watch samples MemAvailable every 100 ms; below DM_IO_THROTTLE_AVAIL_MB (default 900), or 300 MB lower than a second before, the file system's
+// reads wait a little (hle_fs.c io_throttle) so that reclaim and swap catch up before the low-memory killer acts. dm_mem_io_pressure: MemAvailable in MB under pressure, else 0
+static _Atomic long g_io_press;
+int dm_mem_io_pressure(void) { return (int)atomic_load(&g_io_press); }
+static void io_pressure_sample(uint64_t now) {
+    static long hist[10]; static int hi, hn; static long lim = -1; static uint64_t last;
+    if (now - last < 90000000ull) return; last = now;
+    if (lim < 0) { const char *e = getenv("DM_IO_THROTTLE_AVAIL_MB"); lim = e ? atol(e) : 900; }
+    long avail = 0; char ln[128]; FILE *f = fopen("/proc/meminfo", "re"); if (f) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "MemAvailable: %ld", &avail) == 1) break; fclose(f); }
+    if (avail <= 0) return;
+    avail /= 1024; long old = hn == 10 ? hist[hi] : avail; hist[hi] = avail; hi = (hi + 1) % 10; if (hn < 10) hn++;
+    atomic_store(&g_io_press, (avail < lim || old - avail > 300) ? (avail > 0 ? avail : 1) : 0);
+}
 static void mem_watch(void) {
     static uint64_t last, last_trim, last_rel, pre_until; static int64_t pbase = -1, hbase = -1, bbase; static long pavail, prss; static int nline;
     static long low = -1, budget = -1, pre_mb, pre_avail;
@@ -3155,6 +3170,7 @@ static void mem_watch(void) {
         LOG("vk: memory watch: trim below %ld MB available or past %ld MB; early trim %s (game heap +%ld MB, under %ld MB available)", low, budget, on ? "on" : "off", pre_mb, pre_avail);
     }
     uint64_t now = now_ns(); int64_t hu = dm_ue_heap_used();
+    io_pressure_sample(now);
     int jump = pre_mb > 0 && pbase >= 0 && hu - pbase >= (int64_t)pre_mb << 20 && now - last_trim >= 2000000000ull;
     if (!jump && now - last < 1000000000ull) return;
     int tick = now - last >= 1000000000ull; if (tick) last = now;
@@ -3181,6 +3197,9 @@ static void mem_watch(void) {
                 drv / 1048576.0, bud / 1048576.0, g_has_budget ? "" : ", no VK_EXT_memory_budget", all / 1048576.0, (long long)atomic_load(&g_dm_n), blk / 1048576.0, rg / 1048576.0, xr / 1048576.0, kept / 1048576.0,
                 bi / 1048576.0, fb / 1048576.0, (all - blk - rg - xr - kept - bi - fb) / 1048576.0);
         }
+        { static uint64_t pup, ptm; uint64_t up = atomic_load(&g_up_cum), tm = atomic_load(&g_tex_made);
+          if (hbase >= 0 && (up - pup >= (64ull << 20) || drss >= 64) && nline++ < 300) LOG("[mem] last second: texture uploads %.0f MB, %llu textures made", (up - pup) / 1048576.0, (unsigned long long)(tm - ptm));
+          pup = up; ptm = tm; }
         hbase = hu; bbase = dm_ue_heap_big(); prss = rss; pavail = avail; pdrv = drv;
     }
     int is_low = low > 0 && avail > 0 && avail / 1024 < low, over = budget > 0 && ours > budget;
