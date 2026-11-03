@@ -102,7 +102,12 @@ static void img_mem_free(int blk, VkDeviceMemory m, VkDeviceSize off, VkDeviceSi
 }
 
 // ---------- Submission contexts: command buffers, ring buffer, descriptor pool, the writes that wait for completion ----------
-#define NCTX 12   // ~1.3 frames of Unreal's ~9 submissions (24 bought nothing on a GPU-bound frame and cost ring memory): with 8 the CPU could not get one frame ahead, and reusing a context whose ring a later submission still read (its hold) drained the GPU first: CPU and GPU took turns (recording 12.7 + waiting 12.5 ms a frame) // submissions in flight: Unreal submits several command buffers a frame, and with 3 the CPU could not record a frame ahead of the GPU
+#define NCTX_MAX 32
+// Submission contexts (DM_VK_CTX=<n>, 4..32, default 20). 12 was ~1.3 frames of Unreal's ~9 submissions, chosen while frames were GPU-bound ("24 bought nothing"). With the
+// GPU at 37 ms of a 73 ms frame (FINAL FANTASY RESONANCE's castle, vk19.8) the CPU waited 26 ms a frame for a context whose ring a later submission of the same frame still read
+// (its hold): CPU and GPU took turns. More contexts let the CPU record the next frame while the GPU runs this one; each costs a ring (4 MB up, following use)
+static int NCTX = 20;
+// earlier: NCTX 12   // ~1.3 frames of Unreal's ~9 submissions (24 bought nothing on a GPU-bound frame and cost ring memory): with 8 the CPU could not get one frame ahead, and reusing a context whose ring a later submission still read (its hold) drained the GPU first: CPU and GPU took turns (recording 12.7 + waiting 12.5 ms a frame) // submissions in flight: Unreal submits several command buffers a frame, and with 3 the CPU could not record a frame ahead of the GPU
 #define NOQ 4096   // occlusion queries per submission
 #define NTQ 1024   // GPU timestamps per submission (512 regions)
 // Ring sizes: each context's own ring starts at RING_MIN and follows what its submissions use (ring_fit: grown to the peak, up to RING_MAX; halved after a stretch that used less
@@ -137,10 +142,10 @@ typedef struct {
 } ctx_t;
 enum { TRN = 48 };
 static _Atomic uint64_t g_gpu_ns;
-static ctx_t g_ctx[NCTX]; static ctx_t *C; static int g_ci;
+static ctx_t g_ctx[NCTX_MAX]; static ctx_t *C; static int g_ci;
 static uint64_t g_fence, g_done;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
-static int g_pend[NCTX], g_npend;   // contexts submitted and not yet completed, in order (under g_mu)
+static int g_pend[NCTX_MAX], g_npend;   // contexts submitted and not yet completed, in order (under g_mu)
 
 static uint64_t g_wgen;   // a new generation when the ring changes or the write log overflows: the per-submission copies are reused only within one (and only where no write since overlaps them, copy_in)
 static uint32_t g_nwlog;   // writes logged in this generation (wlog_add)
@@ -214,7 +219,7 @@ static VkDeviceSize ring_put(const void *src, VkDeviceSize n, VkDeviceSize align
 // and bytes the CPU had rewritten there in between (Unreal's per-frame uploads into buffers a compute pass also binds) were read stale. Caller holds g_gwmu
 // Cost: a partial read takes the whole range's answer first (one compare a submission): a range the CPU left alone is clean in every part of it. DM_VK_STALE_PATCH=0 leaves
 // the comparison out (the GPU's bytes as they are, as before vk19.3). g_t_stale / g_stale_bytes: time and bytes in these compares and patches (the recording line)
-static uint64_t g_t_stale, g_stale_bytes;
+static uint64_t g_t_stale, g_stale_bytes, g_t_patch, g_patch_regions, g_npatch;   // g_t_patch: the part in gw_patch; regions: copy regions it recorded
 static int stale_patch_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STALE_PATCH"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_STALE_PATCH=0: reads of an earlier submission's GPU-written range take its bytes as they are"); } return v; }
 static int gw_whole_dirty(gw_t *e) {
     if (e->chk != g_fence + 1) { e->chk = g_fence + 1; e->dirty = memcmp((const void *)(uintptr_t)e->addr, e->snap, e->size) != 0; g_stale_bytes += e->size; }
@@ -245,7 +250,7 @@ static void gw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDe
         if (nr == crg) { size_t c2 = crg ? 2 * crg : 256; VkBufferCopy *r2 = realloc(rg, c2 * sizeof *rg); if (!r2) break; rg = r2; crg = c2; }
         rg[nr++] = (VkBufferCopy){a, a, i - a};
     }
-    g_stale_bytes += n;
+    g_stale_bytes += n; g_patch_regions += nr; g_npatch++;
     if (nr) {
         uint64_t first = rg[0].srcOffset, last = rg[nr - 1].srcOffset + rg[nr - 1].size;
         VkDeviceSize st = ring_put(g + first, last - first, 16);
@@ -257,7 +262,7 @@ static void gw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDe
             C->up_used = 1;
         }
     }
-    g_t_stale += now_ns() - t0;
+    g_t_stale += now_ns() - t0; g_t_patch += now_ns() - t0;
 }
 // A read over [addr, addr + size) that earlier submissions still running wrote parts of (Unreal binds its whole GPU-scene buffer; a dispatch updated a few records of it): the guest's
 // bytes copied into the ring, then each written part copied over them from its submission's ring at the start of this submission, oldest first (the upload command buffer; those
@@ -560,6 +565,7 @@ static void vk_init_(void) {
         p_end_rendering = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(g_dev, dv >= VK_API_VERSION_1_3 ? "vkCmdEndRendering" : "vkCmdEndRenderingKHR");
         if (!p_begin_rendering || !p_end_rendering) g_dynrend = 0;
     }
+    { const char *e = getenv("DM_VK_CTX"); if (e && *e) { int n = atoi(e); NCTX = n < 4 ? 4 : n > NCTX_MAX ? NCTX_MAX : n; } LOG("vk: %d submission contexts (DM_VK_CTX)", NCTX); }
     for (int i = 0; i < NCTX; i++) {
         ctx_t *c = &g_ctx[i];
         VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, g_qf};   // reset as a whole each submission (mtl_sub_begin)
@@ -3367,14 +3373,14 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                           (unsigned long long)g_tex_miss[1], (unsigned long long)g_tex_miss[2], (unsigned long long)g_tex_miss[3], (unsigned long long)g_tex_dead, (unsigned long long)g_treg_dead);
     if (n % 600 == 0) { extern uint64_t g_nsub_stat; static uint64_t ls;
         LOG("vk: recording per frame over the last 600: draws %.2f ms (descriptor sets %.2f ms, %.0f%% reused), dispatches %.2f ms, texture uploads %.2f ms (%.1f MB), vkQueueSubmit %.2f ms; %.1f submissions a frame;"
-            " GPU-written data of a running submission used in place %llu times, copied %llu times, waited for %llu times (%.2f ms a frame; indirect draws %llu, partial ranges %llu, misfits in-submission %llu); copies from GPU-written bytes: into textures %llu, buffers %llu; dispatch write-backs %.1f KB of %.1f KB looked at; reads of an earlier submission's GPU-written range: its bytes as they are %llu, with the CPU's rewrites since patched in %llu; texture copies from guest memory over a dispatch's range %llu; those compares and patches %.2f ms (%.1f MB compared); held-pass sampling checks %.2f ms; GPU-written range lookups %.0f a frame, %.0f answered at once, %.0f entries looked at",
+            " GPU-written data of a running submission used in place %llu times, copied %llu times, waited for %llu times (%.2f ms a frame; indirect draws %llu, partial ranges %llu, misfits in-submission %llu); copies from GPU-written bytes: into textures %llu, buffers %llu; dispatch write-backs %.1f KB of %.1f KB looked at; reads of an earlier submission's GPU-written range: its bytes as they are %llu, with the CPU's rewrites since patched in %llu; texture copies from guest memory over a dispatch's range %llu; those compares and patches %.2f ms (%.1f MB compared; patches %.2f ms, %.1f a frame, %.0f copy regions a frame); held-pass sampling checks %.2f ms; GPU-written range lookups %.0f a frame, %.0f answered at once, %.0f entries looked at",
             g_t_draw / 600e6, g_t_ws / 600e6, g_dsc_hit + g_dsc_miss ? 100.0 * g_dsc_hit / (g_dsc_hit + g_dsc_miss) : 0.0, g_t_disp / 600e6, g_t_up / 600e6, g_up_bytes / 600e6 * 1e3 / 1e3, g_t_sub / 600e6,
             (g_nsub_stat - ls) / 600.0, (unsigned long long)atomic_exchange(&g_gw_held, 0), (unsigned long long)atomic_exchange(&g_gw_copied, 0), (unsigned long long)atomic_exchange(&g_gw_waits, 0), atomic_exchange(&g_gw_wait_ns, 0) / 600e6,
             (unsigned long long)atomic_exchange(&g_gw_why[0], 0), (unsigned long long)atomic_exchange(&g_gw_why[1], 0), (unsigned long long)atomic_exchange(&g_gw_why[2], 0),
             (unsigned long long)atomic_exchange(&g_gw_b2t, 0), (unsigned long long)atomic_exchange(&g_gw_b2b, 0), g_wb_words * 4 / 1024.0, g_wb_bytes / 1024.0,
             (unsigned long long)atomic_exchange(&g_gw_gpu_reads, 0), (unsigned long long)atomic_exchange(&g_gw_cpu_fix, 0), (unsigned long long)atomic_exchange(&g_gw_b2t_guest, 0),
-            g_t_stale / 600e6, g_stale_bytes / 600.0 / 1048576.0, g_t_split / 600e6, g_gw_calls / 600.0, g_gw_quick / 600.0, g_gw_walked / 600.0);
-        g_wb_words = g_wb_bytes = 0; g_t_stale = g_stale_bytes = 0; g_t_split = 0; g_gw_calls = g_gw_quick = g_gw_walked = 0;
+            g_t_stale / 600e6, g_stale_bytes / 600.0 / 1048576.0, g_t_patch / 600e6, g_npatch / 600.0, g_patch_regions / 600.0, g_t_split / 600e6, g_gw_calls / 600.0, g_gw_quick / 600.0, g_gw_walked / 600.0);
+        g_wb_words = g_wb_bytes = 0; g_t_stale = g_stale_bytes = 0; g_t_patch = g_patch_regions = g_npatch = 0; g_t_split = 0; g_gw_calls = g_gw_quick = g_gw_walked = 0;
         ls = g_nsub_stat; g_t_draw = g_t_ws = g_t_disp = g_t_up = g_t_sub = 0; g_up_bytes = 0; g_dsc_hit = g_dsc_miss = 0; }
     if (n % 600 == 0) {   // memory: the process (RSS, its anonymous part, PSS) and what the backend holds
         long rss = 0, anon = 0, pss = 0; char ln[256]; FILE *f = fopen("/proc/self/status", "re");
