@@ -515,6 +515,14 @@ static void vk_init_(void) {
         has_sc |= !strcmp(ep[i].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME); has_u8 |= !strcmp(ep[i].extensionName, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
         has_dr |= !strcmp(ep[i].extensionName, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
     }
+    {   // Reading an attachment inside its own pass (a held pass's depth sampled by a contact-shadow draw, now a split: vk19.4) needs one of these; logged to see which this GPU has
+        static const char *const fl[] = {"VK_EXT_attachment_feedback_loop_layout", "VK_EXT_attachment_feedback_loop_dynamic_state", "VK_KHR_dynamic_rendering_local_read",
+                                         "VK_EXT_rasterization_order_attachment_access", "VK_ARM_rasterization_order_attachment_access"};
+        char b[512]; int o = 0;
+        for (size_t k = 0; k < sizeof fl / sizeof *fl; k++) { uint32_t sv = 0; for (uint32_t i = 0; i < ne; i++) if (!strcmp(ep[i].extensionName, fl[k])) sv = ep[i].specVersion ? ep[i].specVersion : 1;
+            o += snprintf(b + o, sizeof b - o, "%s%s %s", k ? ", " : "", fl[k], sv ? "yes" : "no"); }
+        LOG("vk: in-pass attachment reads: %s (Vulkan %u.%u, driver %#x)", b, VK_API_VERSION_MAJOR(dv), VK_API_VERSION_MINOR(dv), g_props.driverVersion);
+    }
     free(ep);
     VkPhysicalDeviceIndexTypeUint8FeaturesEXT u8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT};
     VkPhysicalDeviceDynamicRenderingFeaturesKHR dr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
