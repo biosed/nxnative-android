@@ -538,6 +538,28 @@ static void on_resume(ANativeActivity *a) { (void)a; }
 // Android is short of memory (other apps are being killed): free pages go back to the system now, and the graphics backend's rings shrink to their minimum (dm_vk_trim)
 void dm_vk_trim(void) __attribute__((weak));
 static void on_low_memory(ANativeActivity *a) { (void)a; LOG("front end: low memory: freeing what can be freed"); mallopt(M_PURGE, 0); if (dm_vk_trim) dm_vk_trim(); }
+// onTrimMemory (TrimWatch.java): RUNNING_LOW (10) and up purge as onLowMemory does; RUNNING_MODERATE (5) is only logged
+static void JNICALL trim_native(JNIEnv *env, jclass cl, jint level) {
+    (void)env; (void)cl; static int nl;
+    if (nl++ < 30) LOG("front end: onTrimMemory level %d%s", (int)level, level >= 10 ? ": freeing what can be freed" : "");
+    if (level >= 10) { mallopt(M_PURGE, 0); if (dm_vk_trim) dm_vk_trim(); }
+}
+static void trim_watch(ANativeActivity *a) {   // TrimWatch.register(activity), through the activity's class loader, with nativeTrim bound to trim_native
+    JNIEnv *env = a->env;
+    jobject ld = (*env)->CallObjectMethod(env, a->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "getClassLoader", "()Ljava/lang/ClassLoader;"));
+    jstring nm = (*env)->NewStringUTF(env, "com.nxnative.TrimWatch");
+    jclass cl = ld ? (jclass)(*env)->CallObjectMethod(env, ld, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, ld), "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;"), nm) : NULL;
+    if (cl && !(*env)->ExceptionCheck(env)) {
+        JNINativeMethod m = {"nativeTrim", "(I)V", (void *)trim_native};
+        if ((*env)->RegisterNatives(env, cl, &m, 1) == 0) {
+            jmethodID r = (*env)->GetStaticMethodID(env, cl, "register", "(Landroid/content/Context;)V");
+            if (r && !(*env)->ExceptionCheck(env)) (*env)->CallStaticVoidMethod(env, cl, r, a->clazz);
+        }
+    }
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); LOG("[RED] front end: TrimWatch not registered: only onLowMemory reaches the host"); }
+    else LOG("front end: onTrimMemory watched (TrimWatch)");
+    (*env)->DeleteLocalRef(env, nm);
+}
 static void on_pause(ANativeActivity *a) { (void)a; dm_focus_set(2); }   // still visible behind something (a dialog, a split screen): out of focus, running
 static void on_focus(ANativeActivity *a, int f) { if (f) immersive(a); else input_release_all(); dm_focus_set(f ? 1 : 2); }
 // Destroyed by the player leaving (− and + held, back_to_menu, finish) the game ends; destroyed by Android while the process stays (to reclaim memory, its activity
@@ -563,6 +585,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     ANativeActivity_setWindowFlags(a, 0x80 /* KEEP_SCREEN_ON */ | 0x400 /* FULLSCREEN */, 0);
     immersive(a);
     if (g_booted) return;   // the activity can be made again (rotation, a return): the host runs once per process
+    trim_watch(a);
     snprintf(g_files, sizeof g_files, "%s", a->internalDataPath);
     mallopt(M_DECAY_TIME, 1);   // freed memory (Unreal's heap runs on host malloc) goes back to the system after about a second instead of being kept
     char mk[600]; marker_path(mk, sizeof mk, "game_running");
