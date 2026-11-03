@@ -322,6 +322,7 @@ DM_VK_MIRROR	test	Android: `0` leaves out vk19.6's mirrors (a GPU copy into a st
 DM_VK_NO_DYNREND	test	Android: `1` uses render passes made per pass even where dynamic rendering is available (the path for Vulkan 1.1 / 1.2 GPUs without it)
 DM_VK_NO_TIMELINE	test	Android: set, submissions are not chained by a timeline semaphore even where the GPU has one
 DM_VK_PASSLOG	diagnostic	Android: `=<frame>[+]` logs that frame's passes, draws, copies and dispatches (targets, clears, shaders, depth / stencil / blend)
+DM_VK_PREWARM_KEEP	test	Android: `0` makes the shader pre-warm destroy each pipeline right after making it (only the driver's pipeline cache stays warm); a pipeline is made again from that cache at its first use. Default 1 keeps them all alive
 DM_VK_RTDUMP	diagnostic	Android: `=<frame>[,<frames>]` writes every render target of that frame (and the next ones) as raw files into DM_VK_SHOT_DIR
 DM_VK_RTDUMP_DEC	diagnostic	Android: with DM_VK_RTDUMP, also writes the textures decoded from BC4-7 on upload
 DM_VK_RT_HOLD	test	Android: `0` turns the SetRenderTargets detour hold off: every SetRenderTargets ends the open pass

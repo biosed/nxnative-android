@@ -1780,7 +1780,7 @@ typedef struct {
     VkFormat cf[8]; int nc; VkFormat df; int stencil;
     float line_w; int restart, dual;   // line_w: line primitives only (0 otherwise); dual: blends with the second source, through the pixel shader's mod_dual
 } pso_key;
-typedef struct { pso_key k; uint64_t h; VkPipeline p; VkPipelineLayout pl; _Atomic int state; } pso_ent;   // state: 0 being compiled (pso_worker), 1 ready (p may be NULL: failed)
+typedef struct { pso_key k; uint64_t h; VkPipeline p; VkPipelineLayout pl; _Atomic int state; uint8_t rewarm; } pso_ent;   // state: 0 being compiled (pso_worker), 1 ready (p may be NULL: failed), 3 warm: made once by the pre-warm and destroyed (DM_VK_PREWARM_KEEP=0), made again from the driver's cache at its first use; rewarm: being made again so
 static int g_npso; static _Atomic uint64_t g_pso_ns;   // pipelines made, and the time spent making them (mtl_create_ns: the long-frame lines)
 static uint64_t fnv(const void *p, size_t n) { const uint8_t *b = p; uint64_t h = 0xcbf29ce484222325ull; while (n--) h = (h ^ *b++) * 0x100000001b3ull; return h; }
 static VkBlendFactor bfac(int f) {
@@ -1866,14 +1866,22 @@ static VkPipeline pso_create(const pso_key *k, VkPipelineLayout pl) {
 static pso_ent **g_psot; static uint32_t g_psot_cap; static _Atomic uint64_t g_pso_async, g_pso_skipped; static _Atomic int g_pso_pending;
 static uint64_t g_pso_last_new;   // the frame of the last new pipeline (pcache_save soon after)
 static pthread_mutex_t g_psoq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_psoq_cv = PTHREAD_COND_INITIALIZER; static pso_ent **g_psoq; static int g_npsoq, g_cpsoq;
+static _Atomic uint64_t g_pso_rewarm, g_pso_rewarm_ns;   // warm pipelines made again at their first use, and the time that took (DM_VK_PREWARM_KEEP=0)
 static void *pso_worker(void *a) {
     (void)a;
     for (;;) {
         pthread_mutex_lock(&g_psoq_mu); while (!g_npsoq) pthread_cond_wait(&g_psoq_cv, &g_psoq_mu);
         pso_ent *e = g_psoq[0]; memmove(g_psoq, g_psoq + 1, --g_npsoq * sizeof *g_psoq); pthread_mutex_unlock(&g_psoq_mu);
-        e->p = pso_create(&e->k, e->pl); atomic_store_explicit(&e->state, 1, memory_order_release); atomic_fetch_sub(&g_pso_pending, 1);
+        uint64_t t0 = now_ns(); e->p = pso_create(&e->k, e->pl); if (e->rewarm) atomic_fetch_add(&g_pso_rewarm_ns, now_ns() - t0);
+        atomic_store_explicit(&e->state, 1, memory_order_release); atomic_fetch_sub(&g_pso_pending, 1);
     }
     return NULL;
+}
+static void pso_enqueue(pso_ent *e) {
+    pthread_mutex_lock(&g_psoq_mu);
+    if (g_npsoq == g_cpsoq) { g_cpsoq = g_cpsoq ? 2 * g_cpsoq : 64; g_psoq = realloc(g_psoq, g_cpsoq * sizeof *g_psoq); }
+    g_psoq[g_npsoq++] = e; atomic_fetch_add(&g_pso_pending, 1); atomic_fetch_add(&g_pso_async, 1);
+    pthread_cond_signal(&g_psoq_cv); pthread_mutex_unlock(&g_psoq_mu);
 }
 // Every pipeline made is recorded (pipeline_keys.bin beside the pipeline cache: its shaders' keys and the rest of its key), and the next run makes them all again on a thread of its
 // own after its first frame (pso_precreate), so an effect or a skill met once does not stall the game when it comes back, also when the driver's cache dropped the pipeline
@@ -1908,22 +1916,31 @@ static VkPipeline pso_get(const pso_key *k, VkPipelineLayout pl, int may_wait) {
     pso_ent *e = pso_find_(k, h, &i);
     if (e) {
         pthread_mutex_unlock(&g_psomu);
-        if (atomic_load_explicit(&e->state, memory_order_acquire)) return e->p;
-        if (may_wait) { while (!atomic_load_explicit(&e->state, memory_order_acquire)) usleep(200); return e->p; }   // a worker has it: wait for that one
-        atomic_fetch_add(&g_pso_skipped, 1); return VK_NULL_HANDLE;
+        for (;;) {
+            int st = atomic_load_explicit(&e->state, memory_order_acquire);
+            if (st == 1) return e->p;
+            if (st == 3) {   // warm (made by the pre-warm, then destroyed): made again now, from the driver's cache
+                int exp = 3; if (!atomic_compare_exchange_strong(&e->state, &exp, 0)) continue;
+                e->rewarm = 1; atomic_fetch_add(&g_pso_rewarm, 1);
+                if (may_wait) { uint64_t t0 = now_ns(); e->p = pso_create(k, pl); atomic_fetch_add(&g_pso_rewarm_ns, now_ns() - t0); atomic_store_explicit(&e->state, 1, memory_order_release); return e->p; }
+                pso_enqueue(e); atomic_fetch_add(&g_pso_skipped, 1); return VK_NULL_HANDLE;
+            }
+            if (may_wait) { usleep(200); continue; }   // a worker has it: wait for that one
+            atomic_fetch_add(&g_pso_skipped, 1); return VK_NULL_HANDLE;
+        }
     }
     e = pso_insert_(k, h, pl, i); pthread_mutex_unlock(&g_psomu);
     g_pso_last_new = atomic_load(&g_presents); pso_record(k);
     if (may_wait) { e->p = pso_create(k, pl); atomic_store_explicit(&e->state, 1, memory_order_release); return e->p; }
-    pthread_mutex_lock(&g_psoq_mu);
-    if (g_npsoq == g_cpsoq) { g_cpsoq = g_cpsoq ? 2 * g_cpsoq : 64; g_psoq = realloc(g_psoq, g_cpsoq * sizeof *g_psoq); }
-    g_psoq[g_npsoq++] = e; atomic_fetch_add(&g_pso_pending, 1); atomic_fetch_add(&g_pso_async, 1);
-    pthread_cond_signal(&g_psoq_cv); pthread_mutex_unlock(&g_psoq_mu);
+    pso_enqueue(e);
     atomic_fetch_add(&g_pso_skipped, 1); return VK_NULL_HANDLE;
 }
 
 static int hexkey(const char *s, uint8_t md[8]) { for (int i = 0; i < 8; i++) if (sscanf(s + 2 * i, "%2hhx", &md[i]) != 1) return 0; return 1; }
 static _Atomic uint64_t g_pre_made, g_pre_had, g_pre_slow;
+// DM_VK_PREWARM_KEEP=0: the pre-warm makes each pipeline and destroys it at once, so only the driver's pipeline cache is warm; a pipeline is made again (from that cache) at its first
+// use. FINAL FANTASY RESONANCE: 6619 pipelines kept alive cost RSS +485 MB at boot on a tablet already swapping 2 GB. Default 1 (kept, as before)
+static int prewarm_keep(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PREWARM_KEEP"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_PREWARM_KEEP=0: the pre-warm keeps only the driver's pipeline cache warm"); } return v; }
 static void pso_precreate_one(const pso_rec *r) {
     uint8_t md[8]; pso_key k = r->k;
     if (!r->vs[0] || !hexkey(r->vs, md) || !(k.vs = shader_get(md)) || !k.vs->mod) return;
@@ -1935,8 +1952,10 @@ static void pso_precreate_one(const pso_rec *r) {
     pthread_mutex_lock(&g_psomu);
     if (pso_find_(&k, h, &i)) { pthread_mutex_unlock(&g_psomu); atomic_fetch_add(&g_pre_had, 1); return; }
     pso_ent *e = pso_insert_(&k, h, pl, i); pthread_mutex_unlock(&g_psomu);
-    uint64_t t0 = now_ns(); e->p = pso_create(&k, pl); atomic_store_explicit(&e->state, 1, memory_order_release); atomic_fetch_add(&g_pre_made, 1);
+    uint64_t t0 = now_ns(); e->p = pso_create(&k, pl); atomic_fetch_add(&g_pre_made, 1);
     if (now_ns() - t0 > 3000000ull) atomic_fetch_add(&g_pre_slow, 1);   // not in the driver's cache: compiled
+    if (!prewarm_keep() && e->p) { vkDestroyPipeline(g_dev, e->p, NULL); e->p = VK_NULL_HANDLE; atomic_store_explicit(&e->state, 3, memory_order_release); }   // the driver's cache holds it now
+    else atomic_store_explicit(&e->state, 1, memory_order_release);
 }
 static int g_prewarm_ran;
 static int g_prewarm_depth = -1;   // the depth mode the pre-warm loaded shaders under (dm_vk_prewarm), from the last run's vk_depth_mode
@@ -3459,8 +3478,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (trig && n == trig) { rt_dump(n, 1); trig = 0; } else rt_dump(n, 0);
     if (tf && !trig && n % 30 == 0 && !access(tf, F_OK)) { trig = n + 1; unlink(tf); LOG("vk: %s found: frame %llu is logged and its render targets written", tf, (unsigned long long)trig); }
     if (n % 1800 == 0 || (g_pso_last_new && n - g_pso_last_new == 120 && !atomic_load(&g_pso_pending))) pcache_save();   // also soon after new pipelines settle
-    if (n % 600 == 0) LOG("vk: pipelines: %d made, %llu on worker threads, %llu made again from earlier runs, %llu draws left out while theirs was made, %.0f ms making them, %.0f ms loading shaders, in all", g_npso,
-                          (unsigned long long)atomic_load(&g_pso_async), (unsigned long long)atomic_load(&g_pre_made), (unsigned long long)atomic_load(&g_pso_skipped), atomic_load(&g_pso_ns) / 1e6, atomic_load(&g_sh_ns) / 1e6);
+    if (n % 600 == 0) LOG("vk: pipelines: %d made, %llu on worker threads, %llu made again from earlier runs, %llu draws left out while theirs was made, %.0f ms making them, %.0f ms loading shaders, in all; warm ones made again at first use %llu (%.0f ms)", g_npso,
+                          (unsigned long long)atomic_load(&g_pso_async), (unsigned long long)atomic_load(&g_pre_made), (unsigned long long)atomic_load(&g_pso_skipped), atomic_load(&g_pso_ns) / 1e6, atomic_load(&g_sh_ns) / 1e6,
+                          (unsigned long long)atomic_load(&g_pso_rewarm), atomic_load(&g_pso_rewarm_ns) / 1e6);
     { static int64_t pl = -2; static int on; if (pl == -2) { const char *e = getenv("DM_VK_PASSLOG"); pl = e ? atoll(e) : -1; on = e && strchr(e, '+'); }   // <frame>+: every frame from there on
       g_plog = (on ? (int64_t)n + 1 >= pl && pl >= 0 : (int64_t)n + 1 == pl) || (trig && n + 1 == trig); if (g_plog && on) LOG("plog: frame %llu", (unsigned long long)n + 1); }
     return n;
