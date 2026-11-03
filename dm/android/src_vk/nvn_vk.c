@@ -3159,7 +3159,8 @@ static void mem_watch(void) {
     if (!jump && now - last < 1000000000ull) return;
     int tick = now - last >= 1000000000ull; if (tick) last = now;
     long avail = 0, rss = 0; char ln[128]; FILE *f = fopen("/proc/meminfo", "re"); if (f) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "MemAvailable: %ld", &avail) == 1) break; fclose(f); }
-    if ((f = fopen("/proc/self/status", "re"))) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "VmRSS: %ld", &rss) == 1) break; fclose(f); }
+    long ranon = 0, rfile = 0, rshm = 0, vswap = 0;
+    if ((f = fopen("/proc/self/status", "re"))) { while (fgets(ln, sizeof ln, f)) { sscanf(ln, "VmRSS: %ld", &rss); sscanf(ln, "RssAnon: %ld", &ranon); sscanf(ln, "RssFile: %ld", &rfile); sscanf(ln, "RssShmem: %ld", &rshm); sscanf(ln, "VmSwap: %ld", &vswap); } fclose(f); }
     uint64_t gpu = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) gpu += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
     gpu += atomic_load(&g_ring0_bytes) + atomic_load(&g_extra_ring_bytes);
     long ours = rss / 1024 + (long)(gpu >> 20);   // the process's resident memory and the backend's device memory, in MB
@@ -3168,10 +3169,10 @@ static void mem_watch(void) {
         static int64_t pdrv = -1; static uint64_t last_gl; uint64_t bud = 0; int64_t drv = (int64_t)gpu_driver_usage(&bud);   // the driver's count (VK_EXT_memory_budget), 0 without it
         int64_t dh = hbase >= 0 ? hu - hbase : 0, db = dm_ue_heap_big() - bbase, ddrv = pdrv >= 0 ? drv - pdrv : 0; long drss = (rss - prss) / 1024, dav = (avail - pavail) / 1024;
         if (hbase >= 0) {
-            fall = pre_mb > 0 && ((pavail > 0 && avail > 0 && dav <= -2 * pre_mb) || ddrv >= (int64_t)pre_mb << 20);   // MemAvailable fell fast, or the driver's GPU memory grew fast
+            fall = pre_mb > 0 && ((pavail > 0 && avail > 0 && dav <= -2 * pre_mb) || ddrv >= (int64_t)pre_mb << 20 || drss >= 2 * pre_mb);   // MemAvailable fell fast, the driver's GPU memory or the resident memory grew fast
             if ((dh >= 32 << 20 || dh <= -(64 << 20) || drss >= 64 || dav <= -128 || ddrv >= 64 << 20 || ddrv <= -(64 << 20)) && nline++ < 300)
-                LOG("[mem] last second: game heap %+.0f MB (%.0f MB in use; big blocks %+.0f MB), resident %+ld MB (%ld MB), available %+ld MB (%ld MB), GPU driver %+.0f MB (%.0f MB), device %llu MB",
-                    dh / 1048576.0, hu / 1048576.0, db / 1048576.0, drss, rss / 1024, dav, avail / 1024, ddrv / 1048576.0, drv / 1048576.0, (unsigned long long)(gpu >> 20));
+                LOG("[mem] last second: game heap %+.0f MB (%.0f MB in use; big blocks %+.0f MB), resident %+ld MB (%ld MB: anonymous %ld, file %ld, shared %ld; swapped %ld), available %+ld MB (%ld MB), GPU driver %+.0f MB (%.0f MB), device %llu MB",
+                    dh / 1048576.0, hu / 1048576.0, db / 1048576.0, drss, rss / 1024, ranon / 1024, rfile / 1024, rshm / 1024, vswap / 1024, dav, avail / 1024, ddrv / 1048576.0, drv / 1048576.0, (unsigned long long)(gpu >> 20));
         }
         if (now - last_gl >= 30000000000ull) {   // every 30 s: the driver's count against the backend's own allocations
             last_gl = now; int64_t all = atomic_load(&g_dm_live), blk = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) blk += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
@@ -3201,10 +3202,14 @@ static void mem_watch(void) {
         for (int k = 0; k < g_nxmap; k++) if (g_xmap[k].m == g_xc[g_nxc].m) { g_xmap[k] = g_xmap[--g_nxmap]; break; } } g_xc_bytes = 0; pthread_mutex_unlock(&g_xcmu);
     mallopt(M_PURGE, 0);
     static int nl; if (nl++ < 60) LOG("vk: memory %s (%ld MB available, the process %ld MB resident + %llu MB device, the game heap %.0f MB): idle textures evicted, rings back to their minimum, reuse pools emptied",
-                                      jump ? "early trim: the game heap grew fast" : fall ? "early trim: MemAvailable fell or GPU memory grew fast" : is_low ? "low" : over ? "over budget" : "near low (early trim)",
+                                      jump ? "early trim: the game heap grew fast" : fall ? "early trim: MemAvailable fell, or GPU or resident memory grew, fast" : is_low ? "low" : over ? "over budget" : "near low (early trim)",
                                       avail / 1024, rss / 1024, (unsigned long long)(gpu >> 20), hu / 1048576.0);
 }
-void tex_evict_hook(void) { mem_watch(); tex_evict(atomic_load(&g_trim_gen)); }   // the front end's low-memory signal (app/front_android.c): every ring back to RING_MIN at its next use
+// mem_watch runs on a thread of its own (vk19.32), every 100 ms: run from the submissions it stopped with them, and FINAL FANTASY RESONANCE's killing loads stall the rendering
+// (a frame of 54 NVN functions, then nothing): no line and no trim in the 5 s between the 115.7 MB read and the kill. The textures are still evicted at the next submission (tex_evict)
+static void *mem_watch_thread(void *a) { (void)a; for (;;) { mem_watch(); usleep(100000); } return NULL; }
+static void mem_watch_start(void) { static int started; if (started) return; started = 1; pthread_t t; if (pthread_create(&t, NULL, mem_watch_thread, NULL)) { started = 0; return; } pthread_detach(t); }
+void tex_evict_hook(void) { mem_watch_start(); tex_evict(atomic_load(&g_trim_gen)); }   // the front end's low-memory signal (app/front_android.c): every ring back to RING_MIN at its next use
 // DM_VK_RING_KEEP=1: a ring is not halved after a quiet stretch unless memory is low (g_mem_low). Halving and growing again later made a fresh mapping each time, every page of it
 // faulted in on first write (bursts of thousands of minor faults while a stage streamed in). Default 0: as before
 static int ring_keep(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RING_KEEP"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_RING_KEEP=1: rings shrink only while memory is low"); } return v; }
