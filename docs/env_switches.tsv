@@ -343,6 +343,9 @@ DM_VK_PASSLOG	diagnostic	Android: `=<frame>[+]` logs that frame's passes, draws,
 DM_VK_PASS_BARRIER	test	Android: `1` leaves vertex shaders out of each pass end's barrier (the next pass's vertex work may overlap); a vertex shader that samples such a pass's target gets a barrier first. Default 0
 DM_VK_POOL_TRANSIENT	test	Android: `1` creates the command pools VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, as before vk19.20 (default 0: kept warm, reset without releasing their memory)
 DM_VK_PREWARM_KEEP	test	Android: `1` makes the shader pre-warm keep every pipeline alive (RSS +~500 MB in FINAL FANTASY RESONANCE). Default 0 since vk19.13: each is destroyed right after it is made (only the driver's pipeline cache stays warm) and made again from that cache at its first use
+DM_VK_REUP_CAP_MB	switch	Android: while memory is low, re-uploads of written textures wait once a submission has this many MB of uploads (default 16; 0 no cap); first uploads never wait
+DM_VK_REUP_FRAMES_LOW	switch	Android: while memory is low, a texture is re-uploaded at most every this many frames (default 4); otherwise at most once a frame
+DM_VK_REUP_PARTIAL	switch	Android: `1` (default) re-uploads only the mip levels written since the last upload; `0` re-uploads the whole texture as before
 DM_VK_RING_CACHED	test	Android: `1` puts the host-visible rings in a HOST_CACHED coherent memory type where the GPU has one (the CPU reads them back: dispatch snapshots, write-back compares); default 0, the first coherent type (uncached on the Adreno)
 DM_VK_RING_CAP_MB	switch	Android: all submission contexts' own rings together (MB, default 96; was 160). Past it a ring does not grow and a submission that outgrows it takes extra rings, freed when it is done
 DM_VK_RING_KEEP	test	Android: `1` keeps each ring at its size after a quiet stretch (halved only while memory is low); default 0 halves it as before (growing again later maps fresh pages)
