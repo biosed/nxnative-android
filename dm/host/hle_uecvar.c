@@ -63,10 +63,64 @@ static void ue_drs_tick(void) {
         LOG("main: Unreal dynamic resolution now: OperationMode %d, FrameTimeBudget %g ms, Min/MaxScreenPercentage %g / %g, r.ScreenPercentage %g", om, b, mn, mx, sp);
     }
 }
+// ---- render feature cvars (DM_UE_PERF / DM_UE_CVARS) ----
+// FINAL FANTASY RESONANCE runs Unreal's desktop deferred renderer from its Switch build; a performance profile turns its costliest features down by writing their console
+// variables (found by the rewriter, ue_cvar.py) whenever the game sets them back. DM_UE_PERF=1: what changes no structure of the frame (screen-space reflections off, ambient
+// occlusion one level, motion blur, lens flares and colour fringe off, subsurface and refraction at their lowest, no particle or light-function lights, two shadow cascades of
+// at most 1024, other shadows at 512); =2: also ambient occlusion and contact shadows off, shadows to 60% of their distance, bloom and eye adaptation at their lowest, 70% view
+// distance, half the particle spawn rate, textures one mip down. DM_UE_CVARS=<name>=<value>[,...] sets any found variable (a value with a '.' is a float, else an int), after
+// the profile's. Each change is logged (at most 40 lines); the values are written into the game thread's and the render thread's copies
+typedef struct { const char *name; int is_float; double v; } ue_set;
+static const ue_set k_perf1[] = {
+    {"r.SSR.Quality", 0, 0}, {"r.AmbientOcclusionLevels", 0, 1}, {"r.MotionBlurQuality", 0, 0}, {"r.LensFlareQuality", 0, 0}, {"r.SceneColorFringeQuality", 0, 0},
+    {"r.SSS.Quality", 0, 0}, {"r.RefractionQuality", 0, 0}, {"r.ParticleLightQuality", 0, 0}, {"r.LightFunctionQuality", 0, 0},
+    {"r.Shadow.CSM.MaxCascades", 0, 2}, {"r.Shadow.MaxCSMResolution", 0, 1024}, {"r.Shadow.MaxResolution", 0, 512},
+};
+static const ue_set k_perf2[] = {
+    {"r.AmbientOcclusionLevels", 0, 0}, {"r.ContactShadows", 0, 0}, {"r.Shadow.DistanceScale", 1, 0.6}, {"r.BloomQuality", 0, 1}, {"r.EyeAdaptationQuality", 0, 0},
+    {"r.ViewDistanceScale", 1, 0.7}, {"r.EmitterSpawnRateScale", 1, 0.5}, {"r.Streaming.MipBias", 1, 1.0},
+};
+static void ue_perf_tick(uint8_t *base) {
+    static int state = -1, nset, nlog; static struct { uint64_t off; int is_float; double v; const char *name; } set[64];
+    if (!state) return;
+    if (state < 0) {
+        state = 0;
+        const char *pe = getenv("DM_UE_PERF"), *ce = getenv("DM_UE_CVARS"); int lvl = pe ? atoi(pe) : 0;
+        if (!lvl && !(ce && *ce)) return;
+        #define ADD(nm, fl, val) do { uint64_t o_ = dm_ue_cvar(nm); int k_ = 0; while (k_ < nset && strcmp(set[k_].name, nm)) k_++; \
+            if (!o_) { LOG("[RED] main: Unreal %s not found by the rewriter (ue_cvar.py): not set", nm); break; } \
+            if (k_ == nset) { if (nset == 64) break; nset++; } set[k_].off = o_; set[k_].is_float = (fl); set[k_].v = (val); set[k_].name = (nm); } while (0)
+        if (lvl >= 1) for (size_t i = 0; i < sizeof k_perf1 / sizeof *k_perf1; i++) ADD(k_perf1[i].name, k_perf1[i].is_float, k_perf1[i].v);
+        if (lvl >= 2) for (size_t i = 0; i < sizeof k_perf2 / sizeof *k_perf2; i++) ADD(k_perf2[i].name, k_perf2[i].is_float, k_perf2[i].v);
+        if (ce && *ce) {   // name=value[,name=value...]: the names are kept for the session (strdup)
+            char *dup = strdup(ce), *save = NULL;
+            for (char *t = strtok_r(dup, ",; ", &save); t; t = strtok_r(NULL, ",; ", &save)) {
+                char *eq = strchr(t, '='); if (!eq) { LOG("[RED] DM_UE_CVARS: %s has no value", t); continue; }
+                *eq = 0; const char *nm = t, *vs = eq + 1; ADD(nm, strchr(vs, '.') != NULL, atof(vs));
+            }
+        }
+        #undef ADD
+        LOG("main: Unreal render settings: performance profile %d, %d variables set (DM_UE_PERF / DM_UE_CVARS)", lvl, nset);
+        state = nset > 0;
+    }
+    for (int k = 0; k < nset; k++) {
+        uint64_t val; if (!rd((uint64_t)(uintptr_t)(base + set[k].off + 0x10), &val, sizeof val) || !val) continue;   // not created yet
+        for (int c = 0; c < 2; c++) {
+            uint32_t *p = (uint32_t *)(uintptr_t)(val + 4 * (uint64_t)c), cur, want;
+            if (set[k].is_float) { float f = (float)set[k].v; memcpy(&want, &f, 4); } else { int32_t i = (int32_t)set[k].v; memcpy(&want, &i, 4); }
+            if (!rd((uint64_t)(uintptr_t)p, &cur, 4) || cur == want) continue;
+            dm_guest_write_prepare(p, 4); __atomic_store_n(p, want, __ATOMIC_RELAXED);
+            if (nlog < 40) { nlog++; float cf; int32_t ci; memcpy(&cf, &cur, 4); memcpy(&ci, &cur, 4);
+                if (set[k].is_float) LOG("main: Unreal %s (%s thread) %g -> %g", set[k].name, c ? "render" : "game", cf, set[k].v);
+                else LOG("main: Unreal %s (%s thread) %d -> %d", set[k].name, c ? "render" : "game", ci, (int)set[k].v); }
+        }
+    }
+}
 // DM_UE_TEXTURE_POOL=<MB> raises a smaller pool to <MB> (as the profile's ue_texture_pool); =-<MB> caps a larger one at <MB> (a tablet short of memory: the streamer then keeps fewer
 // top mips, in guest memory and in the GPU's copies of them). The value the game runs with is logged every 600 presents either way, when the rewriter found the variable
 void dm_ue_cvar_tick(void) {
     ue_drs_tick();
+    { uint8_t *b = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) b = g_mod[i].base; if (b) ue_perf_tick(b); }
     static int state = -1, target, cap, nlog; static uint64_t obj_off, n; static const char *src;
     if (!state) return;
     if (state < 0) {
