@@ -667,7 +667,11 @@ static void vk_init_(void) {
     { const char *e = getenv("DM_VK_CTX"); if (e && *e) { int n = atoi(e); NCTX = n < 4 ? 4 : n > NCTX_MAX ? NCTX_MAX : n; } LOG("vk: %d submission contexts (DM_VK_CTX)", NCTX); }
     for (int i = 0; i < NCTX; i++) {
         ctx_t *c = &g_ctx[i];
-        VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, g_qf};   // reset as a whole each submission (mtl_sub_begin)
+        // Reset as a whole each submission (ctx_complete / mtl_sub_begin), without releasing its memory. It was made TRANSIENT: a profile of FINAL FANTASY RESONANCE on the Adreno 825
+        // showed a third of the render thread in kgsl_sharedmem_alloc ioctls under vkCmdCopyBufferToImage (the driver allocating command memory again as the buffers grew), which
+        // a transient pool invites. DM_VK_POOL_TRANSIENT=1: as before
+        static int tr = -1; if (tr < 0) { const char *e = getenv("DM_VK_POOL_TRANSIENT"); tr = e && atoi(e) != 0; LOG("vk: command pools %s (DM_VK_POOL_TRANSIENT=%d)", tr ? "transient" : "kept warm", tr); }
+        VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, tr ? VK_COMMAND_POOL_CREATE_TRANSIENT_BIT : 0, g_qf};
         VKCHECK(vkCreateCommandPool(g_dev, &pi, NULL, &c->pool));
         VkCommandBuffer cbs[2]; VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, c->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2};
         VKCHECK(vkAllocateCommandBuffers(g_dev, &ai, cbs)); c->cb = cbs[0]; c->up = cbs[1];
@@ -1147,6 +1151,10 @@ static void tex_upload_(vtex *v, const tex_t *t) {
     // Odyssey's normal maps do; noise until then) brings a new upload at the texture's next use (tex_get). The stamp is taken and the pages protected BEFORE the storage is read
     // (nvn_dirty.h): protected after the read, a write landing while it ran, or on a page a write had already unprotected, was never seen, and the texture kept what it was mid-write
     if (t->mem && !v->gpu && nvn_dirty_tracked(t->mem, t->L.size)) { v->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size); v->span = nvn_dirty_span(t->mem, t->L.size); }
+    // Every level and layer goes in one vkCmdCopyBufferToImage (regions batched while they share a ring): one call per level and layer cost a driver call each, and the Adreno's
+    // allocated command memory inside them (kgsl_sharedmem_alloc, a third of the render thread while a stage streamed its textures in)
+    enum { NUREG = 64 }; VkBufferImageCopy ureg[NUREG]; uint32_t nureg = 0; VkBuffer ubuf = VK_NULL_HANDLE;
+    #define UFLUSH() do { if (nureg) { vkCmdCopyBufferToImage(C->up, ubuf, v->img, VK_IMAGE_LAYOUT_GENERAL, nureg, ureg); nureg = 0; } } while (0)
     for (unsigned lv = 0; lv < v->levels; lv++) {
         if (lv < 32 && (v->gpu_lv >> lv & 1)) continue;   // a copy on the GPU wrote this level: its storage does not hold that
         uint32_t w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1, d = v->d >> lv ? v->d >> lv : 1;
@@ -1154,8 +1162,8 @@ static void tex_upload_(vtex *v, const tex_t *t) {
         uint32_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh; size_t pitch = (size_t)bx * bpb, lsz = pitch * by * d;
         for (unsigned ly = 0; ly < v->layers; ly++) {
             size_t out = v->f.dec ? (size_t)w * h * dec_bpp(v->f.dec) * d : lsz;
-            VkDeviceSize o = ring_alloc(out, 16);
-            if (o == VK_WHOLE_SIZE) { v->dirty = 1; return; }   // not uploaded: again at the next use (the stamp above would say nothing changed)
+            VkDeviceSize o = ring_alloc(out, 16);   // may move to an extra ring: the regions so far stay with theirs (ubuf, flushed below)
+            if (o == VK_WHOLE_SIZE) { UFLUSH(); v->dirty = 1; return; }   // not uploaded: again at the next use (the stamp above would say nothing changed)
             uint8_t *dst = C->ringp + o, *tmp = v->f.dec ? malloc(lsz) : dst;
             int rc = 0;
             if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) {
@@ -1171,9 +1179,12 @@ static void tex_upload_(vtex *v, const tex_t *t) {
             if (rc) { RED_ONCE(5, "texture format %#x target %d: deswizzle failed", t->d.format, t->d.target); if (v->f.dec) free(tmp); continue; }
             if (v->f.dec) { for (uint32_t z = 0; z < d; z++) bc_decode(v->f.dec, tmp + pitch * by * z, pitch, w, h, dst + (size_t)w * h * dec_bpp(v->f.dec) * z); free(tmp); }
             VkBufferImageCopy c = {o, 0, 0, {v->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, lv, ly, 1}, {0, 0, 0}, {w, h, d}};
-            vkCmdCopyBufferToImage(C->up, C->ring, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            if (ubuf != C->ring) { UFLUSH(); ubuf = C->ring; }
+            ureg[nureg++] = c; if (nureg == NUREG) UFLUSH();
         }
     }
+    UFLUSH();
+    #undef UFLUSH
     C->up_used = 1; v->uploaded = 1;
 }
 static void tex_free(vtex *v) {   // released by the game: draws already recorded (and the one being recorded) may still use it
