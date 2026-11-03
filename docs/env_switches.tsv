@@ -327,6 +327,7 @@ DM_VK_NO_DYNREND	test	Android: `1` uses render passes made per pass even where d
 DM_VK_NO_TIMELINE	test	Android: set, submissions are not chained by a timeline semaphore even where the GPU has one
 DM_VK_PASSLOG	diagnostic	Android: `=<frame>[+]` logs that frame's passes, draws, copies and dispatches (targets, clears, shaders, depth / stencil / blend)
 DM_VK_PASS_BARRIER	test	Android: `1` leaves vertex shaders out of each pass end's barrier (the next pass's vertex work may overlap); a vertex shader that samples such a pass's target gets a barrier first. Default 0
+DM_VK_POOL_TRANSIENT	test	Android: `1` creates the command pools VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, as before vk19.20 (default 0: kept warm, reset without releasing their memory)
 DM_VK_PREWARM_KEEP	test	Android: `1` makes the shader pre-warm keep every pipeline alive (RSS +~500 MB in FINAL FANTASY RESONANCE). Default 0 since vk19.13: each is destroyed right after it is made (only the driver's pipeline cache stays warm) and made again from that cache at its first use
 DM_VK_RING_CACHED	test	Android: `1` puts the host-visible rings in a HOST_CACHED coherent memory type where the GPU has one (the CPU reads them back: dispatch snapshots, write-back compares); default 0, the first coherent type (uncached on the Adreno)
 DM_VK_RTDUMP	diagnostic	Android: `=<frame>[,<frames>]` writes every render target of that frame (and the next ones) as raw files into DM_VK_SHOT_DIR
