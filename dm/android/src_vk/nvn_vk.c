@@ -3099,26 +3099,61 @@ static void heap_release_kick(void) {
     static int started; if (!started) { started = 1; pthread_t t; if (pthread_create(&t, NULL, heap_release_thread, NULL)) { started = 0; return; } pthread_detach(t); }
     pthread_mutex_lock(&g_hrel_mu); g_hrel_req = 1; pthread_cond_signal(&g_hrel_cv); pthread_mutex_unlock(&g_hrel_mu);
 }
+// Early trim (vk19.29, DM_MEM_PRETRIM, default on). The killed runs all had the game heap step from 0.75 to 1.05 GB, the process's resident memory 500 MB up within seconds, and the
+// killer acted 4 s after MemAvailable began to fall: the trim at DM_VK_MEM_LOW_MB came too late to matter. Now the backend trims at once (at most every 2 s) when the game heap has grown
+// DM_MEM_PRETRIM_MB (default 100) since the last one-second check, or MemAvailable fell twice that in a second; and as at the low mark (at most every 5 s) below
+// DM_MEM_PRETRIM_AVAIL_MB (default 1600). After an early trim the backend keeps nothing for reuse for 10 s (g_mem_low). The heap's free pages go back on each trim and every 60 s
+// (no longer every second while memory is low: the walk takes the heap's locks while the game allocates hardest). A line each second the heap, the resident memory or MemAvailable
+// moved a lot ([mem] last second), at most 300
+int64_t dm_ue_heap_used(void), dm_ue_heap_big(void);   // hle_uemalloc.c
 static void mem_watch(void) {
-    static uint64_t last, last_trim, last_rel; uint64_t now = now_ns(); if (now - last < 1000000000ull) return; last = now;
-    static long low = -1, budget = -1;
-    if (low < 0) { const char *e = getenv("DM_VK_MEM_LOW_MB"); low = e ? atol(e) : 1500; e = getenv("DM_MEM_BUDGET_MB"); budget = e ? atol(e) : 2000; }
+    static uint64_t last, last_trim, last_rel, pre_until; static int64_t pbase = -1, hbase = -1, bbase; static long pavail, prss; static int nline;
+    static long low = -1, budget = -1, pre_mb, pre_avail;
+    if (low < 0) {
+        const char *e = getenv("DM_VK_MEM_LOW_MB"); low = e ? atol(e) : 1500; e = getenv("DM_MEM_BUDGET_MB"); budget = e ? atol(e) : 2000;
+        e = getenv("DM_MEM_PRETRIM"); int on = !e || atoi(e) != 0;
+        e = getenv("DM_MEM_PRETRIM_MB"); pre_mb = on ? (e ? atol(e) : 100) : 0; e = getenv("DM_MEM_PRETRIM_AVAIL_MB"); pre_avail = on ? (e ? atol(e) : 1600) : 0;
+        LOG("vk: memory watch: trim below %ld MB available or past %ld MB; early trim %s (game heap +%ld MB, under %ld MB available)", low, budget, on ? "on" : "off", pre_mb, pre_avail);
+    }
+    uint64_t now = now_ns(); int64_t hu = dm_ue_heap_used();
+    int jump = pre_mb > 0 && pbase >= 0 && hu - pbase >= (int64_t)pre_mb << 20 && now - last_trim >= 2000000000ull;
+    if (!jump && now - last < 1000000000ull) return;
+    int tick = now - last >= 1000000000ull; if (tick) last = now;
     long avail = 0, rss = 0; char ln[128]; FILE *f = fopen("/proc/meminfo", "re"); if (f) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "MemAvailable: %ld", &avail) == 1) break; fclose(f); }
     if ((f = fopen("/proc/self/status", "re"))) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "VmRSS: %ld", &rss) == 1) break; fclose(f); }
     uint64_t gpu = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) gpu += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
     gpu += atomic_load(&g_ring0_bytes) + atomic_load(&g_extra_ring_bytes);
     long ours = rss / 1024 + (long)(gpu >> 20);   // the process's resident memory and the backend's device memory, in MB
+    int fall = 0;
+    if (tick) {
+        int64_t dh = hbase >= 0 ? hu - hbase : 0, db = dm_ue_heap_big() - bbase; long drss = (rss - prss) / 1024, dav = (avail - pavail) / 1024;
+        if (hbase >= 0) {
+            fall = pre_mb > 0 && pavail > 0 && avail > 0 && dav <= -2 * pre_mb;
+            if ((dh >= 32 << 20 || dh <= -(64 << 20) || drss >= 64 || dav <= -128) && nline++ < 300)
+                LOG("[mem] last second: game heap %+.0f MB (%.0f MB in use; big blocks %+.0f MB), resident %+ld MB (%ld MB), available %+ld MB (%ld MB), device %llu MB",
+                    dh / 1048576.0, hu / 1048576.0, db / 1048576.0, drss, rss / 1024, dav, avail / 1024, (unsigned long long)(gpu >> 20));
+        }
+        hbase = hu; bbase = dm_ue_heap_big(); prss = rss; pavail = avail;
+    }
     int is_low = low > 0 && avail > 0 && avail / 1024 < low, over = budget > 0 && ours > budget;
-    g_mem_low = is_low || over;
-    if (dm_ueheap_release && (g_mem_low || now - last_rel >= 60000000000ull)) { last_rel = now; heap_release_kick(); }   // on the heap thread, not this one (it walks the heap under its locks)
-    if (!g_mem_low || now - last_trim < 5000000000ull) return;
+    int near = pre_avail > 0 && avail > 0 && avail / 1024 < pre_avail;
+    int early = (jump || fall) && now - last_trim >= 2000000000ull;
+    if (early) pre_until = now + 10000000000ull;
+    if (tick || early) pbase = hu;
+    g_mem_low = is_low || over || near || now < pre_until;
+    if (!early && (!(is_low || over || near) || now - last_trim < 5000000000ull)) {
+        if (dm_ueheap_release && now - last_rel >= 60000000000ull) { last_rel = now; heap_release_kick(); }   // on the heap thread, not this one (it walks the heap under its locks)
+        return;
+    }
     last_trim = now; atomic_fetch_add(&g_trim_gen, 1);
+    if (dm_ueheap_release) { last_rel = now; heap_release_kick(); }
     pthread_mutex_lock(&g_snapmu); for (int k = 0; k < SNAP_NC; k++) { while (g_snap_n[k]) free(g_snap_free[k][--g_snap_n[k]]); } g_snap_kept = 0; pthread_mutex_unlock(&g_snapmu);
     pthread_mutex_lock(&g_xcmu); while (g_nxc) { g_nxc--; vkDestroyBuffer(g_dev, g_xc[g_nxc].b, NULL); vkFreeMemory(g_dev, g_xc[g_nxc].m, NULL);
         for (int k = 0; k < g_nxmap; k++) if (g_xmap[k].m == g_xc[g_nxc].m) { g_xmap[k] = g_xmap[--g_nxmap]; break; } } g_xc_bytes = 0; pthread_mutex_unlock(&g_xcmu);
     mallopt(M_PURGE, 0);
-    static int nl; if (nl++ < 30) LOG("vk: memory %s (%ld MB available, the process %ld MB resident + %llu MB device): idle textures evicted, rings back to their minimum, reuse pools emptied",
-                                      over && !is_low ? "over budget" : "low", avail / 1024, rss / 1024, (unsigned long long)(gpu >> 20));
+    static int nl; if (nl++ < 60) LOG("vk: memory %s (%ld MB available, the process %ld MB resident + %llu MB device, the game heap %.0f MB): idle textures evicted, rings back to their minimum, reuse pools emptied",
+                                      jump ? "early trim: the game heap grew fast" : fall ? "early trim: MemAvailable fell fast" : is_low ? "low" : over ? "over budget" : "near low (early trim)",
+                                      avail / 1024, rss / 1024, (unsigned long long)(gpu >> 20), hu / 1048576.0);
 }
 void tex_evict_hook(void) { mem_watch(); tex_evict(atomic_load(&g_trim_gen)); }   // the front end's low-memory signal (app/front_android.c): every ring back to RING_MIN at its next use
 // DM_VK_RING_KEEP=1: a ring is not halved after a quiet stretch unless memory is low (g_mem_low). Halving and growing again later made a fresh mapping each time, every page of it

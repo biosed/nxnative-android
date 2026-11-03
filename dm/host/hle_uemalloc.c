@@ -66,18 +66,56 @@ static void *realloc_aligned(void *p, size_t n, uint32_t a) {
     memcpy(q, p, old < n ? old : n); release(p); return q;
 }
 
+// Big allocations. FINAL FANTASY RESONANCE's heap stepped from 0.75 to 1.05 GB in use within seconds on the Xiaomi Pad 8, and each run where it did was ended by the low-memory
+// killer seconds later. Each allocation or reallocation of DM_UE_BIGALLOC_MB (default 8; 0: off) or more is logged with the guest code that asked for it (the return address and
+// up to five frames up the frame-pointer chain, each as module+offset; the chain is read with vm_read_overwrite, so a broken one ends the walk instead of faulting), the thread,
+// and the heap's total after it; at most 400 lines. dm_ue_heap_used / dm_ue_heap_big: the graphics backend's per-second growth line and its early trim (nvn_vk.c mem_watch)
+static int64_t g_big_min = -1; static _Atomic int g_big_n; static _Atomic int64_t g_big_bytes;
+int64_t dm_ue_heap_used(void) { return atomic_load(&g_used); }
+int64_t dm_ue_heap_big(void) { return atomic_load(&g_big_bytes); }   // what the big allocations and reallocations added, all told (frees not taken off)
+static int big_where(uint64_t v, char *o, size_t n) {
+    for (int k = 0; k < g_nmod; k++) { uint64_t b = (uint64_t)(uintptr_t)g_mod[k].base; if (v >= b && v < b + g_mod[k].size) return snprintf(o, n, " %s+%#llx", g_mod[k].name, (unsigned long long)(v - b)); }
+    return snprintf(o, n, " %#llx", (unsigned long long)v);
+}
+static void big_note(const char *op, size_t n, size_t old, uint32_t a, void *lr, void *fp) {
+    atomic_fetch_add(&g_big_bytes, (int64_t)n - (int64_t)old);
+    if (atomic_fetch_add(&g_big_n, 1) >= 400) return;
+    char ch[256]; int at = 0;
+    at += big_where((uint64_t)(uintptr_t)lr, ch + at, sizeof ch - at);
+    uint64_t f = fp ? *(uint64_t *)fp : 0;   // this function's frame record: the guest caller's frame pointer
+    for (int i = 0; i < 5 && f && at < (int)sizeof ch - 40; i++) {
+        uint64_t rec[2]; vm_size_t got = 0;
+        if (f & 7 || vm_read_overwrite(mach_task_self(), (vm_address_t)f, sizeof rec, (vm_address_t)rec, &got) != KERN_SUCCESS || got != sizeof rec || !rec[1]) break;
+        at += snprintf(ch + at, sizeof ch - at, " <"); at += big_where(rec[1], ch + at, sizeof ch - at);
+        if (rec[0] <= f || rec[0] - f > (1u << 20)) break;
+        f = rec[0];
+    }
+    char tn[32] = "?"; pthread_getname_np(pthread_self(), tn, sizeof tn);
+    if (old) LOG("[mem] Unreal %s %.1f MB (was %.1f MB, alignment %u) on '%s', the heap now %.0f MB in use; from%s", op, n / 1048576.0, old / 1048576.0, a, tn, atomic_load(&g_used) / 1048576.0, ch);
+    else LOG("[mem] Unreal %s %.1f MB (alignment %u) on '%s', the heap now %.0f MB in use; from%s", op, n / 1048576.0, a, tn, atomic_load(&g_used) / 1048576.0, ch);
+}
+static bool m_GetAllocationSize(void *self, void *p, size_t *out);
+static size_t m_old_size(void *p) { size_t n = 0; m_GetAllocationSize(NULL, p, &n); return n; }
+static inline int big(size_t n) {
+    if (g_big_min < 0) { const char *e = getenv("DM_UE_BIGALLOC_MB"); g_big_min = (e ? atoll(e) : 8) << 20; }
+    return g_big_min > 0 && n >= (size_t)g_big_min;
+}
+#define BIG(op, n, old, a, q) do { if ((q) && big(n)) big_note(op, n, old, a, __builtin_return_address(0), __builtin_frame_address(0)); } while (0)
+
 static void *m_Malloc(void *self, size_t n, uint32_t a) {
     (void)self; void *p = alloc(n, a);
     if (!p) die("Unreal heap: out of memory (%zu bytes, alignment %u, %.2f GB in use)", n, a, atomic_load(&g_used) / 1073741824.0);
+    BIG("Malloc", n, 0, a, p);
     return p;
 }
-static void *m_TryMalloc(void *self, size_t n, uint32_t a) { (void)self; return alloc(n, a); }
+static void *m_TryMalloc(void *self, size_t n, uint32_t a) { (void)self; void *p = alloc(n, a); BIG("TryMalloc", n, 0, a, p); return p; }
 static void *m_Realloc(void *self, void *p, size_t n, uint32_t a) {
-    (void)self; void *q = realloc_aligned(p, n, a);
+    (void)self; size_t old = p && big(n) ? m_old_size(p) : 0; void *q = realloc_aligned(p, n, a);
     if (!q && n) die("Unreal heap: out of memory in Realloc (%zu bytes, alignment %u, %.2f GB in use)", n, a, atomic_load(&g_used) / 1073741824.0);
+    BIG("Realloc", n, old, a, q);
     return q;
 }
-static void *m_TryRealloc(void *self, void *p, size_t n, uint32_t a) { (void)self; return realloc_aligned(p, n, a); }
+static void *m_TryRealloc(void *self, void *p, size_t n, uint32_t a) { (void)self; size_t old = p && big(n) ? m_old_size(p) : 0; void *q = realloc_aligned(p, n, a); BIG("TryRealloc", n, old, a, q); return q; }
 static void m_Free(void *self, void *p) { (void)self; release(p); }
 static size_t m_QuantizeSize(void *self, size_t n, uint32_t a) { (void)self; (void)a; return malloc_good_size(n); }
 static bool m_GetAllocationSize(void *self, void *p, size_t *out) { (void)self; if (!p) return false; *out = malloc_size(p); return true; }
