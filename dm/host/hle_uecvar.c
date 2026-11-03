@@ -63,27 +63,32 @@ static void ue_drs_tick(void) {
         LOG("main: Unreal dynamic resolution now: OperationMode %d, FrameTimeBudget %g ms, Min/MaxScreenPercentage %g / %g, r.ScreenPercentage %g", om, b, mn, mx, sp);
     }
 }
+// DM_UE_TEXTURE_POOL=<MB> raises a smaller pool to <MB> (as the profile's ue_texture_pool); =-<MB> caps a larger one at <MB> (a tablet short of memory: the streamer then keeps fewer
+// top mips, in guest memory and in the GPU's copies of them). The value the game runs with is logged every 600 presents either way, when the rewriter found the variable
 void dm_ue_cvar_tick(void) {
     ue_drs_tick();
-    static int state = -1, target, nlog; static uint64_t obj_off; static const char *src;
+    static int state = -1, target, cap, nlog; static uint64_t obj_off, n; static const char *src;
     if (!state) return;
     if (state < 0) {
         state = 0;
         const char *e = getenv("DM_UE_TEXTURE_POOL");
         target = e ? atoi(e) : TARGET_OS_IPHONE ? 0 : DM_GAME_UE_TEXTURE_POOL; src = e ? "DM_UE_TEXTURE_POOL" : "game profile ue_texture_pool";
-        if (target <= 0) { if (DM_GAME_UE_TEXTURE_POOL) LOG("main: Unreal r.Streaming.PoolSize left as the game sets it (%s)", e ? src : "iOS without DM_UE_TEXTURE_POOL"); return; }
+        cap = target < 0; if (cap) target = -target;
         obj_off = dm_ue_cvar("r.Streaming.PoolSize");
-        if (!obj_off) { LOG("[RED] main: Unreal r.Streaming.PoolSize not found in main by the rewriter (ue_cvar.py; %s %d MB not applied)", src, target); return; }
-        LOG("main: Unreal r.Streaming.PoolSize at main+%#llx, raised to %d MB (%s)", (unsigned long long)obj_off, target, src);
+        if (!obj_off) { if (target > 0) LOG("[RED] main: Unreal r.Streaming.PoolSize not found in main by the rewriter (ue_cvar.py; %s %d MB not applied)", src, target); return; }
+        if (target <= 0) LOG("main: Unreal r.Streaming.PoolSize at main+%#llx left as the game sets it (%s)", (unsigned long long)obj_off, e ? src : DM_GAME_UE_TEXTURE_POOL ? "iOS without DM_UE_TEXTURE_POOL" : "no profile value");
+        else LOG("main: Unreal r.Streaming.PoolSize at main+%#llx, %s %d MB (%s)", (unsigned long long)obj_off, cap ? "capped at" : "raised to", target, src);
         state = 1;
     }
     uint8_t *base = NULL;
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) base = g_mod[i].base;
     uint64_t val;
     if (!base || !rd((uint64_t)(uintptr_t)(base + obj_off + 0x10), &val, sizeof val) || !val) return;   // not created yet
+    if (n++ % 600 == 0) { int32_t g = 0, r = 0; rd(val, &g, 4); rd(val + 4, &r, 4); LOG("main: Unreal r.Streaming.PoolSize now %d MB (game thread), %d MB (render thread)", g, r); }
+    if (target <= 0) return;
     for (int c = 0; c < 2; c++) {
         int32_t cur, *p = (int32_t *)(uintptr_t)(val + 4 * (uint64_t)c);
-        if (!rd((uint64_t)(uintptr_t)p, &cur, sizeof cur) || cur <= 0 || cur >= target) continue;
+        if (!rd((uint64_t)(uintptr_t)p, &cur, sizeof cur) || cur <= 0 || (cap ? cur <= target : cur >= target)) continue;
         dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, target, __ATOMIC_RELAXED);
         if (nlog < 8) { nlog++; LOG("main: Unreal r.Streaming.PoolSize (%s thread) %d → %d MB (%s)", c ? "render" : "game", cur, target, src); }
     }
