@@ -36,7 +36,7 @@ all: $(OUT)/libdmhost.so $(OUT)/libdmboot.so
 # libdmboot.so, the app's NativeActivity library: loads libdmhost.so at a fixed address for hibernation (boot/boot.c), then hands the activity to it
 $(OUT)/libdmboot.so: boot/boot.c
 	@mkdir -p $(dir $@)
-	$(CC) -shared -fPIC -O2 -fvisibility=hidden -Wall -o $@ $< -Wl,--no-undefined -Wl,-z,max-page-size=16384 -landroid -llog -ldl
+	$(CC) -shared -fPIC -O2 -fvisibility=hidden -Wall -o $@ $< -Wl,--build-id=sha1 -Wl,--no-undefined -Wl,-z,max-page-size=16384 -landroid -llog -ldl
 .PHONY: profile clean
 profile:
 	$(MAKE) -C $(HOST) GAME=$(GAME) game_profile

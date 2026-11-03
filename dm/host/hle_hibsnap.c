@@ -88,6 +88,9 @@ static void image_id(uint8_t out[20]) {
     elf_build_id(dm_hib_image_base(), out);
 #endif
 }
+// A build without an identity (an Android library linked without a GNU build ID note: every build had image_id all zeros) cannot tell its snapshots from another
+// build's: none is written, none is restored (until a snapshot can be carried across host builds)
+static int image_id_known(const uint8_t id[20]) { for (int i = 0; i < 20; i++) if (id[i]) return 1; return 0; }
 
 // ---- the save folder's fingerprint: names, sizes and modification times; a snapshot is only restored over the save data it was written with ----
 static uint64_t save_fingerprint(void) {
@@ -274,6 +277,7 @@ static void hib_dir(char *out, size_t n) {
 // What the snapshot cannot hold yet: then there is none (the game simply restarts as before). NULL when nothing stands in the way
 int dm_movie_live(void); int dm_fs_dirs_open(void);
 static const char *policy(void) {
+    { uint8_t id[20]; image_id(id); if (!image_id_known(id)) return "this host build has no build ID (link it with -Wl,--build-id): its snapshot could not be told from another build's"; }
     if (dm_movie_live()) return "a movie decoder exists (its state is in libvpx / VideoToolbox)";
     if (dm_fs_dirs_open()) return "a directory handle is open (the guest holds a host pointer)";
     if (dm_hib_audio_host_outputs()) return "the in-process audio renderer has an output open (not kept yet)";
@@ -473,6 +477,7 @@ static int hdr_check(const hib_hdr *h, char *why, size_t n) {
     uint8_t *win, *arena; size_t win_len, mod_used, arena_used; dm_hib_layout(&win, &win_len, &mod_used, &arena, &arena_used);
     uint8_t id[20]; image_id(id); uint8_t *gb; size_t gs; svc_guest_range(&gb, &gs);
     if (strcmp(h->game, DM_GAME_ID)) { snprintf(why, n, "written for game %s", h->game); return -1; }
+    if (!image_id_known(id) || !image_id_known(h->image_id)) { snprintf(why, n, "no host build ID (%s): it cannot be told from another build's", image_id_known(id) ? "the snapshot's" : "this host's"); return -1; }
     if (h->image_base != dm_hib_image_base() || memcmp(h->image_id, id, 20)) { snprintf(why, n, "written by another host build or at another address (%#llx)", (unsigned long long)h->image_base); return -1; }
     if (!win || h->win != (uint64_t)(uintptr_t)win || h->win_len != win_len || h->mod_used != mod_used || h->arena != (uint64_t)(uintptr_t)arena) { snprintf(why, n, "another address layout"); return -1; }
     if (h->nmod != (uint32_t)g_nmod) { snprintf(why, n, "%u modules, this host loaded %d", h->nmod, g_nmod); return -1; }
