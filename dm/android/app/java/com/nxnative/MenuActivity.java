@@ -5,6 +5,8 @@
 // An APK with the game inside (make_apk.py --bundle: assets/game/ and its list files.txt, each file as its pieces in assets/game/p/) unpacks it into the external folder on its first start, and again after an update,
 // with a progress bar; Jugar waits for it.
 // The menu works with the touch screen and with a controller (A confirms, B goes back, START plays). The screen stays on while it is open, as in the game.
+// The save is backed up where adb reads it, and a save put in <external>/save_import comes in (SaveBackup): at the menu's start (once per process) and when the
+// player comes back from the game, off the UI thread; the game starts only after it (play waits).
 package com.nxnative;
 
 import android.app.Activity;
@@ -46,6 +48,8 @@ public class MenuActivity extends Activity {
     private Button playButton;
     private boolean playKeyDown;
     private TextView status; private android.widget.ProgressBar bar; private volatile boolean unpacking;
+    private static boolean savesDone;   // the start's backup / import, once per process (not again when the activity is made anew in it)
+    private boolean saveBusy, playWaiting;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -54,13 +58,15 @@ public class MenuActivity extends Activity {
         // A game the process left in hibernation (DM_HIBERNATE: its snapshot in <files>/hibernate) resumes at once, as a Switch wakes; the menu is the − and + hold away.
         // Also when Android made this activity again after closing the app's processes (b != null): that is the case hibernation is for. A snapshot the game cannot take
         // (another version, damaged) is removed by the game, which then comes back here (show_menu)
-        boolean resume = new File(getFilesDir(), "hibernate/snap.bin").exists() && hibernationOn() && !new File(getFilesDir(), "show_menu").exists();
+        // A save waiting in save_import: no resume (the import sets the snapshot aside, which would bring the old game back and save over the imported one)
+        boolean resume = new File(getFilesDir(), "hibernate/snap.bin").exists() && hibernationOn() && !new File(getFilesDir(), "show_menu").exists() && !new SaveBackup(this).importWaiting();
         // The notification that keeps a suspended game in memory (GameService) needs the notification permission from Android 13 on; asked once, the game runs without it too.
         // Not on a start that goes straight back into the game: the system dialog would open over it (asked at the next start that shows the menu)
         if (!resume && android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
             requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
         seedFiles();
         buildUi();
+        if (!savesDone) { savesDone = true; saves(); }
         if (needsUnpack()) { if (pendingData() != null) askData(null); else unpack(); return; }
         boolean forced = new File(getFilesDir(), "show_menu").delete();
         if (showFailure()) return;   // the last game process died: the error, not the game again (with "do not show again" on, it would start straight back into it)
@@ -71,7 +77,7 @@ public class MenuActivity extends Activity {
         super.onResume();
         playKeyDown = false;
         SharedLayouts.refreshActive(this);   // a shared on-screen controls profile: the game takes what the shared folder holds now
-        if (launched && new File(getFilesDir(), "show_menu").delete()) launched = false;   // back from the game with − and +
+        if (launched && new File(getFilesDir(), "show_menu").delete()) { launched = false; saves(); }   // back from the game with − and +: its save backed up again
         if (showFailure()) launched = false;
     }
 
@@ -379,8 +385,24 @@ public class MenuActivity extends Activity {
                    + "\nDM_CHEATS_ON=" + list + "\nDM_HIBERNATE=" + (hibernate.isChecked() ? 1 : 0) + "\n";
         try (OutputStream o = new FileOutputStream(new File(getFilesDir(), "settings.env"))) { o.write(env.getBytes(StandardCharsets.UTF_8)); } catch (Exception e) { /* the defaults apply */ }
     }
+    // SaveBackup on its own thread: the backup of the save, then the import if one waits; a play asked meanwhile starts when it is done
+    private void saves() {
+        if (saveBusy) return;
+        saveBusy = true;
+        new Thread(() -> {
+            String msg = null;
+            try { msg = new SaveBackup(this).run(true); } catch (Throwable t) { android.util.Log.e("nxsave", "save backup", t); }
+            final String m = msg;
+            runOnUiThread(() -> {
+                saveBusy = false;
+                if (m != null) android.widget.Toast.makeText(this, m, android.widget.Toast.LENGTH_LONG).show();
+                if (playWaiting) { playWaiting = false; if (!isFinishing() && !isDestroyed()) play(); }
+            });
+        }, "save-backup").start();
+    }
     private void play() {
         if (unpacking) return;
+        if (saveBusy) { playWaiting = true; return; }
         if (!new File(getFilesDir(), "settings.env").exists()) save();
         new File(getFilesDir(), "game_failed").delete(); new File(getFilesDir(), "game_running").delete();   // the player starts it: not a restart after a death
         if (status != null && !unpacking) status.setVisibility(View.GONE);
