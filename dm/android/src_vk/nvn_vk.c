@@ -1948,10 +1948,16 @@ static int next_work_op(const uint8_t *p) {   // the first op from p that is not
     }
     return -1;
 }
+// DM_VK_BARRIER_HOLD (default 1): a barrier between draws into the same targets keeps the pass open too, like the SetRenderTargets detour hold. Unreal's render graph records one
+// between consecutive passes (FINAL FANTASY RESONANCE's deferred lights: 5.5 one-draw passes a frame into the scene colour and depth, each loading and storing both). What it orders
+// was written by passes already ended (their end barrier covers it) or by dispatches (theirs), so only the open pass's own attachments are at stake: the pass counts as merged
+// and a draw sampling one it wrote ends it first (draw_reads_rt). DM_VK_BARRIER_HOLD=0: every barrier ends the open pass, as before
+static int rt_split_on(void);
+static int barrier_hold_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_BARRIER_HOLD"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_BARRIER_HOLD=0: every barrier ends the open pass"); } return v; }
 static int barrier_keeps_pass(const uint8_t *next) {
-    if (!defer_on() || !P.open) return 0;
-    int w = next_work_op(next);
-    return w == OP_DISPATCH || (g_ndefer && (w == OP_DRAW || w == OP_DRAW_IDX));
+    if (!P.open || !rt_split_on() || (!defer_on() && !barrier_hold_on())) return 0;
+    int w = next_work_op(next), draw = w == OP_DRAW || w == OP_DRAW_IDX;
+    return (barrier_hold_on() && draw) || (defer_on() && (w == OP_DISPATCH || (g_ndefer && draw)));
 }
 static void set_rt_(const p_set_rt *r);
 static void set_rt(const uint8_t *op, const p_set_rt *r, uint32_t size) {
