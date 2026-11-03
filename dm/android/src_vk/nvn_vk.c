@@ -983,6 +983,7 @@ struct vtex {
     struct vtex *next;
     uint64_t dead;   // released by the game: freed once the GPU has finished the submission that was being recorded then (fence dead)
     uint64_t lhash, lhash_gen; uint8_t lcpu;
+    uint8_t ubwc;   // made compressible (DM_VK_UBWC)
     VkFormat vfl[2]; uint8_t nvfl; VkImageFormatListCreateInfo fli;   // DM_VK_UBWC: the only formats its views may take (nvfl 0: any, MUTABLE_FORMAT without a list)
     VkImageCreateInfo ci; uint8_t packaged, evicted; uint64_t last_frame, last_fence;   // texture eviction (tex_evict): how it was made, whether its content comes from its storage, when it was last used
     uint32_t gpu_lv;   // levels a copy wrote on the GPU (texture or buffer copies into one level): an upload from storage leaves them alone, the rest still follows the game's writes   // lcpu: a linear texture in a pool the CPU writes (a glyph cache): its storage hashed once a submission, uploaded again when it changed
@@ -1016,9 +1017,15 @@ static void tex_reupload(vtex *v, const tex_t *t, uint64_t since);
 // DM_VK_UBWC=1: images whose views never reinterpret their format keep the Adreno's bandwidth compression (UBWC). Every image used to be made MUTABLE_FORMAT with no format list,
 // which the driver may answer by leaving the image uncompressed: every render target, depth buffer and texture read and written at full size. Now an image is MUTABLE_FORMAT
 // only with a format list -- its own format and its sRGB / UNORM sibling -- or not mutable at all where it has no sibling (depth images included: their views keep their format).
-// Storage images stay as they were (any view). A view asking for a format outside the list takes the image's own (counted: g_ubwc_fallback). Default 0 (off) until measured
-static int ubwc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_UBWC=1: images without format reinterpretation keep compression (format lists)"); } return v; }
-static uint64_t g_ubwc_fallback, g_ubwc_imgs;
+// Storage images stay as they were (any view). A view asking for a format outside the list takes the image's own (counted: g_ubwc_fallback). Default 0 (off), and to stay so:
+// it bought no frame rate, and with it on FINAL FANTASY RESONANCE's texture streaming (100-300 MB a second of copies into compressed images) cost the system memory no resident set
+// or device allocation showed -- MemAvailable 1.8 GB to 0.24 GB in 3 s, the low-memory killer 4 times in 4 at the Earth Shrine arch; with it off the same walk peaked 1.1 GB/s of uploads and lived
+// DM_VK_UBWC=2 (vk19.35, opt-in): compression only for images made as render targets (first use an attachment) or marked COMPRESSIBLE on a format the GPU renders, and only when
+// nothing is uploaded into them: not packaged, not CPU-written, no initial or late fill. Uploaded textures stay plain, the copies into which cost the untracked memory above.
+// Copies into a compressed image are still counted (g_ubwc_b2t: the game's buffer-to-texture copies, g_ubwc_t2t: image copies and blits, g_ubwc_up: uploads, none expected)
+static int ubwc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 0;
+    if (v) LOG("DM_VK_UBWC=%d: %s keep compression (format lists)", v, v == 2 ? "render targets nothing is uploaded into" : "images without format reinterpretation"); } return v; }
+static uint64_t g_ubwc_fallback, g_ubwc_imgs, g_ubwc_b2t, g_ubwc_t2t, g_ubwc_up;
 static VkFormat fmt_sibling(VkFormat f) {   // the sRGB / UNORM twin of a format, VK_FORMAT_UNDEFINED when it has none
     static const VkFormat pr[][2] = {{VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB}, {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB}, {VK_FORMAT_A8B8G8R8_UNORM_PACK32, VK_FORMAT_A8B8G8R8_SRGB_PACK32},
         {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SRGB}, {VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_SRGB}, {VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8_SRGB},
@@ -1121,7 +1128,14 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
                             is3d ? VK_IMAGE_TYPE_3D : t->d.target == NVN_TEXTURE_TARGET_1D || t->d.target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D,
                             f.f, {v->w, t->d.target == NVN_TEXTURE_TARGET_1D_ARRAY ? 1 : v->h, v->d}, v->levels, v->layers, sc, VK_IMAGE_TILING_OPTIMAL, u, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     if (sc != VK_SAMPLE_COUNT_1_BIT) ii.mipLevels = 1;
-    if (ubwc_on() && !(u & VK_IMAGE_USAGE_STORAGE_BIT)) {   // see ubwc_on: a format list, or not mutable
+    int want_ubwc = ubwc_on() && !(u & VK_IMAGE_USAGE_STORAGE_BIT);
+    if (want_ubwc && ubwc_on() == 2) {   // render targets only, and nothing uploaded into them
+        int rt = for_rt || ((t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) && !fmt_block(f.f) && !f.dec && (u & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)));
+        int uploads = !for_rt && t->mem && (t->has_layout || cpu_written(t->serial) || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || init_fill(t, &f) || late_fill(t, &f));
+        want_ubwc = rt && !uploads;
+    }
+    if (want_ubwc) {   // see ubwc_on: a format list, or not mutable
+        v->ubwc = 1;
         VkFormat sib = f.depth ? VK_FORMAT_UNDEFINED : fmt_sibling(f.f); v->vfl[0] = f.f; v->nvfl = 1;
         if (sib != VK_FORMAT_UNDEFINED) { v->vfl[1] = sib; v->nvfl = 2; v->fli = (VkImageFormatListCreateInfo){VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, 2, v->vfl}; ii.pNext = &v->fli; }
         else ii.flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
@@ -1243,7 +1257,7 @@ static void tex_upload_(vtex *v, const tex_t *t, uint64_t since) {
     // Every level and layer goes in one vkCmdCopyBufferToImage (regions batched while they share a ring): one call per level and layer cost a driver call each, and the Adreno's
     // allocated command memory inside them (kgsl_sharedmem_alloc, a third of the render thread while a stage streamed its textures in)
     enum { NUREG = 64 }; VkBufferImageCopy ureg[NUREG]; uint32_t nureg = 0; VkBuffer ubuf = VK_NULL_HANDLE;
-    #define UFLUSH() do { if (nureg) { vkCmdCopyBufferToImage(C->up, ubuf, v->img, VK_IMAGE_LAYOUT_GENERAL, nureg, ureg); nureg = 0; } } while (0)
+    #define UFLUSH() do { if (nureg) { if (v->ubwc) g_ubwc_up++; vkCmdCopyBufferToImage(C->up, ubuf, v->img, VK_IMAGE_LAYOUT_GENERAL, nureg, ureg); nureg = 0; } } while (0)
     for (unsigned lv = 0; lv < v->levels; lv++) {
         if (lv < 32 && (v->gpu_lv >> lv & 1)) continue;   // a copy on the GPU wrote this level: its storage does not hold that
         if (lv < 32 && !(lvmask >> lv & 1)) continue;     // a re-upload: not written since the last one
@@ -3076,6 +3090,7 @@ static void copy_b2t(const p_copy_b2t *c) {
     }
     VkBufferImageCopy bc = {o, (uint32_t)(row / bpb * bw), (uint32_t)(img / row * bh), {v->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, lv, is3d ? 0 : ly + (uint32_t)r->zoffset, is3d ? 1 : d},
                             {r->xoffset, r->yoffset, is3d ? r->zoffset : 0}, {w, h, is3d ? d : 1}};
+    if (v->ubwc) g_ubwc_b2t++;
     gpu_mark(2, 0); vkCmdCopyBufferToImage(C->cb, sb, v->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc); gpu_mark(2, 1);
     barrier_xfer(C->cb);
 }
@@ -3106,10 +3121,12 @@ static void copy_t2t(const p_copy_t2t *c) {
     int lin = (c->flags & 1) && !same, blit_ok = (sf & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (df & VK_FORMAT_FEATURE_BLIT_DST_BIT) && (!lin || (sf & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) && sa == da;
     if (same && (!blit_ok || s->f.f == d->f.f) && sa == da) {   // one size: a copy (formats of one size class), which every format supports
         VkImageCopy ic = {{sa, sl, (uint32_t)c->sr.zoffset, 1}, {c->sr.xoffset, c->sr.yoffset, 0}, {da, dl, (uint32_t)c->dr.zoffset, 1}, {c->dr.xoffset, c->dr.yoffset, 0}, {(uint32_t)c->sr.width, (uint32_t)c->sr.height, 1}};
+        if (d->ubwc) g_ubwc_t2t++;
         vkCmdCopyImage(C->cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
     } else if (blit_ok) {
         VkImageBlit b = {{sa, sl, (uint32_t)c->sr.zoffset, 1}, {{c->sr.xoffset, c->sr.yoffset, 0}, {c->sr.xoffset + c->sr.width, c->sr.yoffset + c->sr.height, 1}},
                          {da, dl, (uint32_t)c->dr.zoffset, 1}, {{c->dr.xoffset, c->dr.yoffset, 0}, {c->dr.xoffset + c->dr.width, c->dr.yoffset + c->dr.height, 1}}};
+        if (d->ubwc) g_ubwc_t2t++;
         vkCmdBlitImage(C->cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &b, lin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     } else { static int n; if (n++ < 8) LOG("[RED] vk: scaled texture copy between formats %d → %d that cannot be blitted: skipped", (int)s->f.f, (int)d->f.f); return; }
     barrier_xfer(C->cb);
@@ -3994,8 +4011,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                             (unsigned long long)g_adpf_n, g_adpf_v2 ? " with the GPU's work" : "", (unsigned long long)g_adpf_fail, g_adpf_err, g_adpf_n ? g_adpf_cpu / 1e6 / g_adpf_n : 0.0, g_adpf_n ? g_adpf_gpu / 1e6 / g_adpf_n : 0.0);
                         g_adpf_n = g_adpf_fail = g_adpf_cpu = g_adpf_gpu = 0; }
     if (n % 600 == 0 && defer_on()) { LOG("vk: DM_VK_DISPATCH_DEFER: %.1f dispatches a frame recorded after their pass, %.1f passes a frame ended early for a draw reading what one writes, %.1f barriers a frame that kept their pass open", g_ndefer_n / 600.0, g_ndefer_haz / 600.0, g_nbar_kept / 600.0); g_ndefer_n = g_ndefer_haz = 0; g_nbar_kept = 0; }
-    if (n % 600 == 0 && (ubwc_on() || pass_barrier_on())) { LOG("vk: DM_VK_UBWC %d: %llu images made with a format list or not mutable so far, %llu views outside the list; DM_VK_PASS_BARRIER %d: %.1f pass ends a frame without vertex shaders, %.1f vertex-shader barriers a frame",
-        ubwc_on(), (unsigned long long)g_ubwc_imgs, (unsigned long long)g_ubwc_fallback, pass_barrier_on(), g_nbar_narrow / 600.0, g_nbar_vs / 600.0); g_nbar_narrow = g_nbar_vs = 0; }
+    if (n % 600 == 0 && (ubwc_on() || pass_barrier_on())) { LOG("vk: DM_VK_UBWC %d: %llu images made with a format list or not mutable so far, %llu views outside the list, copies into them: %llu from buffers, %llu from images, %llu uploads; DM_VK_PASS_BARRIER %d: %.1f pass ends a frame without vertex shaders, %.1f vertex-shader barriers a frame",
+        ubwc_on(), (unsigned long long)g_ubwc_imgs, (unsigned long long)g_ubwc_fallback, (unsigned long long)g_ubwc_b2t, (unsigned long long)g_ubwc_t2t, (unsigned long long)g_ubwc_up, pass_barrier_on(), g_nbar_narrow / 600.0, g_nbar_vs / 600.0); g_nbar_narrow = g_nbar_vs = 0; }
     if (n % 600 == 0) { LOG("vk: waiting for a free submission context per frame: %.2f ms for its own submission, %.2f ms for a later one still reading its ring (%d contexts)",
                         atomic_exchange(&g_wait_fence_ns, 0) / 600e6, atomic_exchange(&g_wait_hold_ns, 0) / 600e6, NCTX); }
     if (n % 600 == 0) { LOG("vk: per frame over the last 600: GPU %.2f ms, recording %.2f ms, waiting for the GPU %.2f ms, present waiting %.2f ms", atomic_exchange(&g_gpu_ns, 0) / 600e6,
