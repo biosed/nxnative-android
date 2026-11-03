@@ -315,15 +315,20 @@ DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.p
 DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (`r.Streaming.PoolSize`) is raised to, overriding the profile's `ue_texture_pool`; `0` keeps the game's own pool. On iOS only this switch turns it on (`Documents/env.txt`)
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
 DM_VK_DIR	path	Android: the folder of the shaders' SPIR-V (`<key>.spv`, `<key>.vk.txt` from dm/android/tools/spv_android.py) and the pipeline cache
+DM_VK_LATE_FILL	test	Android: `0` leaves out vk19.5's late fill (a texture drawn before the game wrote its storage is watched and uploaded when the data comes)
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
+DM_VK_MIRROR	test	Android: `0` leaves out vk19.6's mirrors (a GPU copy into a storage-backed texture is written into its storage too)
 DM_VK_NO_DYNREND	test	Android: `1` uses render passes made per pass even where dynamic rendering is available (the path for Vulkan 1.1 / 1.2 GPUs without it)
 DM_VK_NO_TIMELINE	test	Android: set, submissions are not chained by a timeline semaphore even where the GPU has one
 DM_VK_PASSLOG	diagnostic	Android: `=<frame>[+]` logs that frame's passes, draws, copies and dispatches (targets, clears, shaders, depth / stencil / blend)
 DM_VK_RTDUMP	diagnostic	Android: `=<frame>[,<frames>]` writes every render target of that frame (and the next ones) as raw files into DM_VK_SHOT_DIR
 DM_VK_RTDUMP_DEC	diagnostic	Android: with DM_VK_RTDUMP, also writes the textures decoded from BC4-7 on upload
+DM_VK_RT_HOLD	test	Android: `0` turns the SetRenderTargets detour hold off: every SetRenderTargets ends the open pass
+DM_VK_RT_SPLIT	test	Android: `0` leaves out vk19.4's split: a held pass is not ended for a draw that samples one of its attachments (the castle wall's contact shadow flickers again)
 DM_VK_SHOTS	diagnostic	Android: `=<frame>,…` writes the presented image of those frames into DM_VK_SHOT_DIR
 DM_VK_SHOT_DIR	path	Android: where DM_VK_SHOTS and DM_VK_RTDUMP write (default: the current folder)
 DM_VK_SKIP	diagnostic	Android: `=<mask>` leaves out kinds of GPU work (1 buffer→texture, 2 texture→texture, 4 texture→buffer, 8 clears, 16 uploads, 32 draws / dispatches), for bisecting a wrong picture
+DM_VK_STALE_PATCH	test	Android: `0` leaves out vk19.3's stale-read patch: a read of an earlier submission's GPU-written range takes its bytes as they are, without the CPU's later rewrites
 DM_VK_TEXCOUNT	diagnostic	Android: set, every 600 presents logs the live textures by kind and how many share their storage start with an older one
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
 DM_WATCH	diagnostic	`=<s>` dumps all threads after that many seconds (SIGALRM) and turns on the stall watchdog; off unless set

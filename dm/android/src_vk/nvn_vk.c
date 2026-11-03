@@ -175,11 +175,29 @@ typedef struct { uint64_t addr, size; VkBuffer buf; VkDeviceSize off; uint8_t *p
 enum { NGW = 512 };
 static gw_t g_gw[NGW]; static int g_ngw; static pthread_mutex_t g_gwmu = PTHREAD_MUTEX_INITIALIZER;
 static void xr_raise(VkBuffer b, uint64_t until);   // an extra ring a later submission reads stays until it is done (see g_xr)
+// Which megabytes of guest memory any entry covers (a count per megabyte, folded into 64K slots): a read touching none of them has no entry to find, and gw_find / gw_exact / gw_any
+// answer it without the lock and the walk over every entry -- every uniform, storage and texel buffer of every draw asks, and the entries in flight grow with the GPU's lag.
+// Changed under g_gwmu; read without it on the submit thread, which alone adds entries (a removal seen late only sends the read to the walk)
+enum { GWPG = 1 << 16 };
+static uint16_t g_gw_pg[GWPG];
+static uint64_t g_gw_calls, g_gw_walked, g_gw_quick;   // gw_find calls, entries looked at, calls answered by the megabyte counts (the recording line)
+static void gw_pg_mark(uint64_t addr, uint64_t size, int d) {
+    if (!size) return;
+    uint64_t a = addr >> 20, b = (addr + size - 1) >> 20; if (b - a >= GWPG) b = a + GWPG - 1;
+    for (uint64_t m = a; m <= b; m++) __atomic_add_fetch(&g_gw_pg[m & (GWPG - 1)], (uint16_t)d, __ATOMIC_RELAXED);
+}
+static int gw_pg_any(uint64_t addr, uint64_t size) {
+    if (!size) return 0;
+    uint64_t a = addr >> 20, b = (addr + size - 1) >> 20; if (b - a >= GWPG) return 1;
+    for (uint64_t m = a; m <= b; m++) if (__atomic_load_n(&g_gw_pg[m & (GWPG - 1)], __ATOMIC_RELAXED)) return 1;
+    return 0;
+}
+static void gw_del(int i) { gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] = g_gw[--g_ngw]; }   // caller holds g_gwmu
 static void gw_add(uint64_t addr, uint64_t size, VkBuffer buf, VkDeviceSize off, uint8_t *p, uint64_t fence, int ci, const uint8_t *snap, int exact) {
     pthread_mutex_lock(&g_gwmu);
-    for (int i = 0; i < g_ngw; i++) if (g_gw[i].addr == addr && g_gw[i].size == size) { g_gw[i] = g_gw[--g_ngw]; break; }   // the newer write of one range replaces the older
-    if (g_ngw == NGW) { RED_ONCE(62, "more than %d GPU-written buffer ranges in flight: the oldest is forgotten", NGW); memmove(g_gw, g_gw + 1, (NGW - 1) * sizeof *g_gw); g_ngw--; }
-    g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0};
+    for (int i = 0; i < g_ngw; i++) if (g_gw[i].addr == addr && g_gw[i].size == size) { gw_del(i); break; }   // the newer write of one range replaces the older
+    if (g_ngw == NGW) { RED_ONCE(62, "more than %d GPU-written buffer ranges in flight: the oldest is forgotten", NGW); gw_pg_mark(g_gw[0].addr, g_gw[0].size, -1); memmove(g_gw, g_gw + 1, (NGW - 1) * sizeof *g_gw); g_ngw--; }
+    g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0}; gw_pg_mark(addr, size, 1);
     pthread_mutex_unlock(&g_gwmu);
 }
 // The ring range holding what the GPU wrote at [addr, addr + size), when an entry covers it and the offset in it keeps `align`. An entry of the submission being recorded is
@@ -194,27 +212,52 @@ static VkDeviceSize ring_put(const void *src, VkDeviceSize n, VkDeviceSize align
 // Whether the CPU rewrote any of [lo, hi) of a dispatch's range since the dispatch was recorded (the guest's bytes against its snapshot; only the bytes read). On the Switch the GPU
 // writes the pool's memory itself, so a later read sees the GPU's bytes where it wrote and the CPU's everywhere else; here the whole bound range was taken from the GPU's ring,
 // and bytes the CPU had rewritten there in between (Unreal's per-frame uploads into buffers a compute pass also binds) were read stale. Caller holds g_gwmu
-static int gw_cpu_dirty(gw_t *e, uint64_t lo, uint64_t hi) {
-    if (!e->snap || hi <= lo) return 0;
-    if (lo == e->addr && hi == e->addr + e->size) { if (e->chk != g_fence + 1) { e->chk = g_fence + 1; e->dirty = memcmp((const void *)(uintptr_t)lo, e->snap, hi - lo) != 0; } return e->dirty; }   // the whole range: once a submission
-    return memcmp((const void *)(uintptr_t)lo, e->snap + (lo - e->addr), hi - lo) != 0;
+// Cost: a partial read takes the whole range's answer first (one compare a submission): a range the CPU left alone is clean in every part of it. DM_VK_STALE_PATCH=0 leaves
+// the comparison out (the GPU's bytes as they are, as before vk19.3). g_t_stale / g_stale_bytes: time and bytes in these compares and patches (the recording line)
+static uint64_t g_t_stale, g_stale_bytes;
+static int stale_patch_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STALE_PATCH"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_STALE_PATCH=0: reads of an earlier submission's GPU-written range take its bytes as they are"); } return v; }
+static int gw_whole_dirty(gw_t *e) {
+    if (e->chk != g_fence + 1) { e->chk = g_fence + 1; e->dirty = memcmp((const void *)(uintptr_t)e->addr, e->snap, e->size) != 0; g_stale_bytes += e->size; }
+    return e->dirty;
 }
-// The words of [lo, hi) the CPU rewrote since e was recorded, copied from the guest over dst (where lo lands), after the GPU's bytes were copied there (the upload command buffer)
+static int gw_cpu_dirty(gw_t *e, uint64_t lo, uint64_t hi) {
+    if (!e->snap || hi <= lo || !stale_patch_on()) return 0;
+    uint64_t t0 = now_ns(); int r = gw_whole_dirty(e);   // the whole range: once a submission
+    if (r && !(lo == e->addr && hi == e->addr + e->size)) { r = memcmp((const void *)(uintptr_t)lo, e->snap + (lo - e->addr), hi - lo) != 0; g_stale_bytes += hi - lo; }
+    g_t_stale += now_ns() - t0;
+    return r;
+}
+// The words of [lo, hi) the CPU rewrote since e was recorded, copied from the guest over dst (where lo lands), after the GPU's bytes were copied there (the upload command buffer).
+// Compared 8 bytes at a time (64 at a time over equal stretches); only the bytes from the first rewritten word to the last go into the ring
+static inline uint64_t ld64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
+static inline uint32_t ld32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static void gw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDeviceSize dst_off) {
+    if (!e->snap) return;
+    uint64_t t0 = now_ns();
     const uint8_t *g = (const uint8_t *)(uintptr_t)lo, *sn = e->snap + (lo - e->addr); uint64_t n = hi - lo;
-    if (!e->snap || !memcmp(g, sn, n)) return;
-    VkDeviceSize st = ring_put(g, n, 16); if (st == VK_WHOLE_SIZE) return;
-    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT};
-    vkCmdPipelineBarrier(C->up, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);   // after the GPU's bytes landed
-    VkBufferCopy rg[64]; int nr = 0; uint64_t i = 0;
+    static VkBufferCopy *rg; static size_t crg; size_t nr = 0; uint64_t i = 0;   // the runs of rewritten words (exact: the bytes between them may be the GPU's); under g_gwmu
     while (i < n) {
-        uint64_t w = n - i < 4 ? n - i : 4; if (!memcmp(g + i, sn + i, w)) { i += w; continue; }
-        uint64_t a = i; while (i < n) { uint64_t w2 = n - i < 4 ? n - i : 4; if (!memcmp(g + i, sn + i, w2)) break; i += w2; }
-        rg[nr++] = (VkBufferCopy){st + a, dst_off + a, i - a};
-        if (nr == 64) { vkCmdCopyBuffer(C->up, C->ring, dst, (uint32_t)nr, rg); nr = 0; }
+        if (i + 64 <= n && !memcmp(g + i, sn + i, 64)) { i += 64; continue; }
+        if (i + 8 <= n && ld64(g + i) == ld64(sn + i)) { i += 8; continue; }
+        if (i + 4 <= n ? ld32(g + i) == ld32(sn + i) : !memcmp(g + i, sn + i, n - i)) { i += i + 4 <= n ? 4 : n - i; continue; }
+        uint64_t a = i;
+        while (i < n) { if (i + 4 <= n) { if (ld32(g + i) == ld32(sn + i)) break; i += 4; continue; } if (!memcmp(g + i, sn + i, n - i)) break; i = n; }   // word by word: an unchanged word may hold the GPU's bytes
+        if (nr == crg) { size_t c2 = crg ? 2 * crg : 256; VkBufferCopy *r2 = realloc(rg, c2 * sizeof *rg); if (!r2) break; rg = r2; crg = c2; }
+        rg[nr++] = (VkBufferCopy){a, a, i - a};
     }
-    if (nr) vkCmdCopyBuffer(C->up, C->ring, dst, (uint32_t)nr, rg);
-    C->up_used = 1;
+    g_stale_bytes += n;
+    if (nr) {
+        uint64_t first = rg[0].srcOffset, last = rg[nr - 1].srcOffset + rg[nr - 1].size;
+        VkDeviceSize st = ring_put(g + first, last - first, 16);
+        if (st != VK_WHOLE_SIZE) {
+            VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT};
+            vkCmdPipelineBarrier(C->up, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);   // after the GPU's bytes landed
+            for (size_t k = 0; k < nr; k++) { rg[k].dstOffset = dst_off + rg[k].srcOffset; rg[k].srcOffset = st + (rg[k].srcOffset - first); }
+            for (size_t k = 0; k < nr; k += 4096) vkCmdCopyBuffer(C->up, C->ring, dst, (uint32_t)(nr - k < 4096 ? nr - k : 4096), rg + k);
+            C->up_used = 1;
+        }
+    }
+    g_t_stale += now_ns() - t0;
 }
 // A read over [addr, addr + size) that earlier submissions still running wrote parts of (Unreal binds its whole GPU-scene buffer; a dispatch updated a few records of it): the guest's
 // bytes copied into the ring, then each written part copied over them from its submission's ring at the start of this submission, oldest first (the upload command buffer; those
@@ -247,7 +290,8 @@ static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align)
 static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off, uint8_t **p, int may_hold) {
     int hit = 0; uint64_t wait = 0; int why = 0;
     if (!__atomic_load_n(&g_ngw, __ATOMIC_RELAXED)) return 0;
-    pthread_mutex_lock(&g_gwmu);
+    g_gw_calls++; if (!gw_pg_any(addr, size)) { g_gw_quick++; return 0; }
+    pthread_mutex_lock(&g_gwmu); g_gw_walked += (uint64_t)g_ngw;
     for (int i = g_ngw - 1; i >= 0 && !hit && !wait; i--) {
         gw_t *e = &g_gw[i];
         if (addr >= e->addr + e->size || addr + size <= e->addr) continue;
@@ -290,7 +334,7 @@ static int gw_find(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *b
 // Whether every GPU-written entry over [addr, addr + size) is an exact write, and there is one: a buffer-to-texture copy takes its source from such ranges only; over a dispatch's
 // bound range it reads the guest's bytes (Unreal's staging written by the CPU), as on the Switch, where a copy reads the pool's memory
 static int gw_exact(uint64_t addr, uint64_t size) {
-    if (!__atomic_load_n(&g_ngw, __ATOMIC_RELAXED)) return 0;
+    if (!__atomic_load_n(&g_ngw, __ATOMIC_RELAXED) || !gw_pg_any(addr, size)) return 0;
     int any = 0, ok = 1; pthread_mutex_lock(&g_gwmu);
     for (int i = 0; i < g_ngw; i++) { const gw_t *e = &g_gw[i]; if (addr >= e->addr + e->size || addr + size <= e->addr) continue; any = 1; if (!e->exact) ok = 0; }
     pthread_mutex_unlock(&g_gwmu);
@@ -299,7 +343,7 @@ static int gw_exact(uint64_t addr, uint64_t size) {
 }
 static void gw_expire(uint64_t fence) {   // completion: the submission's writes are in guest memory now, and its rings go
     pthread_mutex_lock(&g_gwmu);
-    for (int i = 0; i < g_ngw;) if (g_gw[i].fence <= fence) g_gw[i] = g_gw[--g_ngw]; else i++;
+    for (int i = 0; i < g_ngw;) if (g_gw[i].fence <= fence) gw_del(i); else i++;
     pthread_mutex_unlock(&g_gwmu);
 }
 // Extra rings kept past their own submission for later ones that read them (under g_gwmu). A later submission can find a range in one after its context completed --
@@ -1514,6 +1558,7 @@ static struct {   // the current render targets and the open dynamic rendering; 
     int n; vtex *ct[8]; VkImageView cv[8]; vtex *dt; VkImageView dv; uint32_t w, h; int open;
     int merged;   // the open pass went on across a SetRenderTargets (rt_hold_scan, or the same targets again): a draw sampling one of its attachments ends it first (draw_reads_rt)
     uint32_t clv[8], cly[8]; uint8_t cwr[8], cdrawn[8];   // each colour attachment's level and layer, and whether a draw wrote it since its last same-pass snapshot (fb_prepare)
+    uint8_t ddrawn;   // the depth / stencil attachment was cleared or written in this pass (draw_reads_rt: an attachment only loaded reads the same from memory)
     uint8_t clr_c[8], clr_d, clr_s; VkClearColorValue cc[8]; float cd; uint32_t cs;
     // Layered rendering: a draw whose vertex (or geometry) shader writes the layer runs in a pass over every layer of the attachments (3D: their depth slices) from the attached one on,
     // through 2D array views (tex_view rt 3). Unreal renders its 32x32x32 colour grading LUT this way, one instance per slice; with a one-slice view all instances landed in slice 0
@@ -1548,7 +1593,7 @@ static void pass_end(void) {
                              VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);   // compute too: a dispatch that reads what the pass drew (Unreal's HZB from depth)
         int wb = 0;
         for (int i = 0; i < P.n; i++) if (P.ct[i] && P.ct[i]->linrow && P.cdrawn[i] && !P.clv[i] && !P.cly[i]) { lin_writeback(P.ct[i]); wb = 1; }
-        memset(P.cdrawn, 0, sizeof P.cdrawn);
+        memset(P.cdrawn, 0, sizeof P.cdrawn); P.ddrawn = 0;
         if (wb) barrier_all(C->cb);
     }
 }
@@ -1571,7 +1616,7 @@ static int pass_begin(void) {
     if (P.layered) d.layers = P.nlayers;
     for (int i = 0; i < P.n; i++) { d.cv[i] = P.layered && P.lcv[i] ? P.lcv[i] : P.cv[i]; d.cf[i] = P.ct[i] ? P.ct[i]->f.f : VK_FORMAT_UNDEFINED; d.cl[i] = P.clr_c[i] ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD; d.cc[i] = P.cc[i]; if (P.clr_c[i]) P.cdrawn[i] = 1; }
     if (P.dt) { d.dv = P.layered && P.ldv ? P.ldv : P.dv; d.df = P.dt->f.f; d.stencil = P.dt->f.stencil; d.dl = P.clr_d ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
-                d.sl = P.clr_s ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD; d.dc = (VkClearDepthStencilValue){P.cd, P.cs}; }
+                d.sl = P.clr_s ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD; d.dc = (VkClearDepthStencilValue){P.cd, P.cs}; if (P.clr_d || P.clr_s) P.ddrawn = 1; }
     memset(P.clr_c, 0, sizeof P.clr_c); P.clr_d = P.clr_s = 0;
     if (g_plog) { char b[512]; int o = 0; for (int i = 0; i < P.n; i++) o += snprintf(b + o, sizeof b - o, " c%d=%llu/%d%s", i, P.ct[i] ? (unsigned long long)P.ct[i]->serial : 0ull, (int)d.cf[i], d.cl[i] == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "");
                   if (P.dt) snprintf(b + o, sizeof b - o, " d=%llu/%d%s%s", (unsigned long long)P.dt->serial, (int)d.df, d.dl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/clr" : "", d.sl == VK_ATTACHMENT_LOAD_OP_CLEAR ? "/sclr" : "");
@@ -2209,29 +2254,40 @@ static void vk_ctl(uint64_t n) {
 // contact-shadow or ambient-occlusion term reads, a colour target -- would read it while the pass still holds it in tile memory (undefined: FINAL FANTASY RESONANCE's castle
 // corridor, the contact shadow along the wall flickering frame to frame). Such a draw ends the pass first, as the Metal host does (nvn_mtl.m draw_samples_rt). Every texture
 // binding of the draw's shaders is looked at: slots, handles from uniform buffers, dynamic slot arrays
-static uint64_t g_nsplit;
-static int rt_serial(uint64_t h, uint64_t *ser) {
+// Only an attachment cleared or written in this pass counts: one the pass only loaded holds in memory what the tile holds, so sampling it reads the same and the pass goes on
+// (the split stores and loads every attachment of the pass again, a full tile store and load on the Adreno). g_rmu is taken once for the whole draw. DM_VK_RT_SPLIT=0: no split
+static uint64_t g_nsplit, g_nsplit_skip; static uint64_t g_t_split;
+static int rt_split_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RT_SPLIT"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_RT_SPLIT=0: a held pass is not ended for a draw that samples one of its attachments"); } return v; }
+static int rt_serial_(uint64_t h, uint64_t *ser) {   // caller holds g_rmu
     int tid = (int)(h & 0xfffff); if (!tid) return 0;
-    pthread_mutex_lock(&g_rmu); int ok = tid < g_ntreg && g_treg[tid].ok; if (ok) *ser = g_treg[tid].t.serial; pthread_mutex_unlock(&g_rmu);
+    int ok = tid < g_ntreg && g_treg[tid].ok; if (ok) *ser = g_treg[tid].t.serial;
     return ok;
 }
+static int g_rt_unwritten;   // the draw samples an attachment the pass did not write (counted, no split)
 static int is_attachment(uint64_t ser) {
-    if (P.dt && P.dt->serial == ser) return 1;
-    for (int i = 0; i < P.n; i++) if (P.ct[i] && P.ct[i]->serial == ser) return 1;
+    if (P.dt && P.dt->serial == ser) { if (P.ddrawn) return 1; g_rt_unwritten = 1; }
+    for (int i = 0; i < P.n; i++) if (P.ct[i] && P.ct[i]->serial == ser) { if (P.cdrawn[i]) return 1; g_rt_unwritten = 1; }
     return 0;
 }
-static int shader_reads_rt(shader_t *s, int stage) {
+static int shader_reads_rt(shader_t *s, int stage) {   // caller holds g_rmu
     if (!s) return 0;
     for (int i = 0; i < s->nb; i++) {
         const sbind *b = &s->b[i]; if (b->type != BT_CIS && b->type != BT_TEX) continue;
         uint32_t cnt = b->count ? b->count : 1; uint64_t ser;
-        if (s->dyn && cnt > 1 && b->reg < 0) { for (uint32_t e = 0; e < cnt && e < 128; e++) if (rt_serial(dyn_slot(stage, (int)e), &ser) && is_attachment(ser)) return 1; continue; }
-        if (b->kind == K_TEXU && cnt == 1) { if (rt_serial(texu_slot(stage, b), &ser) && is_attachment(ser)) return 1; continue; }
-        if (b->kind == K_TEX && b->reg >= 0) for (uint32_t e = 0; e < cnt && b->reg + (int)e < NTEX; e++) if (rt_serial(S.tex[stage][b->reg + e], &ser) && is_attachment(ser)) return 1;
+        if (s->dyn && cnt > 1 && b->reg < 0) { for (uint32_t e = 0; e < cnt && e < 128; e++) if (rt_serial_(dyn_slot(stage, (int)e), &ser) && is_attachment(ser)) return 1; continue; }
+        if (b->kind == K_TEXU && cnt == 1) { if (rt_serial_(texu_slot(stage, b), &ser) && is_attachment(ser)) return 1; continue; }
+        if (b->kind == K_TEX && b->reg >= 0) for (uint32_t e = 0; e < cnt && b->reg + (int)e < NTEX; e++) if (rt_serial_(S.tex[stage][b->reg + e], &ser) && is_attachment(ser)) return 1;
     }
     return 0;
 }
-static int draw_reads_rt(shader_t *vs, shader_t *fs, shader_t *gs) { return shader_reads_rt(vs, 0) || shader_reads_rt(fs, 1) || shader_reads_rt(gs, 2); }
+static int draw_reads_rt(shader_t *vs, shader_t *fs, shader_t *gs) {
+    if (!rt_split_on()) return 0;
+    uint64_t t0 = now_ns(); g_rt_unwritten = 0;
+    pthread_mutex_lock(&g_rmu); int r = shader_reads_rt(vs, 0) || shader_reads_rt(fs, 1) || shader_reads_rt(gs, 2); pthread_mutex_unlock(&g_rmu);
+    if (!r && g_rt_unwritten) g_nsplit_skip++;
+    g_t_split += now_ns() - t0;
+    return r;
+}
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!S.bst[0]) SKIP(0);
     uint32_t didx = g_frame_draw++;   // this draw's number within the frame (the live control file's skip ranges)
@@ -2322,6 +2378,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     VkDescriptorSet gset = VK_NULL_HANDLE; if (gs) { gset = write_set(gs, 2); memcpy(gdyno, g_dyno, g_ndyno * 4); ngdyno = g_ndyno; }
     if (!sets[0] || (fs && !sets[1]) || (gs && !gset)) SKIP(6);
     for (int a = 0; a < P.n; a++) if (S.chmask.mask >> (4 * a) & 0xf) P.cwr[a] = P.cdrawn[a] = 1;
+    if (P.dt && ((S.ds.dt && S.ds.dw) || S.ds.st)) P.ddrawn = 1;   // depth writes, or a stencil test (its ops may write)
     VkCommandBuffer cb = C->cb;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, fs ? 2 : 1, sets, ndyno, dyno);
@@ -2522,7 +2579,9 @@ static int copylog_on(void) {   // DM_VK_COPYLOG=<n>: log the first n buffer-to-
 int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);   // hle_nvn.c
 int nvn_tex_mirror_t2t(const tex_t *s, unsigned sl, unsigned ss, const NVNcopyRegion *sr, const tex_t *d, unsigned dl, unsigned ds, const NVNcopyRegion *dr);
 static uint64_t g_mir_b2t, g_mir_t2t;
+static int mirror_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_MIRROR"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_MIRROR=0: GPU copies into textures are not written into their storage"); } return v; }   // DM_VK_MIRROR=0: off
 static int storage_backed(const tex_t *t, const vtex *v) {
+    if (!mirror_on()) return 0;
     if (!t->mem || !t->pool || (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) || t->d.samples > 1) return 0;
     if (t->d.target == NVN_TEXTURE_TARGET_BUFFER || t->d.target == NVN_TEXTURE_TARGET_3D || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_IMAGE))) return 0;
     return v && !v->gpu;
@@ -2678,7 +2737,7 @@ void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *handles, int n) { g_rest = handles; g_nrest = n; }   // the handles after the one replayed next (rt_hold_scan)
 // A buffer copy is made on the CPU as the command list is walked (the in-order writes, wlog). Where the source holds bytes the GPU wrote and has not put back in guest memory
 // yet (gw_find), the copy is made on the GPU from them into the ring instead, and the destination becomes a GPU-written range like the source (gw_add, back at completion)
-static int gw_any(uint64_t a, uint64_t n) { int r = 0; pthread_mutex_lock(&g_gwmu); for (int i = 0; i < g_ngw && !r; i++) r = a < g_gw[i].addr + g_gw[i].size && g_gw[i].addr < a + n; pthread_mutex_unlock(&g_gwmu); return r; }
+static int gw_any(uint64_t a, uint64_t n) { int r = 0; if (!gw_pg_any(a, n)) return 0; pthread_mutex_lock(&g_gwmu); for (int i = 0; i < g_ngw && !r; i++) r = a < g_gw[i].addr + g_gw[i].size && g_gw[i].addr < a + n; pthread_mutex_unlock(&g_gwmu); return r; }
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     memmove((void *)dst, (const void *)src, n); wlog_add(dst, n);
     if (!n || !g_ngw || !gw_any(src, n)) return;
@@ -3287,13 +3346,14 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                           (unsigned long long)g_tex_miss[1], (unsigned long long)g_tex_miss[2], (unsigned long long)g_tex_miss[3], (unsigned long long)g_tex_dead, (unsigned long long)g_treg_dead);
     if (n % 600 == 0) { extern uint64_t g_nsub_stat; static uint64_t ls;
         LOG("vk: recording per frame over the last 600: draws %.2f ms (descriptor sets %.2f ms, %.0f%% reused), dispatches %.2f ms, texture uploads %.2f ms (%.1f MB), vkQueueSubmit %.2f ms; %.1f submissions a frame;"
-            " GPU-written data of a running submission used in place %llu times, copied %llu times, waited for %llu times (%.2f ms a frame; indirect draws %llu, partial ranges %llu, misfits in-submission %llu); copies from GPU-written bytes: into textures %llu, buffers %llu; dispatch write-backs %.1f KB of %.1f KB looked at; reads of an earlier submission's GPU-written range: its bytes as they are %llu, with the CPU's rewrites since patched in %llu; texture copies from guest memory over a dispatch's range %llu",
+            " GPU-written data of a running submission used in place %llu times, copied %llu times, waited for %llu times (%.2f ms a frame; indirect draws %llu, partial ranges %llu, misfits in-submission %llu); copies from GPU-written bytes: into textures %llu, buffers %llu; dispatch write-backs %.1f KB of %.1f KB looked at; reads of an earlier submission's GPU-written range: its bytes as they are %llu, with the CPU's rewrites since patched in %llu; texture copies from guest memory over a dispatch's range %llu; those compares and patches %.2f ms (%.1f MB compared); held-pass sampling checks %.2f ms; GPU-written range lookups %.0f a frame, %.0f answered at once, %.0f entries looked at",
             g_t_draw / 600e6, g_t_ws / 600e6, g_dsc_hit + g_dsc_miss ? 100.0 * g_dsc_hit / (g_dsc_hit + g_dsc_miss) : 0.0, g_t_disp / 600e6, g_t_up / 600e6, g_up_bytes / 600e6 * 1e3 / 1e3, g_t_sub / 600e6,
             (g_nsub_stat - ls) / 600.0, (unsigned long long)atomic_exchange(&g_gw_held, 0), (unsigned long long)atomic_exchange(&g_gw_copied, 0), (unsigned long long)atomic_exchange(&g_gw_waits, 0), atomic_exchange(&g_gw_wait_ns, 0) / 600e6,
             (unsigned long long)atomic_exchange(&g_gw_why[0], 0), (unsigned long long)atomic_exchange(&g_gw_why[1], 0), (unsigned long long)atomic_exchange(&g_gw_why[2], 0),
             (unsigned long long)atomic_exchange(&g_gw_b2t, 0), (unsigned long long)atomic_exchange(&g_gw_b2b, 0), g_wb_words * 4 / 1024.0, g_wb_bytes / 1024.0,
-            (unsigned long long)atomic_exchange(&g_gw_gpu_reads, 0), (unsigned long long)atomic_exchange(&g_gw_cpu_fix, 0), (unsigned long long)atomic_exchange(&g_gw_b2t_guest, 0));
-        g_wb_words = g_wb_bytes = 0;
+            (unsigned long long)atomic_exchange(&g_gw_gpu_reads, 0), (unsigned long long)atomic_exchange(&g_gw_cpu_fix, 0), (unsigned long long)atomic_exchange(&g_gw_b2t_guest, 0),
+            g_t_stale / 600e6, g_stale_bytes / 600.0 / 1048576.0, g_t_split / 600e6, g_gw_calls / 600.0, g_gw_quick / 600.0, g_gw_walked / 600.0);
+        g_wb_words = g_wb_bytes = 0; g_t_stale = g_stale_bytes = 0; g_t_split = 0; g_gw_calls = g_gw_quick = g_gw_walked = 0;
         ls = g_nsub_stat; g_t_draw = g_t_ws = g_t_disp = g_t_up = g_t_sub = 0; g_up_bytes = 0; g_dsc_hit = g_dsc_miss = 0; }
     if (n % 600 == 0) {   // memory: the process (RSS, its anonymous part, PSS) and what the backend holds
         long rss = 0, anon = 0, pss = 0; char ln[256]; FILE *f = fopen("/proc/self/status", "re");
@@ -3311,8 +3371,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0) LOG("vk: texel buffer slots read as zeros so far: nothing bound %llu, not a buffer texture %llu, format not usable %llu", (unsigned long long)g_tbuf_miss[0],
                           (unsigned long long)g_tbuf_miss[1], (unsigned long long)g_tbuf_miss[2]);
     if (n % 600 == 0) { uint64_t gp = atomic_exchange(&g_gpu_kind_ns[0], 0), gd = atomic_exchange(&g_gpu_kind_ns[1], 0), gc = atomic_exchange(&g_gpu_kind_ns[2], 0);
-                        LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame",
-                            gp / 600e6, gd / 600e6, gc / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; }
+                        LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame (left open %.1f: the attachment it samples was not written in the pass)",
+                            gp / 600e6, gd / 600e6, gc / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0, g_nsplit_skip / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; g_nsplit_skip = 0; }
     if (n % 600 == 0) { LOG("vk: waiting for a free submission context per frame: %.2f ms for its own submission, %.2f ms for a later one still reading its ring (%d contexts)",
                         atomic_exchange(&g_wait_fence_ns, 0) / 600e6, atomic_exchange(&g_wait_hold_ns, 0) / 600e6, NCTX); }
     if (n % 600 == 0) { LOG("vk: per frame over the last 600: GPU %.2f ms, recording %.2f ms, waiting for the GPU %.2f ms, present waiting %.2f ms", atomic_exchange(&g_gpu_ns, 0) / 600e6,
