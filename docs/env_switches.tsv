@@ -320,6 +320,7 @@ DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (r.Streaming
 DM_VK_BARRIER_HOLD	switch	Android: `0` makes every NVN barrier end the open render pass, as before vk19.19; default 1 keeps the pass open when the next work is a draw (the pass then counts as merged: a draw sampling an attachment it wrote ends it first)
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
 DM_VK_CTX	test	Android: `=<n>` (4..32, default 20) submission contexts: how far the CPU may record ahead of the GPU; each holds a ring (4 MB and up)
+DM_VK_DECODE_POOL	test	Android: `1` decodes CPU-decoded textures (BC / ASTC the GPU cannot sample) through one kept buffer instead of a fresh malloc per level; default 0
 DM_VK_DIR	path	Android: the folder of the shaders' SPIR-V (`<key>.spv`, `<key>.vk.txt` from dm/android/tools/spv_android.py) and the pipeline cache
 DM_VK_DISPATCH_DEFER	test	Android: `1` records a dispatch met inside an open render pass after that pass instead of ending it, when it reads none of the pass's attachments; a draw reading what it writes ends the pass first. Default 0
 DM_VK_EVICT_AGE	switch	Android: frames a storage-backed texture stays unused before its image is evicted (default 300; made again from its storage at its next use)
@@ -335,6 +336,7 @@ DM_VK_PASS_BARRIER	test	Android: `1` leaves vertex shaders out of each pass end'
 DM_VK_POOL_TRANSIENT	test	Android: `1` creates the command pools VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, as before vk19.20 (default 0: kept warm, reset without releasing their memory)
 DM_VK_PREWARM_KEEP	test	Android: `1` makes the shader pre-warm keep every pipeline alive (RSS +~500 MB in FINAL FANTASY RESONANCE). Default 0 since vk19.13: each is destroyed right after it is made (only the driver's pipeline cache stays warm) and made again from that cache at its first use
 DM_VK_RING_CACHED	test	Android: `1` puts the host-visible rings in a HOST_CACHED coherent memory type where the GPU has one (the CPU reads them back: dispatch snapshots, write-back compares); default 0, the first coherent type (uncached on the Adreno)
+DM_VK_RING_KEEP	test	Android: `1` keeps each ring at its size after a quiet stretch (halved only while memory is low); default 0 halves it as before (growing again later maps fresh pages)
 DM_VK_RTDUMP	diagnostic	Android: `=<frame>[,<frames>]` writes every render target of that frame (and the next ones) as raw files into DM_VK_SHOT_DIR
 DM_VK_RTDUMP_DEC	diagnostic	Android: with DM_VK_RTDUMP, also writes the textures decoded from BC4-7 on upload
 DM_VK_RT_HOLD	test	Android: `0` turns the SetRenderTargets detour hold off: every SetRenderTargets ends the open pass

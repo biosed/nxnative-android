@@ -1145,6 +1145,16 @@ static void tex_evict(uint64_t trim_gen) {
 static uint64_t g_t_up, g_up_bytes; uint64_t g_nsub_stat;
 static void tex_upload_(vtex *v, const tex_t *t);
 static void tex_upload(vtex *v, const tex_t *t) { uint64_t t0 = now_ns(); tex_upload_(v, t); g_t_up += now_ns() - t0; g_up_bytes += t->L.size; atomic_fetch_add(&g_up_cum, t->L.size); }
+// The compressed texels of a level the CPU decodes (BC / ASTC the GPU cannot sample) were deswizzled into a fresh malloc each time: at that size fresh mapped pages, faulted in on
+// first write. DM_VK_DECODE_POOL=1 keeps one buffer (the largest needed so far, the submit thread's) instead. Default 0: as before
+static uint8_t *g_dec_buf; static size_t g_dec_cap;
+static int decode_pool(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_DECODE_POOL"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_DECODE_POOL=1: one kept buffer for texture decoding"); } return v; }
+static uint8_t *dec_tmp(size_t n) {
+    if (!decode_pool()) return malloc(n);
+    if (n > g_dec_cap) { uint8_t *b = realloc(g_dec_buf, n); if (!b) return malloc(n); g_dec_buf = b; g_dec_cap = n; }
+    return g_dec_buf;
+}
+static void dec_tmp_done(uint8_t *p) { if (p != g_dec_buf) free(p); }
 static void tex_upload_(vtex *v, const tex_t *t) {
     if (vk_skip() & SK_UPLOAD) return;
     if (g_plog) LOG("plog:  upload %llu fmt %#x %ux%ux%u levels %u layers %u target %d", (unsigned long long)t->serial, t->d.format, v->w, v->h, v->d, v->levels, v->layers, t->d.target);
@@ -1167,7 +1177,7 @@ static void tex_upload_(vtex *v, const tex_t *t) {
             size_t out = v->f.dec ? (size_t)w * h * dec_bpp(v->f.dec) * d : lsz;
             VkDeviceSize o = ring_alloc(out, 16);   // may move to an extra ring: the regions so far stay with theirs (ubuf, flushed below)
             if (o == VK_WHOLE_SIZE) { UFLUSH(); v->dirty = 1; return; }   // not uploaded: again at the next use (the stamp above would say nothing changed)
-            uint8_t *dst = C->ringp + o, *tmp = v->f.dec ? malloc(lsz) : dst;
+            uint8_t *dst = C->ringp + o, *tmp = v->f.dec ? dec_tmp(lsz) : dst;
             int rc = 0;
             if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) {
                 // Linear storage: rows at the texture's own pitch (its stride, padded past width * bytes per texel), layers L.layer_size apart -- copied row by row. One block
@@ -1179,8 +1189,8 @@ static void tex_upload_(vtex *v, const tex_t *t) {
                 if ((uint64_t)ly * t->L.layer_size + nvn_tex_level_offset(&t->d, lv) + srow * (by * d - 1) + pitch > t->L.size) { rc = 1; RED_ONCE(6, "linear texture %ux%u format %#x: rows at pitch %zu run past its storage", v->w, v->h, t->d.format, srow); }
                 else for (uint32_t yy = 0; yy < by * d; yy++) memcpy(tmp + (size_t)yy * pitch, src + (size_t)yy * srow, pitch);
             } else rc = nvn_deswizzle(&t->d, lv, ly, t->mem, tmp, pitch);
-            if (rc) { RED_ONCE(5, "texture format %#x target %d: deswizzle failed", t->d.format, t->d.target); if (v->f.dec) free(tmp); continue; }
-            if (v->f.dec) { for (uint32_t z = 0; z < d; z++) bc_decode(v->f.dec, tmp + pitch * by * z, pitch, w, h, dst + (size_t)w * h * dec_bpp(v->f.dec) * z); free(tmp); }
+            if (rc) { RED_ONCE(5, "texture format %#x target %d: deswizzle failed", t->d.format, t->d.target); if (v->f.dec) dec_tmp_done(tmp); continue; }
+            if (v->f.dec) { for (uint32_t z = 0; z < d; z++) bc_decode(v->f.dec, tmp + pitch * by * z, pitch, w, h, dst + (size_t)w * h * dec_bpp(v->f.dec) * z); dec_tmp_done(tmp); }
             VkBufferImageCopy c = {o, 0, 0, {v->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, lv, ly, 1}, {0, 0, 0}, {w, h, d}};
             if (ubuf != C->ring) { UFLUSH(); ubuf = C->ring; }
             ureg[nureg++] = c; if (nureg == NUREG) UFLUSH();
@@ -3087,13 +3097,16 @@ static void mem_watch(void) {
                                       over && !is_low ? "over budget" : "low", avail / 1024, rss / 1024, (unsigned long long)(gpu >> 20));
 }
 void tex_evict_hook(void) { mem_watch(); tex_evict(atomic_load(&g_trim_gen)); }   // the front end's low-memory signal (app/front_android.c): every ring back to RING_MIN at its next use
+// DM_VK_RING_KEEP=1: a ring is not halved after a quiet stretch unless memory is low (g_mem_low). Halving and growing again later made a fresh mapping each time, every page of it
+// faulted in on first write (bursts of thousands of minor faults while a stage streamed in). Default 0: as before
+static int ring_keep(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RING_KEEP"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_RING_KEEP=1: rings shrink only while memory is low"); } return v; }
 static void ring_fit(ctx_t *c) {
     c->last_total = c->total; if (c->total > c->win_max) c->win_max = c->total;
     VkDeviceSize want = c->ring0_size; uint64_t tg = atomic_load(&g_trim_gen);
     if (c->trim_seen != tg) { c->trim_seen = tg; want = RING_MIN; c->win_max = 0; c->nwin = 0; }
     else if (c->last_total > c->ring0_size && c->ring0_size < RING_MAX) { while (want < c->last_total && want < RING_MAX) want *= 2;
                                                                          if (atomic_load(&g_ring0_bytes) + (want - c->ring0_size) > RING_CAP) want = c->ring0_size; }
-    else if (++c->nwin >= 120) { if (c->win_max * 4 < c->ring0_size && c->ring0_size > RING_MIN) want = c->ring0_size / 2; c->win_max = 0; c->nwin = 0; }
+    else if (++c->nwin >= 120) { if (c->win_max * 4 < c->ring0_size && c->ring0_size > RING_MIN && (!ring_keep() || g_mem_low)) want = c->ring0_size / 2; c->win_max = 0; c->nwin = 0; }   // DM_VK_RING_KEEP=1: halved only while memory is low
     if (want == c->ring0_size) return;
     vkDestroyBuffer(g_dev, c->ring0, NULL); vkFreeMemory(g_dev, c->ringm0, NULL); atomic_fetch_sub(&g_ring0_bytes, c->ring0_size);
     c->ring0 = buf_new(want, ALL_BUF_USAGE, &c->ringm0, (void **)&c->ringp0); c->ring0_size = want; atomic_fetch_add(&g_ring0_bytes, want);
