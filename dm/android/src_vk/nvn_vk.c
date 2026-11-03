@@ -386,12 +386,14 @@ static void gsig_add(uint64_t sig, uint64_t ns, uint32_t draws) {
     if (i >= 0 && g_gsig[i].sig == sig) { g_gsig[i].ns += ns; g_gsig[i].n++; g_gsig[i].draws += draws; }
     pthread_mutex_unlock(&g_gsigmu);
 }
+static uint32_t g_scene_w, g_scene_h;   // the last pass with four or more colour targets (a G-buffer): the resolution the game's dynamic resolution picked (DM_UE_DRS)
 static void gsig_report(uint64_t frames) {   // the 10 costliest passes and dispatches over the last frames, then the sums start again
     static int idx[NGSIG]; pthread_mutex_lock(&g_gsigmu);
     for (int kind = 0; kind < 2; kind++) {
         int n = 0; uint64_t tot = 0;
         for (int i = 0; i < NGSIG; i++) if (g_gsig[i].sig && g_gsig[i].n && (int)(g_gsig[i].sig & 1) == kind) { idx[n++] = i; tot += g_gsig[i].ns; }
         for (int a = 0; a < n; a++) for (int b = a + 1; b < n; b++) if (g_gsig[idx[b]].ns > g_gsig[idx[a]].ns) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+        if (!kind) LOG("vk: scene resolution (the last G-buffer pass): %ux%u", g_scene_w, g_scene_h);
         LOG("vk: costliest %s over the last %llu frames (%d kinds, %.2f ms a frame in all):", kind ? "dispatches" : "render passes", (unsigned long long)frames, n, tot / 1e6 / frames);
         for (int a = 0; a < n && a < 10; a++) { const typeof(g_gsig[0]) *e = &g_gsig[idx[a]];
             LOG("vk:   %.2f ms a frame, %.1f a frame, %.0f draws each: %s", e->ns / 1e6 / frames, (double)e->n / frames, e->n ? (double)e->draws / e->n : 0.0, e->d); }
@@ -400,10 +402,35 @@ static void gsig_report(uint64_t frames) {   // the 10 costliest passes and disp
     pthread_mutex_unlock(&g_gsigmu);
 }
 static _Atomic uint64_t g_gpu_kind_ns[3];   // GPU time inside render passes, dispatches, copies (gpu_mark); the rest of a submission's span is time between them
+// Snapshots of dispatch storage ranges (post kind 5: ~3.5 MB a frame in FINAL FANTASY RESONANCE's castle) came from malloc and went back to free: at that size each one was fresh
+// mapped pages, ~400 page faults a frame on the submit thread (12,450 minor faults a second, 14% of its time in the kernel). They come from a pool now: blocks by power-of-two size
+// (4 KB to 64 MB), kept for reuse up to 128 MB in all; the submit thread takes, the completion thread gives back
+enum { SNAP_NC = 15 };   // classes 4 KB << k
+static void *g_snap_free[SNAP_NC][64]; static int g_snap_n[SNAP_NC]; static uint64_t g_snap_kept; static pthread_mutex_t g_snapmu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_snap_hit, g_snap_miss;
+static int snap_class(size_t n) { int k = 0; while (k < SNAP_NC && ((size_t)4096 << k) < n) k++; return k; }
+static uint8_t *snap_alloc(size_t n) {
+    int k = snap_class(n); if (k >= SNAP_NC) return malloc(n);
+    pthread_mutex_lock(&g_snapmu); void *p = g_snap_n[k] ? g_snap_free[k][--g_snap_n[k]] : NULL; if (p) { g_snap_kept -= (size_t)4096 << k; g_snap_hit++; } else g_snap_miss++; pthread_mutex_unlock(&g_snapmu);
+    return p ? p : malloc((size_t)4096 << k);
+}
+static void snap_free(void *p, size_t n) {
+    int k = snap_class(n); if (k >= SNAP_NC) { free(p); return; }
+    pthread_mutex_lock(&g_snapmu);
+    if (g_snap_n[k] < 64 && g_snap_kept + ((size_t)4096 << k) <= (128u << 20)) { g_snap_free[k][g_snap_n[k]++] = p; g_snap_kept += (size_t)4096 << k; p = NULL; }
+    pthread_mutex_unlock(&g_snapmu);
+    free(p);
+}
+// Counter timestamps (ReportCounter TIMESTAMP / TIMESTAMP_TOP, post kind 2): every report of a submission used to get one time, its completion's, so a game timing its GPU work with a
+// top-of-pipe report at the start and a timestamp at the end of one command buffer read 0 (the NVN timing line's "GPU p50 0.00"; Unreal's dynamic resolution steers on it). Now,
+// as the Metal host does by command buffer (nvn_mtl.m rep_ticks), TIMESTAMP_TOP takes the submission's GPU start and the others its GPU end: the end is the completion (the
+// guest clock when the completion thread saw the fence), the start that minus the submission's GPU span. DM_VK_GPU_TS=0: one time for all, as before
+static int gpu_ts_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GPU_TS"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_GPU_TS=0: counter timestamps all take the completion time"); } return v; }
 static void ctx_complete(ctx_t *c) {
-    uint64_t ts[2];
+    uint64_t ts[2], t_end = gpu_ticks(), t_top = t_end;
     if (vkGetQueryPoolResults(g_dev, c->qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0])
-        { uint64_t gns = (uint64_t)((double)(ts[1] - ts[0]) * g_props.limits.timestampPeriod); atomic_fetch_add(&g_gpu_ns, gns); atomic_fetch_add(&g_gpu_cum, gns); }
+        { uint64_t gns = (uint64_t)((double)(ts[1] - ts[0]) * g_props.limits.timestampPeriod); atomic_fetch_add(&g_gpu_ns, gns); atomic_fetch_add(&g_gpu_cum, gns);
+          uint64_t dt = gns * 12 / 625; if (gpu_ts_on() && dt < t_end) t_top = t_end - dt; }   // the GPU's 19.2 MHz ticks
     if (c->ntq >= 2) { static uint64_t t[NTQ]; uint32_t n = c->ntq & ~1u;
         if (vkGetQueryPoolResults(g_dev, c->tq, 0, n, n * 8, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
             for (uint32_t i = 0; i + 1 < n; i += 2) if (t[i + 1] > t[i]) { uint64_t ns = (uint64_t)((double)(t[i + 1] - t[i]) * g_props.limits.timestampPeriod);
@@ -411,7 +438,7 @@ static void ctx_complete(ctx_t *c) {
     for (int i = 0; i < c->npost; i++) {
         post_t *p = &c->post[i];
         if (p->kind == 1) { volatile uint32_t *v = p->dst; if (p->mode == 1) *v += p->v; else *v = p->v; }
-        else if (p->kind == 2) { uint64_t t = gpu_ticks(), rec[2] = {p->type == 0 || p->type == 0x10 ? t : 0, t}; memcpy((void *)p->addr, rec, sizeof rec); }
+        else if (p->kind == 2) { uint64_t t = p->type == 0x10 ? t_top : t_end, rec[2] = {p->type == 0 || p->type == 0x10 ? t : 0, t}; memcpy((void *)p->addr, rec, sizeof rec); }
         else if (p->kind == 4) {   // a segment of counted draws: added to the queue's samples-passed counter (submission order: one completion thread), written out when addr is a report
             static uint64_t total;
             if (p->n == SIZE_MAX) total += 1u << 20;   // more draws than queries: reported visible
@@ -425,7 +452,7 @@ static void ctx_complete(ctx_t *c) {
             for (; i + 4 <= p->n; i += 4) if (memcmp(now + i, snap + i, 4)) { memcpy(dst + i, now + i, 4); nw++; }
             for (; i < p->n; i++) if (now[i] != snap[i]) dst[i] = now[i];
             pthread_mutex_lock(&g_gwmu); for (int k = 0; k < g_ngw; k++) if (g_gw[k].snap >= snap && g_gw[k].snap < snap + p->n) g_gw[k].snap = NULL; pthread_mutex_unlock(&g_gwmu);   // no reader compares against it any more
-            free((void *)snap); g_wb_words += nw; g_wb_bytes += p->n;
+            snap_free((void *)snap, p->n); g_wb_words += nw; g_wb_bytes += p->n;
         }
         else if (p->kind == 6) { for (uint32_t r = 0; r < p->v; r++) memcpy((uint8_t *)p->dst + (size_t)r * p->mode, p->src + (size_t)r * p->mode, p->type); }   // rows: v rows of type bytes, mode apart
         else if (p->kind == 3) { memcpy(p->dst, p->src, p->n);
@@ -1808,6 +1835,7 @@ static int pass_begin(void) {
         if (g_after_split && o < (int)sizeof b) o += snprintf(b + o, sizeof b - o, " (after a split)");
         #undef SMIX
         g_tsig_next = h & ~1ull; gsig_name(g_tsig_next, b); g_after_split = 0;
+        if (P.n >= 4) { g_scene_w = P.w; g_scene_h = P.h; }
     }
     gpu_mark(0, 0); g_npass++; P.merged = 0;
     VkFramebuffer fb = rp_begin(C->cb, &d); P.open = 1;
@@ -2773,7 +2801,7 @@ static void dispatch(const p_dispatch *d) {
         for (int k = 0; k < C->npost && !dup; k++) { const post_t *q = &C->post[k]; uint64_t qa = (uint64_t)(uintptr_t)q->dst;
             if (q->kind == 3 && qa == w->addr && q->src == w->p && q->n == w->size) dup = 1;   // the same range again
             else if (q->kind == 5 && w->addr >= qa && w->addr + w->size <= qa + q->n && q->src + (w->addr - qa) == w->p) { dup = 1; dsnap = (const uint8_t *)(uintptr_t)q->addr + (w->addr - qa); } }   // inside one that goes back by its changed words
-        uint8_t *snap = !dup && !from_gw && w->ci == g_ci && w->p ? malloc(w->size) : NULL;
+        uint8_t *snap = !dup && !from_gw && w->ci == g_ci && w->p ? snap_alloc(w->size) : NULL;
         if (snap) memcpy(snap, w->p, w->size);
         // The range is the GPU's until the submission completes (gw_find), with the bytes it started from to tell the CPU's later rewrites (gw_cpu_dirty)
         gw_add(w->addr, w->size, w->buf, w->off, w->p, g_fence + 1, w->ci, snap ? snap : dsnap, 0);   // this submission's fence value (mtl_sub_commit assigns g_fence + 1)
