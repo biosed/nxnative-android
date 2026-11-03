@@ -3077,8 +3077,9 @@ static void mem_watch(void) {
     long ours = rss / 1024 + (long)(gpu >> 20);   // the process's resident memory and the backend's device memory, in MB
     int is_low = low > 0 && avail > 0 && avail / 1024 < low, over = budget > 0 && ours > budget;
     g_mem_low = is_low || over;
-    if (dm_ueheap_release && (g_mem_low || now - last_rel >= 10000000000ull)) { last_rel = now; size_t r = dm_ueheap_release(65536); g_heap_released += r;
-        static int nr; if (r >= (16u << 20) && nr++ < 40) LOG("vk: game heap: %.0f MB of free blocks given back to the system", r / 1048576.0); }
+    if (dm_ueheap_release && (g_mem_low || now - last_rel >= 10000000000ull)) { last_rel = now; size_t r = dm_ueheap_release(65536); static size_t prev; static int nr;
+        if ((r > prev + (16u << 20) || r + (16u << 20) < prev) && nr++ < 40) LOG("vk: game heap: free blocks of 64 KB or more now %.0f MB, their pages given back to the system", r / 1048576.0);
+        prev = r; g_heap_released = r; }   // the total of the free blocks walked (pages already given back are counted again: madvise does not say)
     if (!g_mem_low || now - last_trim < 5000000000ull) return;
     last_trim = now; atomic_fetch_add(&g_trim_gen, 1);
     pthread_mutex_lock(&g_snapmu); for (int k = 0; k < SNAP_NC; k++) { while (g_snap_n[k]) free(g_snap_free[k][--g_snap_n[k]]); } g_snap_kept = 0; pthread_mutex_unlock(&g_snapmu);
@@ -3797,6 +3798,14 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                         LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame (left open %.1f: the attachment it samples was not written in the pass)",
                             gp / 600e6, gd / 600e6, gc / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0, g_nsplit_skip / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; g_nsplit_skip = 0; }
     if (n % 600 == 0) gsig_report(600);
+    if (n % 600 == 0) {   // the host heap (malloc) and what the backend keeps in it, to attribute the process's native heap (dumpsys meminfo)
+        struct mallinfo mi = mallinfo(); int nt = 0, nv = 0, live = 0; uint64_t snap = 0, xc = 0;
+        pthread_mutex_lock(&g_rmu); for (int hh = 0; hh < NHASH; hh++) for (vtex *v = g_tex[hh]; v; v = v->next) { nt++; nv += v->nviews; } pthread_mutex_unlock(&g_rmu);
+        pthread_mutex_lock(&g_psomu); for (uint32_t i = 0; i < g_psot_cap; i++) if (g_psot[i] && atomic_load(&g_psot[i]->state) == 1 && g_psot[i]->p) live++; pthread_mutex_unlock(&g_psomu);
+        pthread_mutex_lock(&g_snapmu); snap = g_snap_kept; pthread_mutex_unlock(&g_snapmu); pthread_mutex_lock(&g_xcmu); xc = g_xc_bytes; pthread_mutex_unlock(&g_xcmu);
+        LOG("vk: host heap: %.0f MB in use (malloc's own count, %.0f MB mapped); the backend: %d textures (%d views), %d pipelines alive of %d known, %d shaders, snapshot pool %.0f MB, extra rings kept %.0f MB",
+            (unsigned)mi.uordblks / 1048576.0, ((unsigned)mi.arena + (unsigned)mi.hblkhd) / 1048576.0, nt, nv, live, g_npso, g_nsh, snap / 1048576.0, xc / 1048576.0);
+    }
     if (n % 600 == 0) { static long mn0, mj0; struct rusage ru; if (!getrusage(RUSAGE_THREAD, &ru)) { if (mn0 || mj0) LOG("vk: this thread's page faults over the last 600 frames: %.1f minor, %.2f major a frame", (ru.ru_minflt - mn0) / 600.0, (ru.ru_majflt - mj0) / 600.0); mn0 = ru.ru_minflt; mj0 = ru.ru_majflt; } }
     if (n % 600 == 0) { LOG("vk: ADPF over the last 600 frames: %llu reports%s, %llu failed (last error %d), reported CPU %.1f ms and GPU %.1f ms a frame on average (target 16.7 ms)",
                             (unsigned long long)g_adpf_n, g_adpf_v2 ? " with the GPU's work" : "", (unsigned long long)g_adpf_fail, g_adpf_err, g_adpf_n ? g_adpf_cpu / 1e6 / g_adpf_n : 0.0, g_adpf_n ? g_adpf_gpu / 1e6 / g_adpf_n : 0.0);
