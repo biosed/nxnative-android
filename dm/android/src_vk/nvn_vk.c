@@ -151,13 +151,34 @@ static int g_pend[NCTX_MAX], g_npend;   // contexts submitted and not yet comple
 
 static uint64_t g_wgen;   // a new generation when the ring changes or the write log overflows: the per-submission copies are reused only within one (and only where no write since overlaps them, copy_in)
 static uint32_t g_nwlog;   // writes logged in this generation (wlog_add)
+// Extra rings made and freed every few frames were fresh device memory each time (vkAllocateMemory, mapped: page faults as the CPU first writes them). Freed ones are kept (at most
+// 4, 64 MB in all) and taken again by the next submission that outgrows its ring; the mapping of each live one is remembered by its memory (xring_*)
+static struct { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceSize size; } g_xc[4]; static int g_nxc; static VkDeviceSize g_xc_bytes;
+static struct { VkDeviceMemory m; void *p; } g_xmap[256]; static int g_nxmap; static pthread_mutex_t g_xcmu = PTHREAD_MUTEX_INITIALIZER; static uint64_t g_xc_reused;
+static VkBuffer xring_get(VkDeviceSize want, VkDeviceSize *size, VkDeviceMemory *m, uint8_t **p) {
+    pthread_mutex_lock(&g_xcmu); int best = -1;
+    for (int i = 0; i < g_nxc; i++) if (g_xc[i].size >= want && (best < 0 || g_xc[i].size < g_xc[best].size)) best = i;
+    if (best >= 0) { VkBuffer b = g_xc[best].b; *m = g_xc[best].m; *p = g_xc[best].p; *size = g_xc[best].size; g_xc_bytes -= g_xc[best].size; g_xc[best] = g_xc[--g_nxc]; g_xc_reused++; pthread_mutex_unlock(&g_xcmu); return b; }
+    pthread_mutex_unlock(&g_xcmu);
+    VkBuffer b = buf_new(want, ALL_BUF_USAGE, m, (void **)p); *size = want;
+    pthread_mutex_lock(&g_xcmu); if (g_nxmap < 256) g_xmap[g_nxmap++] = (typeof(g_xmap[0])){*m, *p}; pthread_mutex_unlock(&g_xcmu);
+    return b;
+}
+static void xring_put(VkBuffer b, VkDeviceMemory m, VkDeviceSize size) {   // a freed extra ring: kept for reuse, or destroyed
+    pthread_mutex_lock(&g_xcmu); void *p = NULL; int k = 0;
+    for (; k < g_nxmap; k++) if (g_xmap[k].m == m) { p = g_xmap[k].p; break; }
+    if (p && g_nxc < 4 && g_xc_bytes + size <= (64u << 20)) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); return; }
+    if (k < g_nxmap) g_xmap[k] = g_xmap[--g_nxmap];
+    pthread_mutex_unlock(&g_xcmu);
+    vkDestroyBuffer(g_dev, b, NULL); vkFreeMemory(g_dev, m, NULL);
+}
 static VkDeviceSize ring_alloc(VkDeviceSize n, VkDeviceSize align) {
     VkDeviceSize o = (C->used + align - 1) / align * align;
     if (o + n > C->ring_size) {   // full: an extra ring for the rest of this submission (what was recorded keeps its buffer), freed when the submission is done
         if (n > RING_XMAX) { RED_ONCE(1, "one copy of %llu MB is larger than a ring buffer: dropped", (unsigned long long)(n >> 20)); return VK_WHOLE_SIZE; }
         VkDeviceSize xs = C->ring0_size > RING_MIN ? C->ring0_size : 16u << 20; while (xs < n) xs *= 2; if (xs > RING_XMAX) xs = RING_XMAX;
         C->extra = realloc(C->extra, (C->nextra + 1) * sizeof *C->extra);
-        C->extra[C->nextra].b = buf_new(xs, ALL_BUF_USAGE, &C->extra[C->nextra].m, (void **)&C->ringp); C->extra[C->nextra].size = xs; C->ring = C->extra[C->nextra++].b;
+        C->extra[C->nextra].b = xring_get(xs, &xs, &C->extra[C->nextra].m, &C->ringp); C->extra[C->nextra].size = xs; C->ring = C->extra[C->nextra++].b;
         atomic_fetch_add(&g_extra_ring_bytes, xs); atomic_fetch_add(&g_xring_n, 1); C->ring_size = xs;
         C->used = 0; o = 0; g_wgen++; g_nwlog = 0;   // copies cached in the old ring are not reused from the new one
     }
@@ -368,7 +389,7 @@ static void xr_free(uint64_t done) {
     for (int i = 0; i < g_nxr;) {
         int used = g_xr[i].until > done; for (int k = 0; k < g_ngw && !used; k++) used = g_gw[k].buf == g_xr[i].b;
         if (used) { i++; continue; }
-        vkDestroyBuffer(g_dev, g_xr[i].b, NULL); vkFreeMemory(g_dev, g_xr[i].m, NULL); atomic_fetch_sub(&g_extra_ring_bytes, g_xr[i].size); g_xr[i] = g_xr[--g_nxr];
+        xring_put(g_xr[i].b, g_xr[i].m, g_xr[i].size); atomic_fetch_sub(&g_extra_ring_bytes, g_xr[i].size); g_xr[i] = g_xr[--g_nxr];
     }
     pthread_mutex_unlock(&g_gwmu);
 }
@@ -466,7 +487,7 @@ static void ctx_complete(ctx_t *c) {
         if (used) {   // a later submission reads it (gw_find), or a live entry points into it: freed once nothing does (xr_free)
             if (g_nxr == g_cxr) { g_cxr = g_cxr ? 2 * g_cxr : 16; g_xr = realloc(g_xr, g_cxr * sizeof *g_xr); }
             g_xr[g_nxr++] = (typeof(g_xr[0])){c->extra[i].b, c->extra[i].m, hold > c->fence_val ? hold : c->fence_val + 1, c->extra[i].size}; continue; }
-        vkDestroyBuffer(g_dev, c->extra[i].b, NULL); vkFreeMemory(g_dev, c->extra[i].m, NULL); atomic_fetch_sub(&g_extra_ring_bytes, c->extra[i].size); }
+        xring_put(c->extra[i].b, c->extra[i].m, c->extra[i].size); atomic_fetch_sub(&g_extra_ring_bytes, c->extra[i].size); }
     pthread_mutex_unlock(&g_gwmu);
     c->nextra = 0;
     for (int i = 0; i < c->nfb; i++) vkDestroyFramebuffer(g_dev, c->fb[i], NULL);
@@ -3556,13 +3577,14 @@ int dm_vk_prewarm(void) {   // the front end, before the game's main: 0 when the
 // 12% busy at 30 fps: the GPU clock stayed low, and our GPU timestamps grew with it. Looked up at run time (API 33 / 35 functions)
 #include <dlfcn.h>
 #include <sys/syscall.h>
+static uint64_t g_adpf_n, g_adpf_fail, g_adpf_cpu, g_adpf_gpu; static int g_adpf_err, g_adpf_v2;   // reports made, failed (and the last error), their CPU / GPU sums (the 600-frame line)
 static void adpf_frame(uint64_t cpu_ns, uint64_t gpu_ns) {
     static int state; static void *session; static void *(*mk_work)(void); static void (*w_start)(void *, int64_t), (*w_total)(void *, int64_t), (*w_cpu)(void *, int64_t), (*w_gpu)(void *, int64_t), (*w_free)(void *);
     static int (*report)(void *, int64_t); static int (*report2)(void *, void *);
     if (state < 0) return;
     if (!state) {
-        state = -1; const char *e = getenv("DM_ADPF"); if (e && !atoi(e)) return;
-        void *h = dlopen("libandroid.so", RTLD_NOW); if (!h) return;
+        state = -1; const char *e = getenv("DM_ADPF"); if (e && !atoi(e)) { LOG("vk: ADPF off (DM_ADPF=0)"); return; }
+        void *h = dlopen("libandroid.so", RTLD_NOW); if (!h) { LOG("[RED] vk: ADPF: libandroid.so not opened"); return; }
         void *(*getm)(void) = (void *(*)(void))dlsym(h, "APerformanceHint_getManager");
         void *(*mks)(void *, const int32_t *, size_t, int64_t) = (void *(*)(void *, const int32_t *, size_t, int64_t))dlsym(h, "APerformanceHint_createSession");
         report = (int (*)(void *, int64_t))dlsym(h, "APerformanceHint_reportActualWorkDuration");
@@ -3570,23 +3592,25 @@ static void adpf_frame(uint64_t cpu_ns, uint64_t gpu_ns) {
         mk_work = (void *(*)(void))dlsym(h, "AWorkDuration_create"); w_free = (void (*)(void *))dlsym(h, "AWorkDuration_release");
         w_start = (void (*)(void *, int64_t))dlsym(h, "AWorkDuration_setWorkPeriodStartTimestampNanos"); w_total = (void (*)(void *, int64_t))dlsym(h, "AWorkDuration_setActualTotalDurationNanos");
         w_cpu = (void (*)(void *, int64_t))dlsym(h, "AWorkDuration_setActualCpuDurationNanos"); w_gpu = (void (*)(void *, int64_t))dlsym(h, "AWorkDuration_setActualGpuDurationNanos");
-        if (!getm || !mks || !report) return;
+        if (!getm || !mks || !report) { LOG("[RED] vk: ADPF: the performance hint functions are missing (API 33+)"); return; }
         void *m = getm(); int32_t tid = (int32_t)syscall(SYS_gettid);
-        if (!m || !(session = mks(m, &tid, 1, 16666667))) return;
+        if (!m || !(session = mks(m, &tid, 1, 16666667))) { LOG("[RED] vk: ADPF: no hint session (manager %p): the device gives none, the clocks follow their own governor", m); return; }
+        g_adpf_v2 = report2 && mk_work && w_gpu;
         state = 1; LOG("vk: ADPF hint session for the render thread (tid %d), target 16.7 ms%s", tid, report2 && mk_work && w_gpu ? ", with the GPU's work (Android 15)" : "");
     }
     if (report2 && mk_work && w_start && w_total && w_cpu && w_gpu) {
         void *w = mk_work(); if (!w) return;
         uint64_t now = now_ns(), tot = cpu_ns > gpu_ns ? cpu_ns : gpu_ns;
-        w_start(w, (int64_t)(now - tot)); w_total(w, (int64_t)tot); w_cpu(w, (int64_t)cpu_ns); w_gpu(w, (int64_t)gpu_ns); report2(session, w); if (w_free) w_free(w);
-    } else report(session, (int64_t)cpu_ns);
+        w_start(w, (int64_t)(now - tot)); w_total(w, (int64_t)tot); w_cpu(w, (int64_t)cpu_ns); w_gpu(w, (int64_t)gpu_ns); int r = report2(session, w); if (w_free) w_free(w);
+        g_adpf_n++; g_adpf_cpu += cpu_ns; g_adpf_gpu += gpu_ns; if (r) { g_adpf_fail++; g_adpf_err = r; }
+    } else { int r = report(session, (int64_t)cpu_ns); g_adpf_n++; g_adpf_cpu += cpu_ns; if (r) { g_adpf_fail++; g_adpf_err = r; } }
 }
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)period_s;
     uint64_t n = atomic_fetch_add(&g_presents, 1) + 1;
     g_frame_draw = 0; vk_ctl(n);
     {   // the frame's work for the hint session: the time since the last present (its CPU side) and the GPU time per frame of the last completed submissions
-        static uint64_t lastp, gprev; uint64_t now = now_ns(), g = atomic_load(&g_gpu_ns), gd = g >= gprev ? g - gprev : 0; gprev = g;
+        static uint64_t lastp, gprev; uint64_t now = now_ns(), g = atomic_load(&g_gpu_cum), gd = g >= gprev ? g - gprev : 0; gprev = g;
         if (lastp && now - lastp < 1000000000ull) adpf_frame(now - lastp, gd < 200000000ull ? gd : 0);
         lastp = now; }
     {   // a long frame (over 50 ms from the last present): what it held -- new pipelines, draws left out for theirs, waits for a context and for GPU-written data, page faults
@@ -3657,6 +3681,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                         LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame (left open %.1f: the attachment it samples was not written in the pass)",
                             gp / 600e6, gd / 600e6, gc / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0, g_nsplit_skip / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; g_nsplit_skip = 0; }
     if (n % 600 == 0) gsig_report(600);
+    if (n % 600 == 0) { LOG("vk: ADPF over the last 600 frames: %llu reports%s, %llu failed (last error %d), reported CPU %.1f ms and GPU %.1f ms a frame on average (target 16.7 ms)",
+                            (unsigned long long)g_adpf_n, g_adpf_v2 ? " with the GPU's work" : "", (unsigned long long)g_adpf_fail, g_adpf_err, g_adpf_n ? g_adpf_cpu / 1e6 / g_adpf_n : 0.0, g_adpf_n ? g_adpf_gpu / 1e6 / g_adpf_n : 0.0);
+                        g_adpf_n = g_adpf_fail = g_adpf_cpu = g_adpf_gpu = 0; }
     if (n % 600 == 0 && defer_on()) { LOG("vk: DM_VK_DISPATCH_DEFER: %.1f dispatches a frame recorded after their pass, %.1f passes a frame ended early for a draw reading what one writes", g_ndefer_n / 600.0, g_ndefer_haz / 600.0); g_ndefer_n = g_ndefer_haz = 0; }
     if (n % 600 == 0 && (ubwc_on() || pass_barrier_on())) { LOG("vk: DM_VK_UBWC %d: %llu images made with a format list or not mutable so far, %llu views outside the list; DM_VK_PASS_BARRIER %d: %.1f pass ends a frame without vertex shaders, %.1f vertex-shader barriers a frame",
         ubwc_on(), (unsigned long long)g_ubwc_imgs, (unsigned long long)g_ubwc_fallback, pass_barrier_on(), g_nbar_narrow / 600.0, g_nbar_vs / 600.0); g_nbar_narrow = g_nbar_vs = 0; }
