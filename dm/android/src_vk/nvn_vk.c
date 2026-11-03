@@ -176,7 +176,7 @@ static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) g = now_ns();
 // later work recorded from the same range is bound to that ring range itself instead of a fresh copy of the guest's stale bytes (gw_find); the entry dies with the ring
 // (ctx_complete, when the bytes are back in guest memory)
 typedef struct { uint64_t addr, size; VkBuffer buf; VkDeviceSize off; uint8_t *p; uint64_t fence; int ci;   // ci: the context whose ring holds it
-                 const uint8_t *snap; int exact; uint64_t chk; int dirty; } gw_t;
+                 const uint8_t *snap; int exact; uint64_t chk; int dirty; uint8_t dfr; } gw_t;   // dfr: written by a dispatch deferred past the open pass (defer_flush), not recorded yet
 // snap: the guest's bytes the dispatch was recorded with (its post kind 5 owns them; cleared here before they are freed), to tell which words the CPU rewrote since (gw_cpu_dirty);
 // exact: an exact write (a texture-to-buffer or buffer copy writes every byte of its range), not a dispatch's whole bound storage buffer; chk / dirty: gw_cpu_dirty's answer for a submission
 enum { NGW = 512 };
@@ -200,11 +200,13 @@ static int gw_pg_any(uint64_t addr, uint64_t size) {
     return 0;
 }
 static void gw_del(int i) { gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] = g_gw[--g_ngw]; }   // caller holds g_gwmu
+static int g_gw_add_dfr;   // gw_add: the entry is a deferred dispatch's (see defer_on)
+static int g_defer_haz;   // a draw's resources include what a deferred dispatch writes: the pass ends and the dispatches are recorded before the draw (DRAWQ)
 static void gw_add(uint64_t addr, uint64_t size, VkBuffer buf, VkDeviceSize off, uint8_t *p, uint64_t fence, int ci, const uint8_t *snap, int exact) {
     pthread_mutex_lock(&g_gwmu);
     for (int i = 0; i < g_ngw; i++) if (g_gw[i].addr == addr && g_gw[i].size == size) { gw_del(i); break; }   // the newer write of one range replaces the older
     if (g_ngw == NGW) { RED_ONCE(62, "more than %d GPU-written buffer ranges in flight: the oldest is forgotten", NGW); gw_pg_mark(g_gw[0].addr, g_gw[0].size, -1); memmove(g_gw, g_gw + 1, (NGW - 1) * sizeof *g_gw); g_ngw--; }
-    g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0}; gw_pg_mark(addr, size, 1);
+    g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0, (uint8_t)g_gw_add_dfr}; gw_pg_mark(addr, size, 1);
     pthread_mutex_unlock(&g_gwmu);
 }
 // The ring range holding what the GPU wrote at [addr, addr + size), when an entry covers it and the offset in it keeps `align`. An entry of the submission being recorded is
@@ -302,6 +304,7 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
     for (int i = g_ngw - 1; i >= 0 && !hit && !wait; i--) {
         gw_t *e = &g_gw[i];
         if (addr >= e->addr + e->size || addr + size <= e->addr) continue;
+        if (e->dfr) g_defer_haz = 1;   // what a deferred dispatch writes: it is recorded first (DRAWQ / pass_end)
         int inside = addr >= e->addr && addr + size <= e->addr + e->size, fits = inside && (e->off + (addr - e->addr)) % align == 0;
         if (e->fence != g_fence + 1) {   // an earlier submission's, still running
             if (may_hold && !inside) {   // the read spans more than was written: composed in this submission's ring (gw_compose)
@@ -874,6 +877,7 @@ struct vtex {
     VkFormat vfl[2]; uint8_t nvfl; VkImageFormatListCreateInfo fli;   // DM_VK_UBWC: the only formats its views may take (nvfl 0: any, MUTABLE_FORMAT without a list)
     VkImageCreateInfo ci; uint8_t packaged, evicted; uint64_t last_frame, last_fence;   // texture eviction (tex_evict): how it was made, whether its content comes from its storage, when it was last used
     uint32_t gpu_lv;   // levels a copy wrote on the GPU (texture or buffer copies into one level): an upload from storage leaves them alone, the rest still follows the game's writes   // lcpu: a linear texture in a pool the CPU writes (a glyph cache): its storage hashed once a submission, uploaded again when it changed
+    uint64_t dfr_gen;   // a storage image a deferred dispatch writes (defer generation g_defer_gen while it is pending)
     uint64_t vhaz_epoch; uint8_t vhaz;   // DM_VK_PASS_BARRIER: written by a pass whose end barrier left vertex shaders out, in that barrier epoch (see pass_barrier_on)
     int storage;   // made with VK_IMAGE_USAGE_STORAGE_BIT (an NVN image texture whose format Vulkan can store to)
     uint8_t late;   // made before the game wrote its storage, watched for that (late_fill)
@@ -1721,6 +1725,29 @@ static void lin_writeback(vtex *v) {
 // fragments instead of every pass end draining the GPU (59 a frame in the castle). A vertex shader that samples a texture written by such a pass, in the same barrier epoch, gets
 // a barrier for it first (draw_vs_hazard: the open pass is ended for it). Submissions still begin with a full barrier. Default 0 (off) until measured
 static uint64_t g_nbar_narrow, g_nbar_vs;
+// DM_VK_DISPATCH_DEFER=1: a dispatch met while a render pass is open is recorded after that pass instead of ending it, when it reads none of the pass's attachments. FINAL FANTASY
+// RESONANCE's castle: a translucency-lighting-volume injection (four 32x32x32 storage images) between consecutive deferred-light draws split the lights into 7 passes a frame,
+// each loading and storing the scene colour and depth (~0.7 ms each). The dispatch's resources are resolved when it comes (its descriptor set, its uniform copies, the ranges it
+// writes registered as written by this submission); only its recording waits. A draw in the pass that reads what a deferred dispatch writes -- a buffer range it writes (gw_find)
+// or a storage image of it -- ends the pass first and the dispatches are recorded before it (DRAWQ). Every pass end records them, in their order. Default 0 (off) until measured
+typedef struct { shader_t *cs; VkDescriptorSet ds; uint32_t dyno[64], ndyno, g[3], zero_tb; } dfr_t;
+enum { NDEFER = 64 };
+static dfr_t g_dfr[NDEFER]; static int g_ndefer; static uint64_t g_defer_gen = 1, g_ndefer_n, g_ndefer_haz;
+static uint64_t fnv(const void *p, size_t n);
+static int defer_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_DISPATCH_DEFER"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_DISPATCH_DEFER=1: dispatches inside an open pass are recorded after it"); } return v; }
+static void defer_flush(void) {   // after the pass ended (pass_end): the deferred dispatches, in order, each followed by its barrier
+    if (!g_ndefer) return;
+    for (int i = 0; i < g_ndefer; i++) { dfr_t *d = &g_dfr[i];
+        vkCmdBindPipeline(C->cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->cs->cpp);
+        vkCmdBindDescriptorSets(C->cb, VK_PIPELINE_BIND_POINT_COMPUTE, d->cs->cpl, 0, 1, &d->ds, d->ndyno, d->dyno);
+        { char b[64]; snprintf(b, sizeof b, "cs %s", d->cs->key); g_tsig_next = fnv(d->cs->key, strlen(d->cs->key)) | 1; gsig_name(g_tsig_next, b); }
+        gpu_mark(1, 0); vkCmdDispatch(C->cb, d->g[0], d->g[1], d->g[2]); gpu_mark(1, 1);
+        trace_add('c', d->cs->key, NULL, d->g[0], d->g[1], d->g[2], 0, d->zero_tb);
+        barrier_cs(C->cb);
+    }
+    pthread_mutex_lock(&g_gwmu); for (int k = 0; k < g_ngw; k++) g_gw[k].dfr = 0; pthread_mutex_unlock(&g_gwmu);
+    g_ndefer = 0; g_defer_gen++;
+}
 static int pass_barrier_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PASS_BARRIER"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_PASS_BARRIER=1: pass ends do not wait for vertex shaders (their reads of the pass's targets get a barrier)"); } return v; }
 static const uint8_t *g_rt_hold;   // see rt_hold_scan
 static void pass_end(void) {
@@ -1738,6 +1765,7 @@ static void pass_end(void) {
         } else g_vbar_epoch++;
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
         vkCmdPipelineBarrier(C->cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, dst, 0, 1, &mb, 0, NULL, 0, NULL);
+        defer_flush();   // the dispatches deferred while it was open (defer_on)
         int wb = 0;
         for (int i = 0; i < P.n; i++) if (P.ct[i] && P.ct[i]->linrow && P.cdrawn[i] && !P.clv[i] && !P.cly[i]) { lin_writeback(P.ct[i]); wb = 1; }
         memset(P.cdrawn, 0, sizeof P.cdrawn); P.ddrawn = 0;
@@ -1995,12 +2023,14 @@ static pso_ent *pso_insert_(const pso_key *k, uint64_t h, VkPipelineLayout pl, u
     }
     return e;
 }
+static uint64_t g_pso_look[4];   // pipeline lookups: 0 found ready, 1 found warm (made again), 2 found being made, 3 not found (new) -- the pipelines line, to see whether the pre-warm's entries are met
 static VkPipeline pso_get(const pso_key *k, VkPipelineLayout pl, int may_wait) {
     uint64_t h = fnv(k, sizeof *k); uint32_t i = 0;
     pthread_mutex_lock(&g_psomu);
     pso_ent *e = pso_find_(k, h, &i);
     if (e) {
         pthread_mutex_unlock(&g_psomu);
+        { int st0 = atomic_load_explicit(&e->state, memory_order_acquire); g_pso_look[st0 == 1 ? 0 : st0 == 3 ? 1 : 2]++; }
         for (;;) {
             int st = atomic_load_explicit(&e->state, memory_order_acquire);
             if (st == 1) return e->p;
@@ -2014,7 +2044,7 @@ static VkPipeline pso_get(const pso_key *k, VkPipelineLayout pl, int may_wait) {
             atomic_fetch_add(&g_pso_skipped, 1); return VK_NULL_HANDLE;
         }
     }
-    e = pso_insert_(k, h, pl, i); pthread_mutex_unlock(&g_psomu);
+    e = pso_insert_(k, h, pl, i); pthread_mutex_unlock(&g_psomu); g_pso_look[3]++;
     g_pso_last_new = atomic_load(&g_presents); pso_record(k);
     if (may_wait) { e->p = pso_create(k, pl); atomic_store_explicit(&e->state, 1, memory_order_release); return e->p; }
     pso_enqueue(e);
@@ -2024,8 +2054,9 @@ static VkPipeline pso_get(const pso_key *k, VkPipelineLayout pl, int may_wait) {
 static int hexkey(const char *s, uint8_t md[8]) { for (int i = 0; i < 8; i++) if (sscanf(s + 2 * i, "%2hhx", &md[i]) != 1) return 0; return 1; }
 static _Atomic uint64_t g_pre_made, g_pre_had, g_pre_slow;
 // DM_VK_PREWARM_KEEP=0: the pre-warm makes each pipeline and destroys it at once, so only the driver's pipeline cache is warm; a pipeline is made again (from that cache) at its first
-// use. FINAL FANTASY RESONANCE: 6619 pipelines kept alive cost RSS +485 MB at boot on a tablet already swapping 2 GB. Default 1 (kept, as before)
-static int prewarm_keep(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PREWARM_KEEP"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_PREWARM_KEEP=0: the pre-warm keeps only the driver's pipeline cache warm"); } return v; }
+// use. FINAL FANTASY RESONANCE: 6619 pipelines kept alive cost RSS +485 MB at boot on a tablet already swapping 2 GB; with 0 the pre-warm took 1.6 s instead of 22.6 s, RSS +65 MB,
+// the game's swap 0.9 GB lower, and a pipeline made again from the cache took ~0.4 ms. Default 0 since vk19.13; DM_VK_PREWARM_KEEP=1 keeps them all alive as before
+static int prewarm_keep(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PREWARM_KEEP"); v = e && atoi(e) != 0; LOG("DM_VK_PREWARM_KEEP=%d: %s", v, v ? "the pre-warm keeps every pipeline alive" : "the pre-warm keeps only the driver's pipeline cache warm"); } return v; }
 static void pso_precreate_one(const pso_rec *r) {
     uint8_t md[8]; pso_key k = r->k;
     if (!r->vs[0] || !hexkey(r->vs, md) || !(k.vs = shader_get(md)) || !k.vs->mod) return;
@@ -2232,6 +2263,8 @@ static struct { uint64_t key, gen; VkDescriptorSetLayout dsl; VkDescriptorSet ds
 static uint64_t g_dsc_hit, g_dsc_miss;
 static uint64_t g_t_ws, g_t_draw, g_t_disp, g_t_sub;   // time in write_set, in draws (with their write_set), in dispatches, in vkQueueSubmit (the frame stats line)
 static VkDescriptorSet write_set_(shader_t *s, int stage);
+static int g_ws_att; static vtex *g_ws_simg[16]; static int g_nws_simg;   // the last compute write_set: whether it reads an attachment of the open pass, the storage images it binds (defer_on)
+static int ws_is_att(const vtex *v) { if (v == P.dt) return 1; for (int i = 0; i < P.n; i++) if (P.ct[i] == v) return 1; return 0; }
 static int g_vs_haz;   // the vertex shader's write_set met a texture a pass wrote with vertex shaders left out of its end barrier (draw_vs_hazard)
 static uint32_t g_dyno[64]; static uint32_t g_ndyno;   // the dynamic offsets of the last write_set, in binding order (for vkCmdBindDescriptorSets)
 static VkDescriptorSet write_set(shader_t *s, int stage) { uint64_t t0 = now_ns(); VkDescriptorSet d = write_set_(s, stage); g_t_ws += now_ns() - t0; return d; }
@@ -2300,11 +2333,15 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                     th = dyn ? dyn_slot(stage, (int)e) : b->kind == K_TEXU ? texu_slot(stage, b) : S.tex[stage][b->reg + e]; have = !dyn;
                     int ok; vtex *tv; view = tex_slot(stage, th, &sm, &ok, &tv);
                     if (stage == 0 && tv && tv->vhaz && tv->vhaz_epoch == g_vbar_epoch) g_vs_haz = 1;   // written by a pass whose end barrier left vertex shaders out (DM_VK_PASS_BARRIER)
+                    if (tv && g_ndefer && tv->dfr_gen == g_defer_gen) g_defer_haz = 1;   // a storage image a deferred dispatch writes (defer_on)
+                    if (stage == 5 && tv && P.open && ws_is_att(tv)) g_ws_att = 1;   // a dispatch sampling the open pass's attachment is not deferred
                     if (stage == 1 && tv) for (int q = 0; q < g_fb_n; q++) if (tv == g_fb_src[q]) { view = g_fb_view[q]; break; }   // same-pass feedback: the snapshot (fb_prepare)
                 } else if (simg && b->kind == K_IMG && b->reg >= 0 && b->reg + (int)e < 32) {   // an image a shader writes: a single-level view with no swizzle, of an image made for storage
                     int tid = (int)(S.img[stage][b->reg + e] & 0xfffff);
                     pthread_mutex_lock(&g_rmu); treg_t tr = tid && tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
                     vtex *v = tr.ok && tr.t.d.target != NVN_TEXTURE_TARGET_BUFFER ? tex_get(&tr.t, 1) : NULL;
+                    if (v && stage == 5) { if (P.open && ws_is_att(v)) g_ws_att = 1; if (g_nws_simg < 16) g_ws_simg[g_nws_simg++] = v; }   // what a deferred dispatch writes (defer_on)
+                    else if (v && g_ndefer && v->dfr_gen == g_defer_gen) g_defer_haz = 1;
                     VkImageView iv = v && v->storage ? tex_view(v, &tr.t, &tr.v, tr.has_v, -1, 2) : VK_NULL_HANDLE;
                     if (iv) view = iv; else RED_ONCE(73, "shader %s: image slot %d is not a storage-capable image here: its writes are lost", s->key, b->reg + (int)e);
                 }
@@ -2404,7 +2441,9 @@ static int occ_begin(VkCommandBuffer cb) {   // the query of the draw about to b
     g_occ[g_nocc++] = q; g_occ_ndraw++; return (int)q;
 }
 static void occ_end(VkCommandBuffer cb, int q) { if (q >= 0) vkCmdEndQuery(cb, C->oq, (uint32_t)q); }
-#define DRAWQ(call) do { int q_ = occ_begin(cb); call; occ_end(cb, q_); } while (0)
+// A draw that reads what a deferred dispatch writes (g_defer_haz, set while its resources were resolved): the pass ends, which records the deferred dispatches, and begins again;
+// the pipeline, descriptor sets, vertex and index buffers and dynamic state bound stay bound across the two passes
+#define DRAWQ(call) do { if (g_defer_haz && g_ndefer) { g_ndefer_haz++; pass_end(); if (!pass_begin()) return; } int q_ = occ_begin(cb); call; occ_end(cb, q_); } while (0)
 // Indirect arguments, n bytes at addr: 1 when guest memory holds them and they were read into out (written by the CPU, or by a submission that has completed: gw_find waits for
 // one still in flight), 2 when a dispatch of this submission writes them -- not run yet, so the GPU must read them: *b / *off is where
 static int ind_args(uint64_t addr, uint32_t n, void *out, VkBuffer *b, VkDeviceSize *off, int gpu_ok) {
@@ -2470,6 +2509,7 @@ static int draw_reads_rt(shader_t *vs, shader_t *fs, shader_t *gs) {
 }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!S.bst[0]) SKIP(0);
+    g_defer_haz = 0;
     uint32_t didx = g_frame_draw++;   // this draw's number within the frame (the live control file's skip ranges)
     // Indirect draws: the record {count, instances, first, base instance} (indexed: {count, instances, first index, base vertex, base instance}). Read here when the CPU can, and
     // drawn as an ordinary draw (only the vertices it uses copied); written by a dispatch of this very submission (Unreal's GPU particles and culling), drawn by the GPU from the
@@ -2699,9 +2739,17 @@ static void dispatch(const p_dispatch *d) {
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs->mod, "main", NULL}, cs->cpl, VK_NULL_HANDLE, -1};
         if (vkCreateComputePipelines(g_dev, g_pcache, 1, &ci, NULL, &cs->cpp) != VK_SUCCESS) { LOG("[RED] vk: compute pipeline for %s not created", cs->key); cs->mod = VK_NULL_HANDLE; return; }
     }
-    pass_end();
-    g_ws_zero_tb = 0;
+    int dfr = defer_on() && P.open && !ib && g_ndefer < NDEFER;   // recorded after the open pass instead of ending it (defer_on)
+    if (!dfr) pass_end();
+    g_ws_zero_tb = 0; g_ws_att = 0; g_nws_simg = 0;
     VkDescriptorSet ds = write_set(cs, 5); if (!ds) return;
+    if (dfr && (!P.open || g_ws_att)) { dfr = 0; pass_end(); }   // it reads one of the pass's attachments (or the pass ended meanwhile): as before
+    if (dfr) {
+        dfr_t *q = &g_dfr[g_ndefer++]; q->cs = cs; q->ds = ds; q->ndyno = g_ndyno < 64 ? g_ndyno : 64; memcpy(q->dyno, g_dyno, q->ndyno * 4); q->g[0] = g[0]; q->g[1] = g[1]; q->g[2] = g[2]; q->zero_tb = g_ws_zero_tb;
+        for (int i = 0; i < g_nws_simg; i++) g_ws_simg[i]->dfr_gen = g_defer_gen;
+        g_ndefer_n++;
+        if (g_plog) LOG("plog:  dispatch cs %s %ux%ux%u deferred past the open pass, %d storage buffers", cs->key, g[0], g[1], g[2], g_nwb);
+    } else {
     if (g_plog) LOG("plog:  dispatch cs %s %ux%ux%u%s, %d storage buffers", cs->key, g[0], g[1], g[2], ib ? " (indirect, GPU-written)" : "", g_nwb);
     vkCmdBindPipeline(C->cb, VK_PIPELINE_BIND_POINT_COMPUTE, cs->cpp);
     vkCmdBindDescriptorSets(C->cb, VK_PIPELINE_BIND_POINT_COMPUTE, cs->cpl, 0, 1, &ds, g_ndyno, g_dyno);
@@ -2711,6 +2759,8 @@ static void dispatch(const p_dispatch *d) {
     gpu_mark(1, 1);
     trace_add('c', cs->key, NULL, ib ? 0 : g[0], ib ? 0 : g[1], ib ? 0 : g[2], ib != VK_NULL_HANDLE, g_ws_zero_tb);
     barrier_cs(C->cb);
+    }
+    g_gw_add_dfr = dfr;   // its written ranges: a draw reading one records the deferred dispatches first
     for (int i = 0; i < g_nwb; i++) {
         gw_t *w = &g_wb[i]; int from_gw = w->fence != 0;
         // Back into guest memory at completion, only what the GPU changed. The GPU writes the bytes a shader stores and no others: the whole range written back put the bytes the
@@ -2729,6 +2779,7 @@ static void dispatch(const p_dispatch *d) {
         if (snap) post_add((post_t){5, (void *)(uintptr_t)w->addr, 0, 0, (uint64_t)(uintptr_t)snap, 0, w->p, w->size});
         else post_add((post_t){3, (void *)(uintptr_t)w->addr, 0, 0, 0, 0, w->p, w->size});
     }
+    g_gw_add_dfr = 0;
     g_stat_draws++;
 }
 static void clear_color(const p_clear_color *c) {
@@ -3578,6 +3629,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                         LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame, SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame (left open %.1f: the attachment it samples was not written in the pass)",
                             gp / 600e6, gd / 600e6, gc / 600e6, g_npass / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0, g_nsplit_skip / 600.0); g_npass = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; g_nsplit_skip = 0; }
     if (n % 600 == 0) gsig_report(600);
+    if (n % 600 == 0 && defer_on()) { LOG("vk: DM_VK_DISPATCH_DEFER: %.1f dispatches a frame recorded after their pass, %.1f passes a frame ended early for a draw reading what one writes", g_ndefer_n / 600.0, g_ndefer_haz / 600.0); g_ndefer_n = g_ndefer_haz = 0; }
     if (n % 600 == 0 && (ubwc_on() || pass_barrier_on())) { LOG("vk: DM_VK_UBWC %d: %llu images made with a format list or not mutable so far, %llu views outside the list; DM_VK_PASS_BARRIER %d: %.1f pass ends a frame without vertex shaders, %.1f vertex-shader barriers a frame",
         ubwc_on(), (unsigned long long)g_ubwc_imgs, (unsigned long long)g_ubwc_fallback, pass_barrier_on(), g_nbar_narrow / 600.0, g_nbar_vs / 600.0); g_nbar_narrow = g_nbar_vs = 0; }
     if (n % 600 == 0) { LOG("vk: waiting for a free submission context per frame: %.2f ms for its own submission, %.2f ms for a later one still reading its ring (%d contexts)",
@@ -3591,9 +3643,10 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (trig && n == trig) { rt_dump(n, 1); trig = 0; } else rt_dump(n, 0);
     if (tf && !trig && n % 30 == 0 && !access(tf, F_OK)) { trig = n + 1; unlink(tf); LOG("vk: %s found: frame %llu is logged and its render targets written", tf, (unsigned long long)trig); }
     if (n % 1800 == 0 || (g_pso_last_new && n - g_pso_last_new == 120 && !atomic_load(&g_pso_pending))) pcache_save();   // also soon after new pipelines settle
-    if (n % 600 == 0) LOG("vk: pipelines: %d made, %llu on worker threads, %llu made again from earlier runs, %llu draws left out while theirs was made, %.0f ms making them, %.0f ms loading shaders, in all; warm ones made again at first use %llu (%.0f ms)", g_npso,
+    if (n % 600 == 0) LOG("vk: pipelines: %d made, %llu on worker threads, %llu made again from earlier runs, %llu draws left out while theirs was made, %.0f ms making them, %.0f ms loading shaders, in all; warm ones made again at first use %llu (%.0f ms); lookups so far: found ready %llu, found warm %llu, found being made %llu, not found %llu", g_npso,
                           (unsigned long long)atomic_load(&g_pso_async), (unsigned long long)atomic_load(&g_pre_made), (unsigned long long)atomic_load(&g_pso_skipped), atomic_load(&g_pso_ns) / 1e6, atomic_load(&g_sh_ns) / 1e6,
-                          (unsigned long long)atomic_load(&g_pso_rewarm), atomic_load(&g_pso_rewarm_ns) / 1e6);
+                          (unsigned long long)atomic_load(&g_pso_rewarm), atomic_load(&g_pso_rewarm_ns) / 1e6,
+                          (unsigned long long)g_pso_look[0], (unsigned long long)g_pso_look[1], (unsigned long long)g_pso_look[2], (unsigned long long)g_pso_look[3]);
     { static int64_t pl = -2; static int on; if (pl == -2) { const char *e = getenv("DM_VK_PASSLOG"); pl = e ? atoll(e) : -1; on = e && strchr(e, '+'); }   // <frame>+: every frame from there on
       g_plog = (on ? (int64_t)n + 1 >= pl && pl >= 0 : (int64_t)n + 1 == pl) || (trig && n + 1 == trig); if (g_plog && on) LOG("plog: frame %llu", (unsigned long long)n + 1); }
     return n;

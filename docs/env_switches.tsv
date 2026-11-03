@@ -316,6 +316,7 @@ DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (`r.Streamin
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
 DM_VK_CTX	test	Android: `=<n>` (4..32, default 20) submission contexts: how far the CPU may record ahead of the GPU; each holds a ring (4 MB and up)
 DM_VK_DIR	path	Android: the folder of the shaders' SPIR-V (`<key>.spv`, `<key>.vk.txt` from dm/android/tools/spv_android.py) and the pipeline cache
+DM_VK_DISPATCH_DEFER	test	Android: `1` records a dispatch met inside an open render pass after that pass instead of ending it, when it reads none of the pass's attachments; a draw reading what it writes ends the pass first. Default 0
 DM_VK_LATE_FILL	test	Android: `0` leaves out vk19.5's late fill (a texture drawn before the game wrote its storage is watched and uploaded when the data comes)
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
 DM_VK_MIRROR	test	Android: `0` leaves out vk19.6's mirrors (a GPU copy into a storage-backed texture is written into its storage too)
@@ -323,7 +324,7 @@ DM_VK_NO_DYNREND	test	Android: `1` uses render passes made per pass even where d
 DM_VK_NO_TIMELINE	test	Android: set, submissions are not chained by a timeline semaphore even where the GPU has one
 DM_VK_PASSLOG	diagnostic	Android: `=<frame>[+]` logs that frame's passes, draws, copies and dispatches (targets, clears, shaders, depth / stencil / blend)
 DM_VK_PASS_BARRIER	test	Android: `1` leaves vertex shaders out of each pass end's barrier (the next pass's vertex work may overlap); a vertex shader that samples such a pass's target gets a barrier first. Default 0
-DM_VK_PREWARM_KEEP	test	Android: `0` makes the shader pre-warm destroy each pipeline right after making it (only the driver's pipeline cache stays warm); a pipeline is made again from that cache at its first use. Default 1 keeps them all alive
+DM_VK_PREWARM_KEEP	test	Android: `1` makes the shader pre-warm keep every pipeline alive (RSS +~500 MB in FINAL FANTASY RESONANCE). Default 0 since vk19.13: each is destroyed right after it is made (only the driver's pipeline cache stays warm) and made again from that cache at its first use
 DM_VK_RTDUMP	diagnostic	Android: `=<frame>[,<frames>]` writes every render target of that frame (and the next ones) as raw files into DM_VK_SHOT_DIR
 DM_VK_RTDUMP_DEC	diagnostic	Android: with DM_VK_RTDUMP, also writes the textures decoded from BC4-7 on upload
 DM_VK_RT_HOLD	test	Android: `0` turns the SetRenderTargets detour hold off: every SetRenderTargets ends the open pass
