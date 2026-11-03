@@ -79,6 +79,9 @@ DM_MEASURE_LOCK	path	`=<file>`: `scripts/regress.py`'s default `--lock`, the mea
 DM_MEMSTAT	diagnostic	`=<tsv>` writes one line per second of memory accounting: footprint, Metal allocation and resident and charged memory by region class (guest, code, malloc, gpu, …)
 DM_MEMSTAT_DUMP	diagnostic	`=<seconds>`: with `DM_MEMSTAT`, at that second writes every VM region of 1 MiB or more to `<tsv>.regions`
 DM_MEM_BUDGET_MB	switch	Android: the process's resident memory plus the Vulkan backend's device memory (MB, default 2000; 0 off) past which the backend trims as on low memory (idle textures evicted, rings to their minimum, pools emptied, heap pages returned)
+DM_MEM_PRETRIM	switch	Android: early trim, default `1` (on); `0` off. The Vulkan backend trims at once (at most every 2 s) when the game heap grew DM_MEM_PRETRIM_MB since the last one-second check or MemAvailable fell twice that in a second, then keeps nothing for reuse for 10 s
+DM_MEM_PRETRIM_MB	switch	Android: the game-heap growth (MB, default 100) that triggers an early trim (DM_MEM_PRETRIM)
+DM_MEM_PRETRIM_AVAIL_MB	switch	Android: MemAvailable (MB, default 1600) below which the backend trims as at DM_VK_MEM_LOW_MB (at most every 5 s), with DM_MEM_PRETRIM on
 DM_MEM_CAP_GB	switch	`=<GB>`: the memory watchdog exits when resident memory exceeds that many GB (default 24 on the Mac, none on iOS; `0` turns it off)
 DM_METAL_CAPTURE	diagnostic	`=1` makes `build_ipa.sh` produce a build that can write GPU frame captures (`MetalCaptureEnabled` in `Info.plist`), for `DM_GPU_CAPTURE`
 DM_METAL_HUD	player	`1` shows Apple's Metal performance HUD over the game (frame rate, frame and GPU time, memory)
@@ -317,6 +320,7 @@ DM_THRCPU	diagnostic	`=<tsv path>[,<seconds>]` writes each thread's CPU time (10
 DM_TOUCH_HAPTICS	player	`0` turns off the light haptic tap when a touch control is pressed (on by default); launcher setting
 DM_TOUCH_LOG	diagnostic	`=1` logs each touch-screen read with touch points (sample, finger, position, attributes) and each gesture entry, up to 500 lines
 DM_UDC_SELFTEST	diagnostic	`=1` runs a start-up check of DontCare load and store on private depth-stencil and RGBA8 textures (clear, Load + DontCare, read back) and logs one result line
+DM_UE_BIGALLOC_MB	diagnostic	Unreal heap on the host: each allocation or reallocation of this many MB or more (default 8; 0 off) is logged with the guest caller chain (module+offset), the thread and the heap total; at most 400 lines
 DM_UE_CVARS	switch	Unreal games: `<name>=<value>[,…]` sets any console variable the rewriter found (ue_cvar.py NAMES; a value with '.' is a float), after DM_UE_PERF's, whenever the game sets it back
 DM_UE_DRS	switch	Unreal games: `budget16` sets r.DynamicRes.FrameTimeBudget to 16.67 ms (the game's bounds stay), `pinned[:<pct>]` sets the dynamic resolution's minimum and maximum to <pct> (default 75), `off` leaves the game's values. Default: budget16 when the frame target is 60, else off. Needs the variables in main's fixups (ue_cvar.py)
 DM_UE_PERF	switch	Unreal games: `1` turns render features down without changing the frame's structure (SSR off, AO one level, motion blur / lens flares / fringe off, SSS and refraction lowest, no particle or light-function lights, 2 shadow cascades at 1024, other shadows 512); `2` also AO and contact shadows off, shadow distance 60%, bloom and eye adaptation lowest, view distance 70%, half particle spawn rate, textures one mip down. Needs the variables in main's fixups (ue_cvar.py)
