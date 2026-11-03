@@ -1015,7 +1015,9 @@ static void tex_reupload(vtex *v, const tex_t *t, uint64_t since);
 // DM_VK_UBWC=1: images whose views never reinterpret their format keep the Adreno's bandwidth compression (UBWC). Every image used to be made MUTABLE_FORMAT with no format list,
 // which the driver may answer by leaving the image uncompressed: every render target, depth buffer and texture read and written at full size. Now an image is MUTABLE_FORMAT
 // only with a format list -- its own format and its sRGB / UNORM sibling -- or not mutable at all where it has no sibling (depth images included: their views keep their format).
-// Storage images stay as they were (any view). A view asking for a format outside the list takes the image's own (counted: g_ubwc_fallback). Default 0 (off) until measured
+// Storage images stay as they were (any view). A view asking for a format outside the list takes the image's own (counted: g_ubwc_fallback). Default 0 (off), and to stay so:
+// it bought no frame rate, and with it on FINAL FANTASY RESONANCE's texture streaming (100-300 MB a second of copies into compressed images) cost the system memory no resident set
+// or device allocation showed -- MemAvailable 1.8 GB to 0.24 GB in 3 s, the low-memory killer 4 times in 4 at the Earth Shrine arch; with it off the same walk peaked 1.1 GB/s of uploads and lived
 static int ubwc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_UBWC=1: images without format reinterpretation keep compression (format lists)"); } return v; }
 static uint64_t g_ubwc_fallback, g_ubwc_imgs;
 static VkFormat fmt_sibling(VkFormat f) {   // the sRGB / UNORM twin of a format, VK_FORMAT_UNDEFINED when it has none
