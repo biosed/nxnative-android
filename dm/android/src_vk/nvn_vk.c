@@ -3060,21 +3060,33 @@ static void clear_tex(const p_clear_tex *c) {
 static _Atomic uint64_t g_trim_gen, g_wait_fence_ns, g_wait_hold_ns;
 void dm_vk_trim(void) { atomic_fetch_add(&g_trim_gen, 1); }
 // The low-memory signal (onLowMemory) came too late: the low-memory killer ended the game in the foreground twice (FINAL FANTASY RESONANCE on the Xiaomi Pad 8, RSS 2.4 GB, the
-// system swapping). Every second the backend reads MemAvailable; below DM_VK_MEM_LOW_MB (default 1200) it trims as for the signal, at most every 5 s: idle textures evicted (60
-// frames unused), rings back to their minimum, the reuse pools emptied, malloc's free pages given back. Logged with what was available
+// system swapping). Every second the backend reads MemAvailable and the process's resident memory; below DM_VK_MEM_LOW_MB (default 1200) available, or past DM_MEM_BUDGET_MB
+// (default 2000) for the process's resident memory plus the backend's device memory, it trims as for the signal, at most every 5 s: idle textures evicted (60 frames unused), rings
+// back to their minimum, the reuse pools emptied, malloc's free pages given back. The hibernation build's game heap gives its free chunks' pages back every 10 s, and at once then
 #include <malloc.h>
+size_t dm_ueheap_release(size_t min) __attribute__((weak));   // the hibernation build's game heap (hle_ueheap.c): free chunks' pages back to the system
+static uint64_t g_heap_released;
 static void mem_watch(void) {
-    static uint64_t last, last_trim; uint64_t now = now_ns(); if (now - last < 1000000000ull) return; last = now;
-    static long low = -1; if (low < 0) { const char *e = getenv("DM_VK_MEM_LOW_MB"); low = e ? atol(e) : 1200; }
-    long avail = 0; char ln[128]; FILE *f = fopen("/proc/meminfo", "re"); if (f) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "MemAvailable: %ld", &avail) == 1) break; fclose(f); }
-    g_mem_low = avail > 0 && avail / 1024 < low;
+    static uint64_t last, last_trim, last_rel; uint64_t now = now_ns(); if (now - last < 1000000000ull) return; last = now;
+    static long low = -1, budget = -1;
+    if (low < 0) { const char *e = getenv("DM_VK_MEM_LOW_MB"); low = e ? atol(e) : 1200; e = getenv("DM_MEM_BUDGET_MB"); budget = e ? atol(e) : 2000; }
+    long avail = 0, rss = 0; char ln[128]; FILE *f = fopen("/proc/meminfo", "re"); if (f) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "MemAvailable: %ld", &avail) == 1) break; fclose(f); }
+    if ((f = fopen("/proc/self/status", "re"))) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "VmRSS: %ld", &rss) == 1) break; fclose(f); }
+    uint64_t gpu = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) gpu += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
+    gpu += atomic_load(&g_ring0_bytes) + atomic_load(&g_extra_ring_bytes);
+    long ours = rss / 1024 + (long)(gpu >> 20);   // the process's resident memory and the backend's device memory, in MB
+    int is_low = low > 0 && avail > 0 && avail / 1024 < low, over = budget > 0 && ours > budget;
+    g_mem_low = is_low || over;
+    if (dm_ueheap_release && (g_mem_low || now - last_rel >= 10000000000ull)) { last_rel = now; size_t r = dm_ueheap_release(65536); g_heap_released += r;
+        static int nr; if (r >= (16u << 20) && nr++ < 40) LOG("vk: game heap: %.0f MB of free blocks given back to the system", r / 1048576.0); }
     if (!g_mem_low || now - last_trim < 5000000000ull) return;
     last_trim = now; atomic_fetch_add(&g_trim_gen, 1);
     pthread_mutex_lock(&g_snapmu); for (int k = 0; k < SNAP_NC; k++) { while (g_snap_n[k]) free(g_snap_free[k][--g_snap_n[k]]); } g_snap_kept = 0; pthread_mutex_unlock(&g_snapmu);
     pthread_mutex_lock(&g_xcmu); while (g_nxc) { g_nxc--; vkDestroyBuffer(g_dev, g_xc[g_nxc].b, NULL); vkFreeMemory(g_dev, g_xc[g_nxc].m, NULL);
         for (int k = 0; k < g_nxmap; k++) if (g_xmap[k].m == g_xc[g_nxc].m) { g_xmap[k] = g_xmap[--g_nxmap]; break; } } g_xc_bytes = 0; pthread_mutex_unlock(&g_xcmu);
     mallopt(M_PURGE, 0);
-    static int nl; if (nl++ < 20) LOG("vk: memory low (%ld MB available, under %ld): idle textures evicted, rings back to their minimum, reuse pools emptied", avail / 1024, low);
+    static int nl; if (nl++ < 30) LOG("vk: memory %s (%ld MB available, the process %ld MB resident + %llu MB device): idle textures evicted, rings back to their minimum, reuse pools emptied",
+                                      over && !is_low ? "over budget" : "low", avail / 1024, rss / 1024, (unsigned long long)(gpu >> 20));
 }
 void tex_evict_hook(void) { mem_watch(); tex_evict(atomic_load(&g_trim_gen)); }   // the front end's low-memory signal (app/front_android.c): every ring back to RING_MIN at its next use
 static void ring_fit(ctx_t *c) {
