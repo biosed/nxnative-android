@@ -125,7 +125,10 @@ static int NCTX = 20;
 #define RING_MIN (4u << 20)
 #define RING_MAX (64u << 20)
 #define RING_XMAX (256u << 20)
-#define RING_CAP (160ull << 20)   // all contexts' own rings together: past it a ring does not grow, and a submission that outgrows it takes extra rings (freed when it is done)
+// All contexts' own rings together (DM_VK_RING_CAP_MB, default 96; it was 160): past it a ring does not grow, and a submission that outgrows it takes extra rings (freed when it is
+// done). The run that loaded a save into FINAL FANTASY RESONANCE had its rings at the 160 MB cap plus 16 MB extra when the low-memory killer ended it
+static uint64_t ring_cap(void) { static uint64_t v; if (!v) { const char *e = getenv("DM_VK_RING_CAP_MB"); long mb = e && atol(e) > 0 ? atol(e) : 96; v = (uint64_t)mb << 20; LOG("vk: rings capped at %ld MB in all (DM_VK_RING_CAP_MB)", mb); } return v; }
+#define RING_CAP ring_cap()
 typedef struct { int kind; void *dst; uint32_t mode, v; uint64_t addr; uint32_t type; const uint8_t *src; size_t n; } post_t;   // kind 5: n bytes from src where they differ from the snapshot at addr (4-byte words); kind 6: v rows of type bytes, mode apart
 static uint64_t g_wb_words, g_wb_bytes;   // dispatch write-backs: words the GPU changed and written back / bytes of the ranges looked at (completion thread)   // kind 1 event, 2 counter, 3 copy ring → guest, 4 samples-passed report (src: n query indices; n == SIZE_MAX: unknown, reported visible)
 typedef struct vtex vtex;
@@ -1123,6 +1126,9 @@ static int tex_remake(vtex *v, const tex_t *t) {
     return 1;
 }
 static uint64_t g_trim_gen_tex;
+// The age a trim evicts at: 60 frames, and DM_VK_EVICT_FAST (default 30) on an early trim for fast heap growth (mem_watch). FINAL FANTASY RESONANCE's battles load about 300 MB
+// of the game heap at the transition, while the field's textures sit unused behind the battle
+static _Atomic int g_trim_age = 60;
 static void tex_evict(uint64_t trim_gen) {
     static uint64_t last; uint64_t n = atomic_load(&g_presents); int trim = trim_gen != g_trim_gen_tex; g_trim_gen_tex = trim_gen;
     if (!trim && n - last < 60) return;
@@ -1130,7 +1136,7 @@ static void tex_evict(uint64_t trim_gen) {
     uint64_t held = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) held += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
     if (!trim && held < EVICT_FLOOR) return;
     static int64_t eage = -1; if (eage < 0) { const char *e = getenv("DM_VK_EVICT_AGE"); eage = e && atoll(e) > 0 ? atoll(e) : 300; }
-    uint64_t age = trim ? 60 : (uint64_t)eage, done; pthread_mutex_lock(&g_mu); done = g_done; pthread_mutex_unlock(&g_mu);
+    uint64_t age = trim ? (uint64_t)atomic_load(&g_trim_age) : (uint64_t)eage, done; pthread_mutex_lock(&g_mu); done = g_done; pthread_mutex_unlock(&g_mu);
     int nev = 0;
     pthread_mutex_lock(&g_rmu);
     for (int hh = 0; hh < NHASH; hh++) for (vtex *v = g_tex[hh]; v; v = v->next) {
@@ -3148,6 +3154,8 @@ static void mem_watch(void) {
         if (dm_ueheap_release && now - last_rel >= 60000000000ull) { last_rel = now; heap_release_kick(); }   // on the heap thread, not this one (it walks the heap under its locks)
         return;
     }
+    static int fast_age = -1; if (fast_age < 0) { const char *e = getenv("DM_VK_EVICT_FAST"); fast_age = e && atoi(e) > 0 ? atoi(e) : 30; }
+    atomic_store(&g_trim_age, early ? fast_age : 60);
     last_trim = now; atomic_fetch_add(&g_trim_gen, 1);
     if (dm_ueheap_release) { last_rel = now; heap_release_kick(); }
     pthread_mutex_lock(&g_snapmu); for (int k = 0; k < SNAP_NC; k++) { while (g_snap_n[k]) free(g_snap_free[k][--g_snap_n[k]]); } g_snap_kept = 0; pthread_mutex_unlock(&g_snapmu);

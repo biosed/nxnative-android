@@ -333,6 +333,7 @@ DM_VK_DECODE_POOL	test	Android: `1` decodes CPU-decoded textures (BC / ASTC the 
 DM_VK_DIR	path	Android: the folder of the shaders' SPIR-V (`<key>.spv`, `<key>.vk.txt` from dm/android/tools/spv_android.py) and the pipeline cache
 DM_VK_DISPATCH_DEFER	test	Android: `1` records a dispatch met inside an open render pass after that pass instead of ending it, when it reads none of the pass's attachments; a draw reading what it writes ends the pass first. Default 0
 DM_VK_EVICT_AGE	switch	Android: frames a storage-backed texture stays unused before its image is evicted (default 300; made again from its storage at its next use)
+DM_VK_EVICT_FAST	switch	Android: the age in frames (default 30) at which an early trim for fast game-heap growth (DM_MEM_PRETRIM) evicts idle textures; other trims use 60
 DM_VK_GPU_TS	test	Android: `0` gives every counter timestamp of a submission its completion time, as before vk19.14 (now TIMESTAMP_TOP takes the submission's GPU start)
 DM_VK_LATE_FILL	test	Android: `0` leaves out vk19.5's late fill (a texture drawn before the game wrote its storage is watched and uploaded when the data comes)
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
@@ -345,6 +346,7 @@ DM_VK_PASS_BARRIER	test	Android: `1` leaves vertex shaders out of each pass end'
 DM_VK_POOL_TRANSIENT	test	Android: `1` creates the command pools VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, as before vk19.20 (default 0: kept warm, reset without releasing their memory)
 DM_VK_PREWARM_KEEP	test	Android: `1` makes the shader pre-warm keep every pipeline alive (RSS +~500 MB in FINAL FANTASY RESONANCE). Default 0 since vk19.13: each is destroyed right after it is made (only the driver's pipeline cache stays warm) and made again from that cache at its first use
 DM_VK_RING_CACHED	test	Android: `1` puts the host-visible rings in a HOST_CACHED coherent memory type where the GPU has one (the CPU reads them back: dispatch snapshots, write-back compares); default 0, the first coherent type (uncached on the Adreno)
+DM_VK_RING_CAP_MB	switch	Android: all submission contexts' own rings together (MB, default 96; was 160). Past it a ring does not grow and a submission that outgrows it takes extra rings, freed when it is done
 DM_VK_RING_KEEP	test	Android: `1` keeps each ring at its size after a quiet stretch (halved only while memory is low); default 0 halves it as before (growing again later maps fresh pages)
 DM_VK_RTDUMP	diagnostic	Android: `=<frame>[,<frames>]` writes every render target of that frame (and the next ones) as raw files into DM_VK_SHOT_DIR
 DM_VK_RTDUMP_DEC	diagnostic	Android: with DM_VK_RTDUMP, also writes the textures decoded from BC4-7 on upload
