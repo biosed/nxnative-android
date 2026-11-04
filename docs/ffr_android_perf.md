@@ -56,6 +56,7 @@ Env "E": A with `DM_VK_MEM_LOW_MB=600 DM_MEM_PRETRIM_AVAIL_MB=700 DM_MEM_BUDGET_
 | L | vk19.46 | E + `DM_VK_ZEROCOPY=1` | 25.9–26.1 | | | | 23.9–24.2 | 11.2–11.5 | 1,382 | 35–36 / | Z0 works (384 MB backed, 1,046 reads a frame in place, 0 copied) but −0.6 ms rec (noise) and −230 MB MemAvailable: reverted (env off). The estimate (−1.5 to −2.5 ms) came from Run A's profile, when copies and faults were far larger |
 | M3 | vk19.49 | E + `DM_VK_REC_THREAD=1` | 25.4–26.2 | | | | 21.0–27.2 | 9.5–12.4 | | 40–46 / 55–61 | record thread works (after the FenceSync fix: command-buffer syncs fenced at submission) and splits the load (RHIThread 100% → 7.6%, dm-record 77%), but p50 +8 ms: the RHI thread's own guest work is small, so there is little to overlap; the record thread stays the critical path (rec ~24 + context waits ~7) on a low-clocked core (1.67 GHz). p95 better. Reverted (opt-in kept: step 6 builds on it) |
 | N | vk19.50 | E + `DM_ADPF_ALL=1` | 26.25–26.4 | | | | 24.4–24.9 | 11.1–11.3 | | 35–36.7 / 67–75 | every ADPF call returns 0 (session over the hot threads, power efficiency off, workload increases) but the clocks do not move (gold cores 2803 / 787, cpu7 633–1228): HyperOS ignores the hints. Reverted. (Its thread match took GameThread more than once and missed RHIThread: fix if ever reused) |
+| O | vk19.51 | E + `DM_VK_STORE_NONE=1` | 26.7–27.0 | 19.8–20.0 | 6.6 | | 25.2–25.8 | 11.1–11.3 | | 35.3–36.6 / 67.5–74 | passes through secondaries with exact stores: only 0.4 colour and 6.4 depth attachments a frame were unwritten (50.0 and 9.0 stored), so little to save; the 40 per-pass secondaries cost about +0.8 ms CPU and +0.9 ms GPU a frame on the Adreno 825 (the benchmark value for parallel translation). Reverted; lazy clears (~0.6 ms potential) skipped |
 
 ## Findings
 
@@ -102,6 +103,7 @@ Env "E": A with `DM_VK_MEM_LOW_MB=600 DM_MEM_PRETRIM_AVAIL_MB=700 DM_MEM_BUDGET_
 
 - `DM_VK_STALE_PATCH=2` as the default (verified exact in Run I).
 - Stage reuse over the remaining non-reusable kinds (vk19.43 counts them by reason).
+- Current best: Run J′ configuration (vk19.46 defaults, env E). Steps tried and reverted: record thread (M3), ADPF over hot threads (N), store NONE through secondaries (O). Step 5 (more cores for the game) skipped until parallel translation needs it; parallel translation designed by a separate agent.
 - Zero-copy pools: Z0 measured (Run L) — no gain at this spot, reverted; Z1 / Z2 not pursued unless a profile shows copies again.
 - A record thread (as the Metal host's `nvn_rec.h`).
 - Clocks: Run G (half the CPU and GPU time) was the device's state, not code (G2). From vk19.45 every 600 frames logs the CPU / GPU clocks, the thermal status and the Android game mode, and the APK declares the performance and battery game modes; runs are compared only at like clocks.
