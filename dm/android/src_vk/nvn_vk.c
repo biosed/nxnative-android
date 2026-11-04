@@ -399,12 +399,16 @@ static VkDescriptorSet patch_set(void);
 // DM_VK_PATCH_VERIFY=1 (diagnostics, with DM_VK_STALE_PATCH=2): each patch dispatch is checked when its submission completes, every word of its table against the staged
 // words (the ring is host-visible). A mismatch is either a wrong patch or a later write of this submission over the same bytes (a dispatch storing there): both are logged
 enum { NPV = 64 };
-static struct { const uint32_t *dst, *src, *tab; uint32_t n; } g_pv[32][NPV]; static int g_npv[32]; static uint64_t g_pv_words, g_pv_bad, g_pv_checked;
+static struct { const uint32_t *dst, *src, *tab, *snap; uint32_t n; } g_pv[32][NPV]; static int g_npv[32]; static uint64_t g_pv_words, g_pv_bad, g_pv_checked, g_pv_snap_words, g_pv_snap_bad;
 static int patch_verify(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PATCH_VERIFY"); v = e && atoi(e) != 0; } return v; }
+// Two checks: snap, a copy of the destination taken on the GPU right after the dispatch (the patch itself: should be 0 differences), and dst, the destination when the
+// submission is done (later work of the submission, a dispatch storing into the same buffer, may have changed it since: differences there alone are not a fault)
 static void patch_verify_ctx(int ci) {
-    for (int i = 0; i < g_npv[ci]; i++) { const uint32_t *t = g_pv[ci][i].tab;
+    for (int i = 0; i < g_npv[ci]; i++) { const uint32_t *t = g_pv[ci][i].tab, *sn = g_pv[ci][i].snap;
+        if (sn) for (uint32_t j = 0; j < g_pv[ci][i].n; j++) { const uint32_t *d = sn + t[4 * j], *sw = g_pv[ci][i].src + t[4 * j + 1];
+            for (uint32_t k = 0; k < t[4 * j + 2]; k++) { g_pv_snap_words++; if (d[k] != sw[k]) { g_pv_snap_bad++; static int nl; if (nl++ < 12) LOG("[RED] vk: stale patch check, right after the dispatch: run %u (dst word %u, src word %u, %u words) word %u is %#x, staged %#x", j, t[4 * j], t[4 * j + 1], t[4 * j + 2], k, d[k], sw[k]); } } }
         for (uint32_t j = 0; j < g_pv[ci][i].n; j++) { const uint32_t *d = g_pv[ci][i].dst + t[4 * j], *sw = g_pv[ci][i].src + t[4 * j + 1];
-            for (uint32_t k = 0; k < t[4 * j + 2]; k++) { g_pv_words++; if (d[k] != sw[k]) { g_pv_bad++; static int nl; if (nl++ < 20) LOG("[RED] vk: stale patch check: word %u of run %u differs (%#x, staged %#x)", k, j, d[k], sw[k]); } } }
+            for (uint32_t k = 0; k < t[4 * j + 2]; k++) { g_pv_words++; if (d[k] != sw[k]) { g_pv_bad++; static int nl; if (nl++ < 4) LOG("vk: stale patch check, at completion: word %u of run %u is %#x, staged %#x (later work may have written it)", k, j, d[k], sw[k]); } } }
         g_pv_checked++; }
     g_npv[ci] = 0;
 }
@@ -438,7 +442,11 @@ static int gw_patch_cs(const uint8_t *g, const VkBufferCopy *rg, size_t nr, VkBu
     VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
     vkCmdPipelineBarrier(C->up, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);   // before a later copy or patch over the same bytes in this command buffer
     C->up_used = 1; g_patch_disp++; g_patch_runs += nt;
-    if (patch_verify() && dmap && g_ci < 32 && g_npv[g_ci] < NPV) g_pv[g_ci][g_npv[g_ci]++] = (typeof(g_pv[0][0])){(const uint32_t *)dmap, (const uint32_t *)smap, tab, (uint32_t)nt};
+    if (patch_verify() && dmap && g_ci < 32 && g_npv[g_ci] < NPV) {
+        const uint32_t *snap = NULL; VkDeviceSize vo = ring_alloc((dlen + 3) & ~3ull, 16);
+        if (vo != VK_WHOLE_SIZE) { VkBufferCopy vc = {dbase, vo, (dlen + 3) & ~3ull}; vkCmdCopyBuffer(C->up, dst, C->ring, 1, &vc); snap = (const uint32_t *)(C->ringp + vo); }   // after mb2: the dispatch's writes are visible to it
+        g_pv[g_ci][g_npv[g_ci]++] = (typeof(g_pv[0][0])){(const uint32_t *)dmap, (const uint32_t *)smap, tab, snap, (uint32_t)nt};
+    }
     return 1;
 }
 static void gw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDeviceSize dst_off) {
@@ -3531,9 +3539,9 @@ static void mem_watch(void) {
     static uint64_t last, last_trim, last_rel, pre_until; static int64_t pbase = -1, hbase = -1, bbase; static long pavail, prss; static int nline;
     static long low = -1, budget = -1, pre_mb, pre_avail;
     if (low < 0) {
-        const char *e = getenv("DM_VK_MEM_LOW_MB"); low = e ? atol(e) : 1500; e = getenv("DM_MEM_BUDGET_MB"); budget = e ? atol(e) : 2000;
+        const char *e = getenv("DM_VK_MEM_LOW_MB"); low = e ? atol(e) : 800; e = getenv("DM_MEM_BUDGET_MB"); budget = e ? atol(e) : 0;   // vk19.41 defaults (were 1500 / 2000): with the steady-low back-off
         e = getenv("DM_MEM_PRETRIM"); int on = !e || atoi(e) != 0;
-        e = getenv("DM_MEM_PRETRIM_MB"); pre_mb = on ? (e ? atol(e) : 100) : 0; e = getenv("DM_MEM_PRETRIM_AVAIL_MB"); pre_avail = on ? (e ? atol(e) : 1600) : 0;
+        e = getenv("DM_MEM_PRETRIM_MB"); pre_mb = on ? (e ? atol(e) : 100) : 0; e = getenv("DM_MEM_PRETRIM_AVAIL_MB"); pre_avail = on ? (e ? atol(e) : 900) : 0;
         LOG("vk: memory watch: trim below %ld MB available or past %ld MB; early trim %s (game heap +%ld MB, under %ld MB available)", low, budget, on ? "on" : "off", pre_mb, pre_avail);
     }
     uint64_t now = now_ns(); int64_t hu = dm_ue_heap_used();
@@ -4310,7 +4318,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
           static const char *const lwn[LW_N] = {"textures (rmu)", "GPU-written ranges (gwmu)", "contexts (mu)", "queue (qmu)", "image blocks (blkmu)"}; char lb[512]; int lo = 0;
           for (int k = 0; k < LW_N; k++) lo += snprintf(lb + lo, sizeof lb - lo, "%s%s %.2f ms (%.1f)", k ? ", " : "", lwn[k], atomic_exchange(&g_lw_ns[k], 0) / 600e6, atomic_exchange(&g_lw_n[k], 0) / 600.0);
           LOG("vk: lock waits per frame over the last 600, all threads: %s", lb);
-          if (patch_verify()) LOG("vk: stale patch check (DM_VK_PATCH_VERIFY): %llu dispatches, %llu words checked, %llu differ", (unsigned long long)g_pv_checked, (unsigned long long)g_pv_words, (unsigned long long)g_pv_bad);
+          if (patch_verify()) LOG("vk: stale patch check (DM_VK_PATCH_VERIFY): %llu dispatches; right after the dispatch %llu words checked, %llu differ; at completion %llu checked, %llu differ", (unsigned long long)g_pv_checked,
+                                  (unsigned long long)g_pv_snap_words, (unsigned long long)g_pv_snap_bad, (unsigned long long)g_pv_words, (unsigned long long)g_pv_bad);
           LOG("vk: fresh ring memory per frame over the last 600: extra rings %.2f (%.1f MB; %llu taken from the kept ones in all), context rings made again %.3f (%.1f MB)",
               g_xr_fresh / 600.0, g_xr_fresh_bytes / 600.0 / 1048576.0, (unsigned long long)g_xc_reused, g_ring_new / 600.0, g_ring_new_bytes / 600.0 / 1048576.0);
           g_xr_fresh = g_xr_fresh_bytes = g_ring_new = g_ring_new_bytes = 0; }
