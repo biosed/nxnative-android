@@ -4283,6 +4283,26 @@ int dm_vk_prewarm(void) {   // the front end, before the game's main: 0 when the
 #include <dlfcn.h>
 #include <sys/syscall.h>
 static uint64_t g_adpf_n, g_adpf_fail, g_adpf_cpu, g_adpf_gpu; static int g_adpf_err, g_adpf_v2;   // reports made, failed (and the last error), their CPU / GPU sums (the 600-frame line)
+// Clocks and heat (vk19.45), every 600 frames: Run G ran at half the GPU and CPU time of the same build and scene another time, most likely with the device's performance mode
+// on, so a run's numbers are only comparable with its clocks. The CPU frequencies (cpufreq, readable from the app), the GPU's where a readable source exists (tried in turn,
+// the one found named once), the thermal status (AThermal, API 30) and headroom (API 31), the Android game mode the front end read (dm_game_mode: 0 unsupported, 1 standard,
+// 2 performance, 3 battery, 4 custom) and the render thread's core
+int dm_game_mode = -1;
+static long rd_long(const char *path) { FILE *f = fopen(path, "re"); long v = -1; if (f) { if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); } return v; }
+static void clock_line(void) {
+    char b[256]; int o = 0;
+    for (int c = 0; c < 8; c++) { char pth[96]; snprintf(pth, sizeof pth, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c); long f = rd_long(pth); o += snprintf(b + o, sizeof b - o, "%s%ld", c ? " " : "", f > 0 ? f / 1000 : -1); }
+    static const char *const gp[] = {"/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq", "/sys/class/kgsl/kgsl-3d0/gpuclk", "/sys/kernel/gpu/gpu_clock", "/sys/class/devfreq/gpufreq/cur_freq", NULL};
+    static int gi = -2; long g = -1;
+    if (gi == -2) { gi = -1; for (int i = 0; gp[i]; i++) if (rd_long(gp[i]) > 0) { gi = i; LOG("vk: the GPU clock is read from %s", gp[i]); break; } if (gi < 0) LOG("vk: no readable GPU clock (kgsl sysfs and /sys/kernel/gpu denied or absent)"); }
+    if (gi >= 0) { g = rd_long(gp[gi]); if (g > 100000000) g /= 1000000; else if (g > 100000) g /= 1000; }   // Hz or kHz to MHz
+    static void *tm; static int (*st)(void *); static float (*hr)(void *, int); static int ti;
+    if (!ti) { ti = 1; void *h = dlopen("libandroid.so", RTLD_NOW);
+               void *(*acq)(void) = h ? (void *(*)(void))dlsym(h, "AThermal_acquireManager") : NULL; st = h ? (int (*)(void *))dlsym(h, "AThermal_getCurrentThermalStatus") : NULL;
+               hr = h ? (float (*)(void *, int))dlsym(h, "AThermal_getThermalHeadroom") : NULL; tm = acq ? acq() : NULL; }
+    int ts = tm && st ? st(tm) : -1; float hd = tm && hr ? hr(tm, 0) : -1.0f;
+    LOG("vk: clocks: CPU MHz by core %s; GPU %ld MHz; thermal status %d, headroom %.2f; game mode %d; this thread on core %d", b, g, ts, (double)hd, dm_game_mode, sched_getcpu());
+}
 static void adpf_frame(uint64_t cpu_ns, uint64_t gpu_ns) {
     static int state; static void *session; static void *(*mk_work)(void); static void (*w_start)(void *, int64_t), (*w_total)(void *, int64_t), (*w_cpu)(void *, int64_t), (*w_gpu)(void *, int64_t), (*w_free)(void *);
     static int (*report)(void *, int64_t); static int (*report2)(void *, void *);
@@ -4415,6 +4435,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             (unsigned)mi.uordblks / 1048576.0, ((unsigned)mi.arena + (unsigned)mi.hblkhd) / 1048576.0, nt, nv, live, g_npso, g_nsh, snap / 1048576.0, xc / 1048576.0);
     }
     if (n % 600 == 0) { static long mn0, mj0; struct rusage ru; if (!getrusage(RUSAGE_THREAD, &ru)) { if (mn0 || mj0) LOG("vk: this thread's page faults over the last 600 frames: %.1f minor, %.2f major a frame", (ru.ru_minflt - mn0) / 600.0, (ru.ru_majflt - mj0) / 600.0); mn0 = ru.ru_minflt; mj0 = ru.ru_majflt; } }
+    if (n % 600 == 0) clock_line();
     if (n % 600 == 0) { LOG("vk: ADPF over the last 600 frames: %llu reports%s, %llu failed (last error %d), reported CPU %.1f ms and GPU %.1f ms a frame on average (target 16.7 ms)",
                             (unsigned long long)g_adpf_n, g_adpf_v2 ? " with the GPU's work" : "", (unsigned long long)g_adpf_fail, g_adpf_err, g_adpf_n ? g_adpf_cpu / 1e6 / g_adpf_n : 0.0, g_adpf_n ? g_adpf_gpu / 1e6 / g_adpf_n : 0.0);
                         g_adpf_n = g_adpf_fail = g_adpf_cpu = g_adpf_gpu = 0; }

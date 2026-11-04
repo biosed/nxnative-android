@@ -35,6 +35,7 @@ MANIFEST = '''<?xml version="1.0" encoding="utf-8"?>
   <application android:label="{label}" android:icon="@mipmap/icon" android:hasCode="true" android:extractNativeLibs="true" android:isGame="true" android:allowNativeHeapPointerTagging="false"
                android:appCategory="game" android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
     <profileable android:shell="true"/>
+    <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config"/>
     <activity android:name="com.nxnative.MenuActivity" android:exported="true" android:screenOrientation="sensorLandscape"
               android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode|screenLayout|smallestScreenSize">
       <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
@@ -62,6 +63,9 @@ def build(a):
     vc = int(subprocess.run(['date', '+%y%m%d%H'], capture_output=True, text=True).stdout.strip())   # each build installs over the last
     open(os.path.join(w, 'AndroidManifest.xml'), 'w').write(MANIFEST.format(pkg=package(a.id, a.test), vc=vc, vn='0.1.' + str(vc), label=label.replace('&', '&amp;')))
     res = os.path.join(w, 'res', 'mipmap'); os.makedirs(res)
+    os.makedirs(os.path.join(w, 'res', 'xml'))   # the Android game modes this app supports (the system's game settings may choose performance or battery for it)
+    open(os.path.join(w, 'res', 'xml', 'game_mode_config.xml'), 'w').write('<?xml version="1.0" encoding="utf-8"?>\n<game-mode-config xmlns:android="http://schemas.android.com/apk/res/android" '
+        'android:supportsPerformanceGameMode="true" android:supportsBatteryGameMode="true" android:allowGameDownscaling="false" android:allowGameFpsOverride="false"/>\n')
     icon = (glob.glob(os.path.join(a.build, 'extract', '*', 'icon.jpg')) or [None])[0]
     if icon: run('sips', '-s', 'format', 'png', '-Z', '192', icon, '--out', os.path.join(res, 'icon.png'), stdout=subprocess.DEVNULL)
     else: sys.exit('[RED] no icon.jpg under the build folder\'s extract/')
