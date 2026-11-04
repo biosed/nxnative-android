@@ -1,0 +1,98 @@
+# FINAL FANTASY RESONANCE on Android (Vulkan): performance log
+
+Device: Xiaomi Pad 8 (Snapdragon, Adreno 825, HyperOS), the hibernate build (`android-ffr-hib`), the Vulkan backend `dm/android/src_vk/nvn_vk.c`.
+Reference: the same game on the Mac (Metal backend `dm/gfx/nvn/nvn_mtl.m`).
+
+## Method
+
+- Same place every run: the Earth Shrine dungeon, standing still at the spot the save loads into, ~1,000 draws a frame, 8.7 submissions a frame.
+- The backend logs every 600 frames; a run is read from its in-stage windows only (draws per frame ~1,000), 4–6 windows, after the stage has settled.
+- Fields per window (`vk: per frame over the last 600` and `vk: GPU per frame over the last 600`):
+  - **span**: GPU time from the first submission's start to the last one's end, per frame;
+  - **passes / disp / up**: GPU time in render passes, compute dispatches, and the upload command buffers (texture uploads, stale-data patches);
+  - **rec**: CPU time recording the game's command lists into Vulkan (the render thread);
+  - **dset**: the part of rec in descriptor sets (`descriptor sets X ms` in the recording line);
+  - **faults**: minor page faults a frame on the render thread;
+  - **p50 / p95**: frame time (`[nvn] timing`).
+- `bash ab_up.sh <log>` (a one-off helper, not in the repo) prints span, rec, waitgpu, passes, disp, copies, up, submissions and patch regions per window.
+
+## Mac against Android at the same spot
+
+| | Mac (Metal) | Android (Vulkan), Run A | Android, Run I |
+|---|---|---|---|
+| draws a frame | 1,009 | 1,001 | 1,001 |
+| CPU submit / recording a frame | 8.66 ms (23.5 M cycles at 2.72 GHz, 64k instructions a draw) | 34–35 ms | 24–25 ms |
+| GPU a frame | 13.7 ms | 33 ms | 28.3 ms |
+| frame time p50 | 20.2 ms | 45–48 ms | 34–35 ms |
+
+### Techniques: Metal host against Vulkan backend (findings of a side-by-side read)
+
+| Area | Metal host (`nvn_mtl.m`) | Vulkan backend (`nvn_vk.c`) before | Ported |
+|---|---|---|---|
+| Bindings | one per-stage block of 64-bit slots, reused whole while the stage's bindings are unchanged; binds mark dirty only on a real change; texture lookup is one array read | every draw resolved 60–80 descriptors (a lock, `tex_find`, `tex_view` each), hashed them, allocated and wrote a set | vk19.41 `DM_VK_STAGE_REUSE` (set bound again unresolved while shader and stage bindings are unchanged; dynamic uniform offsets resolved again); vk19.43 widened to texel buffers and read-only storage buffers |
+| Pipeline / state | pipeline looked up only when its state is dirty; setters skipped when unchanged | the full pipeline key hashed under a lock every draw; viewport, scissor, depth bias, blend constants and 6 stencil commands recorded every draw | vk19.41 `DM_VK_STATE_SKIP` (last pipeline by memcmp; state recorded only when changed: ~6,200 commands a frame left out) |
+| Memory | zero-copy pools (`newBufferWithBytesNoCopy`: the GPU reads guest memory in place) | every uniform, storage, vertex and index read copied into ring buffers (14% of the render thread in `memmove`), stale-data patches, holds on GPU-written ranges | design only (below) |
+| Threads | can encode on a worker thread (`nvn_rec.h`; off for this game there) | records on the game's submitting thread | open |
+
+## Runs
+
+Env "A": `DM_VK_UBWC=0 DM_UE_PERF=2 DM_UE_TEXTURE_POOL=-350 DM_VK_MEM_LOW_MB=1500 DM_MEM_BUDGET_MB=1600 DM_VK_EVICT_AGE=120`, 20 contexts.
+Env "E": A with `DM_VK_MEM_LOW_MB=600 DM_MEM_PRETRIM_AVAIL_MB=700 DM_MEM_BUDGET_MB=3000` (the backend's steady trims off).
+
+| Run | Build | Env | span | passes | disp | up | rec | dset | faults | p50 / p95 | Verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| A | vk19.36 | A | 33.0–33.4 | 21.8–22.1 | 6.1–6.25 | 4.5–5.2 | 34.1–35.2 | 17.0–17.7 | 4,225 | 45–48 / 90–91 | baseline; CPU and GPU both ~33 ms |
+| B | vk19.36 | A + `DM_VK_STALE_PATCH=0` | 30.9–35.7 | 23.4–26.8 | 7.1–8.5 | 0.20 | 34.4–34.7 | 15.8–15.9 | 4,555 | 45–46 / 89–91 | the upload buffers' 4.6 ms is the patch copy regions, not barriers |
+| C | vk19.37 (`DM_VK_DIRTY_ONCE`) | A | 33.1–34.0 | 21.7–22.0 | 6.25–6.4 | 4.9–5.4 | 33.9–34.5 | 16.6–16.7 | 4,302 | 45 / 91–92 | page scans of textures were not the cost |
+| D | vk19.37 | A + `DM_VK_CTX=32` | 33.2–33.5 | 21.2–21.8 | 6.5–6.65 | 5.0–5.35 | 32.7–34.7 | 17.7–18.7 | 4,751 | 39–45 / 78–82 | context wait 5.8 → 4.9 ms, p50 −4 ms but MemAvailable ~300 MB lower; reverted to 20 |
+| profile | vk19.37 | A | | | | | | | ~4,000 | | render thread ~23 ms on the CPU of its 34 ms: the rest kernel (page faults); `vulkan.adreno.so` 31%, libc 29% (`memmove` 14%), backend 28%, `clock_gettime` 3.8% |
+| E | vk19.37 | E | 33.5–34.2 | 20.9–21.3 | 6.3 | 6.0–6.45 | 29.0–30.3 | 13.9–14.8 | 2,494 | 39–41 / 94–97 | the trim loop cost ~5 ms of CPU |
+| F | vk19.39 | E | 33.7–34.3 | 21.0–21.2 | 6.25–6.35 | 6.2–6.5 | 29.6–30.5 | 14.7 | 2,884 | 41 / 97 | 19.38–19.39 defaults alone: no change |
+| G | vk19.40 | E + `DM_VK_STALE_PATCH=2 DM_VK_PATCH_VERIFY=1` | 16.85–16.9 | 12.9–13.0 | 3.7 | 0.11 | 16.5–17.3 | 7.2–7.5 | 1,057 | 22–24 / 44–45 | not reproduced (H, I); the completion-time check reported 93% of patched words differing (later work of the same submission, see I) |
+| H | vk19.41 | E | 32.4–33.4 | 20.6–21.2 | 5.9–6.1 | 5.7–5.9 | 23.8–24.2 | 10.8–11.1 | 959 | 38–39 / 103–105 | stage reuse and state skip: rec −6 ms; 508 sets a frame bound again unresolved, 989 resolved (549 not reusable kinds) |
+| I | vk19.42 | E + `DM_VK_STALE_PATCH=2 DM_VK_PATCH_VERIFY=1` | 28.2–28.5 | 21.4–21.6 | 6.4–6.5 | 0.21 | 23.8–24.8 | 10.6–10.7 | | 34–35 / 72–75 | compute patch exact: 0 of 5.5 M words differ right after the dispatch; the upload buffers 5.8 → 0.2 ms, GPU −4 ms |
+
+## Findings
+
+- The C→up cost (4.6 ms GPU) was the stale-data patch's copy regions (600–1,300 `vkCmdCopyBuffer` regions a frame), not `barrier_all`. One compute dispatch per patched range (`DM_VK_STALE_PATCH=2`, vk19.39) does the same work in ~0.1 ms; checked exact on the GPU right after the dispatch (`DM_VK_PATCH_VERIFY`, vk19.42). The words differ later in the same submission because the game's own dispatches rewrite the buffer (offset tables: staged 0, later 0x20·k).
+- The backend's memory trims ran every 5 s in the dungeon (MemAvailable ~1 GB, under the low mark and the budget): every ring back to its minimum and faulted in again, textures re-made, malloc purged — ~4,000 page faults a frame, ~5 ms of CPU. vk19.38 trims a steady low every 60 s and keeps the rings; vk19.40 keeps up to 64 MB of extra rings for reuse (fresh extra rings 0.35 a frame).
+- The descriptor-set phase (~15 ms) was binding resolution, not allocation (2.9 µs a set). Metal-style stage reuse (vk19.41) halves it.
+- The memory kills (4 of 4 at the arch walk) were `DM_VK_UBWC=1`: copies into compressed images cost driver memory no counter saw. UBWC stays off.
+
+## Device Vulkan capabilities (Adreno 825, `cmd gpu vkjson`)
+
+- `VK_EXT_external_memory_host`: no.
+- AHardwareBuffer external memory and `VK_KHR_external_memory_fd`: yes.
+- `VK_KHR_push_descriptor`, `VK_EXT_descriptor_buffer`, buffer device address, descriptor indexing, update templates, inline uniform blocks, maintenance5/6: yes.
+- Memory type 6: DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT | HOST_CACHED.
+- `VK_EXT_memory_budget`: not reported (the driver's own count unavailable; `dumpsys gpu --gpumem` from adb is).
+
+### AHardwareBuffer zero-copy probe (standalone, game closed)
+
+16 MB BLOB, CPU_READ/WRITE_OFTEN | GPU_DATA_BUFFER: allocated in 47 ms; dmabuf fd through `AHardwareBuffer_sendHandleToUnixSocket`; mapped `MAP_SHARED | MAP_FIXED` over an existing anonymous range (contents copied, 3.2 ms); imported as a VkBuffer (memory type 1, reported DEVICE_LOCAL); 3 rounds: the GPU saw every CPU write, the CPU saw every GPU write without an invalidate; `mprotect` on the mapping works (a write faults). Go for the design below.
+
+## Env changes on the tablet, and why
+
+- `DM_VK_UBWC=1` → 0 (the code default): the memory kills.
+- `DM_VK_PASS_BARRIER=1`, `DM_VK_DISPATCH_DEFER=1` dropped: A/B leftovers, no frame rate.
+- `DM_VK_CTX=32` tried (Run D), back to 20: −4 ms p50 but ~300 MB less MemAvailable.
+- `DM_VK_MEM_LOW_MB`, `DM_MEM_PRETRIM_AVAIL_MB`, `DM_MEM_BUDGET_MB`: E's values; from vk19.42 the code defaults are 800 / 900 / off, so the env lines can go.
+- `DM_VK_STALE_PATCH=2`: verified exact (Run I); to become the default.
+
+## Zero-copy pools: design (`DM_VK_ZEROCOPY`, not built)
+
+1. **Which pools**: at pool creation (the pool flags passed down), not VIRTUAL / PHYSICAL, not CPU_NO_ACCESS, 64 KB–256 MB; capped by `DM_VK_ZEROCOPY_MB` (dmabuf is not swappable). Stage 1 backs every eligible pool and logs what each is used for.
+2. **Mapping**: page-aligned range; AHB allocated, its fd mapped `MAP_SHARED | MAP_FIXED` over the guest range after the bytes are saved, then copied back; imported as one VkBuffer. Pool release: back to anonymous memory at the same address (contents kept), the AHB freed after the last submission using it.
+3. **Binding**: a range lookup (page index) before the copy paths; a hit binds the pool buffer at `addr - base` (alignment permitting) — no ring copy, no stale patch, no GPU-written range tracking, no write-back.
+4. **Inline updates**: command-list uniform updates, copies and fills are GPU-ordered on the Switch. For backed ranges: uniform updates into a per-submission shadow bound by the draws after them (the Metal host's `ubp_get`), applied to the pool by the GPU at the submission's end; copies and fills recorded as GPU commands in place. Other ranges keep the CPU write log.
+5. **Hibernate**: a snapshot section lists the backed ranges; restore re-allocates and re-maps them at the same addresses before the memory is written back.
+6. **Memory**: the mem lines show the backed MB; expected net about −200 MB of swappable memory (backed pools) against the rings and copies saved.
+7. **Rollout**: Z0 vertex / index streams only; Z1 + uniform / storage / texel reads with no in-submission writes; Z2 + GPU writes in place and update shadows; each with a verify switch comparing against the copy path.
+
+## Open
+
+- `DM_VK_STALE_PATCH=2` as the default (verified exact in Run I).
+- Stage reuse over the remaining non-reusable kinds (vk19.43 counts them by reason).
+- Zero-copy pools (Z0 first).
+- A record thread (as the Metal host's `nvn_rec.h`).
+- Run G's 17 ms GPU span: not reproduced; the cause (device state, thermal, or something in vk19.40) is unknown.
