@@ -52,6 +52,8 @@ Env "E": A with `DM_VK_MEM_LOW_MB=600 DM_MEM_PRETRIM_AVAIL_MB=700 DM_MEM_BUDGET_
 | H | vk19.41 | E | 32.4–33.4 | 20.6–21.2 | 5.9–6.1 | 5.7–5.9 | 23.8–24.2 | 10.8–11.1 | 959 | 38–39 / 103–105 | stage reuse and state skip: rec −6 ms; 508 sets a frame bound again unresolved, 989 resolved (549 not reusable kinds) |
 | I | vk19.42 | E + `DM_VK_STALE_PATCH=2 DM_VK_PATCH_VERIFY=1` | 28.2–28.5 | 21.4–21.6 | 6.4–6.5 | 0.21 | 23.8–24.8 | 10.6–10.7 | | 34–35 / 72–75 | compute patch exact: 0 of 5.5 M words differ right after the dispatch; the upload buffers 5.8 → 0.2 ms, GPU −4 ms |
 | G2 | vk19.40 | as G | 28.45–28.8 | 21.5–21.8 | 6.5–6.6 | 0.19–0.26 | 24.2–24.9 | 9.8–10.3 | 1,037 | 35–37 / 78–84 | G not reproduced by the same build and env: G was the device's state (its performance mode on, by G's screenshot) |
+| J′ | vk19.46 | E, Z0 off | 25.8–26.2 | | | | 24.5–24.9 | 11.0–11.2 | 1,708 | 34–36 / | base for L (MemAvailable ~860 MB) |
+| L | vk19.46 | E + `DM_VK_ZEROCOPY=1` | 25.9–26.1 | | | | 23.9–24.2 | 11.2–11.5 | 1,382 | 35–36 / | Z0 works (384 MB backed, 1,046 reads a frame in place, 0 copied) but −0.6 ms rec (noise) and −230 MB MemAvailable: reverted (env off). The estimate (−1.5 to −2.5 ms) came from Run A's profile, when copies and faults were far larger |
 
 ## Findings
 
@@ -94,8 +96,10 @@ Env "E": A with `DM_VK_MEM_LOW_MB=600 DM_MEM_PRETRIM_AVAIL_MB=700 DM_MEM_BUDGET_
 
 ## Open
 
+- The render thread (Unreal's RHI work and the recording, ~100% of one core) runs on the 3.0 GHz A720 cores 2–4, whose clock swung 787–2803 MHz between windows, while the 3.2 GHz Cortex-X4 (cpu7) idled at 633 MHz: next, one A/B of pinning it to cpu7 (estimate: rec 24.5 → 16–19 ms, p50 35 → 27–30, then GPU-bound).
+
 - `DM_VK_STALE_PATCH=2` as the default (verified exact in Run I).
 - Stage reuse over the remaining non-reusable kinds (vk19.43 counts them by reason).
-- Zero-copy pools (Z0 first).
+- Zero-copy pools: Z0 measured (Run L) — no gain at this spot, reverted; Z1 / Z2 not pursued unless a profile shows copies again.
 - A record thread (as the Metal host's `nvn_rec.h`).
 - Clocks: Run G (half the CPU and GPU time) was the device's state, not code (G2). From vk19.45 every 600 frames logs the CPU / GPU clocks, the thermal status and the Android game mode, and the APK declares the performance and battery game modes; runs are compared only at like clocks.

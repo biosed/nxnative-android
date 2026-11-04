@@ -434,7 +434,11 @@ static void *thread_main(void *p) {
     guest_thread_init(); guest_thread_set_id(t->id);
     guest_gate_stack(1);   // the guest runs on its own stack from dm_thread_enter on: this pthread's stack below this frame is where its SVCs run
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_acquire(t); pthread_mutex_unlock(&G);
-    { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, thr_name(t, nb, sizeof nb)); pthread_setname_np(hn); }   // the guest's name (set before StartThread) for sample / Instruments
+    { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%x %s", t->handle, thr_name(t, nb, sizeof nb));   // the guest's name (set before StartThread) for sample / Instruments / top
+#ifdef __ANDROID__
+      hn[15] = 0;   // Linux keeps 15 characters and refuses a longer name: every guest thread showed as the process ("1018 RHIThread", "1002 GameThread", "101a Foreground ")
+#endif
+      pthread_setname_np(hn); }
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
     die("guest thread entry returned");
 }

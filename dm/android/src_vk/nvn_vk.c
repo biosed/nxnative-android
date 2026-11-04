@@ -746,7 +746,7 @@ static void trace_add(char kind, const char *a, const char *b, uint32_t n0, uint
     if (kind == 'd') C->ndraw++; else { C->ndisp++; uint64_t g = (uint64_t)n0 * n1 * n2; if (g > C->max_groups) { C->max_groups = g > UINT32_MAX ? UINT32_MAX : (uint32_t)g; C->heavy = *t; } }
 }
 static void garbage_free(uint64_t done);
-static void *completion_thread(void *a) {
+static void *completion_thread(void *a) { pthread_setname_np("dm-complete");
     (void)a;
     for (;;) {
         lk_(&g_mu, LW_MU);
@@ -2419,7 +2419,7 @@ static pso_ent **g_psot; static uint32_t g_psot_cap; static _Atomic uint64_t g_p
 static uint64_t g_pso_last_new;   // the frame of the last new pipeline (pcache_save soon after)
 static pthread_mutex_t g_psoq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_psoq_cv = PTHREAD_COND_INITIALIZER; static pso_ent **g_psoq; static int g_npsoq, g_cpsoq;
 static _Atomic uint64_t g_pso_rewarm, g_pso_rewarm_ns;   // warm pipelines made again at their first use, and the time that took (DM_VK_PREWARM_KEEP=0)
-static void *pso_worker(void *a) {
+static void *pso_worker(void *a) { pthread_setname_np("dm-pso");
     (void)a;
     for (;;) {
         pthread_mutex_lock(&g_psoq_mu); while (!g_npsoq) pthread_cond_wait(&g_psoq_cv, &g_psoq_mu);
@@ -2514,7 +2514,7 @@ static void pso_precreate_one(const pso_rec *r) {
 }
 static int g_prewarm_ran;
 static int g_prewarm_depth = -1;   // the depth mode the pre-warm loaded shaders under (dm_vk_prewarm), from the last run's vk_depth_mode
-static void *pso_precreate(void *a) {
+static void *pso_precreate(void *a) { pthread_setname_np("dm-psopre");
     (void)a; const char *d = getenv("DM_VK_DIR"); if (!d || g_prewarm_ran) return NULL;   // the pre-warm before the game did it already
     char p[1100]; snprintf(p, sizeof p, "%s/../pipeline_keys.bin", d); FILE *f = fopen(p, "rb"); if (!f) return NULL;
     uint64_t t0 = now_ns(); pso_rec r; uint64_t n = 0;
@@ -3566,7 +3566,7 @@ static uint64_t g_heap_released;
 // The game heap's release (dm_ueheap_release walks every space under its lock, 5% of the render thread in a profile when it ran here every 10 s) runs on a thread of its own,
 // woken every 60 s and at once on low memory
 static pthread_mutex_t g_hrel_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_hrel_cv = PTHREAD_COND_INITIALIZER; static int g_hrel_req;
-static void *heap_release_thread(void *a) {
+static void *heap_release_thread(void *a) { pthread_setname_np("dm-heaprel");
     (void)a; static size_t prev; static int nr;
     for (;;) {
         pthread_mutex_lock(&g_hrel_mu); while (!g_hrel_req) pthread_cond_wait(&g_hrel_cv, &g_hrel_mu); g_hrel_req = 0; pthread_mutex_unlock(&g_hrel_mu);
@@ -3676,7 +3676,7 @@ static void mem_watch(void) {
 }
 // mem_watch runs on a thread of its own (vk19.32), every 100 ms: run from the submissions it stopped with them, and FINAL FANTASY RESONANCE's killing loads stall the rendering
 // (a frame of 54 NVN functions, then nothing): no line and no trim in the 5 s between the 115.7 MB read and the kill. The textures are still evicted at the next submission (tex_evict)
-static void *mem_watch_thread(void *a) { (void)a; for (;;) { mem_watch(); usleep(100000); } return NULL; }
+static void *mem_watch_thread(void *a) { pthread_setname_np("dm-memwatch"); (void)a; for (;;) { mem_watch(); usleep(100000); } return NULL; }
 static void mem_watch_start(void) { static int started; if (started) return; started = 1; pthread_t t; if (pthread_create(&t, NULL, mem_watch_thread, NULL)) { started = 0; return; } pthread_detach(t); }
 void tex_evict_hook(void) { mem_watch_start(); tex_evict(atomic_load(&g_trim_gen)); }   // the front end's low-memory signal (app/front_android.c): every ring back to RING_MIN at its next use
 // DM_VK_RING_KEEP=1: a ring is not halved after a quiet stretch unless memory is low (g_mem_low). Halving and growing again later made a fresh mapping each time, every page of it
@@ -3847,6 +3847,13 @@ uint64_t mtl_sub_commit(void) {
     return fence;
 }
 uint64_t mtl_last_fence(void) { return g_fence; }
+// The record thread (hle_nvn.c, DM_VK_REC_THREAD): fence values handed out as submissions are queued (they commit in that order: ++g_fence in mtl_sub_commit), and the queue's
+// drain, which whatever waits for all the GPU's work runs first (mtl_finish)
+static _Atomic uint64_t g_fence_q; static void (*g_rec_drain)(void);
+uint64_t mtl_fence_queued(void) { uint64_t q = atomic_load(&g_fence_q); return q > g_fence ? q : g_fence; }
+void mtl_fence_queued_add(void) { uint64_t f = g_fence, q = atomic_load(&g_fence_q); if (q < f) atomic_compare_exchange_strong(&g_fence_q, &q, f); atomic_fetch_add(&g_fence_q, 1); }
+void mtl_rec_drain_hook(void (*f)(void)) { g_rec_drain = f; }
+uint64_t mtl_present_count(void) { return atomic_load(&g_presents); }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     lk_(&g_mu, LW_MU);
     if (timeout_ns == UINT64_MAX || timeout_ns > 60ull * 1000000000ull) { while (g_done < fence) pthread_cond_wait(&g_cv, &g_mu); }
@@ -3856,7 +3863,7 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     }
     int ok = g_done >= fence; pthread_mutex_unlock(&g_mu); return ok;
 }
-void mtl_finish(void) { mtl_wait(g_fence, UINT64_MAX); }
+void mtl_finish(void) { if (g_rec_drain) g_rec_drain(); mtl_wait(g_fence, UINT64_MAX); }
 void mtl_drain(void) { mtl_finish(); pcache_save(); }   // going to the background: the pipelines made so far are kept for the next run
 
 // ---------- Presentation: counted; DM_VK_SHOTS writes chosen frames as BMP files ----------
@@ -4209,7 +4216,7 @@ static _Atomic uint64_t g_presents;
 // longer (real compiles), later ones only seconds (the driver's pipeline cache)
 static _Atomic int g_pw_cancel; static pso_rec *g_pw_recs; static uint32_t g_pw_total; static _Atomic uint32_t g_pw_next, g_pw_done;
 void dm_vk_prewarm_cancel(void) { atomic_store(&g_pw_cancel, 1); }
-static void *pw_worker(void *a) {
+static void *pw_worker(void *a) { pthread_setname_np("dm-prewarm");
     (void)a;
     for (uint32_t i; (i = atomic_fetch_add(&g_pw_next, 1)) < g_pw_total;) { pso_precreate_one(&g_pw_recs[i]); atomic_fetch_add(&g_pw_done, 1); }
     return NULL;
