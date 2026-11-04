@@ -2611,7 +2611,38 @@ static uint64_t texu_slot(int stage, const sbind *b) {   // as a bound slot's ha
     uint32_t h = texu_handle(stage, b), t = h & 0xfffff, sm = h >> 20;
     return (uint64_t)(t ? t + (uint32_t)S.tex_base : 0) | (uint64_t)(sm ? sm + (uint32_t)S.samp_base : 0) << 20;
 }
+// DM_VK_HTAB=1 (vk19.52, opt-in; ffr-par's stage 0b): texture and sampler handles resolved once a submission. A texture slot was a registration lock with a 240-byte copy, tex_get
+// (another lock, the table lookup, the eviction and dirty checks) and tex_view (a walk of the image's views) for every element of every binding, 60-80 a stage. The table keeps,
+// per texture ID, the image and view the first lookup of the submission found, valid while no registration changed (g_reg_gen); a hit touches the image as tex_get does (kept
+// from eviction for this submission) and goes the full way when the image was evicted, released, written since its upload and not yet checked this submission, or is a
+// CPU-written linear texture. Samplers by ID likewise, without the lock. Counted in the descriptor line
+static int htab_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_HTAB"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_HTAB=1: texture and sampler handles resolved once a submission"); } return v; }
+static struct { uint32_t tid; uint64_t gen, reg; vtex *v; VkImageView view; int ok; } g_ht[8192];
+static struct { int sid; uint64_t gen, reg; VkSampler s; } g_hs[1024];
+static uint64_t g_ht_hit, g_ht_miss, g_ht_slow;
+static VkSampler samp_cached(int sid) {
+    uint64_t reg = atomic_load_explicit(&g_reg_gen, memory_order_relaxed); typeof(g_hs[0]) *e = &g_hs[(unsigned)sid % 1024];
+    if (e->sid == sid && e->gen == g_bvgen && e->reg == reg && e->s) return e->s;
+    lk_(&g_rmu, LW_RMU); VkSampler sm = samp_get(sid); pthread_mutex_unlock(&g_rmu);
+    e->sid = sid; e->gen = g_bvgen; e->reg = reg; e->s = sm; return sm;
+}
+static VkImageView tex_slot_(int stage, uint64_t h, VkSampler *sm, int *ok, vtex **vo);
 static VkImageView tex_slot(int stage, uint64_t h, VkSampler *sm, int *ok, vtex **vo) {
+    uint32_t tid = (uint32_t)(h & 0xfffff);
+    if (!htab_on() || !tid) return tex_slot_(stage, h, sm, ok, vo);
+    uint64_t reg = atomic_load_explicit(&g_reg_gen, memory_order_relaxed); typeof(g_ht[0]) *e = &g_ht[(tid * 2654435761u >> 19) % 8192];
+    if (e->tid == tid && e->gen == g_bvgen && e->reg == reg) {
+        vtex *v = e->v; uint64_t pres = atomic_load(&g_presents);
+        if (!v) { *ok = e->ok; if (vo) *vo = NULL; g_ht_hit++; return e->view; }
+        if (!(v->evicted || v->dirty || v->dead || v->late || (v->lcpu && v->lhash_gen != g_bvgen) || (!v->gpu && v->span && v->clean_gen != g_bvgen && !(v->reup_frame && v->reup_frame == pres)))) {
+            v->last_frame = pres; v->last_fence = g_fence + 1; *ok = e->ok; if (vo) *vo = v; g_ht_hit++; return e->view; }
+        g_ht_slow++;
+    } else g_ht_miss++;
+    vtex *v = NULL; VkImageView view = tex_slot_(stage, h, sm, ok, &v); if (vo) *vo = v;
+    e->tid = tid; e->gen = g_bvgen; e->reg = reg; e->v = v; e->view = view; e->ok = *ok;
+    return view;
+}
+static VkImageView tex_slot_(int stage, uint64_t h, VkSampler *sm, int *ok, vtex **vo) {
     int tid = (int)(h & 0xfffff); *ok = 0; if (vo) *vo = NULL;
     if (!tid) { g_tex_miss[0]++; return g_dummy_view; }
     lk_(&g_rmu, LW_RMU);
@@ -2734,6 +2765,7 @@ static VkSampler bind_samp(int stage, const sbind *b, uint64_t th, int el) {
     int r = b->sreg >= 0 ? b->sreg + el : -1;
     int sid = b->skind == S_SAMP && r >= 0 && r < 128 ? (int)(S.samp[stage][r] >> 20) : b->skind == S_SAMP_TEX && b->reg >= 0 && b->reg + el < NTEX ? (int)(S.tex[stage][b->reg + el] >> 20) : b->skind == S_SAMP_ID ? b->sreg :
               b->skind == S_SAMP_UBO ? (b->kind == K_TEXU ? (int)(th >> 20) : (int)(ubo_word(stage, b->sreg, b->soff) >> 20) ? (int)(ubo_word(stage, b->sreg, b->soff) >> 20) + S.samp_base : 0) : 0;
+    if (htab_on()) return samp_cached(sid);
     lk_(&g_rmu, LW_RMU); VkSampler sm = samp_get(sid); pthread_mutex_unlock(&g_rmu);
     return sm;
 }
@@ -4473,6 +4505,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
           LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame; texture storage scans %.1f a frame, %.1f left out as uploaded this frame (DM_VK_DIRTY_ONCE %d); driver segments taken as built %.1f, built %.1f (DM_VK_SEG_CACHE %d); stale patches by dispatch %.2f (%.0f runs); held reads %.1f, their writer %.1f submissions back on average, %llu at most; forwarded %.2f (%.2f MB) (DM_VK_GW_FORWARD %d)",
               dset_cache2(), g_dsc_hit / 600.0, g_dsc_miss / 600.0, miss_us, g_dsc_rej / 600.0, g_memo_hit / 600.0, g_memo_miss / 600.0, g_dsc_hit * miss_us / 1e3 / 600.0, g_dirty_scans / 600.0, g_dirty_skips / 600.0, dirty_once(), g_segc_hit / 600.0, g_segc_miss / 600.0, seg_cache_on(), g_patch_disp / 600.0, g_patch_runs / 600.0, g_hold_n / 600.0, g_hold_n ? (double)g_hold_age_sum / g_hold_n : 0.0, (unsigned long long)g_hold_age_max, g_fwd_n / 600.0, g_fwd_bytes / 600.0 / 1048576.0, gw_forward_k());
           g_memo_hit = g_memo_miss = g_dsc_rej = g_dsc_miss_ns = g_dsc_nmiss_t = 0; g_dirty_scans = g_dirty_skips = 0; g_segc_hit = g_segc_miss = 0; g_patch_disp = g_patch_runs = 0; g_hold_n = g_hold_age_sum = g_hold_age_max = 0; g_fwd_n = g_fwd_bytes = 0;
+          if (htab_on()) { LOG("vk: handle table per frame over the last 600 (DM_VK_HTAB): texture slots %.1f from the table, %.1f looked up (first in the submission or a registration since), %.1f gone the full way (the image needed tex_get)",
+              g_ht_hit / 600.0, g_ht_miss / 600.0, g_ht_slow / 600.0); g_ht_hit = g_ht_miss = g_ht_slow = 0; }
           LOG("vk: stage-level set reuse per frame over the last 600 (DM_VK_STAGE_REUSE %d): %.1f bound again unresolved, %.1f resolved (%.1f of them not reusable: storage images %.1f, storage texel buffers %.1f, other texel buffers %.1f, written or odd storage buffers %.1f, handles in uniforms %.1f, other uniforms %.1f, too many %.1f)",
               stage_reuse(), g_wsc_hit / 600.0, g_wsc_miss / 600.0, g_wsc_nofit / 600.0, g_wsc_nf[WSC_NF_SIMG] / 600.0, g_wsc_nf[WSC_NF_STB] / 600.0, g_wsc_nf[WSC_NF_TB] / 600.0, g_wsc_nf[WSC_NF_SSBO] / 600.0,
               g_wsc_nf[WSC_NF_TEXU] / 600.0, g_wsc_nf[WSC_NF_UBO] / 600.0, g_wsc_nf[WSC_NF_MANY] / 600.0);
