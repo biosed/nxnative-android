@@ -511,7 +511,8 @@ static void game_service(ANativeActivity *a, const char *method, int arg) {
 }
 static void on_start(ANativeActivity *a) { game_suspend(0); game_service(a, "setSuspended", 0); }
 static void on_stop(ANativeActivity *a) { game_suspend(1); game_service(a, "setSuspended", 1); }
-static void on_resume(ANativeActivity *a) { (void)a; }
+static void game_mode_read(ANativeActivity *a);
+static void on_resume(ANativeActivity *a) { game_mode_read(a); }
 // Android is short of memory (other apps are being killed): free pages go back to the system now, and the graphics backend's rings shrink to their minimum (dm_vk_trim)
 void dm_vk_trim(void) __attribute__((weak));
 static void on_low_memory(ANativeActivity *a) { (void)a; LOG("front end: low memory: freeing what can be freed"); mallopt(M_PURGE, 0); if (dm_vk_trim) dm_vk_trim(); }
@@ -537,6 +538,20 @@ static void trim_watch(ANativeActivity *a) {   // TrimWatch.register(activity), 
     else LOG("front end: onTrimMemory watched (TrimWatch)");
     (*env)->DeleteLocalRef(env, nm);
 }
+// The Android game mode (GameManager.getGameMode, API 31: 0 unsupported, 1 standard, 2 performance, 3 battery, 4 custom), read at start and on each resume into dm_game_mode for the
+// backend's clock line. The manifest declares the performance and battery modes (game_mode_config) so the system's game settings can choose them for this app
+extern int dm_game_mode __attribute__((weak));
+static void game_mode_read(ANativeActivity *a) {
+    if (!&dm_game_mode) return;
+    JNIEnv *env = a->env; jstring nm = (*env)->NewStringUTF(env, "game");
+    jobject gm = (*env)->CallObjectMethod(env, a->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"), nm);
+    int mode = -1;
+    if (gm && !(*env)->ExceptionCheck(env)) { jmethodID m = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, gm), "getGameMode", "()I"); if (m && !(*env)->ExceptionCheck(env)) mode = (*env)->CallIntMethod(env, gm, m); }
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mode = -1; }
+    (*env)->DeleteLocalRef(env, nm);
+    if (mode != dm_game_mode) LOG("front end: Android game mode %d (0 unsupported, 1 standard, 2 performance, 3 battery, 4 custom)", mode);
+    dm_game_mode = mode;
+}
 static void on_pause(ANativeActivity *a) { (void)a; dm_focus_set(2); }   // still visible behind something (a dialog, a split screen): out of focus, running
 static void on_focus(ANativeActivity *a, int f) { if (f) immersive(a); else input_release_all(); dm_focus_set(f ? 1 : 2); }
 // Destroyed by the player leaving (− and + held, back_to_menu, finish) the game ends; destroyed by Android while the process stays (to reclaim memory, its activity
@@ -561,7 +576,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     ANativeActivity_setWindowFlags(a, 0x80 /* KEEP_SCREEN_ON */ | 0x400 /* FULLSCREEN */, 0);
     immersive(a);
     if (g_booted) return;   // the activity can be made again (rotation, a return): the host runs once per process
-    trim_watch(a);
+    trim_watch(a); game_mode_read(a);
     snprintf(g_files, sizeof g_files, "%s", a->internalDataPath);
     mallopt(M_DECAY_TIME, 1);   // freed memory (Unreal's heap runs on host malloc) goes back to the system after about a second instead of being kept
     char mk[600]; marker_path(mk, sizeof mk, "game_running");
