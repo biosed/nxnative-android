@@ -76,10 +76,10 @@ DM_LONGFRAME	diagnostic	`0` turns off the long-frame log (on by default), a line
 DM_MEASURE_LOCK	path	`=<file>`: `scripts/regress.py`'s default `--lock`, the measuring lock `scripts/bench.py --lock` shares: held only while a game runs, and the harness's shader builds pause while another process holds it
 DM_MEMSTAT	diagnostic	`=<tsv>` writes one line per second of memory accounting: footprint, Metal allocation and resident and charged memory by region class (guest, code, malloc, gpu, …)
 DM_MEMSTAT_DUMP	diagnostic	`=<seconds>`: with `DM_MEMSTAT`, at that second writes every VM region of 1 MiB or more to `<tsv>.regions`
-DM_MEM_BUDGET_MB	switch	Android: the process's resident memory plus the Vulkan backend's device memory (MB, default 2000; 0 off) past which the backend trims as on low memory (idle textures evicted, rings to their minimum, pools emptied, heap pages returned)
+DM_MEM_BUDGET_MB	switch	Android: the process's resident memory plus the Vulkan backend's device memory (MB, default 0 = off; was 2000) past which the backend trims as on low memory (idle textures evicted, rings to their minimum, pools emptied, heap pages returned)
 DM_MEM_PRETRIM	switch	Android: early trim, default `1` (on); `0` off. The Vulkan backend trims at once (at most every 2 s) when the game heap grew DM_MEM_PRETRIM_MB since the last one-second check or MemAvailable fell twice that in a second, then keeps nothing for reuse for 10 s
 DM_MEM_PRETRIM_MB	switch	Android: the game-heap growth (MB, default 100) that triggers an early trim (DM_MEM_PRETRIM)
-DM_MEM_PRETRIM_AVAIL_MB	switch	Android: MemAvailable (MB, default 1600) below which the backend trims as at DM_VK_MEM_LOW_MB (at most every 5 s), with DM_MEM_PRETRIM on
+DM_MEM_PRETRIM_AVAIL_MB	switch	Android: MemAvailable (MB, default 900; was 1600) below which the backend trims as at DM_VK_MEM_LOW_MB (at most every 5 s), with DM_MEM_PRETRIM on
 DM_MEM_CAP_GB	switch	`=<GB>`: the memory watchdog exits when resident memory exceeds that many GB (default 24 on the Mac, none on iOS; `0` turns it off)
 DM_METAL_CAPTURE	diagnostic	`=1` makes `build_ipa.sh` produce a build that can write GPU frame captures (`MetalCaptureEnabled` in `Info.plist`), for `DM_GPU_CAPTURE`
 DM_METAL_HUD	player	`1` shows Apple's Metal performance HUD over the game (frame rate, frame and GPU time, memory)
@@ -338,7 +338,7 @@ DM_VK_GPU_TS	test	Android: `0` gives every counter timestamp of a submission its
 DM_VK_GW_FORWARD	test	Android: `K` (opt-in, default 0 off) copies a GPU-written range read K or more submissions after its write (at most 8 MB) into the reading submission's ring, so later readers hold that context instead of the writer's
 DM_VK_LATE_FILL	test	Android: `0` leaves out vk19.5's late fill (a texture drawn before the game wrote its storage is watched and uploaded when the data comes)
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
-DM_VK_MEM_LOW_MB	switch	Android: below this MemAvailable (MB, default 1500; 0 off) the Vulkan backend trims every 5 s at most: idle textures evicted, rings to their minimum, reuse pools emptied, malloc's free pages returned
+DM_VK_MEM_LOW_MB	switch	Android: below this MemAvailable (MB, default 800, was 1500; 0 off) the Vulkan backend trims (every 60 s while the low holds, DM_VK_TRIM_STEADY_S): idle textures evicted, rings to their minimum, reuse pools emptied, malloc's free pages returned
 DM_VK_MIRROR	test	Android: `0` leaves out vk19.6's mirrors (a GPU copy into a storage-backed texture is written into its storage too)
 DM_VK_NO_DYNREND	test	Android: `1` uses render passes made per pass even where dynamic rendering is available (the path for Vulkan 1.1 / 1.2 GPUs without it)
 DM_VK_NO_TIMELINE	test	Android: set, submissions are not chained by a timeline semaphore even where the GPU has one
