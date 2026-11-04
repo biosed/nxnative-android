@@ -669,8 +669,13 @@ NVN(nvnSyncInitialize, NVNboolean, NVNsync *s, NVNdevice *d) { (void)d; *(sync_t
 NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
+// (with the Android record thread, DM_VK_REC_THREAD, the most recent one queued: its fence value is fixed when it is queued, the replay commits them in that order)
+static uint64_t nvn_last_fence(void);
+#ifdef __ANDROID__
+static void rq_drain(void);
+#endif
 void mtl_pd_note(const char *what, uint64_t v); int mtl_pd_on(void);
-NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); mtl_pd_note("queue fence sync, fence", ((sync_t *)s)->fence); }
+NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = nvn_last_fence(); mtl_pd_note("queue fence sync, fence", ((sync_t *)s)->fence); }
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
 // A GPU-side wait on a sync: the host has a single Metal queue that executes submissions in order, so commands before the fence are always done first and nothing needs waiting. A sync not fenced yet (fenced later by another thread) is not waited for here; logged once
 NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; static int once; if (!((const sync_t *)s)->fenced && !once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait"); return 1; }
@@ -730,6 +735,9 @@ NVN(nvnQueueInitialize, NVNboolean, NVNqueue *q, const NVNqueueBuilder *b) {
     OLOG("QueueInitialize %p", (void *)q); return 1;
 }
 NVN(nvnQueueFinalize, void, NVNqueue *q) {
+#ifdef __ANDROID__
+    rq_drain();   // its queued submissions first
+#endif
     pthread_mutex_lock(&g_sub_mu); mtl_queue_forget(((queue_t *)q)->serial); ((queue_t *)q)->magic = 0; pthread_mutex_unlock(&g_sub_mu);
 }
 NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *info) {
@@ -1221,7 +1229,86 @@ void dm_gfx_suspend(int on) {
 // The first submission's prepare step (mtl_prepare: the prewarm and the pipeline prebuild) loads shaders and builds pipelines and submits no GPU work, so it runs under the lock but outside the
 // graphics gate: inside it, going to the background meanwhile (dm_gfx_suspend, on the main thread) waited for it, minutes on a first start. It stays host work for the guest scheduler. The lock
 // comes before the gate: a second submission waiting for it must not count as in flight, or the suspend waits for it while the first waits to enter the closed gate holding the lock
+// ---------- The record thread (Android, DM_VK_REC_THREAD=1) ----------
+// The game's RHI thread spent ~100% of a core in QueueSubmitCommands on the Xiaomi Pad 8: the Vulkan translation (24.5 ms a frame at the dungeon) ran inside each call. With the
+// switch, a submission (its command handles, copied: the game's array is reused) and a present are queued, and one host thread replays them in order: the same steps
+// QueueSubmitCommands and QueuePresentTexture took, on another core. The translation reads guest memory later than the call, as the GPU does on the Switch (it reads at execution);
+// fences keep their meaning, a submission's fence value being fixed when it is queued (nvn_last_fence, mtl_fence_queued) and signalled when the replay's work completes.
+// Whatever waits for the GPU drains the queue first (mtl_finish: QueueFinish, the graphics suspend of the background and of hibernation, which also waits for the in-flight calls);
+// a SyncWait needs no drain (the replay reaches the fence on its own; a zero timeout answers "not yet", as the GPU would). The queue holds at most 2 presents and 48 submissions:
+// the game is held when it runs further ahead (producer wait). Not the Metal host's nvn_rec.h, which defers only Metal's encoding calls and drains every submission; there the
+// switch (enc_thread) is a per-game profile key, off by default on the Mac, never tried with this game (not a known problem)
+#ifdef __ANDROID__
+uint64_t mtl_fence_queued(void); void mtl_fence_queued_add(void); void mtl_rec_drain_hook(void (*f)(void)); uint64_t mtl_present_count(void);
+enum { RQ_N = 64, RQ_SUBS = 48, RQ_PRESENTS = 2 };
+typedef struct { int kind; int n; uint64_t *h; uint64_t serial; int origin_ll; const tex_t *t; double period; int crop[4]; int has_crop; } rq_ent;
+static rq_ent g_rq[RQ_N]; static int g_rq_head, g_rq_tail, g_rq_subs, g_rq_pres, g_rq_busy;
+static pthread_mutex_t g_rq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_rq_cv = PTHREAD_COND_INITIALIZER, g_rq_space = PTHREAD_COND_INITIALIZER, g_rq_idle = PTHREAD_COND_INITIALIZER;
+static pthread_t g_rq_thread; static _Atomic uint64_t g_rq_pwait_ns, g_rq_idle_ns, g_rq_depth_sum, g_rq_depth_n, g_rq_depth_max;
+static int rq_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_REC_THREAD"); v = e && atoi(e) != 0; if (v) LOG("[nvn] DM_VK_REC_THREAD=1: submissions and presents are replayed on a record thread"); } return v; }
+static uint64_t nvn_last_fence(void) { return rq_on() ? mtl_fence_queued() : mtl_last_fence(); }
+static void rq_replay_submit(const rq_ent *e);
+static void rq_replay_present(const rq_ent *e);
+static void *rq_thread(void *a) {
+    (void)a; pthread_setname_np("dm-record");
+    for (;;) {
+        pthread_mutex_lock(&g_rq_mu);
+        uint64_t i0 = now_ns(); int waited = 0;
+        while (g_rq_head == g_rq_tail) { waited = 1; pthread_cond_wait(&g_rq_cv, &g_rq_mu); }
+        if (waited) atomic_fetch_add(&g_rq_idle_ns, now_ns() - i0);
+        rq_ent e = g_rq[g_rq_head % RQ_N]; g_rq_busy = 1;
+        pthread_mutex_unlock(&g_rq_mu);
+        pthread_mutex_lock(&g_susp_mu); g_inflight_api++; pthread_mutex_unlock(&g_susp_mu);   // counted as a call in flight (the suspend waits for it), but never held by the suspend: the drain needs it to go on
+        if (e.kind == 0) rq_replay_submit(&e); else rq_replay_present(&e);
+        pthread_mutex_lock(&g_susp_mu); g_inflight_api--; pthread_cond_broadcast(&g_susp_cv); pthread_mutex_unlock(&g_susp_mu);
+        free(e.h);
+        pthread_mutex_lock(&g_rq_mu);
+        g_rq_head++; if (e.kind == 0) g_rq_subs--; else g_rq_pres--; g_rq_busy = 0;
+        pthread_cond_broadcast(&g_rq_space); if (g_rq_head == g_rq_tail) pthread_cond_broadcast(&g_rq_idle);
+        pthread_mutex_unlock(&g_rq_mu);
+    }
+    return NULL;
+}
+static void rq_drain(void) {   // until every queued submission and present is replayed (not from the record thread itself)
+    if (!rq_on() || !g_rq_thread || pthread_equal(pthread_self(), g_rq_thread)) return;
+    pthread_mutex_lock(&g_rq_mu); while (g_rq_head != g_rq_tail || g_rq_busy) pthread_cond_wait(&g_rq_idle, &g_rq_mu); pthread_mutex_unlock(&g_rq_mu);
+}
+static void rq_push(const rq_ent *e) {
+    pthread_mutex_lock(&g_rq_mu);
+    if (!g_rq_thread) { if (pthread_create(&g_rq_thread, NULL, rq_thread, NULL)) die("cannot start the record thread"); mtl_rec_drain_hook(rq_drain); }
+    uint64_t w0 = now_ns(); int waited = 0;
+    while (g_rq_tail - g_rq_head >= RQ_N || (e->kind == 0 && g_rq_subs >= RQ_SUBS) || (e->kind == 1 && g_rq_pres >= RQ_PRESENTS)) { waited = 1; pthread_cond_wait(&g_rq_space, &g_rq_mu); }
+    if (waited) atomic_fetch_add(&g_rq_pwait_ns, now_ns() - w0);
+    g_rq[g_rq_tail % RQ_N] = *e; g_rq_tail++; if (e->kind == 0) g_rq_subs++; else g_rq_pres++;
+    uint64_t d = (uint64_t)(g_rq_tail - g_rq_head); atomic_fetch_add(&g_rq_depth_sum, d); atomic_fetch_add(&g_rq_depth_n, 1); if (d > atomic_load(&g_rq_depth_max)) atomic_store(&g_rq_depth_max, d);
+    pthread_cond_signal(&g_rq_cv);
+    pthread_mutex_unlock(&g_rq_mu);
+}
+static void rq_stats(uint64_t frame) {   // every 600 presents
+    if (!rq_on() || frame % 600) return;
+    uint64_t n = atomic_exchange(&g_rq_depth_n, 0), s = atomic_exchange(&g_rq_depth_sum, 0);
+    LOG("[nvn] record thread over the last 600 frames: queue depth %.1f on average, %llu at most; the game held on a full queue %.2f ms a frame; the record thread idle %.2f ms a frame",
+        n ? (double)s / n : 0.0, (unsigned long long)atomic_exchange(&g_rq_depth_max, 0), atomic_exchange(&g_rq_pwait_ns, 0) / 600e6, atomic_exchange(&g_rq_idle_ns, 0) / 600e6);
+}
+#else
+static uint64_t nvn_last_fence(void) { return mtl_last_fence(); }
+#endif
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
+#ifdef __ANDROID__
+    if (rq_on()) {   // queued: replayed by the record thread (rq_replay_submit)
+        dm_host_mutex_lock(&g_sub_mu);
+        gfx_enter();
+        ((queue_t *)q)->submits++;
+        nvn_cap_submit(n, (const uint64_t *)h);
+        rq_ent e = {0, n, NULL, ((const queue_t *)q)->serial, ((const queue_t *)q)->origin_ll, NULL, 0, {0}, 0};
+        if (n > 0) { e.h = malloc((size_t)n * 8); if (!e.h) die("submit: out of memory"); memcpy(e.h, h, (size_t)n * 8); }
+        mtl_fence_queued_add();
+        rq_push(&e);
+        gfx_leave();
+        pthread_mutex_unlock(&g_sub_mu);
+        return;
+    }
+#endif
     dm_host_mutex_lock(&g_sub_mu);
     dm_host_work++; mtl_prepare(); dm_host_work--;
     gfx_enter();
@@ -1247,6 +1334,23 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     gfx_leave();
 }
 
+#ifdef __ANDROID__
+static void rq_replay_present(const rq_ent *e) { mtl_present(e->t, e->period, e->has_crop ? e->crop : NULL); rq_stats((uint64_t)mtl_present_count()); }
+static void rq_replay_submit(const rq_ent *e) {   // what QueueSubmitCommands does below, from the queued copy
+    mtl_prepare();
+    uint64_t t0 = now_ns();
+    mtl_queue_activate(e->serial);
+    mtl_set_queue_origin_lower_left(e->origin_ll);
+    mtl_pd_note("submit begins, command handles", (uint64_t)e->n);
+    mtl_sub_begin();
+    nvn_ft_poll();
+    mtl_sub_index(e->h, e->n);
+    for (int i = 0; i < e->n; i++) { mtl_exec_rest(e->h + i + 1, e->n - i - 1); mtl_exec((const uint8_t *)e->h[i]); }
+    mtl_exec_rest(NULL, 0);
+    mtl_sub_commit();
+    uint64_t dw = now_ns() - t0; atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);
+}
+#endif
 // Commands that only affect GPU state / only execute on the GPU: the null device only counts them (the thunk has already counted)
 static void nvn_nop(void) {}
 static const char *const g_nops[] = {
@@ -1370,7 +1474,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
-    if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
+    if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = nvn_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
@@ -1857,6 +1961,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (idx >= 0 && idx < o->ntex && idx < 4) {   // enqueue only, return immediately
         const tex_t *t = CTX(o->tex[idx]); int lc[4]; const int *crop = present_crop(o->crop, (int)t->d.width, (int)t->d.height, lc);
         nvn_cap_present(t, crop);   // DM_NVN_CAPTURE (nvn_capture.inc)
+#ifdef __ANDROID__
+        if (rq_on()) {   // queued behind the frame's submissions (rq_replay_present); the Vulkan backend has no present tickets to wait on
+            rq_ent e = {1, 0, NULL, 0, 0, t, present_period(o) / 1e9, {0}, crop != NULL}; if (crop) memcpy(e.crop, crop, sizeof e.crop);
+            rq_push(&e); o->ticket[idx] = 0;
+        } else
+#endif
         o->ticket[idx] = mtl_present(t, present_period(o) / 1e9, crop);
     }
     gfx_leave();
