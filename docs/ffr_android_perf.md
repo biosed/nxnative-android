@@ -48,11 +48,14 @@ Env "E": A with `DM_VK_MEM_LOW_MB=600 DM_MEM_PRETRIM_AVAIL_MB=700 DM_MEM_BUDGET_
 | profile | vk19.37 | A | | | | | | | ~4,000 | | render thread ~23 ms on the CPU of its 34 ms: the rest kernel (page faults); `vulkan.adreno.so` 31%, libc 29% (`memmove` 14%), backend 28%, `clock_gettime` 3.8% |
 | E | vk19.37 | E | 33.5–34.2 | 20.9–21.3 | 6.3 | 6.0–6.45 | 29.0–30.3 | 13.9–14.8 | 2,494 | 39–41 / 94–97 | the trim loop cost ~5 ms of CPU |
 | F | vk19.39 | E | 33.7–34.3 | 21.0–21.2 | 6.25–6.35 | 6.2–6.5 | 29.6–30.5 | 14.7 | 2,884 | 41 / 97 | 19.38–19.39 defaults alone: no change |
-| G | vk19.40 | E + `DM_VK_STALE_PATCH=2 DM_VK_PATCH_VERIFY=1` | 16.85–16.9 | 12.9–13.0 | 3.7 | 0.11 | 16.5–17.3 | 7.2–7.5 | 1,057 | 22–24 / 44–45 | not reproduced (H, I); the completion-time check reported 93% of patched words differing (later work of the same submission, see I) |
+| G | vk19.40 | E + `DM_VK_STALE_PATCH=2 DM_VK_PATCH_VERIFY=1` | 16.85–16.9 | 12.9–13.0 | 3.7 | 0.11 | 16.5–17.3 | 7.2–7.5 | 1,057 | 22–24 / 44–45 | device outlier (G2): CPU and GPU both at half time, likely the performance mode; the completion-time check's 93% is later work of the same submission (see I) |
 | H | vk19.41 | E | 32.4–33.4 | 20.6–21.2 | 5.9–6.1 | 5.7–5.9 | 23.8–24.2 | 10.8–11.1 | 959 | 38–39 / 103–105 | stage reuse and state skip: rec −6 ms; 508 sets a frame bound again unresolved, 989 resolved (549 not reusable kinds) |
 | I | vk19.42 | E + `DM_VK_STALE_PATCH=2 DM_VK_PATCH_VERIFY=1` | 28.2–28.5 | 21.4–21.6 | 6.4–6.5 | 0.21 | 23.8–24.8 | 10.6–10.7 | | 34–35 / 72–75 | compute patch exact: 0 of 5.5 M words differ right after the dispatch; the upload buffers 5.8 → 0.2 ms, GPU −4 ms |
+| G2 | vk19.40 | as G | 28.45–28.8 | 21.5–21.8 | 6.5–6.6 | 0.19–0.26 | 24.2–24.9 | 9.8–10.3 | 1,037 | 35–37 / 78–84 | G not reproduced by the same build and env: G was the device's state (its performance mode on, by G's screenshot) |
 
 ## Findings
+
+- Same build, same env, same spot: Run G gave half the CPU and GPU time of G2. The device's performance mode (HyperOS GameTurbo) moves both; the clock line (vk19.45) is there so it can be seen.
 
 - The C→up cost (4.6 ms GPU) was the stale-data patch's copy regions (600–1,300 `vkCmdCopyBuffer` regions a frame), not `barrier_all`. One compute dispatch per patched range (`DM_VK_STALE_PATCH=2`, vk19.39) does the same work in ~0.1 ms; checked exact on the GPU right after the dispatch (`DM_VK_PATCH_VERIFY`, vk19.42). The words differ later in the same submission because the game's own dispatches rewrite the buffer (offset tables: staged 0, later 0x20·k).
 - The backend's memory trims ran every 5 s in the dungeon (MemAvailable ~1 GB, under the low mark and the budget): every ring back to its minimum and faulted in again, textures re-made, malloc purged — ~4,000 page faults a frame, ~5 ms of CPU. vk19.38 trims a steady low every 60 s and keeps the rings; vk19.40 keeps up to 64 MB of extra rings for reuse (fresh extra rings 0.35 a frame).
@@ -95,4 +98,4 @@ Env "E": A with `DM_VK_MEM_LOW_MB=600 DM_MEM_PRETRIM_AVAIL_MB=700 DM_MEM_BUDGET_
 - Stage reuse over the remaining non-reusable kinds (vk19.43 counts them by reason).
 - Zero-copy pools (Z0 first).
 - A record thread (as the Metal host's `nvn_rec.h`).
-- Run G's 17 ms GPU span: not reproduced; the cause (device state, thermal, or something in vk19.40) is unknown.
+- Clocks: Run G (half the CPU and GPU time) was the device's state, not code (G2). From vk19.45 every 600 frames logs the CPU / GPU clocks, the thermal status and the Android game mode, and the APK declares the performance and battery game modes; runs are compared only at like clocks.

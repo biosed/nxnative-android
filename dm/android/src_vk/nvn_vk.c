@@ -208,6 +208,8 @@ static int g_pend[NCTX_MAX], g_npend;   // contexts submitted and not yet comple
 
 static uint64_t g_wgen;   // a new generation when the ring changes or the write log overflows: the per-submission copies are reused only within one (and only where no write since overlaps them, copy_in)
 static uint32_t g_nwlog;   // writes logged in this generation (wlog_add)
+static int zc_mode(void); static int zc_find(uint64_t addr, uint64_t n, VkBuffer *b, VkDeviceSize *off); static void zc_reap(uint64_t done);   // zero-copy pools (DM_VK_ZEROCOPY)
+static int g_zc_dev; static uint64_t g_zc_bytes, g_zc_hits, g_zc_miss_wlog;
 // Extra rings made and freed every few frames were fresh device memory each time (vkAllocateMemory, mapped: page faults as the CPU first writes them). Freed ones are kept (at most
 // 4, 64 MB in all) and taken again by the next submission that outgrows its ring; the mapping of each live one is remembered by its memory (xring_*)
 static struct { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceSize size; } g_xc[8]; static int g_nxc; static VkDeviceSize g_xc_bytes;
@@ -822,10 +824,11 @@ static void vk_init_(void) {
     uint32_t dv = g_props.apiVersion;
     uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep); vkEnumerateDeviceExtensionProperties(g_pd, NULL, &ne, ep);
-    int has_sc = 0, has_u8 = 0, has_dr = 0;
+    int has_sc = 0, has_u8 = 0, has_dr = 0, has_ahb = 0, has_qff = 0;
     for (uint32_t i = 0; i < ne; i++) {
         has_sc |= !strcmp(ep[i].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME); has_u8 |= !strcmp(ep[i].extensionName, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
         has_dr |= !strcmp(ep[i].extensionName, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME); g_has_budget |= !strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+        has_ahb |= !strcmp(ep[i].extensionName, VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME); has_qff |= !strcmp(ep[i].extensionName, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
     }
     {   // Reading an attachment inside its own pass (a held pass's depth sampled by a contact-shadow draw, now a split: vk19.4) needs one of these; logged to see which this GPU has
         static const char *const fl[] = {"VK_EXT_attachment_feedback_loop_layout", "VK_EXT_attachment_feedback_loop_dynamic_state", "VK_KHR_dynamic_rendering_local_read",
@@ -850,13 +853,14 @@ static void vk_init_(void) {
     vkGetPhysicalDeviceFeatures2(g_pd, &f2);
     f13.robustImageAccess = VK_FALSE;
     g_feat = f2.features;
-    const char *ext[6]; uint32_t next = 0;
+    const char *ext[8]; uint32_t next = 0;
     if (g_has_budget) ext[next++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
     if (has_sc && g_has_surface) ext[next++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     if (has_u8 && u8.indexTypeUint8) { ext[next++] = VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME; g_has_u8 = 1; }
     g_dynrend = dv >= VK_API_VERSION_1_3 ? f13.dynamicRendering : has_dr && dr.dynamicRendering;
     if (getenv("DM_VK_NO_DYNREND")) g_dynrend = 0;   // diagnostics: the render pass path of GPUs without dynamic rendering, on one that has it
     if (g_dynrend && dv < VK_API_VERSION_1_3) ext[next++] = VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
+    if (zc_mode() && has_ahb && has_qff) { ext[next++] = VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME; ext[next++] = VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME; g_zc_dev = 1; }
     float prio = 1;
     VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g_qf, 1, &prio};
     VkDeviceCreateInfo di = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qi, 0, NULL, next, ext, NULL};
@@ -3269,6 +3273,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         else { from = (uint64_t)vlo * stride; to = (uint64_t)vhi * stride + ext[s]; }
         if (to > size) to = size;
         if (S.vbuf[s].address && to > from && gw_find(S.vbuf[s].address + from, to - from, 1, &b, &o, NULL)) {}   // vertices a dispatch wrote (GPU particles)
+        else if (S.vbuf[s].address && to > from && zc_mode() && zc_find(S.vbuf[s].address + from, to - from, &b, &o)) {}   // in a zero-copy pool: read where it is
         else if (S.vbuf[s].address && to > from) { VkDeviceSize ro = copy_in(S.vbuf[s].address + from, to - from, 16); if (ro != VK_WHOLE_SIZE) { b = C->ring; o = ro; } }
         vbs[s] = b; vos[s] = o;
     }
@@ -3308,13 +3313,14 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             g_ds_last.ib_ok = 0; vkCmdBindIndexBuffer(cb, C->ring, o, VK_INDEX_TYPE_UINT32);
             DRAWQ(vkCmdDrawIndexed(cb, out, inst, 0, voff, (uint32_t)di->base_instance));
         } else {
-            VkDeviceSize o = copy_in(di->ibuf, (uint64_t)di->count * isz, 16); if (o == VK_WHOLE_SIZE) return;
+            VkBuffer ibb = C->ring; VkDeviceSize o;
+            if (!(zc_mode() && zc_find(di->ibuf, (uint64_t)di->count * isz, &ibb, &o) && o % isz == 0)) { ibb = C->ring; o = copy_in(di->ibuf, (uint64_t)di->count * isz, 16); if (o == VK_WHOLE_SIZE) return; ibb = C->ring; }   // a zero-copy pool's indices where they are
             VkIndexType it = isz == 1 ? VK_INDEX_TYPE_UINT8_EXT : isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
-            if (sk && o % isz == 0 && o / isz <= UINT32_MAX) {   // the ring bound once at offset 0, this draw's indices reached by firstIndex (DM_VK_STATE_SKIP)
-                if (!g_ds_last.ib_ok || g_ds_last.ib != C->ring || g_ds_last.it != (int)it) { vkCmdBindIndexBuffer(cb, C->ring, 0, it); g_ds_last.ib = C->ring; g_ds_last.it = (int)it; g_ds_last.ib_ok = 1; } else g_bind_skips++;
+            if (sk && o % isz == 0 && o / isz <= UINT32_MAX) {   // the buffer bound once at offset 0, this draw's indices reached by firstIndex (DM_VK_STATE_SKIP)
+                if (!g_ds_last.ib_ok || g_ds_last.ib != ibb || g_ds_last.it != (int)it) { vkCmdBindIndexBuffer(cb, ibb, 0, it); g_ds_last.ib = ibb; g_ds_last.it = (int)it; g_ds_last.ib_ok = 1; } else g_bind_skips++;
                 DRAWQ(vkCmdDrawIndexed(cb, (uint32_t)di->count, inst, (uint32_t)(o / isz), voff, (uint32_t)di->base_instance));
             } else {
-                vkCmdBindIndexBuffer(cb, C->ring, o, it); g_ds_last.ib_ok = 0;
+                vkCmdBindIndexBuffer(cb, ibb, o, it); g_ds_last.ib_ok = 0;
                 DRAWQ(vkCmdDrawIndexed(cb, (uint32_t)di->count, inst, 0, voff, (uint32_t)di->base_instance));
             }
         }
@@ -3689,6 +3695,7 @@ static void ring_fit(ctx_t *c) {
 }
 void mtl_sub_begin(void) {
     vk_init(); g_sub_up_bytes = 0;
+    if (zc_mode()) zc_reap(g_done);
     { shader_t *v0 = g_ds_last.vs, *f0 = g_ds_last.fs, *g0 = g_ds_last.gs; pso_key k0 = g_ds_last.k; VkPipelineLayout l0 = g_ds_last.pl; VkPipeline p0 = g_ds_last.pp;
       memset(&g_ds_last, 0, sizeof g_ds_last); g_ds_last.vs = v0; g_ds_last.fs = f0; g_ds_last.gs = g0; g_ds_last.k = k0; g_ds_last.pl = l0; g_ds_last.pp = p0; }   // a new command buffer: no state recorded in it yet
     g_ci = (g_ci + 1) % NCTX; ctx_t *c = &g_ctx[g_ci];
@@ -4395,6 +4402,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
               stage_reuse(), g_wsc_hit / 600.0, g_wsc_miss / 600.0, g_wsc_nofit / 600.0, g_wsc_nf[WSC_NF_SIMG] / 600.0, g_wsc_nf[WSC_NF_STB] / 600.0, g_wsc_nf[WSC_NF_TB] / 600.0, g_wsc_nf[WSC_NF_SSBO] / 600.0,
               g_wsc_nf[WSC_NF_TEXU] / 600.0, g_wsc_nf[WSC_NF_UBO] / 600.0, g_wsc_nf[WSC_NF_MANY] / 600.0);
           g_wsc_hit = g_wsc_miss = g_wsc_nofit = 0; memset(g_wsc_nf, 0, sizeof g_wsc_nf);
+          if (zc_mode()) { LOG("vk: zero-copy pools: %.0f MB backed; per frame %.1f reads taken in place, %.1f copied because a command-list write overlapped", g_zc_bytes / 1048576.0, g_zc_hits / 600.0, g_zc_miss_wlog / 600.0); g_zc_hits = g_zc_miss_wlog = 0; }
           LOG("vk: state per frame over the last 600 (DM_VK_STATE_SKIP %d): pipelines taken as the last draw's %.1f, state commands left out %.1f, binds left out %.1f", state_skip(), g_pso_memo / 600.0, g_state_skips / 600.0, g_bind_skips / 600.0); g_pso_memo = g_state_skips = g_bind_skips = 0;
           static const char *const lwn[LW_N] = {"textures (rmu)", "GPU-written ranges (gwmu)", "contexts (mu)", "queue (qmu)", "image blocks (blkmu)"}; char lb[512]; int lo = 0;
           for (int k = 0; k < LW_N; k++) lo += snprintf(lb + lo, sizeof lb - lo, "%s%s %.2f ms (%.1f)", k ? ", " : "", lwn[k], atomic_exchange(&g_lw_ns[k], 0) / 600e6, atomic_exchange(&g_lw_n[k], 0) / 600.0);
@@ -4485,18 +4493,107 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     memset(dst, 0, img * (size_t)(r->depth > 0 ? r->depth : 1));
 }
 
+// ---------- Zero-copy pools (DM_VK_ZEROCOPY, vk19.46, opt-in) ----------
+// As the Metal host does with newBufferWithBytesNoCopy: a game memory pool's pages are backed by an AHardwareBuffer (a dmabuf), mapped over the pool's own address range
+// (MAP_SHARED | MAP_FIXED, the bytes copied out and back) when the pool is made, and imported into Vulkan as one buffer, so the GPU reads the guest's bytes where they are.
+// Stage Z0 (=1): vertex and index streams bind the pool buffer at their offset instead of copying into the ring, unless a dispatch wrote them (gw_find first) or a command-list
+// write of this generation overlaps them (the write log). Pools: not CPU_NO_ACCESS (0x1), PHYSICAL (0x100) or VIRTUAL (0x200), 64 KB to 256 MB, DM_VK_ZEROCOPY_MB (384) in all
+// (dmabuf memory cannot be swapped). A pool's release puts anonymous memory back at its address with the same bytes; the AHB and its buffer go when the submissions recorded
+// before the release are done. Probed on the Adreno 825 (ahbprobe): the GPU sees the CPU's writes and the CPU the GPU's, without an invalidate; mprotect on the mapping faults
+#include <android/hardware_buffer.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+static int zc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_ZEROCOPY"); v = e ? atoi(e) : 0; if (v < 0) v = 0; if (v) LOG("vk: DM_VK_ZEROCOPY=%d", v); } return v; }
+typedef struct { uint64_t lo, hi; const void *mem; VkBuffer b; VkDeviceMemory m; AHardwareBuffer *ahb; uint64_t dead; } zcpool;
+enum { NZC = 256 };
+static zcpool g_zc[NZC]; static int g_nzc; static pthread_mutex_t g_zcmu = PTHREAD_MUTEX_INITIALIZER;   // g_zc_dev: the device has the AHB import enabled; g_zc_bytes / hits / miss_wlog (declared at the top)
+static struct { const void *mem; int flags; } g_zc_pf[16]; static int g_zc_npf;   // flags of the pool being made (dm_vk_pool_flags, then mtl_pool_add)
+void dm_vk_pool_flags(const void *mem, int flags) { pthread_mutex_lock(&g_zcmu); g_zc_pf[g_zc_npf++ % 16] = (typeof(g_zc_pf[0])){mem, flags}; pthread_mutex_unlock(&g_zcmu); }
+static int recv_fd(int sock) { char buf[256]; struct iovec io = {buf, sizeof buf}; char c[CMSG_SPACE(sizeof(int) * 4)]; struct msghdr m = {0}; m.msg_iov = &io; m.msg_iovlen = 1; m.msg_control = c; m.msg_controllen = sizeof c;
+    if (recvmsg(sock, &m, 0) < 0) return -1; for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h)) if (h->cmsg_type == SCM_RIGHTS) { int fd; memcpy(&fd, CMSG_DATA(h), sizeof fd); return fd; } return -1; }
+static void vk_init(void);
+static void zc_back(const void *mem, uint64_t size) {
+    int flags = -1; pthread_mutex_lock(&g_zcmu); for (int i = 0; i < 16; i++) if (g_zc_pf[i].mem == mem) { flags = g_zc_pf[i].flags; g_zc_pf[i].mem = NULL; } pthread_mutex_unlock(&g_zcmu);
+    if (flags < 0 || (flags & 0x301) || size < (64u << 10) || size > (256u << 20)) return;
+    static uint64_t cap; if (!cap) { const char *e = getenv("DM_VK_ZEROCOPY_MB"); cap = (uint64_t)(e ? atol(e) : 384) << 20; }
+    uint64_t lo = (uint64_t)(uintptr_t)mem & ~4095ull, hi = ((uint64_t)(uintptr_t)mem + size + 4095) & ~4095ull, n = hi - lo;
+    vk_init(); if (!g_zc_dev) { static int once; if (!once++) LOG("[RED] vk: zero-copy pools: the device has no AHardwareBuffer import"); return; }
+    pthread_mutex_lock(&g_zcmu);
+    int ok = g_nzc < NZC && g_zc_bytes + n <= cap;
+    for (int i = 0; i < g_nzc && ok; i++) if (!g_zc[i].dead && lo < g_zc[i].hi && g_zc[i].lo < hi) ok = 0;   // a page shared with a backed pool: left as it is
+    if (!ok) { pthread_mutex_unlock(&g_zcmu); return; }
+    AHardwareBuffer_Desc d = {.width = (uint32_t)n, .height = 1, .layers = 1, .format = AHARDWAREBUFFER_FORMAT_BLOB,
+        .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER};
+    AHardwareBuffer *ahb = NULL; int fd = -1, sv[2] = {-1, -1}; uint8_t *save = NULL; VkBuffer b = VK_NULL_HANDLE; VkDeviceMemory m = VK_NULL_HANDLE; const char *why = NULL;
+    if (AHardwareBuffer_allocate(&d, &ahb)) why = "AHardwareBuffer_allocate";
+    else if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) || AHardwareBuffer_sendHandleToUnixSocket(ahb, sv[0]) || (fd = recv_fd(sv[1])) < 0) why = "the dmabuf fd";
+    if (!why) {   // the Vulkan buffer first: nothing is remapped unless it imports
+        static PFN_vkGetAndroidHardwareBufferPropertiesANDROID gp; if (!gp) gp = (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(g_dev, "vkGetAndroidHardwareBufferPropertiesANDROID");
+        VkAndroidHardwareBufferPropertiesANDROID ap = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
+        VkExternalMemoryBufferCreateInfo eb = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &eb, 0, n, ALL_BUF_USAGE, VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
+        if (!gp || gp(g_dev, ahb, &ap) != VK_SUCCESS) why = "the AHB's properties";
+        else if (vkCreateBuffer(g_dev, &bi, NULL, &b) != VK_SUCCESS) why = "vkCreateBuffer";
+        else {
+            uint32_t mt = 0; while (mt < 32 && !(ap.memoryTypeBits >> mt & 1)) mt++;
+            VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, b};
+            VkImportAndroidHardwareBufferInfoANDROID imp = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, &ded, ahb};
+            VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, ap.allocationSize, mt};
+            if (vkAllocateMemory(g_dev, &ai, NULL, &m) != VK_SUCCESS) { imp.pNext = NULL; if (vkAllocateMemory(g_dev, &ai, NULL, &m) != VK_SUCCESS) { m = VK_NULL_HANDLE; why = "the import"; } }
+            if (m && vkBindBufferMemory(g_dev, b, m, 0) != VK_SUCCESS) why = "vkBindBufferMemory";
+        }
+    }
+    if (!why && !(save = malloc(n))) why = "a copy buffer";
+    if (!why) {
+        memcpy(save, (void *)(uintptr_t)lo, n);
+        if (mmap((void *)(uintptr_t)lo, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) != (void *)(uintptr_t)lo) { why = "mmap MAP_FIXED"; mmap((void *)(uintptr_t)lo, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0); }
+        memcpy((void *)(uintptr_t)lo, save, n);   // the pool's bytes, in the new pages (or back in anonymous ones)
+    }
+    free(save); if (sv[0] >= 0) { close(sv[0]); close(sv[1]); } if (fd >= 0) close(fd);   // the mapping keeps the dmabuf
+    if (why) { if (b) vkDestroyBuffer(g_dev, b, NULL); if (m) vkFreeMemory(g_dev, m, NULL); if (ahb) AHardwareBuffer_release(ahb); pthread_mutex_unlock(&g_zcmu);
+               static int nl; if (nl++ < 8) LOG("[RED] vk: zero-copy pool %p (%llu KB) not backed: %s failed", mem, (unsigned long long)(n >> 10), why); return; }
+    g_zc[g_nzc++] = (zcpool){lo, hi, mem, b, m, ahb, 0}; g_zc_bytes += n;
+    pthread_mutex_unlock(&g_zcmu);
+    static int nl; if (nl++ < 64) LOG("vk: zero-copy pool %p: %llu KB backed by an AHardwareBuffer (flags %#x; %llu MB in all)", mem, (unsigned long long)(n >> 10), flags, (unsigned long long)(g_zc_bytes >> 20));
+}
+static void zc_unback(const void *mem) {
+    pthread_mutex_lock(&g_zcmu);
+    for (int i = 0; i < g_nzc; i++) if (g_zc[i].mem == mem && !g_zc[i].dead) {
+        uint64_t n = g_zc[i].hi - g_zc[i].lo; uint8_t *save = malloc(n);
+        if (save) { memcpy(save, (void *)(uintptr_t)g_zc[i].lo, n); mmap((void *)(uintptr_t)g_zc[i].lo, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0); memcpy((void *)(uintptr_t)g_zc[i].lo, save, n); free(save); }
+        g_zc[i].dead = g_fence + 2;   // after the submission being recorded, too
+        g_zc_bytes -= n;
+    }
+    pthread_mutex_unlock(&g_zcmu);
+}
+static void zc_reap(uint64_t done) {   // the released pools' buffers and AHBs, once nothing recorded before the release runs
+    pthread_mutex_lock(&g_zcmu);
+    for (int i = 0; i < g_nzc;) if (g_zc[i].dead && g_zc[i].dead <= done) { vkDestroyBuffer(g_dev, g_zc[i].b, NULL); vkFreeMemory(g_dev, g_zc[i].m, NULL); AHardwareBuffer_release(g_zc[i].ahb); g_zc[i] = g_zc[--g_nzc]; } else i++;
+    pthread_mutex_unlock(&g_zcmu);
+}
+// The pool buffer and offset holding [addr, addr + n) whole, when it is backed and no command-list write of this generation touches it (those are applied to guest memory as the
+// list is walked: a draw recorded before one must not see it); 0 otherwise
+static int zc_find(uint64_t addr, uint64_t n, VkBuffer *b, VkDeviceSize *off) {
+    if (!g_nzc || !n) return 0;
+    int hit = 0; pthread_mutex_lock(&g_zcmu);
+    for (int i = 0; i < g_nzc; i++) if (!g_zc[i].dead && addr >= g_zc[i].lo && addr + n <= g_zc[i].hi) { *b = g_zc[i].b; *off = addr - g_zc[i].lo; hit = 1; break; }
+    pthread_mutex_unlock(&g_zcmu);
+    if (!hit) return 0;
+    for (uint32_t k = 0; k < g_nwlog; k++) if (g_wlo[k] < addr + n && g_whi[k] > addr) { g_zc_miss_wlog++; return 0; }
+    g_zc_hits++; return 1;
+}
 // Memory pools: nothing to do (draws copy what they read); mtl_addr answers for the NVN layer whether an address is in one
 #define NPOOL 4096
 static struct { const uint8_t *mem; uint64_t size; } g_pool[NPOOL];
 static int g_npool;
 static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
-void mtl_pool_add(const void *mem, uint64_t size) { pthread_mutex_lock(&g_pool_mu); if (g_npool < NPOOL) { g_pool[g_npool].mem = mem; g_pool[g_npool].size = size; g_npool++; } pthread_mutex_unlock(&g_pool_mu); }
+void mtl_pool_add(const void *mem, uint64_t size) { if (zc_mode()) zc_back(mem, size); pthread_mutex_lock(&g_pool_mu); if (g_npool < NPOOL) { g_pool[g_npool].mem = mem; g_pool[g_npool].size = size; g_npool++; } pthread_mutex_unlock(&g_pool_mu); }
 static uint64_t pool_left(uint64_t addr, uint64_t cap) {
     uint64_t n = 0; pthread_mutex_lock(&g_pool_mu);
     for (int i = 0; i < g_npool; i++) { uint64_t b = (uint64_t)(uintptr_t)g_pool[i].mem; if (addr >= b && addr < b + g_pool[i].size) { n = b + g_pool[i].size - addr; break; } }
     pthread_mutex_unlock(&g_pool_mu); return n < cap ? n : cap;
 }
-void mtl_pool_del(const void *mem) { pthread_mutex_lock(&g_pool_mu); for (int i = 0; i < g_npool; i++) if (g_pool[i].mem == mem) { g_pool[i] = g_pool[--g_npool]; break; } pthread_mutex_unlock(&g_pool_mu); }
+void mtl_pool_del(const void *mem) { if (zc_mode()) zc_unback(mem); pthread_mutex_lock(&g_pool_mu); for (int i = 0; i < g_npool; i++) if (g_pool[i].mem == mem) { g_pool[i] = g_pool[--g_npool]; break; } pthread_mutex_unlock(&g_pool_mu); }
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     int hit = 0; pthread_mutex_lock(&g_pool_mu);
     for (int i = 0; i < g_npool && !hit; i++) { uint64_t b = (uint64_t)(uintptr_t)g_pool[i].mem; if (addr >= b && addr + len <= b + g_pool[i].size) { if (buf) *buf = (void *)g_pool[i].mem; if (off) *off = addr - b; hit = 1; } }
