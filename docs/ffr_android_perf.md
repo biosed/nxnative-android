@@ -55,6 +55,7 @@ Env "E": A with `DM_VK_MEM_LOW_MB=600 DM_MEM_PRETRIM_AVAIL_MB=700 DM_MEM_BUDGET_
 | J′ | vk19.46 | E, Z0 off | 25.8–26.2 | | | | 24.5–24.9 | 11.0–11.2 | 1,708 | 34–36 / | base for L (MemAvailable ~860 MB) |
 | L | vk19.46 | E + `DM_VK_ZEROCOPY=1` | 25.9–26.1 | | | | 23.9–24.2 | 11.2–11.5 | 1,382 | 35–36 / | Z0 works (384 MB backed, 1,046 reads a frame in place, 0 copied) but −0.6 ms rec (noise) and −230 MB MemAvailable: reverted (env off). The estimate (−1.5 to −2.5 ms) came from Run A's profile, when copies and faults were far larger |
 | M3 | vk19.49 | E + `DM_VK_REC_THREAD=1` | 25.4–26.2 | | | | 21.0–27.2 | 9.5–12.4 | | 40–46 / 55–61 | record thread works (after the FenceSync fix: command-buffer syncs fenced at submission) and splits the load (RHIThread 100% → 7.6%, dm-record 77%), but p50 +8 ms: the RHI thread's own guest work is small, so there is little to overlap; the record thread stays the critical path (rec ~24 + context waits ~7) on a low-clocked core (1.67 GHz). p95 better. Reverted (opt-in kept: step 6 builds on it) |
+| N | vk19.50 | E + `DM_ADPF_ALL=1` | 26.25–26.4 | | | | 24.4–24.9 | 11.1–11.3 | | 35–36.7 / 67–75 | every ADPF call returns 0 (session over the hot threads, power efficiency off, workload increases) but the clocks do not move (gold cores 2803 / 787, cpu7 633–1228): HyperOS ignores the hints. Reverted. (Its thread match took GameThread more than once and missed RHIThread: fix if ever reused) |
 
 ## Findings
 
