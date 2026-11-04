@@ -52,6 +52,21 @@ static uint64_t gpu_driver_usage(uint64_t *budget) {
 static _Atomic uint64_t g_fbs_bytes;   // the same-pass feedback snapshots' images (fb_snap_for), never freed
 #define VKCHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) die("Vulkan: %s failed (%d)", #x, (int)r_); } while (0)
 #define RED_ONCE(id, ...) do { static int once_; if (!once_++) LOG("[RED] vk: " __VA_ARGS__); } while (0)
+// Timers of the per-frame statistics (vk19.38): the arm64 virtual counter read in user space, not clock_gettime (3.8% of the render thread in a profile: two calls for every
+// descriptor set, draw and pipeline lookup). Statistics only: waits, fences and deadlines keep now_ns
+static inline uint64_t stat_ns(void) {
+#ifdef __aarch64__
+    static uint64_t f; uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    if (!f) { uint64_t q; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(q)); f = q ? q : 1; }
+    return v / f * 1000000000ull + v % f * 1000000000ull / f;
+#else
+    return now_ns();
+#endif
+}
+// Lock waits (vk19.38): the time a lock of the backend's was waited for (a failed trylock, then the lock), per lock, in the per-600 line
+enum { LW_RMU, LW_GWMU, LW_MU, LW_QMU, LW_BLKMU, LW_N };
+static _Atomic uint64_t g_lw_ns[LW_N], g_lw_n[LW_N];
+static inline void lk_(pthread_mutex_t *m, int k) { if (pthread_mutex_trylock(m)) { uint64_t t = stat_ns(); pthread_mutex_lock(m); atomic_fetch_add_explicit(&g_lw_ns[k], stat_ns() - t, memory_order_relaxed); atomic_fetch_add_explicit(&g_lw_n[k], 1, memory_order_relaxed); } }
 
 static VkInstance g_inst; static VkPhysicalDevice g_pd; static VkDevice g_dev; static VkQueue g_q; static uint32_t g_qf;
 static VkPhysicalDeviceMemoryProperties g_memp; static VkPhysicalDeviceProperties g_props;
@@ -117,7 +132,7 @@ static int fr_take(mblock *b, VkDeviceSize size, VkDeviceSize align, VkDeviceSiz
     return 0;
 }
 static int img_mem_(VkMemoryRequirements r, VkDeviceMemory *m, VkDeviceSize *off);
-static int img_mem(VkMemoryRequirements r, VkDeviceMemory *m, VkDeviceSize *off) { pthread_mutex_lock(&g_blkmu); int b = img_mem_(r, m, off); pthread_mutex_unlock(&g_blkmu); return b; }
+static int img_mem(VkMemoryRequirements r, VkDeviceMemory *m, VkDeviceSize *off) { lk_(&g_blkmu, LW_BLKMU); int b = img_mem_(r, m, off); pthread_mutex_unlock(&g_blkmu); return b; }
 static int img_mem_(VkMemoryRequirements r, VkDeviceMemory *m, VkDeviceSize *off) {
     uint32_t type = mem_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (r.size > (32u << 20)) { *m = mem_alloc(r, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); *off = 0; atomic_fetch_add(&g_big_bytes, r.size); return -1; }   // big images get memory of their own
@@ -134,7 +149,7 @@ static int img_mem_(VkMemoryRequirements r, VkDeviceMemory *m, VkDeviceSize *off
 }
 static void img_mem_free(int blk, VkDeviceMemory m, VkDeviceSize off, VkDeviceSize size) {
     if (blk < 0) { vkFreeMemory(g_dev, m, NULL); atomic_fetch_sub(&g_big_bytes, size); return; }
-    pthread_mutex_lock(&g_blkmu);
+    lk_(&g_blkmu, LW_BLKMU);
     mblock *b = &g_blk[blk]; fr_put(b, off, size);
     if (!--b->live) { vkFreeMemory(g_dev, b->m, NULL); b->m = VK_NULL_HANDLE; b->nfr = 0; }
     pthread_mutex_unlock(&g_blkmu);
@@ -197,6 +212,8 @@ static uint32_t g_nwlog;   // writes logged in this generation (wlog_add)
 // 4, 64 MB in all) and taken again by the next submission that outgrows its ring; the mapping of each live one is remembered by its memory (xring_*)
 static struct { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceSize size; } g_xc[4]; static int g_nxc; static VkDeviceSize g_xc_bytes;
 static int g_mem_low;   // the system is short of memory (mem_watch): nothing is kept for reuse
+static int g_mem_tight;   // real pressure (a burst, or under half the low mark): extra rings are not kept, rings go back to their minimum (vk19.38)
+static _Atomic uint64_t g_ring_trim_gen;
 static struct { VkDeviceMemory m; void *p; } g_xmap[256]; static int g_nxmap; static pthread_mutex_t g_xcmu = PTHREAD_MUTEX_INITIALIZER; static uint64_t g_xc_reused;
 static VkBuffer xring_get(VkDeviceSize want, VkDeviceSize *size, VkDeviceMemory *m, uint8_t **p) {
     pthread_mutex_lock(&g_xcmu); int best = -1;
@@ -210,7 +227,7 @@ static VkBuffer xring_get(VkDeviceSize want, VkDeviceSize *size, VkDeviceMemory 
 static void xring_put(VkBuffer b, VkDeviceMemory m, VkDeviceSize size) {   // a freed extra ring: kept for reuse, or destroyed
     pthread_mutex_lock(&g_xcmu); void *p = NULL; int k = 0;
     for (; k < g_nxmap; k++) if (g_xmap[k].m == m) { p = g_xmap[k].p; break; }
-    if (p && g_nxc < 4 && g_xc_bytes + size <= (32u << 20) && !g_mem_low) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); return; }
+    if (p && g_nxc < 4 && g_xc_bytes + size <= (32u << 20) && !g_mem_tight) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); return; }
     if (k < g_nxmap) g_xmap[k] = g_xmap[--g_nxmap];
     pthread_mutex_unlock(&g_xcmu);
     vkDestroyBuffer(g_dev, b, NULL); vkFreeMemory(g_dev, m, NULL);
@@ -268,7 +285,7 @@ static void gw_del(int i) { gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] 
 static int g_gw_add_dfr;   // gw_add: the entry is a deferred dispatch's (see defer_on)
 static int g_defer_haz;   // a draw's resources include what a deferred dispatch writes: the pass ends and the dispatches are recorded before the draw (DRAWQ)
 static void gw_add(uint64_t addr, uint64_t size, VkBuffer buf, VkDeviceSize off, uint8_t *p, uint64_t fence, int ci, const uint8_t *snap, int exact) {
-    pthread_mutex_lock(&g_gwmu);
+    lk_(&g_gwmu, LW_GWMU);
     for (int i = 0; i < g_ngw; i++) if (g_gw[i].addr == addr && g_gw[i].size == size) { gw_del(i); break; }   // the newer write of one range replaces the older
     if (g_ngw == NGW) { RED_ONCE(62, "more than %d GPU-written buffer ranges in flight: the oldest is forgotten", NGW); gw_pg_mark(g_gw[0].addr, g_gw[0].size, -1); memmove(g_gw, g_gw + 1, (NGW - 1) * sizeof *g_gw); g_ngw--; }
     g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0, (uint8_t)g_gw_add_dfr}; gw_pg_mark(addr, size, 1);
@@ -296,9 +313,9 @@ static int gw_whole_dirty(gw_t *e) {
 }
 static int gw_cpu_dirty(gw_t *e, uint64_t lo, uint64_t hi) {
     if (!e->snap || hi <= lo || !stale_patch_on()) return 0;
-    uint64_t t0 = now_ns(); int r = gw_whole_dirty(e);   // the whole range: once a submission
+    uint64_t t0 = stat_ns(); int r = gw_whole_dirty(e);   // the whole range: once a submission
     if (r && !(lo == e->addr && hi == e->addr + e->size)) { r = memcmp((const void *)(uintptr_t)lo, e->snap + (lo - e->addr), hi - lo) != 0; g_stale_bytes += hi - lo; }
-    g_t_stale += now_ns() - t0;
+    g_t_stale += stat_ns() - t0;
     return r;
 }
 // The words of [lo, hi) the CPU rewrote since e was recorded, copied from the guest over dst (where lo lands), after the GPU's bytes were copied there (the upload command buffer).
@@ -366,7 +383,7 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
     int hit = 0; uint64_t wait = 0; int why = 0;
     if (!__atomic_load_n(&g_ngw, __ATOMIC_RELAXED)) return 0;
     g_gw_calls++; if (!gw_pg_any(addr, size)) { g_gw_quick++; return 0; }
-    pthread_mutex_lock(&g_gwmu); g_gw_walked += (uint64_t)g_ngw;
+    lk_(&g_gwmu, LW_GWMU); g_gw_walked += (uint64_t)g_ngw;
     for (int i = g_ngw - 1; i >= 0 && !hit && !wait; i--) {
         gw_t *e = &g_gw[i];
         if (addr >= e->addr + e->size || addr + size <= e->addr) continue;
@@ -411,14 +428,14 @@ static int gw_find(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *b
 // bound range it reads the guest's bytes (Unreal's staging written by the CPU), as on the Switch, where a copy reads the pool's memory
 static int gw_exact(uint64_t addr, uint64_t size) {
     if (!__atomic_load_n(&g_ngw, __ATOMIC_RELAXED) || !gw_pg_any(addr, size)) return 0;
-    int any = 0, ok = 1; pthread_mutex_lock(&g_gwmu);
+    int any = 0, ok = 1; lk_(&g_gwmu, LW_GWMU);
     for (int i = 0; i < g_ngw; i++) { const gw_t *e = &g_gw[i]; if (addr >= e->addr + e->size || addr + size <= e->addr) continue; any = 1; if (!e->exact) ok = 0; }
     pthread_mutex_unlock(&g_gwmu);
     if (any && !ok) atomic_fetch_add(&g_gw_b2t_guest, 1);
     return any && ok;
 }
 static void gw_expire(uint64_t fence) {   // completion: the submission's writes are in guest memory now, and its rings go
-    pthread_mutex_lock(&g_gwmu);
+    lk_(&g_gwmu, LW_GWMU);
     for (int i = 0; i < g_ngw;) if (g_gw[i].fence <= fence) gw_del(i); else i++;
     pthread_mutex_unlock(&g_gwmu);
 }
@@ -430,7 +447,7 @@ static void gw_expire(uint64_t fence) {   // completion: the submission's writes
 static struct { VkBuffer b; VkDeviceMemory m; uint64_t until; VkDeviceSize size; } *g_xr; static int g_nxr, g_cxr;
 static void xr_raise(VkBuffer b, uint64_t until) { for (int i = 0; i < g_nxr; i++) if (g_xr[i].b == b && g_xr[i].until < until) g_xr[i].until = until; }   // caller holds g_gwmu
 static void xr_free(uint64_t done) {
-    pthread_mutex_lock(&g_gwmu);
+    lk_(&g_gwmu, LW_GWMU);
     for (int i = 0; i < g_nxr;) {
         int used = g_xr[i].until > done; for (int k = 0; k < g_ngw && !used; k++) used = g_gw[k].buf == g_xr[i].b;
         if (used) { i++; continue; }
@@ -527,7 +544,7 @@ static void ctx_complete(ctx_t *c) {
             const uint8_t *snap = (const uint8_t *)(uintptr_t)p->addr, *now = p->src; uint8_t *dst = p->dst; size_t i = 0, nw = 0;
             for (; i + 4 <= p->n; i += 4) if (memcmp(now + i, snap + i, 4)) { memcpy(dst + i, now + i, 4); nw++; }
             for (; i < p->n; i++) if (now[i] != snap[i]) dst[i] = now[i];
-            pthread_mutex_lock(&g_gwmu); for (int k = 0; k < g_ngw; k++) if (g_gw[k].snap >= snap && g_gw[k].snap < snap + p->n) g_gw[k].snap = NULL; pthread_mutex_unlock(&g_gwmu);   // no reader compares against it any more
+            lk_(&g_gwmu, LW_GWMU); for (int k = 0; k < g_ngw; k++) if (g_gw[k].snap >= snap && g_gw[k].snap < snap + p->n) g_gw[k].snap = NULL; pthread_mutex_unlock(&g_gwmu);   // no reader compares against it any more
             snap_free((void *)snap, p->n); g_wb_words += nw; g_wb_bytes += p->n;
         }
         else if (p->kind == 6) { for (uint32_t r = 0; r < p->v; r++) memcpy((uint8_t *)p->dst + (size_t)r * p->mode, p->src + (size_t)r * p->mode, p->type); }   // rows: v rows of type bytes, mode apart
@@ -536,7 +553,7 @@ static void ctx_complete(ctx_t *c) {
     }
     c->npost = 0;
     gw_expire(c->fence_val);
-    pthread_mutex_lock(&g_gwmu); uint64_t hold = c->hold;
+    lk_(&g_gwmu, LW_GWMU); uint64_t hold = c->hold;
     for (int i = 0; i < c->nextra; i++) {
         int used = hold > c->fence_val; for (int k = 0; k < g_ngw && !used; k++) used = g_gw[k].buf == c->extra[i].b;
         if (used) {   // a later submission reads it (gw_find), or a live entry points into it: freed once nothing does (xr_free)
@@ -576,14 +593,14 @@ static void garbage_free(uint64_t done);
 static void *completion_thread(void *a) {
     (void)a;
     for (;;) {
-        pthread_mutex_lock(&g_mu);
+        lk_(&g_mu, LW_MU);
         while (!g_npend) pthread_cond_wait(&g_cv, &g_mu);
         ctx_t *c = &g_ctx[g_pend[0]];
         pthread_mutex_unlock(&g_mu);
         VkResult r = vkWaitForFences(g_dev, 1, &c->fence, VK_TRUE, UINT64_MAX);
         if (r != VK_SUCCESS) { trace_dump("waiting for a submission failed"); die("Vulkan: waiting for a submission failed (%d)", (int)r); }
         ctx_complete(c);
-        pthread_mutex_lock(&g_mu);
+        lk_(&g_mu, LW_MU);
         g_done = c->fence_val; memmove(g_pend, g_pend + 1, --g_npend * sizeof *g_pend);
         pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
         garbage_free(c->fence_val); xr_free(c->fence_val);
@@ -749,7 +766,7 @@ static VkDescriptorPool dpool_new(void) {
 // One-time commands outside the submissions (dummy contents, the present readback): their own pool, the queue lock held, waited for
 static VkCommandPool g_opool;
 static VkCommandBuffer once_begin(void) {
-    pthread_mutex_lock(&g_qmu);
+    lk_(&g_qmu, LW_QMU);
     if (!g_opool) { VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, g_qf}; VKCHECK(vkCreateCommandPool(g_dev, &pi, NULL, &g_opool)); }
     VkCommandBuffer cb; VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, g_opool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
     VKCHECK(vkAllocateCommandBuffers(g_dev, &ai, &cb));
@@ -1104,7 +1121,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
     // FANTASY RESONANCE registers texture objects whose memory holds half-float constants by then (serial 0x3c003c003c003c00), and their slots and image bindings stay bound.
     // An unknown format used to stop them by chance; a plausible one would have made an image of garbage size from a garbage storage pointer
     if (!t || t->magic != MAGIC('T', 'E', 'X', 0)) { if (t) g_tex_dead++; return NULL; }
-    pthread_mutex_lock(&g_rmu); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
+    lk_(&g_rmu, LW_RMU); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
     if (v && v->lcpu && !v->gpu && !for_rt && v->lhash_gen != g_bvgen) {   // a CPU-written linear texture (Unreal's Slate font atlas, a glyph cache): the GPU reads it in place on the Switch
         v->lhash_gen = g_bvgen; uint64_t h = mem_hash(t->mem, t->L.size);
         if (h != v->lhash) { v->lhash = h; tex_upload(v, t); }
@@ -1166,7 +1183,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
     }
     to_general(C->up, v->img, v->aspect); C->up_used = 1;
     v->gpu = for_rt;
-    pthread_mutex_lock(&g_rmu); v->next = g_tex[v->serial % NHASH]; g_tex[v->serial % NHASH] = v; pthread_mutex_unlock(&g_rmu);
+    lk_(&g_rmu, LW_RMU); v->next = g_tex[v->serial % NHASH]; g_tex[v->serial % NHASH] = v; pthread_mutex_unlock(&g_rmu);
     // A linear 2D texture in a pool the CPU can write (not CPU_NO_ACCESS, at most 16 MB): its storage is what the game wrote there, uploaded now and again whenever it changes
     v->lcpu = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && t->mem && t->pool && !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) &&
               !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && t->L.size <= (16u << 20) && !f.depth && sc == VK_SAMPLE_COUNT_1_BIT;
@@ -1216,12 +1233,12 @@ static void tex_evict(uint64_t trim_gen) {
     static uint64_t last; uint64_t n = atomic_load(&g_presents); int trim = trim_gen != g_trim_gen_tex; g_trim_gen_tex = trim_gen;
     if (!trim && n - last < 60) return;
     last = n;
-    uint64_t held = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) held += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
+    uint64_t held = 0; lk_(&g_blkmu, LW_BLKMU); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) held += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
     if (!trim && held < EVICT_FLOOR) return;
     static int64_t eage = -1; if (eage < 0) { const char *e = getenv("DM_VK_EVICT_AGE"); eage = e && atoll(e) > 0 ? atoll(e) : 300; }
-    uint64_t age = trim ? (uint64_t)atomic_load(&g_trim_age) : (uint64_t)eage, done; pthread_mutex_lock(&g_mu); done = g_done; pthread_mutex_unlock(&g_mu);
+    uint64_t age = trim ? (uint64_t)atomic_load(&g_trim_age) : (uint64_t)eage, done; lk_(&g_mu, LW_MU); done = g_done; pthread_mutex_unlock(&g_mu);
     int nev = 0;
-    pthread_mutex_lock(&g_rmu);
+    lk_(&g_rmu, LW_RMU);
     for (int hh = 0; hh < NHASH; hh++) for (vtex *v = g_tex[hh]; v; v = v->next) {
         if (v->dead || v->evicted || !v->packaged || v->gpu || (v->gpu_lv & ~v->mir_lv) || v->dirty || !v->img || v->last_fence > done || n - v->last_frame < age) continue;   // levels GPU copies wrote count when their bytes were mirrored into the storage (mir_lv)
         for (int k = 0; k < v->nviews; k++) vkDestroyImageView(g_dev, v->views[k].v, NULL);
@@ -1318,7 +1335,7 @@ static void garbage_free(uint64_t done) {
     for (int i = 0; i < g_ngb;) {
         vtex *v = g_gb[i];
         if (v->dead > done) { i++; continue; }
-        pthread_mutex_lock(&g_rmu);   // out of the table now (mtl_tex_release left it there)
+        lk_(&g_rmu, LW_RMU);   // out of the table now (mtl_tex_release left it there)
         for (vtex **pp = &g_tex[v->serial % NHASH]; *pp; pp = &(*pp)->next) if (*pp == v) { *pp = v->next; break; }
         pthread_mutex_unlock(&g_rmu);
         for (int k = 0; k < v->nviews; k++) vkDestroyImageView(g_dev, v->views[k].v, NULL);
@@ -1398,7 +1415,7 @@ static treg_t *g_treg; static int g_ntreg;
 static samp_par *g_sreg; static uint8_t *g_sreg_ok; static int g_nsreg;
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
     if (id < 0) return;
-    pthread_mutex_lock(&g_rmu);
+    lk_(&g_rmu, LW_RMU);
     if (id >= g_ntreg) { int n = id + 1024; g_treg = realloc(g_treg, n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
     g_treg[id].t = *t; g_treg[id].ok = 1; g_treg[id].has_v = v != NULL; if (v) g_treg[id].v = *v;
     int dead = t->magic != MAGIC('T', 'E', 'X', 0); if (dead) g_treg_dead++;   // kept as the game registered it; tex_get never makes an image of it (the slot reads the black stand-in, as on the Metal host)
@@ -1408,7 +1425,7 @@ void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
 }
 void mtl_reg_samp(int id, const samp_par *p) {
     if (id < 0) return;
-    pthread_mutex_lock(&g_rmu);
+    lk_(&g_rmu, LW_RMU);
     if (id >= g_nsreg) { int n = id + 256; g_sreg = realloc(g_sreg, n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, n); memset(g_sreg_ok + g_nsreg, 0, n - g_nsreg); g_nsreg = n; }
     g_sreg[id] = *p; g_sreg_ok[id] = 1;
     pthread_mutex_unlock(&g_rmu);
@@ -1419,13 +1436,13 @@ void mtl_tex_init(const tex_t *t) { (void)t; }
 // Unreal mip-streaming copy out of the texture being replaced -- still name it. Taken out of the table at once, such a copy found no image, made a new one from the texture's
 // storage, which lacks what GPU copies put into the image, and copied black into the new texture's lower levels (FINAL FANTASY RESONANCE's corridor: dark columns at a distance)
 void mtl_tex_release(tex_t *t) {
-    pthread_mutex_lock(&g_rmu);
+    lk_(&g_rmu, LW_RMU);
     vtex *v = tex_find(t->serial); int fresh = v && !v->dead;
     pthread_mutex_unlock(&g_rmu);
     if (fresh) tex_free(v);
 }
 void mtl_tex_cpu_written(const tex_t *t) {
-    pthread_mutex_lock(&g_rmu);
+    lk_(&g_rmu, LW_RMU);
     vtex *v = tex_find(t->serial); if (v) v->dirty = 1;
     if (!cpu_written(t->serial)) { if (g_ncpu == g_ccpu) { g_ccpu = g_ccpu ? 2 * g_ccpu : 64; g_cpu_written = realloc(g_cpu_written, g_ccpu * sizeof *g_cpu_written); } g_cpu_written[g_ncpu++] = t->serial; }
     pthread_mutex_unlock(&g_rmu);
@@ -1742,7 +1759,7 @@ static shader_t *shader_get_(const uint8_t md[8]);
 static shader_t *shader_get(const uint8_t md[8]) {
     pthread_mutex_lock(&g_shmu);
     for (int i = 0; i < g_nsh; i++) if (!memcmp(g_sh[i]->md, md, 8)) { shader_t *s = g_sh[i]; pthread_mutex_unlock(&g_shmu); return s; }
-    uint64_t t0 = now_ns(); shader_t *s = shader_get_(md); memcpy(s->md, md, 8); atomic_fetch_add(&g_sh_ns, now_ns() - t0);
+    uint64_t t0 = stat_ns(); shader_t *s = shader_get_(md); memcpy(s->md, md, 8); atomic_fetch_add(&g_sh_ns, stat_ns() - t0);
     pthread_mutex_unlock(&g_shmu); return s;
 }
 static shader_t *shader_get_(const uint8_t md[8]) {
@@ -1941,7 +1958,7 @@ static void defer_flush(void) {   // after the pass ended (pass_end): the deferr
         trace_add('c', d->cs->key, NULL, d->g[0], d->g[1], d->g[2], 0, d->zero_tb);
         barrier_cs(C->cb);
     }
-    pthread_mutex_lock(&g_gwmu); for (int k = 0; k < g_ngw; k++) g_gw[k].dfr = 0; pthread_mutex_unlock(&g_gwmu);
+    lk_(&g_gwmu, LW_GWMU); for (int k = 0; k < g_ngw; k++) g_gw[k].dfr = 0; pthread_mutex_unlock(&g_gwmu);
     g_ndefer = 0; g_defer_gen++;
 }
 static int pass_barrier_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PASS_BARRIER"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_PASS_BARRIER=1: pass ends do not wait for vertex shaders (their reads of the pass's targets get a barrier)"); } return v; }
@@ -2377,7 +2394,7 @@ static uint64_t texu_slot(int stage, const sbind *b) {   // as a bound slot's ha
 static VkImageView tex_slot(int stage, uint64_t h, VkSampler *sm, int *ok, vtex **vo) {
     int tid = (int)(h & 0xfffff); *ok = 0; if (vo) *vo = NULL;
     if (!tid) { g_tex_miss[0]++; return g_dummy_view; }
-    pthread_mutex_lock(&g_rmu);
+    lk_(&g_rmu, LW_RMU);
     treg_t tr = tid < g_ntreg ? g_treg[tid] : (treg_t){0};
     pthread_mutex_unlock(&g_rmu);
     if (!tr.ok) { g_tex_miss[1]++; return g_dummy_view; }
@@ -2428,7 +2445,7 @@ static void fb_prepare(shader_t *fs) {   // before a draw (pass open): find the 
         // a bound slot, or a handle read from a uniform buffer: FINAL FANTASY XII THE ZODIAC AGE's full-screen passes sample their own attachment through such handles
         if (b->type != BT_CIS || !((b->kind == K_TEX && b->reg >= 0 && b->reg < NTEX) || (b->kind == K_TEXU && b->count == 1))) continue;
         int tid = (int)((b->kind == K_TEXU ? texu_slot(1, b) : S.tex[1][b->reg]) & 0xfffff); if (!tid) continue;
-        pthread_mutex_lock(&g_rmu); treg_t tr = tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
+        lk_(&g_rmu, LW_RMU); treg_t tr = tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
         if (!tr.ok) continue;
         vtex *v = tex_get(&tr.t, 0); if (!v) continue;
         for (int a = 0; a < P.n; a++) if (P.ct[a] == v && P.cv[a] && v->d <= 1 && (S.chmask.mask >> (4 * a) & 0xf)) { want[a] = 1; any = 1; }
@@ -2466,7 +2483,7 @@ static VkFormatProperties fmt_props(VkFormat f) {   // vkGetPhysicalDeviceFormat
 static uint64_t g_tbuf_miss[3]; static uint32_t g_ws_zero_tb;   // g_ws_zero_tb: texel buffer elements the last write_sets bound to the zero stand-in (the trace)   // texel buffer slots read as zeros: 0 nothing bound, 1 not a buffer texture / no format, 2 format not usable as a texel buffer here
 static VkBufferView tbuf_view(int stage, uint64_t h, int storage) {
     int tid = (int)(h & 0xfffff); if (!tid) { g_tbuf_miss[0]++; return VK_NULL_HANDLE; }
-    pthread_mutex_lock(&g_rmu); treg_t tr = tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
+    lk_(&g_rmu, LW_RMU); treg_t tr = tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
     if (!tr.ok || tr.t.d.target != NVN_TEXTURE_TARGET_BUFFER || !tr.t.mem) { g_tbuf_miss[tr.ok ? 1 : 0]++; return VK_NULL_HANDLE; }
     int fmtn = tr.has_v && tr.v.set_format ? tr.v.format : tr.t.d.format, bw = 1, bh = 1, bpb = nvn_fmt_bpb(fmtn, &bw, &bh);
     fmt_t f = fmt_of(fmtn);
@@ -2497,7 +2514,7 @@ static VkSampler bind_samp(int stage, const sbind *b, uint64_t th, int el) {
     int r = b->sreg >= 0 ? b->sreg + el : -1;
     int sid = b->skind == S_SAMP && r >= 0 && r < 128 ? (int)(S.samp[stage][r] >> 20) : b->skind == S_SAMP_TEX && b->reg >= 0 && b->reg + el < NTEX ? (int)(S.tex[stage][b->reg + el] >> 20) : b->skind == S_SAMP_ID ? b->sreg :
               b->skind == S_SAMP_UBO ? (b->kind == K_TEXU ? (int)(th >> 20) : (int)(ubo_word(stage, b->sreg, b->soff) >> 20) ? (int)(ubo_word(stage, b->sreg, b->soff) >> 20) + S.samp_base : 0) : 0;
-    pthread_mutex_lock(&g_rmu); VkSampler sm = samp_get(sid); pthread_mutex_unlock(&g_rmu);
+    lk_(&g_rmu, LW_RMU); VkSampler sm = samp_get(sid); pthread_mutex_unlock(&g_rmu);
     return sm;
 }
 // Every element of every binding is written: what is bound where it can be found, a stand-in of the binding's type where not. A descriptor left unwritten is undefined, and a
@@ -2508,6 +2525,12 @@ static struct { uint64_t key, gen; VkDescriptorSetLayout dsl; VkDescriptorSet ds
 static uint64_t g_dsc_hit, g_dsc_miss;
 static uint64_t g_t_ws, g_t_draw, g_t_disp, g_t_sub;   // time in write_set, in draws (with their write_set), in dispatches, in vkQueueSubmit (the frame stats line)
 static VkDescriptorSet write_set_(shader_t *s, int stage);
+// DM_VK_SEG_CACHE (vk19.38, default 1): the 4 KB driver segment is a function of the stage's texture, image, sampler and storage-buffer bindings and of its kind. g_bgen[stage]
+// changes with any bind of those (OP_BIND_TEX / SAMP / IMG / SSBO, the state reset); a segment built in this submission from the same generation is taken as it was, without
+// building, hashing and comparing its 4 KB again (two or three of them for every draw)
+static uint64_t g_bgen[6], g_bgen_next = 1, g_segc_hit, g_segc_miss;
+static struct { uint64_t gen, bgen; VkBuffer b; VkDeviceSize off; } g_segc[6][3];
+static int seg_cache_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SEG_CACHE"); v = !e || atoi(e) != 0; } return v; }
 // DM_VK_DSET_CACHE2 (vk19.36, default 1). The descriptor-set cache (g_dsc) keys a set by what its bindings resolved to, and two kinds of binding were put into the ring anew
 // for every draw: the 4 KB driver segment (K_DRVCB: texture / sampler handle tables) and the shader's constant block (K_C1). Each draw then had a new ring offset, so its set
 // never matched an earlier one: a new set, a vkAllocateDescriptorSets and a vkUpdateDescriptorSets (6-7 ms a frame at 400 draws, 25-55% reused). Now those blocks are kept by
@@ -2539,7 +2562,7 @@ static int g_ws_att; static vtex *g_ws_simg[16]; static int g_nws_simg;   // the
 static int ws_is_att(const vtex *v) { if (v == P.dt) return 1; for (int i = 0; i < P.n; i++) if (P.ct[i] == v) return 1; return 0; }
 static int g_vs_haz;   // the vertex shader's write_set met a texture a pass wrote with vertex shaders left out of its end barrier (draw_vs_hazard)
 static uint32_t g_dyno[64]; static uint32_t g_ndyno;   // the dynamic offsets of the last write_set, in binding order (for vkCmdBindDescriptorSets)
-static VkDescriptorSet write_set(shader_t *s, int stage) { uint64_t t0 = now_ns(); VkDescriptorSet d = write_set_(s, stage); g_t_ws += now_ns() - t0; return d; }
+static VkDescriptorSet write_set(shader_t *s, int stage) { uint64_t t0 = stat_ns(); VkDescriptorSet d = write_set_(s, stage); g_t_ws += stat_ns() - t0; return d; }
 static VkDescriptorSet write_set_(shader_t *s, int stage) {
     if (stage == 5) g_nwb = 0;
     g_ndyno = 0;
@@ -2575,6 +2598,10 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                 if (stage != 5 && s->ssbo_wr) { static const shader_t *seen[8]; static int nseen; int k = 0; while (k < nseen && seen[k] != s) k++;
                                   if (k == nseen && nseen < 8) { seen[nseen++] = s; LOG("[RED] vk: shader %s (stage %d) binds storage buffer c%d at %#llx size %llu: what a draw writes to it is lost", s->key, stage, b->reg, (unsigned long long)u->addr, (unsigned long long)u->size); } }
             } else if (b->kind == K_DRVCB) {   // driver segments: c2 holds the bound texture / sampler handles (as nvn_mtl.m fills them), c0 the storage buffer table
+                int skind = b->off == 2 ? (s->dyn ? 0 : 1) : 2;   // the segment's kind: what it is built from
+                if (seg_cache_on() && stage < 6 && g_segc[stage][skind].gen == g_bvgen && g_segc[stage][skind].bgen == g_bgen[stage]) {   // built from the same bindings in this submission
+                    *d = (VkDescriptorBufferInfo){g_segc[stage][skind].b, g_segc[stage][skind].off, 4096}; g_segc_hit++;
+                } else {
                 uint8_t seg[4096]; memset(seg, 0, sizeof seg);
                 if (b->off == 2 && s->dyn) {   // tex_dyn_slots (as nvn_mtl.m): the tables hold slot indices, which the shader's arithmetic turns into indices of its slot arrays (dyn_slot)
                     for (int r = 0; r < 32; r++) { uint64_t h = S.tex[stage][r]; uint32_t v = !h ? 0 : (uint32_t)r | (h >> 20 ? (uint32_t)r << 20 : 0); memcpy(seg + 0x20 + 8 * r, &v, 4); }
@@ -2592,6 +2619,9 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                     if (stage != 5) { const float mp = 2047.0f; memcpy(seg + 0x610, &mp, 4); }
                 }
                 VkBuffer rb; VkDeviceSize o = ring_put_memo(seg, sizeof seg, 256, &rb); if (o != VK_WHOLE_SIZE) *d = (VkDescriptorBufferInfo){rb, o, sizeof seg};
+                if (o != VK_WHOLE_SIZE && stage < 6) { g_segc[stage][skind].gen = g_bvgen; g_segc[stage][skind].bgen = g_bgen[stage]; g_segc[stage][skind].b = rb; g_segc[stage][skind].off = o; }
+                g_segc_miss++;
+                }
             }
             x->pBufferInfo = d;
             if (s->dynu[i]) { x->descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; g_dyno[g_ndyno++] = (uint32_t)d->offset; d->offset = 0; }   // the offset goes with the bind
@@ -2610,7 +2640,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                     if (stage == 1 && tv) for (int q = 0; q < g_fb_n; q++) if (tv == g_fb_src[q]) { view = g_fb_view[q]; break; }   // same-pass feedback: the snapshot (fb_prepare)
                 } else if (simg && b->kind == K_IMG && b->reg >= 0 && b->reg + (int)e < 32) {   // an image a shader writes: a single-level view with no swizzle, of an image made for storage
                     int tid = (int)(S.img[stage][b->reg + e] & 0xfffff);
-                    pthread_mutex_lock(&g_rmu); treg_t tr = tid && tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
+                    lk_(&g_rmu, LW_RMU); treg_t tr = tid && tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
                     vtex *v = tr.ok && tr.t.d.target != NVN_TEXTURE_TARGET_BUFFER ? tex_get(&tr.t, 1) : NULL;
                     if (v && stage == 5) { if (P.open && ws_is_att(v)) g_ws_att = 1; if (g_nws_simg < 16) g_ws_simg[g_nws_simg++] = v; }   // what a deferred dispatch writes (defer_on)
                     else if (v && g_ndefer && v->dfr_gen == g_defer_gen) g_defer_haz = 1;
@@ -2618,8 +2648,8 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                     if (iv) view = iv; else RED_ONCE(73, "shader %s: image slot %d is not a storage-capable image here: its writes are lost", s->key, b->reg + (int)e);
                 }
                 if (b->type == BT_CIS && have) sm = bind_samp(stage, b, th, (int)e);
-                else if (b->type == BT_CIS && dyn && (th >> 20)) { pthread_mutex_lock(&g_rmu); sm = samp_get((int)(th >> 20)); pthread_mutex_unlock(&g_rmu); }
-                else if (b->type == BT_SAMP && dyn) { pthread_mutex_lock(&g_rmu); sm = samp_get((int)(S.samp[stage][e < 128 ? e : 0] >> 20)); pthread_mutex_unlock(&g_rmu); }   // sampler slot k
+                else if (b->type == BT_CIS && dyn && (th >> 20)) { lk_(&g_rmu, LW_RMU); sm = samp_get((int)(th >> 20)); pthread_mutex_unlock(&g_rmu); }
+                else if (b->type == BT_SAMP && dyn) { lk_(&g_rmu, LW_RMU); sm = samp_get((int)(S.samp[stage][e < 128 ? e : 0] >> 20)); pthread_mutex_unlock(&g_rmu); }   // sampler slot k
                 else if (b->type == BT_SAMP && b->skind != S_NONE) sm = bind_samp(stage, b, 0, (int)e);
                 ii[ne + e] = (VkDescriptorImageInfo){sm, view, VK_IMAGE_LAYOUT_GENERAL};
             }
@@ -2643,8 +2673,8 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                 o += snprintf(ln + o, sizeof ln - o, " buf %#llx +%llu %s guest %g %g %g %g", (unsigned long long)u->addr, (unsigned long long)u->size, bi[ne].buffer == C->ring ? "ring" : bi[ne].buffer == g_zero_buf || bi[ne].buffer == g_scratch_buf ? "zero" : "gpu-written", f[0], f[1], f[2], f[3]);
             } else if (b->type == BT_CIS || b->type == BT_TEX || b->type == BT_SIMG) {
                 uint64_t h = b->type == BT_SIMG ? (b->reg >= 0 && b->reg < 32 ? S.img[stage][b->reg] : 0) : b->kind == K_TEXU ? texu_slot(stage, b) : b->reg >= 0 && b->reg < NTEX ? S.tex[stage][b->reg] : 0;
-                int tid = (int)(h & 0xfffff); pthread_mutex_lock(&g_rmu); treg_t tr = tid && tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
-                { vtex *pv = NULL; pthread_mutex_lock(&g_rmu); if (tr.ok) pv = tex_find(tr.t.serial); pthread_mutex_unlock(&g_rmu);
+                int tid = (int)(h & 0xfffff); lk_(&g_rmu, LW_RMU); treg_t tr = tid && tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
+                { vtex *pv = NULL; lk_(&g_rmu, LW_RMU); if (tr.ok) pv = tex_find(tr.t.serial); pthread_mutex_unlock(&g_rmu);
                   o += snprintf(ln + o, sizeof ln - o, " lv %u view %d+%d gpu %d gpu_lv %#x", tr.t.d.levels, tr.has_v && tr.v.set_levels ? tr.v.base_level : 0, tr.has_v && tr.v.set_levels ? tr.v.nlevels : 0,
                                 pv ? pv->gpu : -1, pv ? pv->gpu_lv : 0);
                   int sid = (int)(h >> 20); if (b->type == BT_CIS && sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) { const samp_par *sp = &g_sreg[sid]; o += snprintf(ln + o, sizeof ln - o, " samp min %d mag %d lod %g..%g bias %g", sp->minf, sp->magf, sp->lod_min, sp->lod_max, sp->lod_bias); } }
@@ -2675,7 +2705,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
         if (!dset_cache2() || (ce->key2 == key2 && ce->nk == nk && (nk > KMAX || !memcmp(ce->km, km, (size_t)nk * 8)))) { g_dsc_hit++; return ce->ds; }
         g_dsc_rej++;   // the same 64-bit hash, other bindings: a new set
     }
-    uint64_t tm0 = now_ns();
+    uint64_t tm0 = stat_ns();
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, C->dps[C->idp], 1, &s->dsl};
     while (vkAllocateDescriptorSets(g_dev, &ai, &ds) != VK_SUCCESS) {   // this pool is full: the next of the chain, made when there is none
         if (++C->idp == C->ndp) { if (C->ndp >= 256) { RED_ONCE(20, "256 descriptor pools in one submission: draws are dropped"); C->idp--; return VK_NULL_HANDLE; }
@@ -2685,7 +2715,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
     for (int k = 0; k < nw; k++) w[k].dstSet = ds;
     vkUpdateDescriptorSets(g_dev, (uint32_t)nw, w, 0, NULL);
     ce->key = key; ce->gen = g_bvgen; ce->dsl = s->dsl; ce->ds = ds; ce->key2 = key2; ce->nk = nk; if (nk <= KMAX) memcpy(ce->km, km, (size_t)nk * 8); g_dsc_miss++;
-    g_dsc_miss_ns += now_ns() - tm0; g_dsc_nmiss_t++;
+    g_dsc_miss_ns += stat_ns() - tm0; g_dsc_nmiss_t++;
     return ds;
 }
 static _Atomic uint64_t g_wait_ns, g_rec_ns, g_pwait_ns;   // time the submit thread waited for the GPU, spent recording, and the present waited for its slot
@@ -2779,7 +2809,7 @@ static int shader_reads_rt(shader_t *s, int stage) {   // caller holds g_rmu
 static int draw_reads_rt(shader_t *vs, shader_t *fs, shader_t *gs) {
     if (!rt_split_on()) return 0;
     uint64_t t0 = now_ns(); g_rt_unwritten = 0;
-    pthread_mutex_lock(&g_rmu); int r = shader_reads_rt(vs, 0) || shader_reads_rt(fs, 1) || shader_reads_rt(gs, 2); pthread_mutex_unlock(&g_rmu);
+    lk_(&g_rmu, LW_RMU); int r = shader_reads_rt(vs, 0) || shader_reads_rt(fs, 1) || shader_reads_rt(gs, 2); pthread_mutex_unlock(&g_rmu);
     if (!r && g_rt_unwritten) g_nsplit_skip++;
     g_t_split += now_ns() - t0;
     return r;
@@ -3214,7 +3244,7 @@ static void clear_tex(const p_clear_tex *c) {
 // ---------- Submission ----------
 // The context's own ring sized to what its submissions take (its previous one is complete, and nothing holds its ring: mtl_sub_begin waited for both)
 static _Atomic uint64_t g_trim_gen, g_wait_fence_ns, g_wait_hold_ns;
-void dm_vk_trim(void) { atomic_fetch_add(&g_trim_gen, 1); }
+void dm_vk_trim(void) { atomic_fetch_add(&g_trim_gen, 1); atomic_fetch_add(&g_ring_trim_gen, 1); }   // Android's own signal: real pressure
 // The low-memory signal (onLowMemory) came too late: the low-memory killer ended the game in the foreground twice (FINAL FANTASY RESONANCE on the Xiaomi Pad 8, RSS 2.4 GB, the
 // system swapping). Every second the backend reads MemAvailable and the process's resident memory; below DM_VK_MEM_LOW_MB (default 1500) available, or past DM_MEM_BUDGET_MB
 // (default 2000) for the process's resident memory plus the backend's device memory, it trims as for the signal, at most every 5 s: idle textures evicted (60 frames unused), rings
@@ -3276,7 +3306,7 @@ static void mem_watch(void) {
     long avail = 0, rss = 0; char ln[128]; FILE *f = fopen("/proc/meminfo", "re"); if (f) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "MemAvailable: %ld", &avail) == 1) break; fclose(f); }
     long ranon = 0, rfile = 0, rshm = 0, vswap = 0;
     if ((f = fopen("/proc/self/status", "re"))) { while (fgets(ln, sizeof ln, f)) { sscanf(ln, "VmRSS: %ld", &rss); sscanf(ln, "RssAnon: %ld", &ranon); sscanf(ln, "RssFile: %ld", &rfile); sscanf(ln, "RssShmem: %ld", &rshm); sscanf(ln, "VmSwap: %ld", &vswap); } fclose(f); }
-    uint64_t gpu = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) gpu += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
+    uint64_t gpu = 0; lk_(&g_blkmu, LW_BLKMU); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) gpu += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
     gpu += atomic_load(&g_ring0_bytes) + atomic_load(&g_extra_ring_bytes);
     long ours = rss / 1024 + (long)(gpu >> 20);   // the process's resident memory and the backend's device memory, in MB
     int fall = 0;
@@ -3290,7 +3320,7 @@ static void mem_watch(void) {
                     dh / 1048576.0, hu / 1048576.0, db / 1048576.0, drss, rss / 1024, ranon / 1024, rfile / 1024, rshm / 1024, vswap / 1024, dav, avail / 1024, ddrv / 1048576.0, drv / 1048576.0, (unsigned long long)(gpu >> 20));
         }
         if (now - last_gl >= 30000000000ull) {   // every 30 s: the driver's count against the backend's own allocations
-            last_gl = now; int64_t all = atomic_load(&g_dm_live), blk = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) blk += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
+            last_gl = now; int64_t all = atomic_load(&g_dm_live), blk = 0; lk_(&g_blkmu, LW_BLKMU); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) blk += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
             int64_t rg = atomic_load(&g_ring0_bytes), xr = atomic_load(&g_extra_ring_bytes), bi = atomic_load(&g_big_bytes), fb = atomic_load(&g_fbs_bytes), kept = (int64_t)g_xc_bytes;
             LOG("[mem] GPU memory: the driver counts %.0f MB (budget %.0f MB%s); the backend's allocations %.0f MB in %lld: image blocks %.0f, rings %.0f, extra rings %.0f (%.0f kept), big images %.0f, feedback snapshots %.0f, the rest %.0f",
                 drv / 1048576.0, bud / 1048576.0, g_has_budget ? "" : ", no VK_EXT_memory_budget", all / 1048576.0, (long long)atomic_load(&g_dm_n), blk / 1048576.0, rg / 1048576.0, xr / 1048576.0, kept / 1048576.0,
@@ -3310,21 +3340,28 @@ static void mem_watch(void) {
     if (early) pre_until = now + 10000000000ull;
     if (tick || early) pbase = hu;
     g_mem_low = is_low || over || near || now < pre_until;
-    if (!early && (!(is_low || over || near) || now - last_trim < 5000000000ull)) {
+    g_mem_tight = early || now < pre_until || (low > 0 && avail > 0 && avail / 1024 < low / 2);   // real pressure: a burst, or under half the low mark
+    // A steady low (vk19.38): the dungeon sat at ~1 GB available, under the low mark and the budget, and the backend trimmed every 5 s, the most it may: every ring back to
+    // its minimum (fresh mappings again, each page faulted on its first write: ~4,000 faults a frame on the render thread), textures re-made, malloc purged. Now a low that
+    // holds without falling trims again only after DM_VK_TRIM_STEADY_S (default 60) seconds, or at once when MemAvailable fell 100 MB since the last trim; rings go back to their
+    // minimum and malloc is purged only under real pressure (g_mem_tight). DM_VK_TRIM_STEADY_S=5: as before
+    static long steady_s = -1; static long avail_at_trim; if (steady_s < 0) { const char *e = getenv("DM_VK_TRIM_STEADY_S"); steady_s = e && atol(e) > 0 ? atol(e) : 60; }
+    uint64_t gap = early ? 2000000000ull : (avail / 1024 + 100 < avail_at_trim || g_mem_tight) ? 5000000000ull : (uint64_t)steady_s * 1000000000ull;
+    if (!early && (!(is_low || over || near) || now - last_trim < gap)) {
         if (dm_ueheap_release && now - last_rel >= 60000000000ull) { last_rel = now; heap_release_kick(); }   // on the heap thread, not this one (it walks the heap under its locks)
         return;
     }
     static int fast_age = -1; if (fast_age < 0) { const char *e = getenv("DM_VK_EVICT_FAST"); fast_age = e && atoi(e) > 0 ? atoi(e) : 30; }
     atomic_store(&g_trim_age, early ? fast_age : 60);
-    last_trim = now; atomic_fetch_add(&g_trim_gen, 1);
+    last_trim = now; avail_at_trim = avail / 1024; atomic_fetch_add(&g_trim_gen, 1); if (g_mem_tight) atomic_fetch_add(&g_ring_trim_gen, 1);
     if (dm_ueheap_release) { last_rel = now; heap_release_kick(); }
     pthread_mutex_lock(&g_snapmu); for (int k = 0; k < SNAP_NC; k++) { while (g_snap_n[k]) free(g_snap_free[k][--g_snap_n[k]]); } g_snap_kept = 0; pthread_mutex_unlock(&g_snapmu);
     pthread_mutex_lock(&g_xcmu); while (g_nxc) { g_nxc--; vkDestroyBuffer(g_dev, g_xc[g_nxc].b, NULL); vkFreeMemory(g_dev, g_xc[g_nxc].m, NULL);
         for (int k = 0; k < g_nxmap; k++) if (g_xmap[k].m == g_xc[g_nxc].m) { g_xmap[k] = g_xmap[--g_nxmap]; break; } } g_xc_bytes = 0; pthread_mutex_unlock(&g_xcmu);
-    mallopt(M_PURGE, 0);
-    static int nl; if (nl++ < 60) LOG("vk: memory %s (%ld MB available, the process %ld MB resident + %llu MB device, the game heap %.0f MB): idle textures evicted, rings back to their minimum, reuse pools emptied",
+    if (g_mem_tight) mallopt(M_PURGE, 0);
+    static int nl; if (nl++ < 60) LOG("vk: memory %s (%ld MB available, the process %ld MB resident + %llu MB device, the game heap %.0f MB): idle textures evicted, reuse pools emptied%s",
                                       jump ? "early trim: the game heap grew fast" : fall ? "early trim: MemAvailable fell, or GPU or resident memory grew, fast" : is_low ? "low" : over ? "over budget" : "near low (early trim)",
-                                      avail / 1024, rss / 1024, (unsigned long long)(gpu >> 20), hu / 1048576.0);
+                                      avail / 1024, rss / 1024, (unsigned long long)(gpu >> 20), hu / 1048576.0, g_mem_tight ? ", rings back to their minimum, malloc purged" : "");
 }
 // mem_watch runs on a thread of its own (vk19.32), every 100 ms: run from the submissions it stopped with them, and FINAL FANTASY RESONANCE's killing loads stall the rendering
 // (a frame of 54 NVN functions, then nothing): no line and no trim in the 5 s between the 115.7 MB read and the kill. The textures are still evicted at the next submission (tex_evict)
@@ -3336,7 +3373,7 @@ void tex_evict_hook(void) { mem_watch_start(); tex_evict(atomic_load(&g_trim_gen
 static int ring_keep(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RING_KEEP"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_RING_KEEP=1: rings shrink only while memory is low"); } return v; }
 static void ring_fit(ctx_t *c) {
     c->last_total = c->total; if (c->total > c->win_max) c->win_max = c->total;
-    VkDeviceSize want = c->ring0_size; uint64_t tg = atomic_load(&g_trim_gen);
+    VkDeviceSize want = c->ring0_size; uint64_t tg = atomic_load(&g_ring_trim_gen);
     if (c->trim_seen != tg) { c->trim_seen = tg; want = RING_MIN; c->win_max = 0; c->nwin = 0; }
     else if (c->last_total > c->ring0_size && c->ring0_size < RING_MAX) { while (want < c->last_total && want < RING_MAX) want *= 2;
                                                                          if (atomic_load(&g_ring0_bytes) + (want - c->ring0_size) > RING_CAP) want = c->ring0_size; }
@@ -3349,11 +3386,11 @@ void mtl_sub_begin(void) {
     vk_init(); g_sub_up_bytes = 0;
     g_ci = (g_ci + 1) % NCTX; ctx_t *c = &g_ctx[g_ci];
     uint64_t w0 = now_ns();
-    pthread_mutex_lock(&g_mu);
+    lk_(&g_mu, LW_MU);
     { uint64_t t1 = now_ns(); while (c->fence_val > g_done) pthread_cond_wait(&g_cv, &g_mu); uint64_t t2 = now_ns(); while (c->hold > g_done) pthread_cond_wait(&g_cv, &g_mu);
       atomic_fetch_add(&g_wait_fence_ns, t2 - t1); atomic_fetch_add(&g_wait_hold_ns, now_ns() - t2); }   // its own submission still running / a later one still reading its ring
     pthread_mutex_unlock(&g_mu);
-    pthread_mutex_lock(&g_gwmu); c->hold = 0; pthread_mutex_unlock(&g_gwmu);
+    lk_(&g_gwmu, LW_GWMU); c->hold = 0; pthread_mutex_unlock(&g_gwmu);
     atomic_fetch_add(&g_wait_ns, now_ns() - w0); atomic_fetch_add(&g_wait_cum, now_ns() - w0);
     ring_fit(c);
     C = c;
@@ -3377,7 +3414,7 @@ void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *handles, int n) { g_rest = handles; g_nrest = n; }   // the handles after the one replayed next (rt_hold_scan)
 // A buffer copy is made on the CPU as the command list is walked (the in-order writes, wlog). Where the source holds bytes the GPU wrote and has not put back in guest memory
 // yet (gw_find), the copy is made on the GPU from them into the ring instead, and the destination becomes a GPU-written range like the source (gw_add, back at completion)
-static int gw_any(uint64_t a, uint64_t n) { int r = 0; if (!gw_pg_any(a, n)) return 0; pthread_mutex_lock(&g_gwmu); for (int i = 0; i < g_ngw && !r; i++) r = a < g_gw[i].addr + g_gw[i].size && g_gw[i].addr < a + n; pthread_mutex_unlock(&g_gwmu); return r; }
+static int gw_any(uint64_t a, uint64_t n) { int r = 0; if (!gw_pg_any(a, n)) return 0; lk_(&g_gwmu, LW_GWMU); for (int i = 0; i < g_ngw && !r; i++) r = a < g_gw[i].addr + g_gw[i].size && g_gw[i].addr < a + n; pthread_mutex_unlock(&g_gwmu); return r; }
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     memmove((void *)dst, (const void *)src, n); wlog_add(dst, n);
     if (!n || !g_ngw || !gw_any(src, n)) return;
@@ -3395,6 +3432,7 @@ void mtl_exec(const uint8_t *p) { uint64_t t0 = now_ns(); mtl_exec_(p); atomic_f
 // NVN's initial command buffer state, as the Metal backend's state_reset: games set some of it only by state objects or never (Metroid Dread never sets the stencil value mask,
 // which starts at 0xff; left at 0 its G-buffer draws, stencil test "not equal 2", failed everywhere and the level's opaque geometry stayed black)
 static void state_defaults(void) {
+    for (int i = 0; i < 6; i++) g_bgen[i] = g_bgen_next++;   // the bindings may change wholesale
     for (int i = 0; i < 8; i++) S.blend[i] = (blend_st){i, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_FUNC_ONE, NVN_BLEND_FUNC_ZERO, NVN_BLEND_EQUATION_ADD, NVN_BLEND_EQUATION_ADD};
     S.color = (color_st){0, NVN_LOGIC_OP_COPY, NVN_ALPHA_FUNC_ALWAYS}; S.chmask.mask = 0xffffffffu;
     S.poly = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0};
@@ -3420,9 +3458,9 @@ static void mtl_exec_(const uint8_t *p) {
             case OP_SET_RT: set_rt(p, (const p_set_rt *)a, h.size); break;
             case OP_CLEAR_COLOR: clear_color((const p_clear_color *)a); break;
             case OP_CLEAR_DS: clear_ds((const p_clear_ds *)a); break;
-            case OP_DRAW: { uint64_t t0 = now_ns(); p_draw t; draw(draw_rec(a, h.size, &t), NULL); g_t_draw += now_ns() - t0; break; }
-            case OP_DRAW_IDX: { uint64_t t0 = now_ns(); p_draw_idx t; draw(NULL, draw_idx_rec(a, h.size, &t)); g_t_draw += now_ns() - t0; break; }
-            case OP_DISPATCH: { uint64_t t0 = now_ns(); dispatch((const p_dispatch *)a); g_t_disp += now_ns() - t0; break; }
+            case OP_DRAW: { uint64_t t0 = stat_ns(); p_draw t; draw(draw_rec(a, h.size, &t), NULL); g_t_draw += stat_ns() - t0; break; }
+            case OP_DRAW_IDX: { uint64_t t0 = stat_ns(); p_draw_idx t; draw(NULL, draw_idx_rec(a, h.size, &t)); g_t_draw += stat_ns() - t0; break; }
+            case OP_DISPATCH: { uint64_t t0 = stat_ns(); dispatch((const p_dispatch *)a); g_t_disp += stat_ns() - t0; break; }
             case OP_COPY_B2T: copy_b2t((const p_copy_b2t *)a); break;
             case OP_COPY_T2T: copy_t2t((const p_copy_t2t *)a); break;
             case OP_COPY_T2B: copy_t2b((const p_copy_t2t *)a); break;
@@ -3443,13 +3481,13 @@ static void mtl_exec_(const uint8_t *p) {
             case OP_BIND_VSTREAM: { const p_bind_vstream *b = (const p_bind_vstream *)a; memcpy(S.stream, b->st, 8 * b->n); S.nstream = b->n; break; }
             case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf t1; const p_bind_vbuf *b = vbuf_rec(h.op, a, &t1); if (b->first >= 0 && b->first + b->n <= 16) memcpy(&S.vbuf[b->first], b->r, sizeof *b->r * b->n); break; }
             case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf t1; const p_bind_buf *b = bind_buf_rec(h.op, a, &t1); if (b->stage < 6 && b->index < 16) S.ubo[b->stage][b->index] = *b; break; }
-            case OP_BIND_SSBO: { const p_bind_buf *b = (const p_bind_buf *)a; if (b->stage < 6 && b->index < 16) S.ssbo[b->stage][b->index] = *b; break; }
+            case OP_BIND_SSBO: { const p_bind_buf *b = (const p_bind_buf *)a; if (b->stage < 6 && b->index < 16) { S.ssbo[b->stage][b->index] = *b; g_bgen[b->stage] = g_bgen_next++; } break; }
             case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: {
                 p_bind_handles t1; const p_bind_handles *b = bind_rec(h.op, a, &t1); uint64_t hh[32]; memcpy(hh, b->h, 8 * (b->n < 32 ? b->n : 32));
                 if (b->defer && b->src) memcpy(hh, (const void *)(uintptr_t)b->src, 8 * (b->n < 32 ? b->n : 32));   // BindTexturesDeferred: the handles as they are now
                 uint64_t *dst = h.op == OP_BIND_TEX || h.op == OP_BIND_TEX1 ? S.tex[b->stage] : h.op == OP_BIND_SAMP ? S.samp[b->stage] : S.img[b->stage];
                 int lim = h.op == OP_BIND_TEX || h.op == OP_BIND_TEX1 ? NTEX : h.op == OP_BIND_SAMP ? 128 : 32;
-                if (b->stage < 6 && b->first >= 0 && b->first + b->n <= lim) memcpy(dst + b->first, hh, 8 * b->n);
+                if (b->stage < 6 && b->first >= 0 && b->first + b->n <= lim) { memcpy(dst + b->first, hh, 8 * b->n); g_bgen[b->stage] = g_bgen_next++; }
                 break;
             }
             case OP_STENCIL: { const p_stencil *b = (const p_stencil *)a; for (int f = 0; f < 2; f++) if (b->face & (1 << f)) { if (b->which == 0) S.st_vmask[f] = b->value_mask; else if (b->which == 1) S.st_wmask[f] = b->mask; else S.st_ref[f] = b->ref; } break; }
@@ -3481,7 +3519,7 @@ uint64_t mtl_sub_commit(void) {
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 2, cbs, 0, NULL};
     VKCHECK(vkResetFences(g_dev, 1, &C->fence));
     VkTimelineSemaphoreSubmitInfo ts = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO}; uint64_t wv, sv; VkPipelineStageFlags wst = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    pthread_mutex_lock(&g_qmu);
+    lk_(&g_qmu, LW_QMU);
     // The game's submissions are ordered among themselves by the barrier each begins with (one queue: a barrier waits for everything submitted before it). Each still signals the
     // timeline (the present waits for the frame's last one), but waits on it only after a present: the Mali-G57 did not keep a present's blit in order with what followed, and a
     // semaphore wait on every one of Unreal's ~9 submissions a frame left the Adreno 825 idle between them (GPU 10% busy at 19 fps)
@@ -3491,12 +3529,12 @@ uint64_t mtl_sub_commit(void) {
     uint64_t ts0 = now_ns(); VkResult r = vkQueueSubmit(g_q, 1, &si, C->fence); g_t_sub += now_ns() - ts0; pthread_mutex_unlock(&g_qmu);
     { static uint64_t nsub; nsub++; extern uint64_t g_nsub_stat; g_nsub_stat = nsub; }
     if (r != VK_SUCCESS) { trace_dump("submission failed"); die("Vulkan: submission failed (%d)", (int)r); }
-    pthread_mutex_lock(&g_mu); g_pend[g_npend++] = g_ci; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    lk_(&g_mu, LW_MU); g_pend[g_npend++] = g_ci; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
     return fence;
 }
 uint64_t mtl_last_fence(void) { return g_fence; }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
-    pthread_mutex_lock(&g_mu);
+    lk_(&g_mu, LW_MU);
     if (timeout_ns == UINT64_MAX || timeout_ns > 60ull * 1000000000ull) { while (g_done < fence) pthread_cond_wait(&g_cv, &g_mu); }
     else {
         struct timespec t; clock_gettime(CLOCK_REALTIME, &t); uint64_t ns = (uint64_t)t.tv_nsec + timeout_ns; t.tv_sec += (time_t)(ns / 1000000000ull); t.tv_nsec = (long)(ns % 1000000000ull);
@@ -3515,7 +3553,7 @@ static void shot(const tex_t *t, uint64_t n) {
     char key[24]; snprintf(key, sizeof key, ",%llu,", (unsigned long long)n); char hay[1024]; snprintf(hay, sizeof hay, ",%s,", list);
     if (!strstr(hay, key)) return;
     mtl_finish();
-    pthread_mutex_lock(&g_rmu); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
+    lk_(&g_rmu, LW_RMU); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
     if (!v || (v->f.f != VK_FORMAT_R8G8B8A8_UNORM && v->f.f != VK_FORMAT_R8G8B8A8_SRGB && v->f.f != VK_FORMAT_B8G8R8A8_UNORM)) { LOG("[RED] vk: frame %llu: the presented texture is not an 8-bit RGBA image (%s)", (unsigned long long)n, v ? "format" : "never drawn"); return; }
     uint32_t w = v->w, h = v->h; VkDeviceMemory m; void *px;
     VkBuffer b = buf_new((VkDeviceSize)w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &m, &px);
@@ -3556,7 +3594,7 @@ static void rt_dump(uint64_t n, int force) {
     const char *base = getenv("DM_VK_SHOT_DIR"); if (!base) base = ".";
     char dir[512]; if (cnt > 1) { snprintf(dir, sizeof dir, "%s/f%llu", base, (unsigned long long)n); mkdir(dir, 0777); chmod(dir, 0777); } else snprintf(dir, sizeof dir, "%s", base);
     mtl_finish(); int nd = 0;
-    pthread_mutex_lock(&g_rmu);
+    lk_(&g_rmu, LW_RMU);
     for (int hsh = 0; hsh < NHASH; hsh++) for (vtex *v = g_tex[hsh]; v; v = v->next) {
         int bpp = rt_bpp(v->f.f); if (!v->img) continue; if (!(v->gpu || (getenv("DM_VK_RTDUMP_DEC") && v->f.dec >= DEC_BC4)) || !bpp || !(v->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) continue;
         VkDeviceMemory m; void *px; VkDeviceSize sz = (VkDeviceSize)v->w * v->h * bpp;
@@ -3586,7 +3624,7 @@ static const char *tf_name(VkSurfaceTransformFlagBitsKHR t) {
 }
 static void win_drop(void) {
     // the queue is externally synchronized: no submission while the device drains
-    if (W.sc) { pthread_mutex_lock(&g_qmu); vkDeviceWaitIdle(g_dev); pthread_mutex_unlock(&g_qmu); for (uint32_t i = 0; i < W.n; i++) vkDestroyImageView(g_dev, W.view[i], NULL); vkDestroySwapchainKHR(g_dev, W.sc, NULL); W.sc = VK_NULL_HANDLE; }
+    if (W.sc) { lk_(&g_qmu, LW_QMU); vkDeviceWaitIdle(g_dev); pthread_mutex_unlock(&g_qmu); for (uint32_t i = 0; i < W.n; i++) vkDestroyImageView(g_dev, W.view[i], NULL); vkDestroySwapchainKHR(g_dev, W.sc, NULL); W.sc = VK_NULL_HANDLE; }
     if (W.surf) { vkDestroySurfaceKHR(g_inst, W.surf, NULL); W.surf = VK_NULL_HANDLE; }
 }
 static int win_make(ANativeWindow *aw) {
@@ -3807,7 +3845,7 @@ static void win_present(const tex_t *t, const int crop[4]) {
     aw = front_native_window(&gen);
     if (!aw || gen != W.gen) { win_drop(); W.gen = gen; if (aw) win_make(aw); }
     if (!aw || !W.sc) { front_window_lock(0); return; }
-    pthread_mutex_lock(&g_rmu); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
+    lk_(&g_rmu, LW_RMU); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
     if (!v) { front_window_lock(0); return; }
     typeof(g_pres[0]) *P_ = &g_pres[g_pi]; g_pi = (g_pi + 1) % NPRES;
     { uint64_t w0 = now_ns(); vkWaitForFences(g_dev, 1, &P_->fence, VK_TRUE, UINT64_MAX); atomic_fetch_add(&g_pwait_ns, now_ns() - w0); }
@@ -3842,7 +3880,7 @@ static void win_present(const tex_t *t, const int crop[4]) {
     VkTimelineSemaphoreSubmitInfo ts = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, NULL, 2, wv, 2, sv};
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, g_tl ? &ts : NULL, g_tl ? 2 : 1, wsem, ws, 1, &cb, g_tl ? 2 : 1, ssem};
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &P_->done, 1, &W.sc, &idx, NULL};
-    pthread_mutex_lock(&g_qmu);
+    lk_(&g_qmu, LW_QMU);
     if (g_tl) { wv[1] = g_tlv; sv[1] = ++g_tlv; g_after_present = 1; }
     vkQueueSubmit(g_q, 1, &si, P_->fence); r = vkQueuePresentKHR(g_q, &pi); pthread_mutex_unlock(&g_qmu);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.gen = -1; W.why = "out of date at present"; } else if (r == VK_SUBOPTIMAL_KHR && W.gen != -1) win_suboptimal();
@@ -3897,7 +3935,7 @@ static void pw_draw(uint32_t done, uint32_t total) {   // one frame of the pre-w
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &P_->acq, &ws, 1, &cb, 1, &P_->done};
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &P_->done, 1, &W.sc, &idx, NULL};
-    pthread_mutex_lock(&g_qmu); vkQueueSubmit(g_q, 1, &si, P_->fence); r = vkQueuePresentKHR(g_q, &pi); pthread_mutex_unlock(&g_qmu);
+    lk_(&g_qmu, LW_QMU); vkQueueSubmit(g_q, 1, &si, P_->fence); r = vkQueuePresentKHR(g_q, &pi); pthread_mutex_unlock(&g_qmu);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.gen = -1; W.why = "out of date at present"; } else if (r == VK_SUBOPTIMAL_KHR && W.gen != -1) win_suboptimal();
     front_window_lock(0);
 }
@@ -3989,7 +4027,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                                     (unsigned long long)n, (unsigned long long)g_stat_draws, (unsigned long long)g_stat_skip, (unsigned long long)g_skip_why[0], (unsigned long long)g_skip_why[1], (unsigned long long)g_skip_why[2],
                                     (unsigned long long)g_skip_why[3], (unsigned long long)g_skip_why[4], (unsigned long long)g_skip_why[5], (unsigned long long)g_skip_why[6], g_npso, g_nsh);
     if (n % 600 == 0 && getenv("DM_VK_TEXCOUNT")) {   // diagnostics: live textures by kind, and how many share their storage start with an older one
-        int ng = 0, nu = 0, nn = 0, dup = 0; pthread_mutex_lock(&g_rmu);
+        int ng = 0, nu = 0, nn = 0, dup = 0; lk_(&g_rmu, LW_RMU);
         for (int h = 0; h < NHASH; h++) for (vtex *v = g_tex[h]; v; v = v->next) {
             if (v->gpu) ng++; else if (v->uploaded) nu++; else nn++;
             for (int h2 = 0; h2 < NHASH && v->mem; h2++) for (vtex *o = g_tex[h2]; o; o = o->next) if (o != v && o->mem == v->mem && o->serial < v->serial && o->w == v->w && o->nvn_fmt == v->nvn_fmt) { dup++; h2 = NHASH; break; }
@@ -3997,7 +4035,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         pthread_mutex_unlock(&g_rmu);
         LOG("vk: live textures: %d rendered to, %d uploaded, %d neither; %d on the storage of an older one of the same size and format", ng, nu, nn, dup);
     }
-    if (n % 600 == 0) { uint64_t live = 0, held = 0; int nb = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) { nb++; held += g_blk[i].size; live += g_blk[i].live; } pthread_mutex_unlock(&g_blkmu);
+    if (n % 600 == 0) { uint64_t live = 0, held = 0; int nb = 0; lk_(&g_blkmu, LW_BLKMU); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) { nb++; held += g_blk[i].size; live += g_blk[i].live; } pthread_mutex_unlock(&g_blkmu);
                         LOG("vk: image memory: %d blocks of 64 MB (%.0f MB, %llu live images in them), big images %.0f MB now; rings %.0f MB extra", nb, held / 1048576.0, (unsigned long long)live, atomic_load(&g_big_bytes) / 1048576.0, atomic_load(&g_extra_ring_bytes) / 1048576.0); }
     if (n % 600 == 0 && g_fb_copies) LOG("vk: same-pass feedback snapshots so far: %llu", (unsigned long long)g_fb_copies);
     if (n % 600 == 0) LOG("vk: texture slots read as black so far: no handle %llu, handle not registered %llu, texture not created %llu, no view %llu; lookups of a dead texture object %llu (registrations of one %llu)", (unsigned long long)g_tex_miss[0],
@@ -4013,16 +4051,19 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             g_t_stale / 600e6, g_stale_bytes / 600.0 / 1048576.0, g_t_patch / 600e6, g_npatch / 600.0, g_patch_regions / 600.0, g_t_split / 600e6, g_vid_push / 600.0, g_vid_nz / 600.0, g_gw_calls / 600.0, g_gw_quick / 600.0, g_gw_walked / 600.0);
         g_wb_words = g_wb_bytes = 0; g_t_stale = g_stale_bytes = 0; g_t_patch = g_patch_regions = g_npatch = 0; g_vid_push = g_vid_nz = 0; g_t_split = 0; g_gw_calls = g_gw_quick = g_gw_walked = 0;
         { double miss_us = g_dsc_nmiss_t ? g_dsc_miss_ns / 1e3 / g_dsc_nmiss_t : 0;
-          LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame; texture storage scans %.1f a frame, %.1f left out as uploaded this frame (DM_VK_DIRTY_ONCE %d)",
-              dset_cache2(), g_dsc_hit / 600.0, g_dsc_miss / 600.0, miss_us, g_dsc_rej / 600.0, g_memo_hit / 600.0, g_memo_miss / 600.0, g_dsc_hit * miss_us / 1e3 / 600.0, g_dirty_scans / 600.0, g_dirty_skips / 600.0, dirty_once());
-          g_memo_hit = g_memo_miss = g_dsc_rej = g_dsc_miss_ns = g_dsc_nmiss_t = 0; g_dirty_scans = g_dirty_skips = 0; }
+          LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame; texture storage scans %.1f a frame, %.1f left out as uploaded this frame (DM_VK_DIRTY_ONCE %d); driver segments taken as built %.1f, built %.1f (DM_VK_SEG_CACHE %d)",
+              dset_cache2(), g_dsc_hit / 600.0, g_dsc_miss / 600.0, miss_us, g_dsc_rej / 600.0, g_memo_hit / 600.0, g_memo_miss / 600.0, g_dsc_hit * miss_us / 1e3 / 600.0, g_dirty_scans / 600.0, g_dirty_skips / 600.0, dirty_once(), g_segc_hit / 600.0, g_segc_miss / 600.0, seg_cache_on());
+          g_memo_hit = g_memo_miss = g_dsc_rej = g_dsc_miss_ns = g_dsc_nmiss_t = 0; g_dirty_scans = g_dirty_skips = 0; g_segc_hit = g_segc_miss = 0;
+          static const char *const lwn[LW_N] = {"textures (rmu)", "GPU-written ranges (gwmu)", "contexts (mu)", "queue (qmu)", "image blocks (blkmu)"}; char lb[512]; int lo = 0;
+          for (int k = 0; k < LW_N; k++) lo += snprintf(lb + lo, sizeof lb - lo, "%s%s %.2f ms (%.1f)", k ? ", " : "", lwn[k], atomic_exchange(&g_lw_ns[k], 0) / 600e6, atomic_exchange(&g_lw_n[k], 0) / 600.0);
+          LOG("vk: lock waits per frame over the last 600, all threads: %s", lb); }
         ls = g_nsub_stat; g_t_draw = g_t_ws = g_t_disp = g_t_up = g_t_sub = 0; g_up_bytes = 0; g_dsc_hit = g_dsc_miss = 0; }
     if (n % 600 == 0) {   // memory: the process (RSS, its anonymous part, PSS) and what the backend holds
         long rss = 0, anon = 0, pss = 0; char ln[256]; FILE *f = fopen("/proc/self/status", "re");
         if (f) { while (fgets(ln, sizeof ln, f)) { sscanf(ln, "VmRSS: %ld", &rss); sscanf(ln, "RssAnon: %ld", &anon); } fclose(f); }
         static long pss_last; if (n % 6000 == 0 && (f = fopen("/proc/self/smaps_rollup", "re"))) { while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "Pss: %ld", &pss_last) == 1) break; fclose(f); }   // every 6000 frames: smaps_rollup walks every mapping of the process (the fixed hibernation layout's tens of GB), a 70 ms frame each time it was read every 600
         pss = pss_last;
-        int nb = 0; pthread_mutex_lock(&g_blkmu); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) nb++; pthread_mutex_unlock(&g_blkmu);
+        int nb = 0; lk_(&g_blkmu, LW_BLKMU); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) nb++; pthread_mutex_unlock(&g_blkmu);
         long cached = 0, avail = 0; if ((f = fopen("/proc/meminfo", "re"))) { while (fgets(ln, sizeof ln, f)) { sscanf(ln, "Cached: %ld", &cached); sscanf(ln, "MemAvailable: %ld", &avail); } fclose(f); }
         extern _Atomic uint64_t g_fs_dropped;
         LOG("vk: memory: process RSS %.0f MB (anonymous %.0f MB), PSS %.0f MB; Vulkan rings %.0f MB + extra %.0f MB, image blocks %d x 64 MB, big images %.0f MB, %d descriptor pools;"
@@ -4039,7 +4080,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0) gsig_report(600);
     if (n % 600 == 0) {   // the host heap (malloc) and what the backend keeps in it, to attribute the process's native heap (dumpsys meminfo)
         struct mallinfo mi = mallinfo(); int nt = 0, nv = 0, live = 0; uint64_t snap = 0, xc = 0;
-        pthread_mutex_lock(&g_rmu); for (int hh = 0; hh < NHASH; hh++) for (vtex *v = g_tex[hh]; v; v = v->next) { nt++; nv += v->nviews; } pthread_mutex_unlock(&g_rmu);
+        lk_(&g_rmu, LW_RMU); for (int hh = 0; hh < NHASH; hh++) for (vtex *v = g_tex[hh]; v; v = v->next) { nt++; nv += v->nviews; } pthread_mutex_unlock(&g_rmu);
         pthread_mutex_lock(&g_psomu); for (uint32_t i = 0; i < g_psot_cap; i++) if (g_psot[i] && atomic_load(&g_psot[i]->state) == 1 && g_psot[i]->p) live++; pthread_mutex_unlock(&g_psomu);
         pthread_mutex_lock(&g_snapmu); snap = g_snap_kept; pthread_mutex_unlock(&g_snapmu); pthread_mutex_lock(&g_xcmu); xc = g_xc_bytes; pthread_mutex_unlock(&g_xcmu);
         LOG("vk: host heap: %.0f MB in use (malloc's own count, %.0f MB mapped); the backend: %d textures (%d views), %d pipelines alive of %d known, %d shaders, snapshot pool %.0f MB, extra rings kept %.0f MB",
