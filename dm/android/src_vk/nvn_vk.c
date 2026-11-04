@@ -4296,6 +4296,8 @@ int dm_vk_prewarm(void) {   // the front end, before the game's main: 0 when the
 // 16.7 ms target, and on Android 15 and later the GPU's part too, so the governors raise the CPU and GPU clocks for a game that keeps missing its target. GameTurbo showed the GPU
 // 12% busy at 30 fps: the GPU clock stayed low, and our GPU timestamps grew with it. Looked up at run time (API 33 / 35 functions)
 #include <dlfcn.h>
+#include <dirent.h>
+#include <stdbool.h>
 #include <sys/syscall.h>
 static uint64_t g_adpf_n, g_adpf_fail, g_adpf_cpu, g_adpf_gpu; static int g_adpf_err, g_adpf_v2;   // reports made, failed (and the last error), their CPU / GPU sums (the 600-frame line)
 // Clocks and heat (vk19.45), every 600 frames: Run G ran at half the GPU and CPU time of the same build and scene another time, most likely with the device's performance mode
@@ -4318,7 +4320,25 @@ static void clock_line(void) {
     int ts = tm && st ? st(tm) : -1; float hd = tm && hr ? hr(tm, 0) : -1.0f;
     LOG("vk: clocks: CPU MHz by core %s; GPU %ld MHz; thermal status %d, headroom %.2f; game mode %d; this thread on core %d", b, g, ts, (double)hd, dm_game_mode, sched_getcpu());
 }
+// DM_ADPF_ALL=1 (vk19.50, opt-in): the hint session holds every hot thread, not only the one that presents: the game's RHIThread, RenderThread, GameThread and RHIInterrupt, our
+// dm-complete and dm-record (found by name in /proc/self/task, again every 600 frames: APerformanceHint_setThreads, API 34), asks not to be run for power efficiency
+// (APerformanceHint_setPreferPowerEfficiency(false), API 35), and on a frame over 1.5 times the target says the work grew (APerformanceHint_notifyWorkloadIncrease, API 36), at most
+// once a second. The clocks sagged to 787 MHz on the gold cores and 1.67 GHz on the prime one while the session reported 43 ms against 16.7. No core is named anywhere
+static int adpf_all(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_ADPF_ALL"); v = e && atoi(e) != 0; } return v; }
+static int adpf_tids(int32_t *out, int max, char *names, size_t nn) {   // the hot threads by name, this one first
+    static const char *const want[] = {"RHIThread", "RenderThread", "GameThread", "RHIInterrupt", "dm-complete", "dm-record"};
+    int n = 0; out[n++] = (int32_t)syscall(SYS_gettid); size_t o = 0; if (nn) names[0] = 0;
+    DIR *d = opendir("/proc/self/task"); if (!d) return n;
+    for (struct dirent *e; (e = readdir(d)) && n < max;) {
+        int tid = atoi(e->d_name); if (tid <= 0 || tid == out[0]) continue;
+        char pth[64], cm[32] = ""; snprintf(pth, sizeof pth, "/proc/self/task/%d/comm", tid); FILE *f = fopen(pth, "re"); if (!f) continue;
+        if (fgets(cm, sizeof cm, f)) cm[strcspn(cm, "\n")] = 0; fclose(f);
+        for (size_t k = 0; k < sizeof want / sizeof *want; k++) if (strstr(cm, want[k])) { out[n++] = tid; if (o < nn) o += (size_t)snprintf(names + o, nn - o, "%s%s", o ? ", " : "", cm); break; }
+    }
+    closedir(d); return n;
+}
 static void adpf_frame(uint64_t cpu_ns, uint64_t gpu_ns) {
+    static int (*set_threads)(void *, const int32_t *, size_t); static int (*notify_up)(void *, bool, bool, const char *); static uint64_t last_up, nframe;
     static int state; static void *session; static void *(*mk_work)(void); static void (*w_start)(void *, int64_t), (*w_total)(void *, int64_t), (*w_cpu)(void *, int64_t), (*w_gpu)(void *, int64_t), (*w_free)(void *);
     static int (*report)(void *, int64_t); static int (*report2)(void *, void *);
     if (state < 0) return;
@@ -4333,11 +4353,24 @@ static void adpf_frame(uint64_t cpu_ns, uint64_t gpu_ns) {
         w_start = (void (*)(void *, int64_t))dlsym(h, "AWorkDuration_setWorkPeriodStartTimestampNanos"); w_total = (void (*)(void *, int64_t))dlsym(h, "AWorkDuration_setActualTotalDurationNanos");
         w_cpu = (void (*)(void *, int64_t))dlsym(h, "AWorkDuration_setActualCpuDurationNanos"); w_gpu = (void (*)(void *, int64_t))dlsym(h, "AWorkDuration_setActualGpuDurationNanos");
         if (!getm || !mks || !report) { LOG("[RED] vk: ADPF: the performance hint functions are missing (API 33+)"); return; }
-        void *m = getm(); int32_t tid = (int32_t)syscall(SYS_gettid);
-        if (!m || !(session = mks(m, &tid, 1, 16666667))) { LOG("[RED] vk: ADPF: no hint session (manager %p): the device gives none, the clocks follow their own governor", m); return; }
+        void *m = getm(); int32_t tids[16]; char nm[256] = ""; int nt = adpf_all() ? adpf_tids(tids, 16, nm, sizeof nm) : (tids[0] = (int32_t)syscall(SYS_gettid), 1);
+        if (!m || !(session = mks(m, tids, (size_t)nt, 16666667))) { LOG("[RED] vk: ADPF: no hint session (manager %p): the device gives none, the clocks follow their own governor", m); return; }
         g_adpf_v2 = report2 && mk_work && w_gpu;
-        state = 1; LOG("vk: ADPF hint session for the render thread (tid %d), target 16.7 ms%s", tid, report2 && mk_work && w_gpu ? ", with the GPU's work (Android 15)" : "");
+        state = 1; LOG("vk: ADPF hint session for %d thread%s (tid %d%s%s), target 16.7 ms%s", nt, nt > 1 ? "s" : "", tids[0], nt > 1 ? " and " : "", nm, report2 && mk_work && w_gpu ? ", with the GPU's work (Android 15)" : "");
+        if (adpf_all()) {
+            set_threads = (int (*)(void *, const int32_t *, size_t))dlsym(h, "APerformanceHint_setThreads");
+            int (*pref)(void *, bool) = (int (*)(void *, bool))dlsym(h, "APerformanceHint_setPreferPowerEfficiency");
+            notify_up = (int (*)(void *, bool, bool, const char *))dlsym(h, "APerformanceHint_notifyWorkloadIncrease");
+            int rp = pref ? pref(session, false) : -1;
+            LOG("vk: ADPF (DM_ADPF_ALL): setThreads %s, setPreferPowerEfficiency(false) %s (%d), notifyWorkloadIncrease %s", set_threads ? "available" : "missing (API 34)", pref ? "called" : "missing (API 35)", rp, notify_up ? "available" : "missing (API 36)");
+        }
     }
+    nframe++;
+    if (adpf_all() && set_threads && nframe % 600 == 0) {   // threads come and go (the record thread, a new RHI thread after a reset): the list again
+        int32_t tids[16]; char nm[256] = ""; int nt = adpf_tids(tids, 16, nm, sizeof nm); int r = set_threads(session, tids, (size_t)nt);
+        static int nl; if (nl++ < 6 || r) LOG("vk: ADPF threads now %d (%s): setThreads %d", nt, nm, r);
+    }
+    if (adpf_all() && notify_up && cpu_ns > 25000000ull) { uint64_t t = now_ns(); if (t - last_up > 1000000000ull) { last_up = t; int r = notify_up(session, true, gpu_ns > 25000000ull, "frame over target"); static int nl; if (nl++ < 3) LOG("vk: ADPF notifyWorkloadIncrease %d", r); } }
     if (report2 && mk_work && w_start && w_total && w_cpu && w_gpu) {
         void *w = mk_work(); if (!w) return;
         uint64_t now = now_ns(), tot = cpu_ns > gpu_ns ? cpu_ns : gpu_ns;
