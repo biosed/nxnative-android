@@ -2740,7 +2740,13 @@ static VkDescriptorSet write_set(shader_t *s, int stage) { uint64_t t0 = stat_ns
 // bind; a buffer other than the set's means a new set), and its textures are touched as tex_get would: kept from eviction for this submission, the vertex-hazard and deferral
 // checks; one evicted, written since its upload, or not yet checked this submission sends the draw down the full path. Sets with storage buffers or images, texel buffers,
 // bindless (dyn) slots, same-pass feedback snapshots, compute, or a pass log are never reused this way
-typedef struct { const shader_t *s; uint64_t bgen, reg, bvgen; int64_t tb, sb; VkDescriptorSet ds; int ok; int nd; uint16_t di[16]; VkBuffer db[16]; VkDeviceSize dr[16]; int nv; vtex *v[64]; } wsc_t;
+// ck: bindings checked again on reuse (vk19.43): a uniform texel buffer element (its view resolved again: the same view, or a new set) and a storage buffer a draw stage only
+// reads (its buffer, offset and range resolved again: the same, or a new set)
+typedef struct { uint8_t kind; uint16_t i, e; VkBufferView v; VkBuffer b; VkDeviceSize off, range; } wck_t;
+typedef struct { const shader_t *s; uint64_t bgen, reg, bvgen; int64_t tb, sb; VkDescriptorSet ds; int ok; int nd; uint16_t di[16]; VkBuffer db[16]; VkDeviceSize dr[16]; int nv; vtex *v[64]; int nck; wck_t ck[16]; } wsc_t;
+enum { WSC_NF_SIMG, WSC_NF_STB, WSC_NF_TB, WSC_NF_SSBO, WSC_NF_TEXU, WSC_NF_UBO, WSC_NF_MANY, WSC_NF_N };
+static uint64_t g_wsc_nf[WSC_NF_N];
+static VkBufferView tbuf_view(int stage, uint64_t h, int storage);
 static wsc_t g_wsc[6]; static uint64_t g_wsc_hit, g_wsc_miss, g_wsc_nofit;
 static int stage_reuse(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STAGE_REUSE"); v = !e || atoi(e) != 0; LOG("vk: DM_VK_STAGE_REUSE=%d", v); } return v; }
 static int dyn_resolve(shader_t *s, int stage, int i, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range);
@@ -2752,6 +2758,13 @@ static VkDescriptorSet wsc_try(shader_t *s, int stage) {
         if (v->evicted || v->dirty || v->dead || (!v->gpu && v->span && v->clean_gen != g_bvgen && !(v->reup_frame && v->reup_frame == pres && !v->late))) return VK_NULL_HANDLE; }
     uint32_t dy[16];
     for (int k = 0; k < c->nd; k++) { VkBuffer b; VkDeviceSize o, r; if (!dyn_resolve(s, stage, c->di[k], &b, &o, &r) || b != c->db[k] || r != c->dr[k]) return VK_NULL_HANDLE; dy[k] = (uint32_t)o; }
+    for (int k = 0; k < c->nck; k++) { const wck_t *q = &c->ck[k]; const sbind *b = &s->b[q->i];
+        if (q->kind == 0) { int r = b->reg + q->e; uint64_t h = b->kind == K_TBUF ? S.tex[stage][r] : S.img[stage][r]; if (tbuf_view(stage, h, 0) != q->v) return VK_NULL_HANDLE; }
+        else { const p_bind_buf *u = b->kind == K_SBUF ? &S.ssbo[stage][b->reg] : &S.ubo[stage][b->reg]; VkBuffer gb = VK_NULL_HANDLE; VkDeviceSize go = 0;
+               VkDeviceSize al = b->type == BT_UBO ? g_props.limits.minUniformBufferOffsetAlignment : g_props.limits.minStorageBufferOffsetAlignment; if (!al) al = 256;
+               if (u->addr && u->size && gw_find(u->addr, u->size, al, &gb, &go, NULL)) {}
+               else if (u->addr && u->size) { go = copy_in(u->addr, u->size, 256); if (go == VK_WHOLE_SIZE) return VK_NULL_HANDLE; gb = C->ring; }
+               if (gb != q->b || go != q->off || u->size != q->range) return VK_NULL_HANDLE; } }
     for (int k = 0; k < c->nv; k++) { vtex *v = c->v[k]; v->last_frame = pres; v->last_fence = g_fence + 1;
         if (stage == 0 && v->vhaz && v->vhaz_epoch == g_vbar_epoch) g_vs_haz = 1;
         if (g_ndefer && v->dfr_gen == g_defer_gen) g_defer_haz = 1; }
@@ -2846,10 +2859,12 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
             }
             x->pBufferInfo = d;
             if (fit) { if (s->dynu[i] && cnt == 1 && (b->kind == K_CBUF || b->kind == K_C1 || b->kind == K_DRVCB) && nc.nd < 16) { nc.di[nc.nd] = (uint16_t)i; nc.db[nc.nd] = d->buffer; nc.dr[nc.nd] = d->range; nc.nd++; }
-                       else if (s->dynu[i] || b->kind != K_SUPPORT) fit = 0; }
+                       else if (!s->dynu[i] && cnt == 1 && (b->kind == K_SBUF || b->kind == K_UBOP) && b->reg >= 0 && b->reg < 16 && !s->ssbo_wr && nc.nck < 16)   // a storage (or pointer-bound uniform) buffer a draw stage only reads
+                           nc.ck[nc.nck++] = (wck_t){1, (uint16_t)i, 0, VK_NULL_HANDLE, d->buffer, d->offset, d->range};
+                       else if (s->dynu[i] || b->kind != K_SUPPORT) { fit = 0; g_wsc_nf[nc.nck >= 16 || nc.nd >= 16 ? WSC_NF_MANY : (b->kind == K_SBUF || b->kind == K_UBOP) ? WSC_NF_SSBO : WSC_NF_UBO]++; } }
             if (s->dynu[i]) { x->descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; g_dyno[g_ndyno++] = (uint32_t)d->offset; d->offset = 0; }   // the offset goes with the bind
         } else if (b->type == BT_CIS || b->type == BT_TEX || b->type == BT_SAMP || b->type == BT_SIMG) {
-            int simg = b->type == BT_SIMG; if (simg || b->skind == S_SAMP_UBO) fit = 0;
+            int simg = b->type == BT_SIMG; if (fit && (simg || b->skind == S_SAMP_UBO)) { fit = 0; g_wsc_nf[simg ? WSC_NF_SIMG : WSC_NF_TEXU]++; }
             for (uint32_t e = 0; e < cnt; e++) {
                 VkSampler sm = b->type == BT_TEX || simg ? VK_NULL_HANDLE : g_dummy_samp; VkImageView view = b->type == BT_SAMP ? VK_NULL_HANDLE : simg ? g_dummy_simg_view : g_dummy_view;
                 uint64_t th = 0; int have = 0;
@@ -2857,7 +2872,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                 if (b->type != BT_SAMP && !simg && (dyn || (b->kind == K_TEX && b->reg >= 0 && b->reg + (int)e < NTEX) || (b->kind == K_TEXU && cnt == 1))) {
                     th = dyn ? dyn_slot(stage, (int)e) : b->kind == K_TEXU ? texu_slot(stage, b) : S.tex[stage][b->reg + e]; have = !dyn;
                     int ok; vtex *tv; view = tex_slot(stage, th, &sm, &ok, &tv);
-                    if (fit) { if (b->kind == K_TEXU) fit = 0; else if (tv) { if (nc.nv < 64) nc.v[nc.nv++] = tv; else fit = 0; } }
+                    if (fit) { if (b->kind == K_TEXU) { fit = 0; g_wsc_nf[WSC_NF_TEXU]++; } else if (tv) { if (nc.nv < 64) nc.v[nc.nv++] = tv; else { fit = 0; g_wsc_nf[WSC_NF_MANY]++; } } }
                     if (stage == 0 && tv && tv->vhaz && tv->vhaz_epoch == g_vbar_epoch) g_vs_haz = 1;   // written by a pass whose end barrier left vertex shaders out (DM_VK_PASS_BARRIER)
                     if (tv && g_ndefer && tv->dfr_gen == g_defer_gen) g_defer_haz = 1;   // a storage image a deferred dispatch writes (defer_on)
                     if (stage == 5 && tv && P.open && ws_is_att(tv)) g_ws_att = 1;   // a dispatch sampling the open pass's attachment is not deferred
@@ -2879,12 +2894,14 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
             }
             x->pImageInfo = &ii[ne];
         } else if (b->type == BT_TBUF || b->type == BT_UTB || b->type == BT_STB) {
-            int st = b->type == BT_STB; fit = 0;
+            int st = b->type == BT_STB; if (fit && st) { fit = 0; g_wsc_nf[WSC_NF_STB]++; }
             for (uint32_t e = 0; e < cnt; e++) {
                 VkBufferView v = VK_NULL_HANDLE; int r = b->reg >= 0 ? b->reg + (int)e : -1;
                 if (s->dyn && cnt > 1 && b->reg < 0) { uint64_t h = dyn_slot(stage, (int)e); if (h) v = tbuf_view(stage, h, st); }   // slot k, when it holds a buffer texture
                 else if (b->kind == K_TBUF && r >= 0 && r < NTEX) v = tbuf_view(stage, S.tex[stage][r], st);
                 else if (b->kind == K_IMG && r >= 0 && r < 32) v = tbuf_view(stage, S.img[stage][r], st);
+                if (fit) { if ((b->kind == K_TBUF || b->kind == K_IMG) && r >= 0 && nc.nck < 16) nc.ck[nc.nck++] = (wck_t){0, (uint16_t)i, (uint16_t)e, v};
+                           else { fit = 0; g_wsc_nf[nc.nck >= 16 ? WSC_NF_MANY : WSC_NF_TB]++; } }
                 bv[ne + e] = v ? v : st ? g_dummy_stb : g_dummy_utb; if (!v && r >= 0) g_ws_zero_tb++;
             }
             x->pTexelBufferView = &bv[ne];
@@ -4299,8 +4316,10 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
           LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame; texture storage scans %.1f a frame, %.1f left out as uploaded this frame (DM_VK_DIRTY_ONCE %d); driver segments taken as built %.1f, built %.1f (DM_VK_SEG_CACHE %d); stale patches by dispatch %.2f (%.0f runs); held reads %.1f, their writer %.1f submissions back on average, %llu at most; forwarded %.2f (%.2f MB) (DM_VK_GW_FORWARD %d)",
               dset_cache2(), g_dsc_hit / 600.0, g_dsc_miss / 600.0, miss_us, g_dsc_rej / 600.0, g_memo_hit / 600.0, g_memo_miss / 600.0, g_dsc_hit * miss_us / 1e3 / 600.0, g_dirty_scans / 600.0, g_dirty_skips / 600.0, dirty_once(), g_segc_hit / 600.0, g_segc_miss / 600.0, seg_cache_on(), g_patch_disp / 600.0, g_patch_runs / 600.0, g_hold_n / 600.0, g_hold_n ? (double)g_hold_age_sum / g_hold_n : 0.0, (unsigned long long)g_hold_age_max, g_fwd_n / 600.0, g_fwd_bytes / 600.0 / 1048576.0, gw_forward_k());
           g_memo_hit = g_memo_miss = g_dsc_rej = g_dsc_miss_ns = g_dsc_nmiss_t = 0; g_dirty_scans = g_dirty_skips = 0; g_segc_hit = g_segc_miss = 0; g_patch_disp = g_patch_runs = 0; g_hold_n = g_hold_age_sum = g_hold_age_max = 0; g_fwd_n = g_fwd_bytes = 0;
-          LOG("vk: stage-level set reuse per frame over the last 600 (DM_VK_STAGE_REUSE %d): %.1f bound again unresolved, %.1f resolved (%.1f of them not reusable kinds)", stage_reuse(), g_wsc_hit / 600.0, g_wsc_miss / 600.0, g_wsc_nofit / 600.0);
-          g_wsc_hit = g_wsc_miss = g_wsc_nofit = 0;
+          LOG("vk: stage-level set reuse per frame over the last 600 (DM_VK_STAGE_REUSE %d): %.1f bound again unresolved, %.1f resolved (%.1f of them not reusable: storage images %.1f, storage texel buffers %.1f, other texel buffers %.1f, written or odd storage buffers %.1f, handles in uniforms %.1f, other uniforms %.1f, too many %.1f)",
+              stage_reuse(), g_wsc_hit / 600.0, g_wsc_miss / 600.0, g_wsc_nofit / 600.0, g_wsc_nf[WSC_NF_SIMG] / 600.0, g_wsc_nf[WSC_NF_STB] / 600.0, g_wsc_nf[WSC_NF_TB] / 600.0, g_wsc_nf[WSC_NF_SSBO] / 600.0,
+              g_wsc_nf[WSC_NF_TEXU] / 600.0, g_wsc_nf[WSC_NF_UBO] / 600.0, g_wsc_nf[WSC_NF_MANY] / 600.0);
+          g_wsc_hit = g_wsc_miss = g_wsc_nofit = 0; memset(g_wsc_nf, 0, sizeof g_wsc_nf);
           LOG("vk: state per frame over the last 600 (DM_VK_STATE_SKIP %d): pipelines taken as the last draw's %.1f, state commands left out %.1f", state_skip(), g_pso_memo / 600.0, g_state_skips / 600.0); g_pso_memo = g_state_skips = 0;
           static const char *const lwn[LW_N] = {"textures (rmu)", "GPU-written ranges (gwmu)", "contexts (mu)", "queue (qmu)", "image blocks (blkmu)"}; char lb[512]; int lo = 0;
           for (int k = 0; k < LW_N; k++) lo += snprintf(lb + lo, sizeof lb - lo, "%s%s %.2f ms (%.1f)", k ? ", " : "", lwn[k], atomic_exchange(&g_lw_ns[k], 0) / 600e6, atomic_exchange(&g_lw_n[k], 0) / 600.0);
