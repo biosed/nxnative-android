@@ -312,7 +312,7 @@ static VkDeviceSize ring_put(const void *src, VkDeviceSize n, VkDeviceSize align
 // Cost: a partial read takes the whole range's answer first (one compare a submission): a range the CPU left alone is clean in every part of it. DM_VK_STALE_PATCH=0 leaves
 // the comparison out (the GPU's bytes as they are, as before vk19.3). g_t_stale / g_stale_bytes: time and bytes in these compares and patches (the recording line)
 static uint64_t g_t_stale, g_stale_bytes, g_t_patch, g_patch_regions, g_npatch;   // g_t_patch: the part in gw_patch; regions: copy regions it recorded
-static int stale_patch_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STALE_PATCH"); v = e ? atoi(e) : 1; if (v < 0 || v > 2) v = 1;
+static int stale_patch_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STALE_PATCH"); v = e ? atoi(e) : 2; if (v < 0 || v > 2) v = 2;   // 2 by default from vk19.44: checked exact on the GPU (Run I, DM_VK_PATCH_VERIFY)
     if (!v) LOG("DM_VK_STALE_PATCH=0: reads of an earlier submission's GPU-written range take its bytes as they are"); if (v == 2) LOG("DM_VK_STALE_PATCH=2: the CPU's rewrites over GPU-written ranges are put in place by a compute dispatch"); } return v; }
 static int stale_patch_on(void) { return stale_patch_mode() != 0; }
 static int gw_whole_dirty(gw_t *e) {
@@ -2062,7 +2062,8 @@ static VkFramebuffer rp_begin(VkCommandBuffer cb, const rp_desc *d) {
     vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     return fb;
 }
-static void rp_end(VkCommandBuffer cb) { if (g_dynrend) p_end_rendering(cb); else vkCmdEndRenderPass(cb); }
+static void occ_close(VkCommandBuffer cb);
+static void rp_end(VkCommandBuffer cb) { occ_close(cb); if (g_dynrend) p_end_rendering(cb); else vkCmdEndRenderPass(cb); }
 
 // ---------- Replay state ----------
 #define NTEX 256
@@ -2977,17 +2978,32 @@ static void occ_seg(uint64_t addr, int reset) {
     if (n || addr || reset) post_add((post_t){4, NULL, (uint32_t)reset, 0, addr, 1, (const uint8_t *)l, n});
     g_nocc = 0; g_occ_over = 0;
 }
-static uint64_t g_occ_nrep, g_occ_nrst, g_occ_ndraw;   // the frame stats line
-static void occ_reset(void) { g_occ_on = 1; g_occ_nrst++; occ_seg(0, 1); }
-static void occ_report(uint64_t addr) { g_occ_on = 1; g_occ_nrep++; occ_seg(addr, 0); }
+static uint64_t g_occ_nrep, g_occ_nrst, g_occ_ndraw, g_occ_nq;   // the frame stats line
+// DM_VK_OCC_MODE (vk19.44): 0 as before, a query around every draw from the first counter use on (the counter never stopped: ~937 of 1,001 draws a frame in the dungeon, against
+// ~57 reset / report pairs); 1 the same, but counting only from a reset to the report after it; 2 (default) as 1, and one query for each stretch of counted draws in a pass (begun at
+// the first, ended at the pass end, a report or a reset), as the Metal host keeps one visibility slot per pass. Counting stops after a report and starts again at a reset; a report
+// that comes with no reset since the last one (a game that subtracts reports) switches to counting everything, as mode 0, for good
+static int g_occ_q = -1, g_occ_cum;
+static int occ_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_OCC_MODE"); v = e ? atoi(e) : 2; if (v < 0 || v > 2) v = 2; LOG("vk: DM_VK_OCC_MODE=%d", v); } return v; }
+static void occ_close(VkCommandBuffer cb) { if (g_occ_q >= 0) { vkCmdEndQuery(cb, C->oq, (uint32_t)g_occ_q); g_occ_q = -1; } }
+static void occ_reset(void) { if (P.open) occ_close(C->cb); g_occ_on = 1; g_occ_nrst++; occ_seg(0, 1); }
+static void occ_report(uint64_t addr) {
+    if (P.open) occ_close(C->cb);
+    if (occ_mode() && !g_occ_on && !g_occ_cum && g_occ_nrep) { g_occ_cum = 1; LOG("vk: occlusion: a report with no reset since the last one: every draw counted from now on (as DM_VK_OCC_MODE=0)"); }
+    g_occ_nrep++; occ_seg(addr, 0);
+    g_occ_on = !occ_mode() || g_occ_cum;   // paired: nothing counts again until the next reset
+}
 static void occ_flush(void) { if (g_occ_on) occ_seg(0, 0); }   // the end of a submission: its last segment, counted only
 static int occ_begin(VkCommandBuffer cb) {   // the query of the draw about to be made, or -1
     if (!g_occ_on) return -1;
+    if (occ_mode() == 2 && g_occ_q >= 0) { g_occ_ndraw++; return -1; }   // inside this stretch's query
     if (C->noq >= NOQ) { if (!g_occ_over) RED_ONCE(80, "more than %d occlusion-counted draws in one submission: the rest report as visible", NOQ); g_occ_over = 1; return -1; }
     uint32_t q = C->noq++;
     vkCmdBeginQuery(cb, C->oq, q, g_feat.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     if (g_nocc == g_cocc) { g_cocc = g_cocc ? 2 * g_cocc : 256; g_occ = realloc(g_occ, g_cocc * sizeof *g_occ); }
-    g_occ[g_nocc++] = q; g_occ_ndraw++; return (int)q;
+    g_occ[g_nocc++] = q; g_occ_ndraw++; g_occ_nq++;
+    if (occ_mode() == 2) { g_occ_q = (int)q; return -1; }   // ended by occ_close
+    return (int)q;
 }
 static void occ_end(VkCommandBuffer cb, int q) { if (q >= 0) vkCmdEndQuery(cb, C->oq, (uint32_t)q); }
 // A draw that reads what a deferred dispatch writes (g_defer_haz, set while its resources were resolved): the pass ends, which records the deferred dispatches, and begins again;
@@ -3060,7 +3076,11 @@ static int draw_reads_rt(shader_t *vs, shader_t *fs, shader_t *gs) {
 // key and shaders are the same, and the pipeline bind and each piece of dynamic state (viewport, scissor, depth bias, blend constants, the stencil masks and references) are
 // recorded only when they differ from what this command buffer last had. Reset at each submission's start (a new command buffer)
 static struct { shader_t *vs, *fs, *gs; pso_key k; VkPipelineLayout pl; VkPipeline pp, bound; VkViewport vp; VkRect2D sc; float db[3], bc[4]; uint32_t st[2][3];
-                int has_vp, has_sc, has_db, has_bc, has_st[2]; } g_ds_last;
+                int has_vp, has_sc, has_db, has_bc, has_st[2];
+                VkBuffer vb[16]; VkDeviceSize vo[16]; uint32_t vb_ok;   // the vertex buffers bound in this command buffer (vb_ok: which slots)
+                VkBuffer ib; int it; int ib_ok;                     // the index buffer bound (at offset 0: draws index it by firstIndex)
+                VkPipelineLayout dpl; int dn; VkDescriptorSet dsets[2]; uint32_t ndy; uint32_t dy[192]; int ds_ok; } g_ds_last;
+static uint64_t g_bind_skips;
 static uint64_t g_pso_memo, g_state_skips;
 static int state_skip(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STATE_SKIP"); v = !e || atoi(e) != 0; LOG("vk: DM_VK_STATE_SKIP=%d", v); } return v; }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
@@ -3171,8 +3191,15 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (P.dt && ((S.ds.dt && S.ds.dw) || S.ds.st)) P.ddrawn = 1;   // depth writes, or a stencil test (its ops may write)
     VkCommandBuffer cb = C->cb;
     if (!state_skip() || g_ds_last.bound != pp) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp); g_ds_last.bound = pp; } else g_state_skips++;
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, fs ? 2 : 1, sets, ndyno, dyno);
-    if (gs) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 2, 1, &gset, ngdyno, gdyno);
+    {   // the same sets and offsets with the same layout as the last draw: left bound (DM_VK_STATE_SKIP)
+        int dn = fs ? 2 : 1;
+        if (state_skip() && !gs && g_ds_last.ds_ok && g_ds_last.dpl == pl && g_ds_last.dn == dn && g_ds_last.dsets[0] == sets[0] && (dn < 2 || g_ds_last.dsets[1] == sets[1]) && g_ds_last.ndy == ndyno && !memcmp(g_ds_last.dy, dyno, ndyno * 4)) g_bind_skips++;
+        else {
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, dn, sets, ndyno, dyno);
+            if (state_skip() && !gs && ndyno <= 192) { g_ds_last.dpl = pl; g_ds_last.dn = dn; g_ds_last.dsets[0] = sets[0]; g_ds_last.dsets[1] = sets[1]; g_ds_last.ndy = ndyno; memcpy(g_ds_last.dy, dyno, ndyno * 4); g_ds_last.ds_ok = 1; } else g_ds_last.ds_ok = 0;
+        }
+    }
+    if (gs) { vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 2, 1, &gset, ngdyno, gdyno); g_ds_last.ds_ok = 0; }
     // NVN's upper-left origin keeps D3D's y-up clip space; Vulkan's is y-down: the viewport is flipped (negative height)
     float x = 0, y = 0, w = (float)P.w, h = (float)P.h;
     if (S.has_vp) { x = S.vp[0][0]; y = S.vp[0][1]; w = S.vp[0][2]; h = S.vp[0][3]; }
@@ -3230,6 +3257,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (vs->vid) { int32_t bias = (int32_t)vlo; vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 4, &bias); g_vid_push++; if (bias) g_vid_nz++; }   // the shader adds it back to VertexIndex (spv_vid_bias)
     uint32_t used = 0, ext[16] = {0};
     for (int i = 0; i < S.nattr; i++) if (vs->vin_mask >> i & 1) { uint32_t st = S.attr[i].stream, e = S.attr[i].offset + 16; used |= 1u << st; if (e > ext[st]) ext[st] = e; }
+    VkBuffer vbs[16]; VkDeviceSize vos[16];
     for (int s = 0; s < 16; s++) if (used >> s & 1) {
         VkDeviceSize o = 0; VkBuffer b = g_zero_buf;
         uint64_t stride = s < S.nstream ? S.stream[s].stride : 0, size = S.vbuf[s].size, from, to;
@@ -3240,14 +3268,22 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         if (to > size) to = size;
         if (S.vbuf[s].address && to > from && gw_find(S.vbuf[s].address + from, to - from, 1, &b, &o, NULL)) {}   // vertices a dispatch wrote (GPU particles)
         else if (S.vbuf[s].address && to > from) { VkDeviceSize ro = copy_in(S.vbuf[s].address + from, to - from, 16); if (ro != VK_WHOLE_SIZE) { b = C->ring; o = ro; } }
-        vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &b, &o);
+        vbs[s] = b; vos[s] = o;
+    }
+    // one call for each run of consecutive slots that changed (DM_VK_STATE_SKIP): was a call per stream for every draw
+    for (int s = 0; s < 16;) {
+        if (!(used >> s & 1) || (sk && (g_ds_last.vb_ok >> s & 1) && g_ds_last.vb[s] == vbs[s] && g_ds_last.vo[s] == vos[s])) { if (used >> s & 1) g_bind_skips++; s++; continue; }
+        int e = s; while (e < 16 && (used >> e & 1) && !(sk && (g_ds_last.vb_ok >> e & 1) && g_ds_last.vb[e] == vbs[e] && g_ds_last.vo[e] == vos[e])) e++;
+        vkCmdBindVertexBuffers(cb, (uint32_t)s, (uint32_t)(e - s), vbs + s, vos + s);
+        for (int k = s; k < e; k++) { g_ds_last.vb[k] = vbs[k]; g_ds_last.vo[k] = vos[k]; g_ds_last.vb_ok |= 1u << k; }
+        s = e;
     }
     if (ind_b) {   // arguments the GPU writes (ind_args): the records are in the ring where the dispatch leaves them
         if (dw) DRAWQ(vkCmdDrawIndirect(cb, ind_b, ind_o, 1, 16));
         else {
             uint64_t n = pool_left(di->ibuf, 8u << 20); VkDeviceSize o = n ? copy_in(di->ibuf, n, 16) : VK_WHOLE_SIZE;
             if (o == VK_WHOLE_SIZE) { RED_ONCE(38, "a GPU-written indirect indexed draw: its index buffer is not in a known pool"); return; }
-            vkCmdBindIndexBuffer(cb, C->ring, o, isz == 1 ? VK_INDEX_TYPE_UINT8_EXT : isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+            g_ds_last.ib_ok = 0; vkCmdBindIndexBuffer(cb, C->ring, o, isz == 1 ? VK_INDEX_TYPE_UINT8_EXT : isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
             DRAWQ(vkCmdDrawIndexedIndirect(cb, ind_b, ind_o, 1, 20));
         }
     } else if (dw) {
@@ -3256,7 +3292,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             VkDeviceSize o = ring_alloc((VkDeviceSize)nq * 24, 16); if (o == VK_WHOLE_SIZE) return;
             uint32_t *ix = (uint32_t *)(C->ringp + o);
             for (uint32_t q = 0; q < nq; q++) { uint32_t b = q * 4; uint32_t v[6] = {b, b + 1, b + 2, b, b + 2, b + 3}; memcpy(ix + 6 * q, v, 24); }
-            vkCmdBindIndexBuffer(cb, C->ring, o, VK_INDEX_TYPE_UINT32);
+            g_ds_last.ib_ok = 0; vkCmdBindIndexBuffer(cb, C->ring, o, VK_INDEX_TYPE_UINT32);
             DRAWQ(vkCmdDrawIndexed(cb, nq * 6, inst, 0, (int32_t)(dw->first - vlo), (uint32_t)dw->base_instance));
         } else DRAWQ(vkCmdDraw(cb, (uint32_t)dw->count, inst, (uint32_t)(dw->first - vlo), (uint32_t)dw->base_instance));
     } else {
@@ -3267,12 +3303,18 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             uint32_t *ix = (uint32_t *)(C->ringp + o);
             if (nq) for (uint32_t q = 0; q < nq; q++) { uint32_t b = 4 * q; uint32_t v[6] = {IDX(b), IDX(b + 1), IDX(b + 2), IDX(b), IDX(b + 2), IDX(b + 3)}; memcpy(ix + 6 * q, v, 24); }
             else for (uint32_t i = 0; i < n; i++) ix[i] = IDX(i);
-            vkCmdBindIndexBuffer(cb, C->ring, o, VK_INDEX_TYPE_UINT32);
+            g_ds_last.ib_ok = 0; vkCmdBindIndexBuffer(cb, C->ring, o, VK_INDEX_TYPE_UINT32);
             DRAWQ(vkCmdDrawIndexed(cb, out, inst, 0, voff, (uint32_t)di->base_instance));
         } else {
             VkDeviceSize o = copy_in(di->ibuf, (uint64_t)di->count * isz, 16); if (o == VK_WHOLE_SIZE) return;
-            vkCmdBindIndexBuffer(cb, C->ring, o, isz == 1 ? VK_INDEX_TYPE_UINT8_EXT : isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-            DRAWQ(vkCmdDrawIndexed(cb, (uint32_t)di->count, inst, 0, voff, (uint32_t)di->base_instance));
+            VkIndexType it = isz == 1 ? VK_INDEX_TYPE_UINT8_EXT : isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+            if (sk && o % isz == 0 && o / isz <= UINT32_MAX) {   // the ring bound once at offset 0, this draw's indices reached by firstIndex (DM_VK_STATE_SKIP)
+                if (!g_ds_last.ib_ok || g_ds_last.ib != C->ring || g_ds_last.it != (int)it) { vkCmdBindIndexBuffer(cb, C->ring, 0, it); g_ds_last.ib = C->ring; g_ds_last.it = (int)it; g_ds_last.ib_ok = 1; } else g_bind_skips++;
+                DRAWQ(vkCmdDrawIndexed(cb, (uint32_t)di->count, inst, (uint32_t)(o / isz), voff, (uint32_t)di->base_instance));
+            } else {
+                vkCmdBindIndexBuffer(cb, C->ring, o, it); g_ds_last.ib_ok = 0;
+                DRAWQ(vkCmdDrawIndexed(cb, (uint32_t)di->count, inst, 0, voff, (uint32_t)di->base_instance));
+            }
         }
     }
     #undef IDX
@@ -4320,7 +4362,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
               stage_reuse(), g_wsc_hit / 600.0, g_wsc_miss / 600.0, g_wsc_nofit / 600.0, g_wsc_nf[WSC_NF_SIMG] / 600.0, g_wsc_nf[WSC_NF_STB] / 600.0, g_wsc_nf[WSC_NF_TB] / 600.0, g_wsc_nf[WSC_NF_SSBO] / 600.0,
               g_wsc_nf[WSC_NF_TEXU] / 600.0, g_wsc_nf[WSC_NF_UBO] / 600.0, g_wsc_nf[WSC_NF_MANY] / 600.0);
           g_wsc_hit = g_wsc_miss = g_wsc_nofit = 0; memset(g_wsc_nf, 0, sizeof g_wsc_nf);
-          LOG("vk: state per frame over the last 600 (DM_VK_STATE_SKIP %d): pipelines taken as the last draw's %.1f, state commands left out %.1f", state_skip(), g_pso_memo / 600.0, g_state_skips / 600.0); g_pso_memo = g_state_skips = 0;
+          LOG("vk: state per frame over the last 600 (DM_VK_STATE_SKIP %d): pipelines taken as the last draw's %.1f, state commands left out %.1f, binds left out %.1f", state_skip(), g_pso_memo / 600.0, g_state_skips / 600.0, g_bind_skips / 600.0); g_pso_memo = g_state_skips = g_bind_skips = 0;
           static const char *const lwn[LW_N] = {"textures (rmu)", "GPU-written ranges (gwmu)", "contexts (mu)", "queue (qmu)", "image blocks (blkmu)"}; char lb[512]; int lo = 0;
           for (int k = 0; k < LW_N; k++) lo += snprintf(lb + lo, sizeof lb - lo, "%s%s %.2f ms (%.1f)", k ? ", " : "", lwn[k], atomic_exchange(&g_lw_ns[k], 0) / 600e6, atomic_exchange(&g_lw_n[k], 0) / 600.0);
           LOG("vk: lock waits per frame over the last 600, all threads: %s", lb);
@@ -4343,7 +4385,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             rss / 1024.0, anon / 1024.0, pss / 1024.0, atomic_load(&g_ring0_bytes) / 1048576.0, atomic_load(&g_extra_ring_bytes) / 1048576.0, nb, atomic_load(&g_big_bytes) / 1048576.0, atomic_load(&g_ndp_total),
             avail / 1024.0, cached / 1024.0, atomic_load(&g_fs_dropped) / 1048576.0, (unsigned long long)g_evicted, (unsigned long long)g_remade, (unsigned long long)g_late_fill, (unsigned long long)g_late_watch, (unsigned long long)g_mir_b2t, (unsigned long long)g_mir_t2t);
     }
-    if (n % 600 == 0) LOG("vk: occlusion queries so far: %llu samples-passed reports, %llu resets, %llu draws counted", (unsigned long long)g_occ_nrep, (unsigned long long)g_occ_nrst, (unsigned long long)g_occ_ndraw);
+    if (n % 600 == 0) { static uint64_t pr, prs, pd, pq; LOG("vk: occlusion per frame over the last 600 (DM_VK_OCC_MODE %d%s): %.1f samples-passed reports, %.1f resets, %.1f draws counted in %.1f queries", occ_mode(), g_occ_cum ? ", counting everything" : "",
+                          (g_occ_nrep - pr) / 600.0, (g_occ_nrst - prs) / 600.0, (g_occ_ndraw - pd) / 600.0, (g_occ_nq - pq) / 600.0); pr = g_occ_nrep; prs = g_occ_nrst; pd = g_occ_ndraw; pq = g_occ_nq; }
     if (n % 600 == 0) LOG("vk: texel buffer slots read as zeros so far: nothing bound %llu, not a buffer texture %llu, format not usable %llu", (unsigned long long)g_tbuf_miss[0],
                           (unsigned long long)g_tbuf_miss[1], (unsigned long long)g_tbuf_miss[2]);
     if (n % 600 == 0) { uint64_t gp = atomic_exchange(&g_gpu_kind_ns[0], 0), gd = atomic_exchange(&g_gpu_kind_ns[1], 0), gc = atomic_exchange(&g_gpu_kind_ns[2], 0);
