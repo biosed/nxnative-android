@@ -686,7 +686,18 @@ static _Atomic uint64_t g_sync_ns;
 // The thread's core is given up while the host waits on the GPU or submits / presents (hle_thread.c core_serial; weak empty ones for the graphics unit tests, which have no hle_thread.c)
 __attribute__((weak)) void dm_core_leave(void) {}
 __attribute__((weak)) void dm_core_return(void) {}
+#ifdef __ANDROID__
+static void rq_wait_log(const char *what, const void *s, uint64_t fence, int fenced, uint64_t timeout, int result);   // the record thread's first 200 waits (rq_on)
+#endif
+static NVNsyncWaitResult sync_wait_(const NVNsync *s, uint64_t timeout);
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
+    NVNsyncWaitResult r = sync_wait_(s, timeout);
+#ifdef __ANDROID__
+    if (rq_on()) rq_wait_log("SyncWait", s, ((const sync_t *)s)->fence, ((const sync_t *)s)->fenced, timeout, (int)r);
+#endif
+    return r;
+}
+static NVNsyncWaitResult sync_wait_(const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
@@ -749,7 +760,11 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; mtl_pd_note("queue flush", 0); }
-NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; mtl_pd_note("queue finish", 0); mtl_finish(); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; mtl_pd_note("queue finish", 0); mtl_finish();
+#ifdef __ANDROID__
+    if (rq_on()) rq_wait_log("QueueFinish", q, 0, 0, 0, 0);
+#endif
+}
 
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
 #define CB(c) ((cmd_t *)(c))
@@ -1253,6 +1268,23 @@ static pthread_t g_rq_thread; static _Atomic uint64_t g_rq_pwait_ns, g_rq_idle_n
 static int rq_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_REC_THREAD"); v = e && atoi(e) != 0; if (v) LOG("[nvn] DM_VK_REC_THREAD=1: submissions and presents are replayed on a record thread"); } return v; }
 static uint64_t nvn_last_fence(void) { return rq_on() ? mtl_fence_queued() : mtl_last_fence(); }
 static void rq_replay_submit(const rq_ent *e);
+// A sync fenced in a command buffer (nvnCommandBufferFenceSync, OP_FENCE_SYNC) is fenced when its command buffer is submitted. The replay used to set it, which the queue now
+// delays: Unreal's NVN RHI waited on such a sync at its first frames, found it unfenced (TIMEOUT_EXPIRED at once) and stopped at "GPU interrupt wait returned TIMEOUT_EXPIRED"
+// (NVNSubmission.cpp; the sync wait at main+0x1443cb0); a reused sync would have shown its old, completed fence. The submitted lists are walked here for their FenceSyncs
+static void rq_fence_syncs(const uint64_t *h, int n, uint64_t fence) {
+    for (int i = 0; i < n; i++) {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)h[i], *stk[32]; int ns = 0, guard = 0;
+        while (p && guard++ < (1 << 22)) {
+            op_hdr hd; memcpy(&hd, p, sizeof hd); const uint8_t *a = p + 8;
+            if (hd.op == OP_END) { if (!ns) break; p = stk[--ns]; continue; }
+            if (hd.op == OP_JUMP) { memcpy(&p, a, 8); continue; }
+            if (hd.op == OP_CALL) { const uint8_t *t; memcpy(&t, a, 8); if (ns < 32) { stk[ns++] = p + hd.size; p = t; continue; } }
+            if (hd.op == OP_FENCE_SYNC) { sync_t *sy; memcpy(&sy, a, 8); sy->fence = fence; sy->fenced = 1; }
+            if (!hd.size) break;
+            p += hd.size;
+        }
+    }
+}
 static void rq_replay_present(const rq_ent *e);
 static void *rq_thread(void *a) {
     (void)a; pthread_setname_np("dm-record");
@@ -1289,6 +1321,13 @@ static void rq_push(const rq_ent *e) {
     pthread_cond_signal(&g_rq_cv);
     pthread_mutex_unlock(&g_rq_mu);
 }
+static void rq_wait_log(const char *what, const void *s, uint64_t fence, int fenced, uint64_t timeout, int result) {
+    static _Atomic int n; if (atomic_fetch_add(&n, 1) >= 200) return;
+    char tn[16] = ""; pthread_getname_np(pthread_self(), tn, sizeof tn);
+    pthread_mutex_lock(&g_rq_mu); int depth = g_rq_tail - g_rq_head, busy = g_rq_busy, started = g_rq_thread != 0; pthread_mutex_unlock(&g_rq_mu);
+    LOG("[nvn] record thread wait: %s %p fence %llu (fenced %d) timeout %llu -> %d; on '%s'; queued fence %llu, submitted %llu; queue %d%s%s",
+        what, s, (unsigned long long)fence, fenced, (unsigned long long)timeout, result, tn, (unsigned long long)mtl_fence_queued(), (unsigned long long)mtl_last_fence(), depth, busy ? ", replaying" : "", started ? "" : ", no record thread yet");
+}
 static void rq_stats(uint64_t frame) {   // every 600 presents
     if (!rq_on() || frame % 600) return;
     uint64_t n = atomic_exchange(&g_rq_depth_n, 0), s = atomic_exchange(&g_rq_depth_sum, 0);
@@ -1310,6 +1349,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         rq_ent e = {0, n, NULL, ((const queue_t *)q)->serial, ((const queue_t *)q)->origin_ll, NULL, 0, {0}, 0};
         if (n > 0) { e.h = malloc((size_t)n * 8); if (!e.h) die("submit: out of memory"); memcpy(e.h, h, (size_t)n * 8); }
         mtl_fence_queued_add();
+        rq_fence_syncs(e.h, n, mtl_fence_queued());   // the command lists' FenceSyncs take this submission's fence now, as on NVN (the replay sets the same)
         rq_push(&e);
         gfx_leave();
         pthread_mutex_unlock(&g_sub_mu);
