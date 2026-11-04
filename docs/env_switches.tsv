@@ -340,6 +340,7 @@ DM_VK_DSET_CACHE2	switch	Android: `1` (default) keeps the driver segment and con
 DM_VK_EVICT_AGE	switch	Android: frames a storage-backed texture stays unused before its image is evicted (default 300; made again from its storage at its next use)
 DM_VK_EVICT_FAST	switch	Android: the age in frames (default 30) at which an early trim for fast game-heap growth (DM_MEM_PRETRIM) evicts idle textures; other trims use 60
 DM_VK_GPU_TS	test	Android: `0` gives every counter timestamp of a submission its completion time, as before vk19.14 (now TIMESTAMP_TOP takes the submission's GPU start)
+DM_VK_GW_FORWARD	test	Android: `K` (opt-in, default 0 off) copies a GPU-written range read K or more submissions after its write (at most 8 MB) into the reading submission's ring, so later readers hold that context instead of the writer's
 DM_VK_LATE_FILL	test	Android: `0` leaves out vk19.5's late fill (a texture drawn before the game wrote its storage is watched and uploaded when the data comes)
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
 DM_VK_MEM_LOW_MB	switch	Android: below this MemAvailable (MB, default 1500; 0 off) the Vulkan backend trims every 5 s at most: idle textures evicted, rings to their minimum, reuse pools emptied, malloc's free pages returned
@@ -364,7 +365,7 @@ DM_VK_SEG_CACHE	switch	Android: `1` (default) takes a 4 KB driver segment built 
 DM_VK_SHOTS	diagnostic	Android: `=<frame>,…` writes the presented image of those frames into DM_VK_SHOT_DIR
 DM_VK_SHOT_DIR	path	Android: where DM_VK_SHOTS and DM_VK_RTDUMP write (default: the current folder)
 DM_VK_SKIP	diagnostic	Android: `=<mask>` leaves out kinds of GPU work (1 buffer→texture, 2 texture→texture, 4 texture→buffer, 8 clears, 16 uploads, 32 draws / dispatches), for bisecting a wrong picture
-DM_VK_STALE_PATCH	test	Android: `0` leaves out vk19.3's stale-read patch: a read of an earlier submission's GPU-written range takes its bytes as they are, without the CPU's later rewrites
+DM_VK_STALE_PATCH	test	Android: `0` leaves out vk19.3's stale-read patch: a read of an earlier submission's GPU-written range takes its bytes as they are, without the CPU's later rewrites; `2` puts the rewrites in place with one compute dispatch per patched range instead of a copy region per run
 DM_VK_TEXCOUNT	diagnostic	Android: set, every 600 presents logs the live textures by kind and how many share their storage start with an older one
 DM_VK_TRIM_STEADY_S	switch	Android: while memory stays low without falling, the backend trims again only after this many seconds (default 60; 5 as before); rings go back to their minimum and malloc is purged only under real pressure
 DM_VK_UBWC	test	Android: `2` (opt-in) keeps compression only for render targets nothing is uploaded into; `1` makes images whose views never reinterpret the format keep the GPU's compression: a format list (own format and its sRGB / UNORM twin) or not mutable at all; storage images unchanged. Default 0; keep it off: with it on, texture streaming into compressed images ate untracked driver memory and the low-memory killer ended FINAL FANTASY RESONANCE 4 times in 4

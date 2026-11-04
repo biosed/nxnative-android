@@ -258,7 +258,8 @@ static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) g = now_ns();
 // later work recorded from the same range is bound to that ring range itself instead of a fresh copy of the guest's stale bytes (gw_find); the entry dies with the ring
 // (ctx_complete, when the bytes are back in guest memory)
 typedef struct { uint64_t addr, size; VkBuffer buf; VkDeviceSize off; uint8_t *p; uint64_t fence; int ci;   // ci: the context whose ring holds it
-                 const uint8_t *snap; int exact; uint64_t chk; int dirty; uint8_t dfr; } gw_t;   // dfr: written by a dispatch deferred past the open pass (defer_flush), not recorded yet
+                 const uint8_t *snap; int exact; uint64_t chk; int dirty; uint8_t dfr;
+                 VkBuffer fbuf; VkDeviceSize foff; uint8_t *fp; uint64_t ffence; int fci; } gw_t;   // f*: its forwarded copy (DM_VK_GW_FORWARD): in the ring of submission ffence, context fci   // dfr: written by a dispatch deferred past the open pass (defer_flush), not recorded yet
 // snap: the guest's bytes the dispatch was recorded with (its post kind 5 owns them; cleared here before they are freed), to tell which words the CPU rewrote since (gw_cpu_dirty);
 // exact: an exact write (a texture-to-buffer or buffer copy writes every byte of its range), not a dispatch's whole bound storage buffer; chk / dirty: gw_cpu_dirty's answer for a submission
 enum { NGW = 512 };
@@ -306,7 +307,9 @@ static VkDeviceSize ring_put(const void *src, VkDeviceSize n, VkDeviceSize align
 // Cost: a partial read takes the whole range's answer first (one compare a submission): a range the CPU left alone is clean in every part of it. DM_VK_STALE_PATCH=0 leaves
 // the comparison out (the GPU's bytes as they are, as before vk19.3). g_t_stale / g_stale_bytes: time and bytes in these compares and patches (the recording line)
 static uint64_t g_t_stale, g_stale_bytes, g_t_patch, g_patch_regions, g_npatch;   // g_t_patch: the part in gw_patch; regions: copy regions it recorded
-static int stale_patch_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STALE_PATCH"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_STALE_PATCH=0: reads of an earlier submission's GPU-written range take its bytes as they are"); } return v; }
+static int stale_patch_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STALE_PATCH"); v = e ? atoi(e) : 1; if (v < 0 || v > 2) v = 1;
+    if (!v) LOG("DM_VK_STALE_PATCH=0: reads of an earlier submission's GPU-written range take its bytes as they are"); if (v == 2) LOG("DM_VK_STALE_PATCH=2: the CPU's rewrites over GPU-written ranges are put in place by a compute dispatch"); } return v; }
+static int stale_patch_on(void) { return stale_patch_mode() != 0; }
 static int gw_whole_dirty(gw_t *e) {
     if (e->chk != g_fence + 1) { e->chk = g_fence + 1; e->dirty = memcmp((const void *)(uintptr_t)e->addr, e->snap, e->size) != 0; g_stale_bytes += e->size; }
     return e->dirty;
@@ -322,6 +325,103 @@ static int gw_cpu_dirty(gw_t *e, uint64_t lo, uint64_t hi) {
 // Compared 8 bytes at a time (64 at a time over equal stretches); only the bytes from the first rewritten word to the last go into the ring
 static inline uint64_t ld64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
 static inline uint32_t ld32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+// DM_VK_STALE_PATCH=2 (vk19.39): the runs go to the GPU as a table and one compute dispatch copies them (a thread a run, at most 64 words each), where mode 1 records a
+// copy region for each: ~600-1,300 regions a frame in the dungeon cost the upload command buffers 4.6 ms of GPU time (Run B: 0.2 ms without any patch). The shader, compiled
+// with the NDK's glslc and kept here as words (our own source, below):
+//   layout(local_size_x = 64) in; readonly buffer Src { uint s[]; } (binding 0); buffer Dst { uint d[]; } (1); readonly buffer Tab { uvec4 t[]; } (2); push constant uint count;
+//   main: i = gl_GlobalInvocationID.x; if (i >= count) return; uvec4 e = t[i]; for (k < e.z) d[e.x + k] = s[e.y + k];
+// Runs not on 4-byte boundaries, or a range past maxStorageBufferRange, keep the copy regions
+static const uint32_t k_patch_spv[] = {
+0x07230203, 0x00010300, 0x000d000a, 0x00000058, 0x00000000, 0x00020011, 0x00000001, 0x0006000b, 0x00000001, 0x4c534c47,
+0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0006000f, 0x00000005, 0x00000004, 0x6e69616d,
+0x00000000, 0x0000000b, 0x00060010, 0x00000004, 0x00000011, 0x00000040, 0x00000001, 0x00000001, 0x00040047, 0x0000000b,
+0x0000000b, 0x0000001c, 0x00050048, 0x00000011, 0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x00000011, 0x00000002,
+0x00040047, 0x00000021, 0x00000006, 0x00000010, 0x00040048, 0x00000022, 0x00000000, 0x00000018, 0x00050048, 0x00000022,
+0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x00000022, 0x00000002, 0x00040047, 0x00000024, 0x00000022, 0x00000000,
+0x00040047, 0x00000024, 0x00000021, 0x00000002, 0x00040047, 0x00000034, 0x00000006, 0x00000004, 0x00050048, 0x00000035,
+0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x00000035, 0x00000002, 0x00040047, 0x00000037, 0x00000022, 0x00000000,
+0x00040047, 0x00000037, 0x00000021, 0x00000001, 0x00040047, 0x0000003c, 0x00000006, 0x00000004, 0x00040048, 0x0000003d,
+0x00000000, 0x00000018, 0x00050048, 0x0000003d, 0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x0000003d, 0x00000002,
+0x00040047, 0x0000003f, 0x00000022, 0x00000000, 0x00040047, 0x0000003f, 0x00000021, 0x00000000, 0x00040047, 0x0000004d,
+0x0000000b, 0x00000019, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000020,
+0x00000000, 0x00040017, 0x00000009, 0x00000006, 0x00000003, 0x00040020, 0x0000000a, 0x00000001, 0x00000009, 0x0004003b,
+0x0000000a, 0x0000000b, 0x00000001, 0x0004002b, 0x00000006, 0x0000000c, 0x00000000, 0x00040020, 0x0000000d, 0x00000001,
+0x00000006, 0x0003001e, 0x00000011, 0x00000006, 0x00040020, 0x00000012, 0x00000009, 0x00000011, 0x0004003b, 0x00000012,
+0x00000013, 0x00000009, 0x00040015, 0x00000014, 0x00000020, 0x00000001, 0x0004002b, 0x00000014, 0x00000015, 0x00000000,
+0x00040020, 0x00000016, 0x00000009, 0x00000006, 0x00020014, 0x00000019, 0x00040017, 0x0000001e, 0x00000006, 0x00000004,
+0x0003001d, 0x00000021, 0x0000001e, 0x0003001e, 0x00000022, 0x00000021, 0x00040020, 0x00000023, 0x0000000c, 0x00000022,
+0x0004003b, 0x00000023, 0x00000024, 0x0000000c, 0x00040020, 0x00000026, 0x0000000c, 0x0000001e, 0x0003001d, 0x00000034,
+0x00000006, 0x0003001e, 0x00000035, 0x00000034, 0x00040020, 0x00000036, 0x0000000c, 0x00000035, 0x0004003b, 0x00000036,
+0x00000037, 0x0000000c, 0x0003001d, 0x0000003c, 0x00000006, 0x0003001e, 0x0000003d, 0x0000003c, 0x00040020, 0x0000003e,
+0x0000000c, 0x0000003d, 0x0004003b, 0x0000003e, 0x0000003f, 0x0000000c, 0x0004002b, 0x00000006, 0x00000040, 0x00000001,
+0x00040020, 0x00000045, 0x0000000c, 0x00000006, 0x0004002b, 0x00000014, 0x0000004a, 0x00000001, 0x0004002b, 0x00000006,
+0x0000004c, 0x00000040, 0x0006002c, 0x00000009, 0x0000004d, 0x0000004c, 0x00000040, 0x00000040, 0x00050036, 0x00000002,
+0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x000300f7, 0x0000004e, 0x00000000, 0x000300fb, 0x0000000c,
+0x0000004f, 0x000200f8, 0x0000004f, 0x00050041, 0x0000000d, 0x0000000e, 0x0000000b, 0x0000000c, 0x0004003d, 0x00000006,
+0x0000000f, 0x0000000e, 0x00050041, 0x00000016, 0x00000017, 0x00000013, 0x00000015, 0x0004003d, 0x00000006, 0x00000018,
+0x00000017, 0x000500ae, 0x00000019, 0x0000001a, 0x0000000f, 0x00000018, 0x000300f7, 0x0000001c, 0x00000000, 0x000400fa,
+0x0000001a, 0x0000001b, 0x0000001c, 0x000200f8, 0x0000001b, 0x000200f9, 0x0000004e, 0x000200f8, 0x0000001c, 0x00060041,
+0x00000026, 0x00000027, 0x00000024, 0x00000015, 0x0000000f, 0x0004003d, 0x0000001e, 0x00000028, 0x00000027, 0x000200f9,
+0x0000002a, 0x000200f8, 0x0000002a, 0x000700f5, 0x00000006, 0x00000057, 0x0000000c, 0x0000001c, 0x0000004b, 0x0000002b,
+0x00050051, 0x00000006, 0x00000032, 0x00000028, 0x00000002, 0x000500b0, 0x00000019, 0x00000033, 0x00000057, 0x00000032,
+0x000400f6, 0x0000002c, 0x0000002b, 0x00000000, 0x000400fa, 0x00000033, 0x0000002b, 0x0000002c, 0x000200f8, 0x0000002b,
+0x00050051, 0x00000006, 0x00000039, 0x00000028, 0x00000000, 0x00050080, 0x00000006, 0x0000003b, 0x00000039, 0x00000057,
+0x00050051, 0x00000006, 0x00000042, 0x00000028, 0x00000001, 0x00050080, 0x00000006, 0x00000044, 0x00000042, 0x00000057,
+0x00060041, 0x00000045, 0x00000046, 0x0000003f, 0x00000015, 0x00000044, 0x0004003d, 0x00000006, 0x00000047, 0x00000046,
+0x00060041, 0x00000045, 0x00000048, 0x00000037, 0x00000015, 0x0000003b, 0x0003003e, 0x00000048, 0x00000047, 0x00050080,
+0x00000006, 0x0000004b, 0x00000057, 0x0000004a, 0x000200f9, 0x0000002a, 0x000200f8, 0x0000002c, 0x000200f9, 0x0000004e,
+0x000200f8, 0x0000004e, 0x000100fd, 0x00010038
+};
+static VkPipeline g_patch_pipe; static VkPipelineLayout g_patch_pl; static VkDescriptorSetLayout g_patch_dsl; static int g_patch_ok = -1;
+static uint64_t g_patch_disp, g_patch_runs;
+static int patch_pipe(void) {
+    if (g_patch_ok >= 0) return g_patch_ok;
+    g_patch_ok = 0;
+    VkDescriptorSetLayoutBinding b[3]; for (int i = 0; i < 3; i++) b[i] = (VkDescriptorSetLayoutBinding){(uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 3, b};
+    if (vkCreateDescriptorSetLayout(g_dev, &li, NULL, &g_patch_dsl) != VK_SUCCESS) return 0;
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 4};
+    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_patch_dsl, 1, &pr};
+    if (vkCreatePipelineLayout(g_dev, &pli, NULL, &g_patch_pl) != VK_SUCCESS) return 0;
+    VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof k_patch_spv, k_patch_spv}; VkShaderModule m;
+    if (vkCreateShaderModule(g_dev, &mi, NULL, &m) != VK_SUCCESS) return 0;
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", NULL}, g_patch_pl, VK_NULL_HANDLE, 0};
+    VkResult r = vkCreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &ci, NULL, &g_patch_pipe); vkDestroyShaderModule(g_dev, m, NULL);
+    if (r != VK_SUCCESS) { LOG("[RED] vk: the stale-patch compute pipeline was not made (%d): copy regions instead", (int)r); return 0; }
+    g_patch_ok = 1; return 1;
+}
+static VkDescriptorSet patch_set(void);
+// The runs rg[0..nr) (srcOffset: from lo, size: bytes) as a dispatch: returns 0 when it cannot (the caller records the copy regions)
+static int gw_patch_cs(const uint8_t *g, const VkBufferCopy *rg, size_t nr, VkBuffer dst, VkDeviceSize dst_off) {
+    if (stale_patch_mode() != 2 || !patch_pipe()) return 0;
+    VkDeviceSize sal = g_props.limits.minStorageBufferOffsetAlignment ? g_props.limits.minStorageBufferOffsetAlignment : 256; if (sal < 256) sal = 256;
+    uint64_t first = rg[0].srcOffset, last = rg[nr - 1].srcOffset + rg[nr - 1].size;
+    if ((dst_off + first) % 4) return 0;
+    size_t nt = 0; for (size_t k = 0; k < nr; k++) { if (rg[k].srcOffset % 4 || rg[k].size % 4) return 0; nt += (rg[k].size / 4 + 63) / 64; }
+    VkDeviceSize dbase = (dst_off + first) / sal * sal, dlen = dst_off + last - dbase, slen = last - first;
+    if (dlen > g_props.limits.maxStorageBufferRange || slen > g_props.limits.maxStorageBufferRange || nt > (1u << 20)) return 0;
+    VkDeviceSize so = ring_put(g + first, slen, sal); if (so == VK_WHOLE_SIZE) return 0; VkBuffer sb = C->ring;
+    VkDeviceSize to = ring_alloc(nt * 16, sal); if (to == VK_WHOLE_SIZE) return 0; VkBuffer tb = C->ring; uint32_t *tab = (uint32_t *)(C->ringp + to);   // after the source: ring_alloc may move to an extra ring
+    size_t j = 0;
+    for (size_t k = 0; k < nr; k++) for (uint64_t w = 0; w < rg[k].size / 4; w += 64) {
+        uint64_t nw = rg[k].size / 4 - w; if (nw > 64) nw = 64;
+        tab[4 * j] = (uint32_t)((dst_off + rg[k].srcOffset - dbase) / 4 + w); tab[4 * j + 1] = (uint32_t)((rg[k].srcOffset - first) / 4 + w); tab[4 * j + 2] = (uint32_t)nw; tab[4 * j + 3] = 0; j++;
+    }
+    VkDescriptorSet ds = patch_set(); if (!ds) return 0;
+    VkDescriptorBufferInfo bi[3] = {{sb, so, slen}, {dst, dbase, (dlen + 3) & ~3ull}, {tb, to, nt * 16}};
+    VkWriteDescriptorSet w[3]; for (int i = 0; i < 3; i++) w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, ds, (uint32_t)i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[i], NULL};
+    vkUpdateDescriptorSets(g_dev, 3, w, 0, NULL);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+    vkCmdPipelineBarrier(C->up, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);   // after the GPU's bytes landed
+    vkCmdBindPipeline(C->up, VK_PIPELINE_BIND_POINT_COMPUTE, g_patch_pipe);
+    vkCmdBindDescriptorSets(C->up, VK_PIPELINE_BIND_POINT_COMPUTE, g_patch_pl, 0, 1, &ds, 0, NULL);
+    uint32_t cnt = (uint32_t)nt; vkCmdPushConstants(C->up, g_patch_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &cnt);
+    vkCmdDispatch(C->up, (cnt + 63) / 64, 1, 1);
+    VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+    vkCmdPipelineBarrier(C->up, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);   // before a later copy or patch over the same bytes in this command buffer
+    C->up_used = 1; g_patch_disp++; g_patch_runs += nt;
+    return 1;
+}
 static void gw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDeviceSize dst_off) {
     if (!e->snap) return;
     uint64_t t0 = now_ns();
@@ -337,6 +437,7 @@ static void gw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDe
         rg[nr++] = (VkBufferCopy){a, a, i - a};
     }
     g_stale_bytes += n; g_patch_regions += nr; g_npatch++;
+    if (nr && gw_patch_cs(g, rg, nr, dst, dst_off)) nr = 0;   // DM_VK_STALE_PATCH=2: done by a dispatch
     if (nr) {
         uint64_t first = rg[0].srcOffset, last = rg[nr - 1].srcOffset + rg[nr - 1].size;
         VkDeviceSize st = ring_put(g + first, last - first, 16);
@@ -379,6 +480,13 @@ static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align)
     }
     return ro;
 }
+// DM_VK_GW_FORWARD=K (vk19.39, opt-in, 0 off): a read held on an earlier submission's ring (the GPU's bytes used in place) keeps that context from reuse until the reader is
+// done, and Unreal reads its GPU-scene ranges for many submissions after the write: the recorder waited ~5.5 ms a frame for "a later one still reading its ring". When the
+// writer is K or more submissions back, the whole range (at most 8 MB) is copied into this submission's ring at its start (the upload command buffer, after everything
+// before: the writer is done) and later readers hold that copy's context instead; a copy whose context was reused since is made again. The entry itself (and the writer's
+// completion, which puts the bytes back in guest memory and ends it) is unchanged. Hold ages and forwarded MB are counted for the per-600 line
+static uint64_t g_fwd_n, g_fwd_bytes, g_hold_n, g_hold_age_sum, g_hold_age_max;
+static int gw_forward_k(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_FORWARD"); v = e ? atoi(e) : 0; if (v < 0) v = 0; if (v) LOG("DM_VK_GW_FORWARD=%d: GPU-written ranges read %d or more submissions after their write are copied forward", v, v); } return v; }
 static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off, uint8_t **p, int may_hold) {
     int hit = 0; uint64_t wait = 0; int why = 0;
     if (!__atomic_load_n(&g_ngw, __ATOMIC_RELAXED)) return 0;
@@ -396,6 +504,24 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
                 *buf = C->ring; *off = ro; if (p) *p = C->ringp + ro; g_gw_ci = g_ci; hit = 1; atomic_fetch_add(&g_gw_copied, 1); break;
             }
             if (!may_hold) { wait = e->fence; why = 0; break; }
+            { uint64_t age = g_fence + 1 - e->fence; g_hold_n++; g_hold_age_sum += age; if (age > g_hold_age_max) g_hold_age_max = age;
+              int K = gw_forward_k(); if (K >= NCTX) K = NCTX / 2;   // below the context count: a copy older than K is renewed before its context can come round again
+              if (K && inside && fits && age >= (uint64_t)K && e->size <= (8u << 20) && !gw_cpu_dirty(e, addr, addr + size)) {
+                  if (e->ffence && e->ffence != g_fence + 1 && (g_ctx[e->fci].fence_val != e->ffence || g_fence + 1 - e->ffence >= (uint64_t)K)) e->ffence = 0;   // its context reused since (fence_val is set at commit: this submission's own copy stays), or old again: a new copy
+                  if (!e->ffence) {
+                      VkDeviceSize fal = g_props.limits.minStorageBufferOffsetAlignment > 256 ? g_props.limits.minStorageBufferOffsetAlignment : 256;
+                      VkDeviceSize ro = ring_alloc(e->size, fal);
+                      if (ro != VK_WHOLE_SIZE && C->ring == C->ring0) {   // the context's own ring (an extra ring dies with its submission)
+                          VkBufferCopy bc = {e->off, ro, e->size}; vkCmdCopyBuffer(C->up, e->buf, C->ring, 1, &bc); C->up_used = 1;
+                          e->fbuf = C->ring; e->foff = ro; e->fp = C->ringp + ro; e->ffence = g_fence + 1; e->fci = g_ci; g_fwd_n++; g_fwd_bytes += e->size;
+                      }
+                  }
+                  if (e->ffence && (e->foff + (addr - e->addr)) % align == 0) {
+                      ctx_t *f = &g_ctx[e->fci]; if (f->hold < g_fence + 1) f->hold = g_fence + 1; xr_raise(e->fbuf, g_fence + 1);
+                      { ctx_t *o0 = &g_ctx[e->ci]; if (e->ffence == g_fence + 1 && o0->hold < g_fence + 1) o0->hold = g_fence + 1; xr_raise(e->buf, g_fence + 1); }   // the copy itself reads the writer's ring in this submission
+                      *buf = e->fbuf; *off = e->foff + (addr - e->addr); if (p) *p = e->fp + (addr - e->addr); g_gw_ci = e->fci; hit = 1; atomic_fetch_add(&g_gw_held, 1); break;
+                  }
+              } }
             ctx_t *o = &g_ctx[e->ci]; if (o->hold < g_fence + 1) o->hold = g_fence + 1; xr_raise(e->buf, g_fence + 1);
             if (inside && gw_cpu_dirty(e, addr, addr + size)) {   // the CPU rewrote words of it since: the GPU's bytes and then the CPU's rewrites over them, in this submission's ring
                 VkDeviceSize ro = ring_alloc(size, align < 16 ? 16 : align);
@@ -755,6 +881,15 @@ static void vk_init(void) { pthread_once(&g_once, vk_init_); }
 static _Atomic int g_ndp_total;
 // A descriptor pool of modest size: Unreal's shaders bind a dozen texel buffers, an array of 32 more and an array of 32 samplers a stage, so a submission with many draws chains
 // several (dset_alloc); one pool sized for the worst case per context held hundreds of thousands of descriptors in eight contexts
+static VkDescriptorPool dpool_new(void);
+static VkDescriptorSet patch_set(void) {   // from the submission's descriptor pools, as write_set takes them
+    VkDescriptorSet ds; VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, C->dps[C->idp], 1, &g_patch_dsl};
+    while (vkAllocateDescriptorSets(g_dev, &ai, &ds) != VK_SUCCESS) {
+        if (++C->idp == C->ndp) { if (C->ndp >= 256) { C->idp--; return VK_NULL_HANDLE; } C->dps = realloc(C->dps, (C->ndp + 1) * sizeof *C->dps); C->dps[C->ndp++] = dpool_new(); }
+        ai.descriptorPool = C->dps[C->idp];
+    }
+    return ds;
+}
 static VkDescriptorPool dpool_new(void) {
     VkDescriptorPoolSize ps[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024},
                                  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 12288}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 512},
@@ -4064,9 +4199,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             g_t_stale / 600e6, g_stale_bytes / 600.0 / 1048576.0, g_t_patch / 600e6, g_npatch / 600.0, g_patch_regions / 600.0, g_t_split / 600e6, g_vid_push / 600.0, g_vid_nz / 600.0, g_gw_calls / 600.0, g_gw_quick / 600.0, g_gw_walked / 600.0);
         g_wb_words = g_wb_bytes = 0; g_t_stale = g_stale_bytes = 0; g_t_patch = g_patch_regions = g_npatch = 0; g_vid_push = g_vid_nz = 0; g_t_split = 0; g_gw_calls = g_gw_quick = g_gw_walked = 0;
         { double miss_us = g_dsc_nmiss_t ? g_dsc_miss_ns / 1e3 / g_dsc_nmiss_t : 0;
-          LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame; texture storage scans %.1f a frame, %.1f left out as uploaded this frame (DM_VK_DIRTY_ONCE %d); driver segments taken as built %.1f, built %.1f (DM_VK_SEG_CACHE %d)",
-              dset_cache2(), g_dsc_hit / 600.0, g_dsc_miss / 600.0, miss_us, g_dsc_rej / 600.0, g_memo_hit / 600.0, g_memo_miss / 600.0, g_dsc_hit * miss_us / 1e3 / 600.0, g_dirty_scans / 600.0, g_dirty_skips / 600.0, dirty_once(), g_segc_hit / 600.0, g_segc_miss / 600.0, seg_cache_on());
-          g_memo_hit = g_memo_miss = g_dsc_rej = g_dsc_miss_ns = g_dsc_nmiss_t = 0; g_dirty_scans = g_dirty_skips = 0; g_segc_hit = g_segc_miss = 0;
+          LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame; texture storage scans %.1f a frame, %.1f left out as uploaded this frame (DM_VK_DIRTY_ONCE %d); driver segments taken as built %.1f, built %.1f (DM_VK_SEG_CACHE %d); stale patches by dispatch %.2f (%.0f runs); held reads %.1f, their writer %.1f submissions back on average, %llu at most; forwarded %.2f (%.2f MB) (DM_VK_GW_FORWARD %d)",
+              dset_cache2(), g_dsc_hit / 600.0, g_dsc_miss / 600.0, miss_us, g_dsc_rej / 600.0, g_memo_hit / 600.0, g_memo_miss / 600.0, g_dsc_hit * miss_us / 1e3 / 600.0, g_dirty_scans / 600.0, g_dirty_skips / 600.0, dirty_once(), g_segc_hit / 600.0, g_segc_miss / 600.0, seg_cache_on(), g_patch_disp / 600.0, g_patch_runs / 600.0, g_hold_n / 600.0, g_hold_n ? (double)g_hold_age_sum / g_hold_n : 0.0, (unsigned long long)g_hold_age_max, g_fwd_n / 600.0, g_fwd_bytes / 600.0 / 1048576.0, gw_forward_k());
+          g_memo_hit = g_memo_miss = g_dsc_rej = g_dsc_miss_ns = g_dsc_nmiss_t = 0; g_dirty_scans = g_dirty_skips = 0; g_segc_hit = g_segc_miss = 0; g_patch_disp = g_patch_runs = 0; g_hold_n = g_hold_age_sum = g_hold_age_max = 0; g_fwd_n = g_fwd_bytes = 0;
           static const char *const lwn[LW_N] = {"textures (rmu)", "GPU-written ranges (gwmu)", "contexts (mu)", "queue (qmu)", "image blocks (blkmu)"}; char lb[512]; int lo = 0;
           for (int k = 0; k < LW_N; k++) lo += snprintf(lb + lo, sizeof lb - lo, "%s%s %.2f ms (%.1f)", k ? ", " : "", lwn[k], atomic_exchange(&g_lw_ns[k], 0) / 600e6, atomic_exchange(&g_lw_n[k], 0) / 600.0);
           LOG("vk: lock waits per frame over the last 600, all threads: %s", lb); }
