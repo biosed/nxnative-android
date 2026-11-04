@@ -3851,6 +3851,7 @@ uint64_t mtl_fence_queued(void) { uint64_t q = atomic_load(&g_fence_q); return q
 void mtl_fence_queued_add(void) { uint64_t f = g_fence, q = atomic_load(&g_fence_q); if (q < f) atomic_compare_exchange_strong(&g_fence_q, &q, f); atomic_fetch_add(&g_fence_q, 1); }
 void mtl_rec_drain_hook(void (*f)(void)) { g_rec_drain = f; }
 uint64_t mtl_present_count(void) { return atomic_load(&g_presents); }
+void mtl_wait_committed(uint64_t fence) { lk_(&g_mu, LW_MU); while (g_fence < fence) pthread_cond_wait(&g_cv, &g_mu); pthread_mutex_unlock(&g_mu); }   // until the record thread has submitted it (mtl_sub_commit broadcasts g_cv)
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     lk_(&g_mu, LW_MU);
     if (timeout_ns == UINT64_MAX || timeout_ns > 60ull * 1000000000ull) { while (g_done < fence) pthread_cond_wait(&g_cv, &g_mu); }

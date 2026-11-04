@@ -672,7 +672,7 @@ NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 // (with the Android record thread, DM_VK_REC_THREAD, the most recent one queued: its fence value is fixed when it is queued, the replay commits them in that order)
 static uint64_t nvn_last_fence(void);
 #ifdef __ANDROID__
-static void rq_drain(void);
+static void rq_drain(void); static int rq_on(void);
 #endif
 void mtl_pd_note(const char *what, uint64_t v); int mtl_pd_on(void);
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = nvn_last_fence(); mtl_pd_note("queue fence sync, fence", ((sync_t *)s)->fence); }
@@ -691,6 +691,11 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
     if (w(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+#ifdef __ANDROID__
+    // With the record thread, a fence may not be submitted yet: the time until it is does not count against the game's timeout (on the Switch the submission was made by the time
+    // its sync could be waited on). Unreal's NVN RHI treats an expired wait as fatal
+    if (rq_on() && timeout) { void mtl_wait_committed(uint64_t); dm_core_leave(); mtl_wait_committed(o->fence); dm_core_return(); }
+#endif
     uint64_t t0 = now_ns(); dm_core_leave(); int ok = w(o->fence, timeout); dm_core_return(); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
     if (mtl_pd_on()) { char tn[32] = ""; pthread_getname_np(pthread_self(), tn, sizeof tn); char what[96]; snprintf(what, sizeof what, "CPU SyncWait (thread %s) waited %.2f ms for fence", tn, (now_ns() - t0) / 1e6); mtl_pd_note(what, o->fence); }
     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
@@ -1297,6 +1302,8 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
 #ifdef __ANDROID__
     if (rq_on()) {   // queued: replayed by the record thread (rq_replay_submit)
         dm_host_mutex_lock(&g_sub_mu);
+        dm_host_work++; mtl_prepare(); dm_host_work--;   // here, as before: the first one is the pre-warm (seconds), during which the game must stay in this call -- queued, its replay
+            // came only after the pre-warm while the game already waited on the submission's sync, and Unreal's NVN RHI stopped at "GPU interrupt wait returned TIMEOUT_EXPIRED"
         gfx_enter();
         ((queue_t *)q)->submits++;
         nvn_cap_submit(n, (const uint64_t *)h);
@@ -1336,8 +1343,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
 
 #ifdef __ANDROID__
 static void rq_replay_present(const rq_ent *e) { mtl_present(e->t, e->period, e->has_crop ? e->crop : NULL); rq_stats((uint64_t)mtl_present_count()); }
-static void rq_replay_submit(const rq_ent *e) {   // what QueueSubmitCommands does below, from the queued copy
-    mtl_prepare();
+static void rq_replay_submit(const rq_ent *e) {   // what QueueSubmitCommands does below, from the queued copy (mtl_prepare ran when it was queued)
     uint64_t t0 = now_ns();
     mtl_queue_activate(e->serial);
     mtl_set_queue_origin_lower_left(e->origin_ll);
