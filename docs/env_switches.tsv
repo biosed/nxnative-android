@@ -329,6 +329,7 @@ DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to
 DM_VK_CTX	test	Android: `=<n>` (4..32, default 20) submission contexts: how far the CPU may record ahead of the GPU; each holds a ring (4 MB and up)
 DM_VK_DECODE_POOL	test	Android: `1` decodes CPU-decoded textures (BC / ASTC the GPU cannot sample) through one kept buffer instead of a fresh malloc per level; default 0
 DM_VK_DIR	path	Android: the folder of the shaders' SPIR-V (`<key>.spv`, `<key>.vk.txt` from dm/android/tools/spv_android.py) and the pipeline cache
+DM_VK_DIRTY_ONCE	switch	Android: `1` (default) asks once a submission whether a packaged texture's storage was written since its upload (a scan of its pages), and not at all when it was uploaded this frame; `0` asks at every binding
 DM_VK_DISPATCH_DEFER	test	Android: `1` records a dispatch met inside an open render pass after that pass instead of ending it, when it reads none of the pass's attachments; a draw reading what it writes ends the pass first. Default 0
 DM_VK_DSET_CACHE2	switch	Android: `1` (default) keeps the driver segment and constant blocks put into the ring by content for the submission, so descriptor sets can be reused, and compares a reused set's whole key; `0` as before
 DM_VK_EVICT_AGE	switch	Android: frames a storage-backed texture stays unused before its image is evicted (default 300; made again from its storage at its next use)

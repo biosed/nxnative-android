@@ -978,6 +978,7 @@ struct vtex {
     int dirty;   // the CPU wrote its storage since the last upload (WriteTexels, a movie frame, a flushed pool range): uploaded again at its next use, unless the GPU renders into it
     const uint8_t *mem; uint64_t len;   // its storage in guest memory
     uint64_t reup_frame;   // the frame of its last upload (re-uploads at most once a frame, tex_get)
+    uint64_t clean_gen;    // the submission (g_bvgen) in which its storage was last found unwritten since its upload (DM_VK_DIRTY_ONCE)
     uint64_t stamp; const void *span;   // uploaded from a dirty-tracked pool (nvn_dirty.c): the write generation then and the tracked range, re-uploaded when the game writes it
     vview *views; int nviews;
     struct vtex *next;
@@ -1083,6 +1084,21 @@ static int reup_hold(const vtex *v, uint64_t fr) {
     if (g_mem_low && (fr - v->reup_frame < (uint64_t)lowf || (cap > 0 && g_sub_up_bytes >= (uint64_t)cap))) return 1;
     return 0;
 }
+// DM_VK_DIRTY_ONCE (vk19.37, default 1): whether a packaged texture's storage was written since its upload is asked once a submission, not at every binding. The question scans
+// the generation of every page the texture covers (a 5 MB texture: 1,300 pages), and the dungeon's ~1,000 draws a frame bind several textures each: thousands of scans a frame.
+// Found clean, a texture stays clean for the rest of the submission's recording: the GPU runs the submission later anyway, and a write landing meanwhile is seen by the next one
+static uint64_t g_dirty_scans, g_dirty_skips;
+static int dirty_once(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_DIRTY_ONCE"); v = !e || atoi(e) != 0; } return v; }
+static int reup_this_frame(const vtex *v) {   // uploaded already this frame: a re-upload would be held (reup_hold), so the scan is left out
+    if (!dirty_once() || v->late || !v->reup_frame || v->reup_frame != atomic_load(&g_presents)) return 0;
+    g_dirty_skips++; return 1;
+}
+static int tex_clean_now(vtex *v, const tex_t *t) {
+    g_dirty_scans++;
+    if (nvn_dirty_since_span(v->span, t->mem, t->L.size, v->stamp)) return 0;
+    if (dirty_once()) v->clean_gen = g_bvgen;
+    return 1;
+}
 static vtex *tex_get(const tex_t *t, int for_rt) {
     // A texture object that is no longer one -- finalized, its memory reused for other data -- is never made into an image (as nvn_mtl.m tex_mtl_ checks the magic): FINAL
     // FANTASY RESONANCE registers texture objects whose memory holds half-float constants by then (serial 0x3c003c003c003c00), and their slots and image bindings stay bound.
@@ -1098,7 +1114,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
         v->last_frame = atomic_load(&g_presents); v->last_fence = g_fence + 1;
         if (v->evicted && !tex_remake(v, t)) return NULL;   // evicted while unused (tex_evict): made again from its storage
         if (for_rt) v->gpu = 1;
-        else if (!v->gpu && t->mem && (v->dirty || (v->span && nvn_dirty_since_span(v->span, t->mem, t->L.size, v->stamp)))) {
+        else if (!v->gpu && t->mem && (v->dirty || (v->span && v->clean_gen != g_bvgen && !reup_this_frame(v) && !tex_clean_now(v, t)))) {
             uint64_t fr = atomic_load(&g_presents);
             if (!v->dirty && !v->late && reup_hold(v, fr)) g_reup_held++;   // its stamp still says written: the next use tries again
             else { uint64_t since = v->dirty ? 0 : v->stamp; v->dirty = 0; v->reup_frame = fr; tex_reupload(v, t, since); g_pkg_reup++;
@@ -3997,9 +4013,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             g_t_stale / 600e6, g_stale_bytes / 600.0 / 1048576.0, g_t_patch / 600e6, g_npatch / 600.0, g_patch_regions / 600.0, g_t_split / 600e6, g_vid_push / 600.0, g_vid_nz / 600.0, g_gw_calls / 600.0, g_gw_quick / 600.0, g_gw_walked / 600.0);
         g_wb_words = g_wb_bytes = 0; g_t_stale = g_stale_bytes = 0; g_t_patch = g_patch_regions = g_npatch = 0; g_vid_push = g_vid_nz = 0; g_t_split = 0; g_gw_calls = g_gw_quick = g_gw_walked = 0;
         { double miss_us = g_dsc_nmiss_t ? g_dsc_miss_ns / 1e3 / g_dsc_nmiss_t : 0;
-          LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame",
-              dset_cache2(), g_dsc_hit / 600.0, g_dsc_miss / 600.0, miss_us, g_dsc_rej / 600.0, g_memo_hit / 600.0, g_memo_miss / 600.0, g_dsc_hit * miss_us / 1e3 / 600.0);
-          g_memo_hit = g_memo_miss = g_dsc_rej = g_dsc_miss_ns = g_dsc_nmiss_t = 0; }
+          LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame; texture storage scans %.1f a frame, %.1f left out as uploaded this frame (DM_VK_DIRTY_ONCE %d)",
+              dset_cache2(), g_dsc_hit / 600.0, g_dsc_miss / 600.0, miss_us, g_dsc_rej / 600.0, g_memo_hit / 600.0, g_memo_miss / 600.0, g_dsc_hit * miss_us / 1e3 / 600.0, g_dirty_scans / 600.0, g_dirty_skips / 600.0, dirty_once());
+          g_memo_hit = g_memo_miss = g_dsc_rej = g_dsc_miss_ns = g_dsc_nmiss_t = 0; g_dirty_scans = g_dirty_skips = 0; }
         ls = g_nsub_stat; g_t_draw = g_t_ws = g_t_disp = g_t_up = g_t_sub = 0; g_up_bytes = 0; g_dsc_hit = g_dsc_miss = 0; }
     if (n % 600 == 0) {   // memory: the process (RSS, its anonymous part, PSS) and what the backend holds
         long rss = 0, anon = 0, pss = 0; char ln[256]; FILE *f = fopen("/proc/self/status", "re");
