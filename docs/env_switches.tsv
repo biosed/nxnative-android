@@ -1,5 +1,6 @@
 name	class	meaning
 DM_AB	diagnostic	`=<frames>` splits the run into phases of that many frames and alternates every switch set to `ab` (on in the odd phases); logs an `[ab]` line per phase with GPU and frame time and attachment traffic
+DM_ADPF_ALL	switch	Android: `1` (opt-in) puts the game's RHIThread, RenderThread, GameThread, RHIInterrupt and the backend's dm-complete / dm-record in the hint session (by name, again every 600 frames), turns power-efficiency preference off and notifies workload increases on frames over 25 ms
 DM_ALIAS_SIZE	diagnostic	`=<bytes>` gives the guest an alias region of that size instead of the profile's (at least 256 MB, whole host pages; the heap and stacks stay as they are): `0x1000000000`, the Switch's 64 GB, holds what a game reserves unchanged; the NSP script's address region check sets it (Mac only: an iPhone has no room)
 DM_ALIAS_WINDOWS	diagnostic	`=<MB>` logs every 30 s how much of each window of that size in the alias region is mapped (windows aligned to their size in absolute addresses)
 DM_ALLOW_OTHER_METAL	switch	`1` lets `own_compilers.py` build the shader libraries with a Metal compiler other than the one in `dmsh_chain.lock` (it stops otherwise, GitHub issue #242); the NSP script sets it for `--allow-other-metal`
