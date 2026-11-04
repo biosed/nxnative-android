@@ -179,6 +179,7 @@ static uint64_t g_wb_words, g_wb_bytes;   // dispatch write-backs: words the GPU
 typedef struct vtex vtex;
 typedef struct {
     VkCommandPool pool; VkCommandBuffer cb, up; VkFence fence; VkDescriptorPool dp;
+    VkCommandBuffer prim; VkCommandBuffer *sec; int nsec, csec;   // DM_VK_STORE_NONE: the primary while a pass records into a secondary (sec[nsec - 1]); the pool's secondaries
     VkBuffer ring; VkDeviceMemory ringm; uint8_t *ringp; VkDeviceSize used;
     post_t *post; int npost, cpost;
     uint64_t fence_val; int up_used;
@@ -2087,6 +2088,7 @@ static int g_depth_zero = 1, g_origin_ll;
 static struct {   // the current render targets and the open dynamic rendering; clears that come before the pass's first draw become its load actions (a tiler then never reads the old contents)
     int n; vtex *ct[8]; VkImageView cv[8]; vtex *dt; VkImageView dv; uint32_t w, h; int open;
     int merged;   // the open pass went on across a SetRenderTargets (rt_hold_scan, or the same targets again): a draw sampling one of its attachments ends it first (draw_reads_rt)
+    uint8_t pw_c[8], pw_d; rp_desc rpd;   // DM_VK_STORE_NONE: what this open pass wrote (draws, clears, its CLEAR loads), and its description (begun at its end)
     uint32_t clv[8], cly[8]; uint8_t cwr[8], cdrawn[8];   // each colour attachment's level and layer, and whether a draw wrote it since its last same-pass snapshot (fb_prepare)
     uint8_t ddrawn;   // the depth / stencil attachment was cleared or written in this pass (draw_reads_rt: an attachment only loaded reads the same from memory)
     uint8_t clr_c[8], clr_d, clr_s; VkClearColorValue cc[8]; float cd; uint32_t cs;
@@ -2139,12 +2141,49 @@ static void defer_flush(void) {   // after the pass ended (pass_end): the deferr
 }
 static int pass_barrier_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PASS_BARRIER"); v = e && atoi(e) != 0; if (v) LOG("DM_VK_PASS_BARRIER=1: pass ends do not wait for vertex shaders (their reads of the pass's targets get a barrier)"); } return v; }
 static const uint8_t *g_rt_hold;   // see rt_hold_scan
+// DM_VK_STORE_NONE=1 (vk19.51, opt-in; dynamic rendering only). Every pass stored every attachment and loaded it unless cleared: on the Adreno's tiles, a store writes the whole
+// attachment back from tile memory even when the pass left it alone. The store has to be chosen when rendering begins, before the pass's draws are known, so the pass is recorded
+// into a secondary command buffer instead, and at its end the primary begins rendering with STORE for the attachments the pass wrote (a draw with their channels, a clear, a
+// CLEAR load) and NONE (the memory left as it is) for the others, executes the secondary and ends. Loads stay as they were. Each secondary starts with no bound state
+static int store_none_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STORE_NONE"); v = e && atoi(e) != 0 && g_dynrend && g_props.apiVersion >= VK_API_VERSION_1_3;
+    if (v && defer_on()) { v = 0; LOG("[RED] vk: DM_VK_STORE_NONE is off with DM_VK_DISPATCH_DEFER (a deferred dispatch splits a pass in the middle of a draw's recording)"); }
+    if (v) LOG("vk: DM_VK_STORE_NONE=1: passes recorded into secondary command buffers, unwritten attachments not stored"); } return v; }
+static uint64_t g_sn_passes, g_sn_none_c, g_sn_all_c, g_sn_none_d, g_sn_all_d;
+static void ds_last_newcb(void);   // the state skip's record of what this command buffer has bound: none (a new secondary, or the primary after one ran)
+static VkCommandBuffer sec_begin(const rp_desc *d, VkSampleCountFlagBits samples) {
+    if (C->nsec == C->csec) { int add = 16; C->sec = realloc(C->sec, (size_t)(C->csec + add) * sizeof *C->sec);
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, C->pool, VK_COMMAND_BUFFER_LEVEL_SECONDARY, (uint32_t)add}; VKCHECK(vkAllocateCommandBuffers(g_dev, &ai, C->sec + C->csec)); C->csec += add; }
+    VkCommandBuffer sb = C->sec[C->nsec++];
+    VkFormat cf[8]; for (int i = 0; i < d->n; i++) cf[i] = d->cv[i] ? d->cf[i] : VK_FORMAT_UNDEFINED;
+    VkCommandBufferInheritanceRenderingInfo ir = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO, NULL, 0, 0, (uint32_t)d->n, cf, d->dv ? d->df : VK_FORMAT_UNDEFINED, d->dv && d->stencil ? d->df : VK_FORMAT_UNDEFINED, samples};
+    VkCommandBufferInheritanceInfo ih = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, &ir, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, VK_FALSE, 0, 0};
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT, &ih};
+    VKCHECK(vkBeginCommandBuffer(sb, &bi));
+    return sb;
+}
+static void sec_end(void) {   // the open pass's secondary ends; the primary renders it with the stores it needs
+    occ_close(C->cb); VKCHECK(vkEndCommandBuffer(C->cb));
+    VkCommandBuffer sb = C->cb; C->cb = C->prim; C->prim = VK_NULL_HANDLE;
+    const rp_desc *d = &P.rpd;
+    VkRenderingAttachmentInfo ca[8], da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, sa = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    for (int i = 0; i < d->n; i++) {
+        int w = P.pw_c[i] || d->cl[i] == VK_ATTACHMENT_LOAD_OP_CLEAR; if (d->cv[i]) { if (w) g_sn_all_c++; else g_sn_none_c++; }
+        ca[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, d->cv[i], d->layout, 0, NULL, 0, d->cv[i] ? d->cl[i] : VK_ATTACHMENT_LOAD_OP_DONT_CARE, w ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_NONE, {.color = d->cc[i]}};
+    }
+    if (d->dv) { int w = P.pw_d || d->dl == VK_ATTACHMENT_LOAD_OP_CLEAR || d->sl == VK_ATTACHMENT_LOAD_OP_CLEAR; if (w) g_sn_all_d++; else g_sn_none_d++;
+                 da.imageView = d->dv; da.imageLayout = d->layout; da.loadOp = d->dl; da.storeOp = w ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_NONE; da.clearValue.depthStencil = d->dc;
+                 if (d->stencil) { sa = da; sa.loadOp = d->sl; } }
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT, {{0, 0}, {d->w, d->h}}, d->layers ? d->layers : 1, 0, (uint32_t)d->n, ca, d->dv ? &da : NULL, d->dv && d->stencil ? &sa : NULL};
+    p_begin_rendering(C->cb, &ri); vkCmdExecuteCommands(C->cb, 1, &sb); p_end_rendering(C->cb);
+    g_sn_passes++; ds_last_newcb();
+}
 static void pass_end_(int line) {
     g_rt_hold = NULL;
     if (P.open) gsig_end(g_cur_sig, line);
     if (!P.open) { int pend = P.clr_d || P.clr_s; for (int i = 0; i < 8; i++) pend |= P.clr_c[i]; if (pend) pass_begin(); }   // clears with no draw after them still happen
     if (P.open) {
-        rp_end(C->cb); P.open = 0; gpu_mark(0, 1);
+        if (C->prim) sec_end(); else rp_end(C->cb);
+        P.open = 0; gpu_mark(0, 1);
         // what the pass wrote is read by later passes, samples and copies; their vertex work may start before it ends
         VkPipelineStageFlags dst = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                                    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;   // compute too: a dispatch that reads what the pass drew (Unreal's HZB from depth)
@@ -2208,6 +2247,11 @@ static int pass_begin(void) {
         if (P.n >= 4) { g_scene_w = P.w; g_scene_h = P.h; }
     }
     gpu_mark(0, 0); g_npass++; P.merged = 0;
+    memset(P.pw_c, 0, sizeof P.pw_c); P.pw_d = 0;
+    if (store_none_on()) {   // recorded into a secondary, begun at the pass's end (sec_end)
+        VkSampleCountFlagBits sc = P.n && P.ct[0] ? P.ct[0]->ci.samples : P.dt ? P.dt->ci.samples : VK_SAMPLE_COUNT_1_BIT; if (!sc) sc = VK_SAMPLE_COUNT_1_BIT;
+        P.rpd = d; C->prim = C->cb; C->cb = sec_begin(&d, sc); ds_last_newcb(); P.open = 1; return 1;
+    }
     VkFramebuffer fb = rp_begin(C->cb, &d); P.open = 1;
     if (fb) { if (C->nfb == C->cfb) { C->cfb = C->cfb ? 2 * C->cfb : 256; C->fb = realloc(C->fb, C->cfb * sizeof *C->fb); } C->fb[C->nfb++] = fb; }
     return 1;
@@ -3085,6 +3129,10 @@ static struct { shader_t *vs, *fs, *gs; pso_key k; VkPipelineLayout pl; VkPipeli
                 VkBuffer ib; int it; int ib_ok;                     // the index buffer bound (at offset 0: draws index it by firstIndex)
                 VkPipelineLayout dpl; int dn; VkDescriptorSet dsets[2]; uint32_t ndy; uint32_t dy[192]; int ds_ok; } g_ds_last;
 static uint64_t g_bind_skips;
+static void ds_last_newcb(void) {   // nothing bound in the command buffer being recorded; the pipeline memo (by key) stays
+    shader_t *v0 = g_ds_last.vs, *f0 = g_ds_last.fs, *g0 = g_ds_last.gs; pso_key k0 = g_ds_last.k; VkPipelineLayout l0 = g_ds_last.pl; VkPipeline p0 = g_ds_last.pp;
+    memset(&g_ds_last, 0, sizeof g_ds_last); g_ds_last.vs = v0; g_ds_last.fs = f0; g_ds_last.gs = g0; g_ds_last.k = k0; g_ds_last.pl = l0; g_ds_last.pp = p0;
+}
 static uint64_t g_pso_memo, g_state_skips;
 static int state_skip(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STATE_SKIP"); v = !e || atoi(e) != 0; LOG("vk: DM_VK_STATE_SKIP=%d", v); } return v; }
 static void draw(const p_draw *dw, const p_draw_idx *di) {
@@ -3191,8 +3239,8 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     g_fb_n = 0;
     VkDescriptorSet gset = VK_NULL_HANDLE; if (gs) { gset = write_set(gs, 2); memcpy(gdyno, g_dyno, g_ndyno * 4); ngdyno = g_ndyno; }
     if (!sets[0] || (fs && !sets[1]) || (gs && !gset)) SKIP(6);
-    for (int a = 0; a < P.n; a++) if (S.chmask.mask >> (4 * a) & 0xf) P.cwr[a] = P.cdrawn[a] = 1;
-    if (P.dt && ((S.ds.dt && S.ds.dw) || S.ds.st)) P.ddrawn = 1;   // depth writes, or a stencil test (its ops may write)
+    for (int a = 0; a < P.n; a++) if (S.chmask.mask >> (4 * a) & 0xf) P.cwr[a] = P.cdrawn[a] = P.pw_c[a] = 1;
+    if (P.dt && ((S.ds.dt && S.ds.dw) || S.ds.st)) P.ddrawn = P.pw_d = 1;   // depth writes, or a stencil test (its ops may write)
     VkCommandBuffer cb = C->cb;
     if (!state_skip() || g_ds_last.bound != pp) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp); g_ds_last.bound = pp; } else g_state_skips++;
     {   // the same sets and offsets with the same layout as the last draw: left bound (DM_VK_STATE_SKIP)
@@ -3403,7 +3451,7 @@ static void clear_color(const p_clear_color *c) {
     if (!P.open) { P.clr_c[c->index] = 1; memcpy(&P.cc[c->index], c->rgba, 16); return; }   // before the pass's first draw: its load action
     VkClearAttachment a = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)c->index, {.color = {{c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]}}}};
     VkClearRect r = {{{0, 0}, {P.w, P.h}}, 0, P.layered ? P.nlayers : 1};   // a layered pass clears every layer, as NVN clears every layer of a layered target
-    vkCmdClearAttachments(C->cb, 1, &a, 1, &r);
+    vkCmdClearAttachments(C->cb, 1, &a, 1, &r); P.pw_c[c->index] = 1;
 }
 static void clear_ds(const p_clear_ds *c) {
     if (!P.dt) return;
@@ -3413,7 +3461,7 @@ static void clear_ds(const p_clear_ds *c) {
     if (!asp) return;
     VkClearAttachment a = {asp, 0, {.depthStencil = {c->depth, (uint32_t)c->stencil}}};
     VkClearRect r = {{{0, 0}, {P.w, P.h}}, 0, P.layered ? P.nlayers : 1};   // a layered pass clears every layer, as NVN clears every layer of a layered target
-    vkCmdClearAttachments(C->cb, 1, &a, 1, &r);
+    vkCmdClearAttachments(C->cb, 1, &a, 1, &r); P.pw_d = 1;
 }
 // Copies and blits are checked against the image before they are recorded: a region past a level's extent, a level or layer the image lacks, or a blit the format does not support
 // (VK_FORMAT_FEATURE_BLIT_SRC / DST, linear filtering) is invalid usage, and the Mali-G57 answered such work in Super Mario Odyssey with a lost device. Equal-size blits fall back to a copy
@@ -3693,8 +3741,7 @@ static void ring_fit(ctx_t *c) {
 void mtl_sub_begin(void) {
     vk_init(); g_sub_up_bytes = 0;
     if (zc_mode()) zc_reap(g_done);
-    { shader_t *v0 = g_ds_last.vs, *f0 = g_ds_last.fs, *g0 = g_ds_last.gs; pso_key k0 = g_ds_last.k; VkPipelineLayout l0 = g_ds_last.pl; VkPipeline p0 = g_ds_last.pp;
-      memset(&g_ds_last, 0, sizeof g_ds_last); g_ds_last.vs = v0; g_ds_last.fs = f0; g_ds_last.gs = g0; g_ds_last.k = k0; g_ds_last.pl = l0; g_ds_last.pp = p0; }   // a new command buffer: no state recorded in it yet
+    ds_last_newcb();   // a new command buffer: no state recorded in it yet
     g_ci = (g_ci + 1) % NCTX; ctx_t *c = &g_ctx[g_ci];
     uint64_t w0 = now_ns();
     lk_(&g_mu, LW_MU);
@@ -3713,7 +3760,7 @@ void mtl_sub_begin(void) {
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
     if (!C->reset_done) VKCHECK(vkResetCommandPool(g_dev, C->pool, 0));   // both command buffers at once, their memory kept; normally done already by the completion thread
     C->reset_done = 0;
-    VKCHECK(vkBeginCommandBuffer(C->cb, &bi)); VKCHECK(vkBeginCommandBuffer(C->up, &bi));
+    VKCHECK(vkBeginCommandBuffer(C->cb, &bi)); VKCHECK(vkBeginCommandBuffer(C->up, &bi)); C->nsec = 0; C->prim = VK_NULL_HANDLE;   // the pool's reset reset its secondaries too
     barrier_all(C->up); g_vbar_epoch++;   // after everything submitted before (see mtl_sub_commit: no semaphore wait between the game's submissions)
     vkCmdResetQueryPool(C->up, C->qp, 0, 3); vkCmdWriteTimestamp(C->up, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, C->qp, 0);
     if (!C->oq_init) { vkCmdResetQueryPool(C->up, C->oq, 0, NOQ); C->oq_init = 1; } else if (C->noq) vkCmdResetQueryPool(C->up, C->oq, 0, C->noq);   // only those used last time
@@ -4431,6 +4478,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
               g_wsc_nf[WSC_NF_TEXU] / 600.0, g_wsc_nf[WSC_NF_UBO] / 600.0, g_wsc_nf[WSC_NF_MANY] / 600.0);
           g_wsc_hit = g_wsc_miss = g_wsc_nofit = 0; memset(g_wsc_nf, 0, sizeof g_wsc_nf);
           if (zc_mode()) { LOG("vk: zero-copy pools: %.0f MB backed; per frame %.1f reads taken in place, %.1f copied because a command-list write overlapped", g_zc_bytes / 1048576.0, g_zc_hits / 600.0, g_zc_miss_wlog / 600.0); g_zc_hits = g_zc_miss_wlog = 0; }
+          if (store_none_on()) { LOG("vk: DM_VK_STORE_NONE per frame over the last 600: %.1f passes through secondaries; colour attachments stored %.1f, left unstored %.1f; depth stored %.1f, left unstored %.1f",
+              g_sn_passes / 600.0, g_sn_all_c / 600.0, g_sn_none_c / 600.0, g_sn_all_d / 600.0, g_sn_none_d / 600.0); g_sn_passes = g_sn_all_c = g_sn_none_c = g_sn_all_d = g_sn_none_d = 0; }
           LOG("vk: state per frame over the last 600 (DM_VK_STATE_SKIP %d): pipelines taken as the last draw's %.1f, state commands left out %.1f, binds left out %.1f", state_skip(), g_pso_memo / 600.0, g_state_skips / 600.0, g_bind_skips / 600.0); g_pso_memo = g_state_skips = g_bind_skips = 0;
           static const char *const lwn[LW_N] = {"textures (rmu)", "GPU-written ranges (gwmu)", "contexts (mu)", "queue (qmu)", "image blocks (blkmu)"}; char lb[512]; int lo = 0;
           for (int k = 0; k < LW_N; k++) lo += snprintf(lb + lo, sizeof lb - lo, "%s%s %.2f ms (%.1f)", k ? ", " : "", lwn[k], atomic_exchange(&g_lw_ns[k], 0) / 600e6, atomic_exchange(&g_lw_n[k], 0) / 600.0);
