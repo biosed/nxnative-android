@@ -349,6 +349,7 @@ DM_VK_NO_DYNREND	test	Android: `1` uses render passes made per pass even where d
 DM_VK_NO_TIMELINE	test	Android: set, submissions are not chained by a timeline semaphore even where the GPU has one
 DM_VK_PASSLOG	diagnostic	Android: `=<frame>[+]` logs that frame's passes, draws, copies and dispatches (targets, clears, shaders, depth / stencil / blend)
 DM_VK_PASS_BARRIER	test	Android: `1` leaves vertex shaders out of each pass end's barrier (the next pass's vertex work may overlap); a vertex shader that samples such a pass's target gets a barrier first. Default 0
+DM_VK_PATCH_VERIFY	diagnostic	Android: `1` checks each compute stale patch (DM_VK_STALE_PATCH=2) word by word against the staged words when its submission completes, and logs the counts and the first mismatches
 DM_VK_POOL_TRANSIENT	test	Android: `1` creates the command pools VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, as before vk19.20 (default 0: kept warm, reset without releasing their memory)
 DM_VK_PREWARM_KEEP	test	Android: `1` makes the shader pre-warm keep every pipeline alive (RSS +~500 MB in FINAL FANTASY RESONANCE). Default 0 since vk19.13: each is destroyed right after it is made (only the driver's pipeline cache stays warm) and made again from that cache at its first use
 DM_VK_REUP_CAP_MB	switch	Android: while memory is low, re-uploads of written textures wait once a submission has this many MB of uploads (default 16; 0 no cap); first uploads never wait
@@ -370,6 +371,7 @@ DM_VK_TEXCOUNT	diagnostic	Android: set, every 600 presents logs the live texture
 DM_VK_TRIM_STEADY_S	switch	Android: while memory stays low without falling, the backend trims again only after this many seconds (default 60; 5 as before); rings go back to their minimum and malloc is purged only under real pressure
 DM_VK_UBWC	test	Android: `2` (opt-in) keeps compression only for render targets nothing is uploaded into; `1` makes images whose views never reinterpret the format keep the GPU's compression: a format list (own format and its sRGB / UNORM twin) or not mutable at all; storage images unchanged. Default 0; keep it off: with it on, texture streaming into compressed images ate untracked driver memory and the low-memory killer ended FINAL FANTASY RESONANCE 4 times in 4
 DM_VK_VTXIDX_FIX	test	Android: `0` leaves out vk19.10's VertexIndex bias (vertex shaders that read VertexIndex get the draw's first copied vertex added back through a push constant)
+DM_VK_XRING_KEEP_MB	switch	Android: extra rings kept for reuse (MB, default 64, at most 8 rings; was 32 MB / 4); let go under real memory pressure and by the trims
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
 DM_WATCH	diagnostic	`=<s>` dumps all threads after that many seconds (SIGALRM) and turns on the stall watchdog; off unless set
 DM_WATCH_SAMPLE	diagnostic	`=<path>` (Mac): when the stall watchdog fires, samples the process for 1 s with `/usr/bin/sample` and writes the thread stacks to that path

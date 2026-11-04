@@ -210,7 +210,12 @@ static uint64_t g_wgen;   // a new generation when the ring changes or the write
 static uint32_t g_nwlog;   // writes logged in this generation (wlog_add)
 // Extra rings made and freed every few frames were fresh device memory each time (vkAllocateMemory, mapped: page faults as the CPU first writes them). Freed ones are kept (at most
 // 4, 64 MB in all) and taken again by the next submission that outgrows its ring; the mapping of each live one is remembered by its memory (xring_*)
-static struct { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceSize size; } g_xc[4]; static int g_nxc; static VkDeviceSize g_xc_bytes;
+static struct { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceSize size; } g_xc[8]; static int g_nxc; static VkDeviceSize g_xc_bytes;
+// DM_VK_XRING_KEEP_MB (vk19.40, default 64; was 4 rings and 32 MB): the extra rings kept for reuse. With the rings at their 96 MB cap, the dungeon's submissions took about two
+// extra rings a frame (48-64 MB live), and those the 32 MB could not keep were fresh mappings each time, every page faulted on its first write (~2,500 faults a frame left after
+// the trims stopped). Kept rings are let go under real pressure (g_mem_tight) and by the trims. g_xr_fresh / g_ring_new: fresh extra rings and context rings made again (the per-600 line)
+static uint64_t g_xr_fresh, g_xr_fresh_bytes, g_ring_new, g_ring_new_bytes;
+static VkDeviceSize xring_keep(void) { static VkDeviceSize v; if (!v) { const char *e = getenv("DM_VK_XRING_KEEP_MB"); long mb = e && atol(e) >= 0 ? atol(e) : 64; v = ((VkDeviceSize)mb << 20) | 1; } return v & ~(VkDeviceSize)1; }
 static int g_mem_low;   // the system is short of memory (mem_watch): nothing is kept for reuse
 static int g_mem_tight;   // real pressure (a burst, or under half the low mark): extra rings are not kept, rings go back to their minimum (vk19.38)
 static _Atomic uint64_t g_ring_trim_gen;
@@ -220,14 +225,14 @@ static VkBuffer xring_get(VkDeviceSize want, VkDeviceSize *size, VkDeviceMemory 
     for (int i = 0; i < g_nxc; i++) if (g_xc[i].size >= want && (best < 0 || g_xc[i].size < g_xc[best].size)) best = i;
     if (best >= 0) { VkBuffer b = g_xc[best].b; *m = g_xc[best].m; *p = g_xc[best].p; *size = g_xc[best].size; g_xc_bytes -= g_xc[best].size; g_xc[best] = g_xc[--g_nxc]; g_xc_reused++; pthread_mutex_unlock(&g_xcmu); return b; }
     pthread_mutex_unlock(&g_xcmu);
-    VkBuffer b = buf_new(want, ALL_BUF_USAGE, m, (void **)p); *size = want;
+    VkBuffer b = buf_new(want, ALL_BUF_USAGE, m, (void **)p); *size = want; g_xr_fresh++; g_xr_fresh_bytes += want;
     pthread_mutex_lock(&g_xcmu); if (g_nxmap < 256) g_xmap[g_nxmap++] = (typeof(g_xmap[0])){*m, *p}; pthread_mutex_unlock(&g_xcmu);
     return b;
 }
 static void xring_put(VkBuffer b, VkDeviceMemory m, VkDeviceSize size) {   // a freed extra ring: kept for reuse, or destroyed
     pthread_mutex_lock(&g_xcmu); void *p = NULL; int k = 0;
     for (; k < g_nxmap; k++) if (g_xmap[k].m == m) { p = g_xmap[k].p; break; }
-    if (p && g_nxc < 4 && g_xc_bytes + size <= (32u << 20) && !g_mem_tight) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); return; }
+    if (p && g_nxc < 8 && g_xc_bytes + size <= xring_keep() && !g_mem_tight) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); return; }
     if (k < g_nxmap) g_xmap[k] = g_xmap[--g_nxmap];
     pthread_mutex_unlock(&g_xcmu);
     vkDestroyBuffer(g_dev, b, NULL); vkFreeMemory(g_dev, m, NULL);
@@ -391,6 +396,18 @@ static int patch_pipe(void) {
     g_patch_ok = 1; return 1;
 }
 static VkDescriptorSet patch_set(void);
+// DM_VK_PATCH_VERIFY=1 (diagnostics, with DM_VK_STALE_PATCH=2): each patch dispatch is checked when its submission completes, every word of its table against the staged
+// words (the ring is host-visible). A mismatch is either a wrong patch or a later write of this submission over the same bytes (a dispatch storing there): both are logged
+enum { NPV = 64 };
+static struct { const uint32_t *dst, *src, *tab; uint32_t n; } g_pv[32][NPV]; static int g_npv[32]; static uint64_t g_pv_words, g_pv_bad, g_pv_checked;
+static int patch_verify(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_PATCH_VERIFY"); v = e && atoi(e) != 0; } return v; }
+static void patch_verify_ctx(int ci) {
+    for (int i = 0; i < g_npv[ci]; i++) { const uint32_t *t = g_pv[ci][i].tab;
+        for (uint32_t j = 0; j < g_pv[ci][i].n; j++) { const uint32_t *d = g_pv[ci][i].dst + t[4 * j], *sw = g_pv[ci][i].src + t[4 * j + 1];
+            for (uint32_t k = 0; k < t[4 * j + 2]; k++) { g_pv_words++; if (d[k] != sw[k]) { g_pv_bad++; static int nl; if (nl++ < 20) LOG("[RED] vk: stale patch check: word %u of run %u differs (%#x, staged %#x)", k, j, d[k], sw[k]); } } }
+        g_pv_checked++; }
+    g_npv[ci] = 0;
+}
 // The runs rg[0..nr) (srcOffset: from lo, size: bytes) as a dispatch: returns 0 when it cannot (the caller records the copy regions)
 static int gw_patch_cs(const uint8_t *g, const VkBufferCopy *rg, size_t nr, VkBuffer dst, VkDeviceSize dst_off) {
     if (stale_patch_mode() != 2 || !patch_pipe()) return 0;
@@ -400,7 +417,8 @@ static int gw_patch_cs(const uint8_t *g, const VkBufferCopy *rg, size_t nr, VkBu
     size_t nt = 0; for (size_t k = 0; k < nr; k++) { if (rg[k].srcOffset % 4 || rg[k].size % 4) return 0; nt += (rg[k].size / 4 + 63) / 64; }
     VkDeviceSize dbase = (dst_off + first) / sal * sal, dlen = dst_off + last - dbase, slen = last - first;
     if (dlen > g_props.limits.maxStorageBufferRange || slen > g_props.limits.maxStorageBufferRange || nt > (1u << 20)) return 0;
-    VkDeviceSize so = ring_put(g + first, slen, sal); if (so == VK_WHOLE_SIZE) return 0; VkBuffer sb = C->ring;
+    const uint8_t *dmap = dst == C->ring ? C->ringp + (dbase - 0) : NULL;   // the destination's mapping, for DM_VK_PATCH_VERIFY (the caller's current ring)
+    VkDeviceSize so = ring_put(g + first, slen, sal); if (so == VK_WHOLE_SIZE) return 0; VkBuffer sb = C->ring; const uint8_t *smap = C->ringp + so;
     VkDeviceSize to = ring_alloc(nt * 16, sal); if (to == VK_WHOLE_SIZE) return 0; VkBuffer tb = C->ring; uint32_t *tab = (uint32_t *)(C->ringp + to);   // after the source: ring_alloc may move to an extra ring
     size_t j = 0;
     for (size_t k = 0; k < nr; k++) for (uint64_t w = 0; w < rg[k].size / 4; w += 64) {
@@ -420,6 +438,7 @@ static int gw_patch_cs(const uint8_t *g, const VkBufferCopy *rg, size_t nr, VkBu
     VkMemoryBarrier mb2 = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
     vkCmdPipelineBarrier(C->up, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);   // before a later copy or patch over the same bytes in this command buffer
     C->up_used = 1; g_patch_disp++; g_patch_runs += nt;
+    if (patch_verify() && dmap && g_ci < 32 && g_npv[g_ci] < NPV) g_pv[g_ci][g_npv[g_ci]++] = (typeof(g_pv[0][0])){(const uint32_t *)dmap, (const uint32_t *)smap, tab, (uint32_t)nt};
     return 1;
 }
 static void gw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDeviceSize dst_off) {
@@ -645,6 +664,7 @@ static void snap_free(void *p, size_t n) {
 // guest clock when the completion thread saw the fence), the start that minus the submission's GPU span. DM_VK_GPU_TS=0: one time for all, as before
 static int gpu_ts_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GPU_TS"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_GPU_TS=0: counter timestamps all take the completion time"); } return v; }
 static void ctx_complete(ctx_t *c) {
+    if (patch_verify()) { int ci = (int)(c - g_ctx); if (ci >= 0 && ci < 32 && g_npv[ci]) patch_verify_ctx(ci); }
     uint64_t ts[3], t_end = gpu_ticks(), t_top = t_end;
     if (vkGetQueryPoolResults(g_dev, c->qp, 0, 3, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[2] >= ts[0]) atomic_fetch_add(&g_up_gpu_ns, (uint64_t)((double)(ts[2] - ts[0]) * g_props.limits.timestampPeriod));
     if (vkGetQueryPoolResults(g_dev, c->qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0])
@@ -3518,7 +3538,7 @@ static void ring_fit(ctx_t *c) {
     else if (++c->nwin >= 120) { if (c->win_max * 4 < c->ring0_size && c->ring0_size > RING_MIN && (!ring_keep() || g_mem_low)) want = c->ring0_size / 2; c->win_max = 0; c->nwin = 0; }   // DM_VK_RING_KEEP=1: halved only while memory is low
     if (want == c->ring0_size) return;
     vkDestroyBuffer(g_dev, c->ring0, NULL); vkFreeMemory(g_dev, c->ringm0, NULL); atomic_fetch_sub(&g_ring0_bytes, c->ring0_size);
-    c->ring0 = buf_new(want, ALL_BUF_USAGE, &c->ringm0, (void **)&c->ringp0); c->ring0_size = want; atomic_fetch_add(&g_ring0_bytes, want);
+    c->ring0 = buf_new(want, ALL_BUF_USAGE, &c->ringm0, (void **)&c->ringp0); c->ring0_size = want; atomic_fetch_add(&g_ring0_bytes, want); g_ring_new++; g_ring_new_bytes += want;
 }
 void mtl_sub_begin(void) {
     vk_init(); g_sub_up_bytes = 0;
@@ -4204,7 +4224,11 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
           g_memo_hit = g_memo_miss = g_dsc_rej = g_dsc_miss_ns = g_dsc_nmiss_t = 0; g_dirty_scans = g_dirty_skips = 0; g_segc_hit = g_segc_miss = 0; g_patch_disp = g_patch_runs = 0; g_hold_n = g_hold_age_sum = g_hold_age_max = 0; g_fwd_n = g_fwd_bytes = 0;
           static const char *const lwn[LW_N] = {"textures (rmu)", "GPU-written ranges (gwmu)", "contexts (mu)", "queue (qmu)", "image blocks (blkmu)"}; char lb[512]; int lo = 0;
           for (int k = 0; k < LW_N; k++) lo += snprintf(lb + lo, sizeof lb - lo, "%s%s %.2f ms (%.1f)", k ? ", " : "", lwn[k], atomic_exchange(&g_lw_ns[k], 0) / 600e6, atomic_exchange(&g_lw_n[k], 0) / 600.0);
-          LOG("vk: lock waits per frame over the last 600, all threads: %s", lb); }
+          LOG("vk: lock waits per frame over the last 600, all threads: %s", lb);
+          if (patch_verify()) LOG("vk: stale patch check (DM_VK_PATCH_VERIFY): %llu dispatches, %llu words checked, %llu differ", (unsigned long long)g_pv_checked, (unsigned long long)g_pv_words, (unsigned long long)g_pv_bad);
+          LOG("vk: fresh ring memory per frame over the last 600: extra rings %.2f (%.1f MB; %llu taken from the kept ones in all), context rings made again %.3f (%.1f MB)",
+              g_xr_fresh / 600.0, g_xr_fresh_bytes / 600.0 / 1048576.0, (unsigned long long)g_xc_reused, g_ring_new / 600.0, g_ring_new_bytes / 600.0 / 1048576.0);
+          g_xr_fresh = g_xr_fresh_bytes = g_ring_new = g_ring_new_bytes = 0; }
         ls = g_nsub_stat; g_t_draw = g_t_ws = g_t_disp = g_t_up = g_t_sub = 0; g_up_bytes = 0; g_dsc_hit = g_dsc_miss = 0; }
     if (n % 600 == 0) {   // memory: the process (RSS, its anonymous part, PSS) and what the backend holds
         long rss = 0, anon = 0, pss = 0; char ln[256]; FILE *f = fopen("/proc/self/status", "re");
