@@ -3753,7 +3753,8 @@ static void mem_watch(void) {
 }
 // mem_watch runs on a thread of its own (vk19.32), every 100 ms: run from the submissions it stopped with them, and FINAL FANTASY RESONANCE's killing loads stall the rendering
 // (a frame of 54 NVN functions, then nothing): no line and no trim in the 5 s between the 115.7 MB read and the kill. The textures are still evicted at the next submission (tex_evict)
-static void *mem_watch_thread(void *a) { pthread_setname_np("dm-memwatch"); (void)a; for (;;) { mem_watch(); usleep(100000); } return NULL; }
+static void topo_tick(void);   // DM_TOPO_AFFINITY (below), once a second
+static void *mem_watch_thread(void *a) { pthread_setname_np("dm-memwatch"); (void)a; for (int i = 0;; i++) { mem_watch(); if (i % 10 == 0) topo_tick(); usleep(100000); } return NULL; }
 static void mem_watch_start(void) { static int started; if (started) return; started = 1; pthread_t t; if (pthread_create(&t, NULL, mem_watch_thread, NULL)) { started = 0; return; } pthread_detach(t); }
 void tex_evict_hook(void) { mem_watch_start(); tex_evict(atomic_load(&g_trim_gen)); }   // the front end's low-memory signal (app/front_android.c): every ring back to RING_MIN at its next use
 // DM_VK_RING_KEEP=1: a ring is not halved after a quiet stretch unless memory is low (g_mem_low). Halving and growing again later made a fresh mapping each time, every page of it
@@ -3772,6 +3773,7 @@ static void ring_fit(ctx_t *c) {
 }
 void mtl_sub_begin(void) {
     vk_init(); g_sub_up_bytes = 0;
+    { extern _Atomic int g_rec_tid; int t = (int)gettid(); if (atomic_load_explicit(&g_rec_tid, memory_order_relaxed) != t) atomic_store(&g_rec_tid, t); }   // the recording thread (DM_TOPO_AFFINITY)
     if (zc_mode()) zc_reap(g_done);
     ds_last_newcb();   // a new command buffer: no state recorded in it yet
     g_ci = (g_ci + 1) % NCTX; ctx_t *c = &g_ctx[g_ci];
@@ -4372,6 +4374,66 @@ static uint64_t g_adpf_n, g_adpf_fail, g_adpf_cpu, g_adpf_gpu; static int g_adpf
 // 2 performance, 3 battery, 4 custom) and the render thread's core
 int dm_game_mode = -1;
 static long rd_long(const char *path) { FILE *f = fopen(path, "re"); long v = -1; if (f) { if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); } return v; }
+// DM_TOPO_AFFINITY=1 (vk19.53, opt-in): host threads placed by the cores' measured strength, read at run time: cpu_capacity per core (else cpuinfo_max_freq; else nothing is
+// done), grouped into tiers. The thread that records the submissions (the one in mtl_sub_begin: the game's RHI thread, or dm-record) goes to the strongest tier, the other hot
+// threads (RHIThread, RenderThread, GameThread, RHIInterrupt by their names, and dm-complete) to the next one, everything else stays where the kernel puts it. No core number is
+// assumed: on the Xiaomi Pad 8 the tiers came out as the device has them. A strongest tier of one core that is throttling (thermal status 2 or more, or headroom 0.95 or more)
+// is widened to the top two tiers until it recovers. Host affinity only: the guest's core masks (core_serial) are untouched. Applied once a second to new or moved threads
+_Atomic int g_rec_tid;
+static int topo_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_TOPO_AFFINITY"); v = e && atoi(e) != 0; } return v; }
+static cpu_set_t g_topo_top, g_topo_next, g_topo_top2; static int g_topo_ok = -1, g_topo_wide, g_topo_ntop;
+static void topo_init(void) {
+    long cap[64]; int n = (int)sysconf(_SC_NPROCESSORS_CONF); if (n > 64) n = 64; if (n < 1) n = 1;
+    int src = 0;
+    for (int c = 0; c < n; c++) { char pth[96]; snprintf(pth, sizeof pth, "/sys/devices/system/cpu/cpu%d/cpu_capacity", c); cap[c] = rd_long(pth); if (cap[c] > 0) src |= 1; }
+    if (!(src & 1)) for (int c = 0; c < n; c++) { char pth[96]; snprintf(pth, sizeof pth, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c); cap[c] = rd_long(pth); if (cap[c] > 0) src |= 2; }
+    if (!src) { g_topo_ok = 0; LOG("vk: topology: neither cpu_capacity nor cpuinfo_max_freq readable: threads left where they are (DM_TOPO_AFFINITY)"); return; }
+    long t1 = 0, t2 = 0; for (int c = 0; c < n; c++) if (cap[c] > t1) t1 = cap[c];
+    for (int c = 0; c < n; c++) if (cap[c] < t1 && cap[c] > t2) t2 = cap[c];
+    CPU_ZERO(&g_topo_top); CPU_ZERO(&g_topo_next); CPU_ZERO(&g_topo_top2);
+    char b[256]; int o = 0;
+    for (int c = 0; c < n; c++) { if (cap[c] == t1) { CPU_SET(c, &g_topo_top); CPU_SET(c, &g_topo_top2); g_topo_ntop++; } else if (cap[c] == t2) { CPU_SET(c, &g_topo_next); CPU_SET(c, &g_topo_top2); }
+                                  o += snprintf(b + o, sizeof b - o, "%s%d:%ld", c ? " " : "", c, cap[c]); }
+    if (!t2) g_topo_next = g_topo_top;   // one tier only: everything shares it
+    g_topo_ok = 1; LOG("vk: topology (%s): %s; the recording thread on the %d core%s of the strongest tier, the other hot threads on the next", src & 1 ? "cpu_capacity" : "cpuinfo_max_freq", b, g_topo_ntop, g_topo_ntop > 1 ? "s" : "");
+}
+static struct { int tid; int role; } g_topo_set[32]; static int g_topo_nset;   // threads placed and how (role 1 recording, 2 hot)
+static int topo_role_of(int tid) { for (int i = 0; i < g_topo_nset; i++) if (g_topo_set[i].tid == tid) return g_topo_set[i].role; return 0; }
+static void topo_place(int tid, int role, const char *name) {
+    const cpu_set_t *m = role == 1 ? (g_topo_wide ? &g_topo_top2 : &g_topo_top) : &g_topo_next;
+    int r = sched_setaffinity(tid, sizeof *m, m);
+    int i = 0; while (i < g_topo_nset && g_topo_set[i].tid != tid) i++;
+    if (i == g_topo_nset && g_topo_nset < 32) g_topo_nset++;
+    if (i < 32) g_topo_set[i] = (typeof(g_topo_set[0])){tid, role};
+    static int nl; if (nl++ < 24) LOG("vk: topology: %s (tid %d) %s%s", name, tid, role == 1 ? "on the strongest tier" : "on the next tier", r ? " -- sched_setaffinity failed" : "");
+}
+static void topo_tick(void) {
+    if (!topo_on()) return;
+    if (g_topo_ok < 0) topo_init();
+    if (!g_topo_ok) return;
+    {   // a single strongest core throttling: the top two tiers until it recovers
+        static void *tm; static int (*st)(void *); static float (*hr)(void *, int); static int ti;
+        if (!ti) { ti = 1; void *h = dlopen("libandroid.so", RTLD_NOW); void *(*acq)(void) = h ? (void *(*)(void))dlsym(h, "AThermal_acquireManager") : NULL;
+                   st = h ? (int (*)(void *))dlsym(h, "AThermal_getCurrentThermalStatus") : NULL; hr = h ? (float (*)(void *, int))dlsym(h, "AThermal_getThermalHeadroom") : NULL; tm = acq ? acq() : NULL; }
+        int ts = tm && st ? st(tm) : 0; float hd = tm && hr ? hr(tm, 0) : 0;
+        int wide = g_topo_wide;
+        if (g_topo_ntop == 1 && (ts >= 2 || hd >= 0.95f)) wide = 1; else if (ts < 2 && hd < 0.85f) wide = 0;
+        if (wide != g_topo_wide) { g_topo_wide = wide; LOG("vk: topology: thermal status %d, headroom %.2f: the recording thread %s", ts, (double)hd, wide ? "widened to the top two tiers" : "back on the strongest tier");
+                                   for (int i = 0; i < g_topo_nset; i++) if (g_topo_set[i].role == 1) g_topo_set[i].role = -1; }   // re-placed below
+    }
+    int rec = atomic_load(&g_rec_tid);
+    static const char *const hot[] = {"RHIThread", "RenderThread", "GameThread", "RHIInterrupt", "dm-complete", "dm-record"};
+    DIR *d = opendir("/proc/self/task"); if (!d) return;
+    for (struct dirent *e; (e = readdir(d));) {
+        int tid = atoi(e->d_name); if (tid <= 0) continue;
+        char pth[64], cm[32] = ""; snprintf(pth, sizeof pth, "/proc/self/task/%d/comm", tid); FILE *f = fopen(pth, "re"); if (!f) continue;
+        if (fgets(cm, sizeof cm, f)) cm[strcspn(cm, "\n")] = 0; fclose(f);
+        int role = tid == rec ? 1 : 0;
+        if (!role) for (size_t k = 0; k < sizeof hot / sizeof *hot; k++) if (strstr(cm, hot[k])) { role = 2; break; }
+        if (role && topo_role_of(tid) != role) topo_place(tid, role, cm);
+    }
+    closedir(d);
+}
 static void clock_line(void) {
     char b[256]; int o = 0;
     for (int c = 0; c < 8; c++) { char pth[96]; snprintf(pth, sizeof pth, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c); long f = rd_long(pth); o += snprintf(b + o, sizeof b - o, "%s%ld", c ? " " : "", f > 0 ? f / 1000 : -1); }
@@ -4384,7 +4446,12 @@ static void clock_line(void) {
                void *(*acq)(void) = h ? (void *(*)(void))dlsym(h, "AThermal_acquireManager") : NULL; st = h ? (int (*)(void *))dlsym(h, "AThermal_getCurrentThermalStatus") : NULL;
                hr = h ? (float (*)(void *, int))dlsym(h, "AThermal_getThermalHeadroom") : NULL; tm = acq ? acq() : NULL; }
     int ts = tm && st ? st(tm) : -1; float hd = tm && hr ? hr(tm, 0) : -1.0f;
-    LOG("vk: clocks: CPU MHz by core %s; GPU %ld MHz; thermal status %d, headroom %.2f; game mode %d; this thread on core %d", b, g, ts, (double)hd, dm_game_mode, sched_getcpu());
+    char hb[256] = ""; int ho = 0;   // where the hot threads ran last (DM_TOPO_AFFINITY's placement, or the kernel's)
+    for (int i = 0; i < g_topo_nset && ho < (int)sizeof hb - 40; i++) { char pth[64], ln[512]; snprintf(pth, sizeof pth, "/proc/self/task/%d/stat", g_topo_set[i].tid); FILE *f = fopen(pth, "re");
+        if (f && fgets(ln, sizeof ln, f)) { char *q = strrchr(ln, ')'); int fld = 0, cpu = -1; for (char *t = q ? q + 2 : ln; *t && fld < 37; t++) if (*t == ' ') { fld++; if (fld == 36) cpu = atoi(t + 1); }
+                                            ho += snprintf(hb + ho, sizeof hb - ho, "%s%d:%d", ho ? " " : "; placed threads tid:core ", g_topo_set[i].tid, cpu); }
+        if (f) fclose(f); }
+    LOG("vk: clocks: CPU MHz by core %s; GPU %ld MHz; thermal status %d, headroom %.2f; game mode %d; this thread on core %d%s", b, g, ts, (double)hd, dm_game_mode, sched_getcpu(), hb);
 }
 // DM_ADPF_ALL=1 (vk19.50, opt-in): the hint session holds every hot thread, not only the one that presents: the game's RHIThread, RenderThread, GameThread and RHIInterrupt, our
 // dm-complete and dm-record (found by name in /proc/self/task, again every 600 frames: APerformanceHint_setThreads, API 34), asks not to be run for power efficiency
