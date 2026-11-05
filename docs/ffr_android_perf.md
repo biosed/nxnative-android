@@ -61,6 +61,7 @@ Env "E": A with `DM_VK_MEM_LOW_MB=600 DM_MEM_PRETRIM_AVAIL_MB=700 DM_MEM_BUDGET_
 | Q | vk19.53 | E + `DM_VK_HTAB=1 DM_TOPO_AFFINITY=1` | 26.0–27.0 | | | | 22.0–23.5 | 9.7–10.3 | | 27.8–30.9 / 70–76 | kept: the recording thread (RHIThread) ran on the strongest core (cpu7, 1.67–2.84 GHz). But the threads put on the next tier ran on cores 0, 1 and 6: the masks did not hold (see R) |
 | Q′ | vk19.53 | E + `DM_TOPO_AFFINITY=1` | | | | | 22.5–23.0 | 10.2–10.6 | | 28.8–31.2 / | the handle table's share: dset −0.3 ms (noise): HTAB not kept |
 | R | vk19.54 | E + `DM_TOPO_AFFINITY=1` | 26.5–26.9 | | | | 27.2–27.8 | 12.3–12.6 | | 39–40.5 / 65–75 | placement by the guest threads' own tids, masks read back each second: every sched_setaffinity returned 0 yet the mask read back right after was all cores (no failure, 983 re-applications); RHIThread then ran on cores 2–3, GameThread on 7. Worse than Q: reverted to vk19.53. Our HLE sets no host affinity anywhere: the kernel / vendor layer ignores (or undoes) an app's affinity on these threads, and touching the game's real threads every second seems to cost their placement |
+| S | vk19.53 | E + `DM_TOPO_AFFINITY=1 DM_VK_RING_CAP_MB=160` | 26.6–26.8 | | | | 26.1–26.8 | | | 37.7–41.3 / 64–77 | confounded: the recording thread ran on cores 2–4 (22.2 fps). Across J′, Q, Q′, R, S the recording thread's core decides: on cpu7 (Q, Q′: 20 of 20 samples) rec 22.5 and ~25 fps, on cores 2–3 (J′, R, S) rec 25–27.8 and ~22 fps. The ring-cap A/B is to be redone once placement holds |
 
 ## Findings
 
