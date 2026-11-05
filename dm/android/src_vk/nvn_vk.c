@@ -3773,7 +3773,8 @@ static void ring_fit(ctx_t *c) {
 }
 void mtl_sub_begin(void) {
     vk_init(); g_sub_up_bytes = 0;
-    { extern _Atomic int g_rec_tid; int t = (int)gettid(); if (atomic_load_explicit(&g_rec_tid, memory_order_relaxed) != t) atomic_store(&g_rec_tid, t); }   // the recording thread (DM_TOPO_AFFINITY)
+    { extern _Atomic int g_rec_tid; static int cand, streak; int t = (int)gettid();   // the recording thread (DM_TOPO_AFFINITY): the one that made the last 30 submissions in a row
+      if (t != cand) { cand = t; streak = 0; } if (++streak >= 30 && atomic_load_explicit(&g_rec_tid, memory_order_relaxed) != t) atomic_store(&g_rec_tid, t); }
     if (zc_mode()) zc_reap(g_done);
     ds_last_newcb();   // a new command buffer: no state recorded in it yet
     g_ci = (g_ci + 1) % NCTX; ctx_t *c = &g_ctx[g_ci];
@@ -4398,14 +4399,35 @@ static void topo_init(void) {
     g_topo_ok = 1; LOG("vk: topology (%s): %s; the recording thread on the %d core%s of the strongest tier, the other hot threads on the next", src & 1 ? "cpu_capacity" : "cpuinfo_max_freq", b, g_topo_ntop, g_topo_ntop > 1 ? "s" : "");
 }
 static struct { int tid; int role; } g_topo_set[32]; static int g_topo_nset;   // threads placed and how (role 1 recording, 2 hot)
+// Guest threads by their guest name (hle_thread.c, at their start): Run Q matched names in /proc and took the app's own HWUI RenderThread, host threads that inherited a guest
+// thread's name ("1002 GameThread" six times), and missed Unreal's render thread (its name is cut to "1019 RenderThre")
+static struct { int tid; char name[32]; } g_gthr[128]; static int g_ngthr; static pthread_mutex_t g_gthr_mu = PTHREAD_MUTEX_INITIALIZER;
+void dm_guest_thread_named(int tid, const char *name) {
+    pthread_mutex_lock(&g_gthr_mu);
+    int i = 0; while (i < g_ngthr && g_gthr[i].tid != tid) i++;
+    if (i == g_ngthr && g_ngthr < 128) g_ngthr++;
+    if (i < 128) { g_gthr[i].tid = tid; snprintf(g_gthr[i].name, sizeof g_gthr[i].name, "%s", name); }
+    pthread_mutex_unlock(&g_gthr_mu);
+}
 static int topo_role_of(int tid) { for (int i = 0; i < g_topo_nset; i++) if (g_topo_set[i].tid == tid) return g_topo_set[i].role; return 0; }
-static void topo_place(int tid, int role, const char *name) {
+static void mask_str(const cpu_set_t *m, char *b, size_t n) { int o = 0; b[0] = 0; for (int c = 0; c < 64 && o < (int)n - 4; c++) if (CPU_ISSET(c, m)) o += snprintf(b + o, n - o, "%s%d", o ? "," : "", c); }
+static uint64_t g_topo_reapplied;
+static void topo_place(int tid, int role, const char *name) {   // its mask, applied again whenever it is not what it should be (the system may move a thread's cpuset, which resets its mask)
     const cpu_set_t *m = role == 1 ? (g_topo_wide ? &g_topo_top2 : &g_topo_top) : &g_topo_next;
-    int r = sched_setaffinity(tid, sizeof *m, m);
+    cpu_set_t cur; CPU_ZERO(&cur); int known = !sched_getaffinity(tid, sizeof cur, &cur);
     int i = 0; while (i < g_topo_nset && g_topo_set[i].tid != tid) i++;
+    int was = i < g_topo_nset ? g_topo_set[i].role : 0;
+    if (known && was == role && CPU_EQUAL(&cur, m)) return;
+    int r = sched_setaffinity(tid, sizeof *m, m), err = r ? errno : 0;
     if (i == g_topo_nset && g_topo_nset < 32) g_topo_nset++;
     if (i < 32) g_topo_set[i] = (typeof(g_topo_set[0])){tid, role};
-    static int nl; if (nl++ < 24) LOG("vk: topology: %s (tid %d) %s%s", name, tid, role == 1 ? "on the strongest tier" : "on the next tier", r ? " -- sched_setaffinity failed" : "");
+    if (was == role) g_topo_reapplied++;
+    cpu_set_t now; CPU_ZERO(&now); sched_getaffinity(tid, sizeof now, &now); char want[64], got[64]; mask_str(m, want, sizeof want); mask_str(&now, got, sizeof got);
+    static int nl; if (nl++ < 40 || r) {
+        char cs[96] = ""; if (r) { char pth[64]; snprintf(pth, sizeof pth, "/proc/self/task/%d/cpuset", tid); FILE *f = fopen(pth, "re"); if (f) { if (fgets(cs, sizeof cs, f)) cs[strcspn(cs, "\n")] = 0; fclose(f); } }
+        LOG("vk: topology: %s (tid %d) %s: wanted {%s}, has {%s}%s%s%s%s", name, tid, role == 1 ? "the recording thread" : "a hot thread", want, got, was == role ? " (applied again: it had been changed)" : "",
+            r ? " -- sched_setaffinity failed: " : "", r ? strerror(err) : "", r && cs[0] ? (snprintf(cs + strlen(cs), sizeof cs - strlen(cs), " (cpuset)"), cs) : "");
+    }
 }
 static void topo_tick(void) {
     if (!topo_on()) return;
@@ -4422,17 +4444,23 @@ static void topo_tick(void) {
                                    for (int i = 0; i < g_topo_nset; i++) if (g_topo_set[i].role == 1) g_topo_set[i].role = -1; }   // re-placed below
     }
     int rec = atomic_load(&g_rec_tid);
-    static const char *const hot[] = {"RHIThread", "RenderThread", "GameThread", "RHIInterrupt", "dm-complete", "dm-record"};
-    DIR *d = opendir("/proc/self/task"); if (!d) return;
-    for (struct dirent *e; (e = readdir(d));) {
+    // the guest's hot threads by their guest names (dm_guest_thread_named), the backend's by their own (dm-complete, dm-record)
+    static const char *const ghot[] = {"RHIThread", "RenderThread", "GameThread", "RHIInterrupt"};
+    struct { int tid; char name[32]; } lst[160]; int nl = 0;
+    pthread_mutex_lock(&g_gthr_mu);
+    for (int i = 0; i < g_ngthr && nl < 160; i++) for (size_t k = 0; k < sizeof ghot / sizeof *ghot; k++) if (!strncmp(g_gthr[i].name, ghot[k], strlen(ghot[k]))) {
+        lst[nl].tid = g_gthr[i].tid; snprintf(lst[nl].name, sizeof lst[nl].name, "%s", g_gthr[i].name); nl++; break; }
+    pthread_mutex_unlock(&g_gthr_mu);
+    DIR *d = opendir("/proc/self/task");
+    if (d) { for (struct dirent *e; (e = readdir(d)) && nl < 160;) {
         int tid = atoi(e->d_name); if (tid <= 0) continue;
         char pth[64], cm[32] = ""; snprintf(pth, sizeof pth, "/proc/self/task/%d/comm", tid); FILE *f = fopen(pth, "re"); if (!f) continue;
         if (fgets(cm, sizeof cm, f)) cm[strcspn(cm, "\n")] = 0; fclose(f);
-        int role = tid == rec ? 1 : 0;
-        if (!role) for (size_t k = 0; k < sizeof hot / sizeof *hot; k++) if (strstr(cm, hot[k])) { role = 2; break; }
-        if (role && topo_role_of(tid) != role) topo_place(tid, role, cm);
-    }
-    closedir(d);
+        if (!strcmp(cm, "dm-complete") || !strcmp(cm, "dm-record") || tid == rec) { lst[nl].tid = tid; snprintf(lst[nl].name, sizeof lst[nl].name, "%s", cm); nl++; }
+      } closedir(d); }
+    for (int i = 0; i < nl; i++) { int dup = 0; for (int j = 0; j < i; j++) dup |= lst[j].tid == lst[i].tid; if (dup) continue;
+        char pth[64]; snprintf(pth, sizeof pth, "/proc/self/task/%d", lst[i].tid); if (access(pth, F_OK)) continue;   // gone
+        topo_place(lst[i].tid, lst[i].tid == rec ? 1 : 2, lst[i].name); }
 }
 static void clock_line(void) {
     char b[256]; int o = 0;
@@ -4450,6 +4478,7 @@ static void clock_line(void) {
     for (int i = 0; i < g_topo_nset && ho < (int)sizeof hb - 40; i++) { char pth[64], ln[512]; snprintf(pth, sizeof pth, "/proc/self/task/%d/stat", g_topo_set[i].tid); FILE *f = fopen(pth, "re");
         if (f && fgets(ln, sizeof ln, f)) { char *q = strrchr(ln, ')'); int fld = 0, cpu = -1; for (char *t = q ? q + 2 : ln; *t && fld < 37; t++) if (*t == ' ') { fld++; if (fld == 36) cpu = atoi(t + 1); }
                                             ho += snprintf(hb + ho, sizeof hb - ho, "%s%d:%d", ho ? " " : "; placed threads tid:core ", g_topo_set[i].tid, cpu); }
+        if (i == g_topo_nset - 1 && g_topo_reapplied && ho < (int)sizeof hb - 40) ho += snprintf(hb + ho, sizeof hb - ho, " (masks applied again %llu times)", (unsigned long long)g_topo_reapplied);
         if (f) fclose(f); }
     LOG("vk: clocks: CPU MHz by core %s; GPU %ld MHz; thermal status %d, headroom %.2f; game mode %d; this thread on core %d%s", b, g, ts, (double)hd, dm_game_mode, sched_getcpu(), hb);
 }

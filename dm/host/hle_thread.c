@@ -409,6 +409,7 @@ static void *thread_main(void *p) {
     { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%x %s", t->handle, thr_name(t, nb, sizeof nb));   // the guest's name (set before StartThread) for sample / Instruments / top
 #ifdef __ANDROID__
       hn[15] = 0;   // Linux keeps 15 characters and refuses a longer name: every guest thread showed as the process ("1018 RHIThread", "1002 GameThread", "101a Foreground ")
+      { void dm_guest_thread_named(int tid, const char *name) __attribute__((weak)); if (dm_guest_thread_named) dm_guest_thread_named((int)gettid(), nb); }   // the Vulkan backend's thread placement (DM_TOPO_AFFINITY) by guest name: a comm can be inherited by host threads the guest thread starts, and is cut
 #endif
       pthread_setname_np(hn); }
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
