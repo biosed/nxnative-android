@@ -3776,6 +3776,7 @@ static void ring_fit(ctx_t *c) {
 }
 void mtl_sub_begin(void) {
     vk_init(); g_sub_up_bytes = 0;
+    { void topo_self_tick(void); topo_self_tick(); }   // DM_TOPO_SELF: the recording thread places itself
     { extern _Atomic int g_rec_tid; static int cand, streak; int t = (int)gettid();   // the recording thread (DM_TOPO_AFFINITY): the one that made the last 30 submissions in a row
       if (t != cand) { cand = t; streak = 0; } if (++streak >= 30 && atomic_load_explicit(&g_rec_tid, memory_order_relaxed) != t) atomic_store(&g_rec_tid, t); }
     if (zc_mode()) zc_reap(g_done);
@@ -4475,6 +4476,49 @@ static void topo_tick(void) {
         char pth[64]; snprintf(pth, sizeof pth, "/proc/self/task/%d", lst[i].tid); if (access(pth, F_OK)) continue;   // gone
         topo_place(lst[i].tid, lst[i].tid == rec ? 1 : 2, lst[i].name); }
 }
+// DM_TOPO_SELF=1 (vk19.55, opt-in): the recording thread puts ITSELF on the strongest tier. Run R showed another thread's mask set by sched_setaffinity(tid) read back as every core
+// right away, while the runs whose recording thread sat on the strongest core (Q, Q': cpu7 in 20 of 20 samples) recorded 4 ms faster and ran 3 fps faster than those where it
+// sat on the gold cores (J', R, S). The recording thread is the one with the most submissions over the last 300 (and at least 30 of them in a row); from inside mtl_sub_begin it
+// calls sched_setaffinity(0) with the strongest tier (the top two while a single strongest core throttles), reads its own mask back every 60 submissions and applies it again
+// when it changed (counted). No other thread is touched
+static int topo_self_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_TOPO_SELF"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_TOPO_SELF=1: the recording thread places itself on the strongest cores"); } return v; }
+static uint64_t g_ts_applied, g_ts_reapplied;
+void topo_self_tick(void) {
+    if (!topo_self_on()) return;
+    static int win_tid[8], win_cnt[8], win_n, subs, cand, streak, best_streak[8], winner; static uint64_t nsub;
+    int t = (int)gettid(); nsub++;
+    if (t != cand) { cand = t; streak = 0; } streak++;
+    int k = 0; while (k < win_n && win_tid[k] != t) k++;
+    if (k == win_n && win_n < 8) { win_tid[k] = t; win_cnt[k] = 0; best_streak[k] = 0; win_n++; }
+    if (k < 8) { win_cnt[k]++; if (streak > best_streak[k]) best_streak[k] = streak; }
+    if (++subs >= 300) {   // the window's winner: most submissions, and a run of 30 at least
+        int w = -1; for (int i = 0; i < win_n; i++) if (best_streak[i] >= 30 && (w < 0 || win_cnt[i] > win_cnt[w])) w = i;
+        if (w >= 0 && win_tid[w] != winner) { LOG("vk: DM_TOPO_SELF: the recording thread is tid %d (%d of the last 300 submissions)", win_tid[w], win_cnt[w]); winner = win_tid[w]; }
+        subs = 0; win_n = 0;
+    }
+    if (t != winner) return;
+    if (g_topo_ok < 0) topo_init();
+    if (!g_topo_ok) return;
+    static uint64_t last_chk, last_th; static int placed, wide;
+    if (nsub - last_th >= 600) { last_th = nsub;   // a single strongest core throttling: the top two tiers until it recovers
+        static void *tm; static int (*st)(void *); static float (*hr)(void *, int); static int ti;
+        if (!ti) { ti = 1; void *h = dlopen("libandroid.so", RTLD_NOW); void *(*acq)(void) = h ? (void *(*)(void))dlsym(h, "AThermal_acquireManager") : NULL;
+                   st = h ? (int (*)(void *))dlsym(h, "AThermal_getCurrentThermalStatus") : NULL; hr = h ? (float (*)(void *, int))dlsym(h, "AThermal_getThermalHeadroom") : NULL; tm = acq ? acq() : NULL; }
+        int ts = tm && st ? st(tm) : 0; float hd = tm && hr ? hr(tm, 0) : 0; int w2 = wide;
+        if (g_topo_ntop == 1 && (ts >= 2 || hd >= 0.95f)) w2 = 1; else if (ts < 2 && hd < 0.85f) w2 = 0;
+        if (w2 != wide) { wide = w2; placed = 0; LOG("vk: DM_TOPO_SELF: thermal status %d, headroom %.2f: %s", ts, (double)hd, wide ? "on the top two tiers" : "back on the strongest tier"); }
+    }
+    if (placed && nsub - last_chk < 60) return;
+    last_chk = nsub;
+    const cpu_set_t *m = wide ? &g_topo_top2 : &g_topo_top;
+    cpu_set_t cur; CPU_ZERO(&cur);
+    if (placed && !sched_getaffinity(0, sizeof cur, &cur) && CPU_EQUAL(&cur, m)) return;
+    int r = sched_setaffinity(0, sizeof *m, m), err = r ? errno : 0;
+    cpu_set_t now; CPU_ZERO(&now); sched_getaffinity(0, sizeof now, &now); char want[64], got[64]; mask_str(m, want, sizeof want); mask_str(&now, got, sizeof got);
+    if (placed) g_ts_reapplied++; else g_ts_applied++;
+    static int nl; if (nl++ < 20 || r) LOG("vk: DM_TOPO_SELF: tid %d %s: wanted {%s}, reads back {%s}%s%s", t, placed ? "placed again (its mask had changed)" : "placed", want, got, r ? " -- failed: " : "", r ? strerror(err) : "");
+    placed = 1;
+}
 static void clock_line(void) {
     char b[256]; int o = 0;
     for (int c = 0; c < 8; c++) { char pth[96]; snprintf(pth, sizeof pth, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c); long f = rd_long(pth); o += snprintf(b + o, sizeof b - o, "%s%ld", c ? " " : "", f > 0 ? f / 1000 : -1); }
@@ -4493,7 +4537,8 @@ static void clock_line(void) {
                                             ho += snprintf(hb + ho, sizeof hb - ho, "%s%d:%d", ho ? " " : "; placed threads tid:core ", g_topo_set[i].tid, cpu); }
         if (i == g_topo_nset - 1 && g_topo_reapplied && ho < (int)sizeof hb - 40) ho += snprintf(hb + ho, sizeof hb - ho, " (masks applied again %llu times)", (unsigned long long)g_topo_reapplied);
         if (f) fclose(f); }
-    LOG("vk: clocks: CPU MHz by core %s; GPU %ld MHz; thermal status %d, headroom %.2f; game mode %d; this thread on core %d%s", b, g, ts, (double)hd, dm_game_mode, sched_getcpu(), hb);
+    if (topo_self_on() && (int)sizeof hb - (int)strlen(hb) > 48) snprintf(hb + strlen(hb), sizeof hb - strlen(hb), "; self-placed %llu, again %llu", (unsigned long long)g_ts_applied, (unsigned long long)g_ts_reapplied);
+    LOG("vk: clocks: CPU MHz by core %s; GPU %ld MHz; thermal status %d, headroom %.2f; game mode %d; this thread on core %d (tid %d)%s", b, g, ts, (double)hd, dm_game_mode, sched_getcpu(), (int)gettid(), hb);
 }
 // DM_ADPF_ALL=1 (vk19.50, opt-in): the hint session holds every hot thread, not only the one that presents: the game's RHIThread, RenderThread, GameThread and RHIInterrupt, our
 // dm-complete and dm-record (found by name in /proc/self/task, again every 600 frames: APerformanceHint_setThreads, API 34), asks not to be run for power efficiency
