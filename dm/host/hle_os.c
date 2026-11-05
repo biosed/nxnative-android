@@ -80,9 +80,10 @@ static pthread_cond_t g_gfz_cv = PTHREAD_COND_INITIALIZER; static _Atomic int g_
 void guest_clock_read_wait(void) {
     if (!atomic_load(&g_gfz_bg) || atomic_load(&dm_host_work)) return;
     pthread_mutex_lock(&g_gfz_mu);
-    while (g_gfz_reasons & 2u) pthread_cond_wait(&g_gfz_cv, &g_gfz_mu);
+    while ((g_gfz_reasons & 2u) && !atomic_load(&dm_hib_parking_now)) pthread_cond_wait(&g_gfz_cv, &g_gfz_mu);   // hibernation parks a reader at its gate instead (hle.c)
     pthread_mutex_unlock(&g_gfz_mu);
 }
+void guest_clock_kick(void) { pthread_mutex_lock(&g_gfz_mu); pthread_cond_broadcast(&g_gfz_cv); pthread_mutex_unlock(&g_gfz_mu); }   // hibernation: readers waiting above look at the park flag
 void guest_clock_freeze_for(int reason, int on) {
     pthread_mutex_lock(&g_gfz_mu);
     if (on) g_gfz_reasons |= 1u << reason; else g_gfz_reasons &= ~(1u << reason);
@@ -158,4 +159,13 @@ static void sa_init(void) {
 HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEm", "passed straight to the SDK; with the profile's alloc_big_align (13 Sentinels, Unicorn Overlord) allocations ≥ 64 KB are 64 KB aligned (memory pool start)", void *, h_mem_SAAllocate, void *self, size_t size) {
     pthread_once(&g_sa_once, sa_init);
     return g_sa_big_align && size >= 0x10000 ? g_sa_alloc_al(self, size, 0x10000) : g_sa_alloc(self, size);
+}
+
+// Hibernation: the guest clock goes on from where the snapshot left it (it was frozen while the snapshot was written), not frozen for any reason
+void dm_hib_clock_restore(uint64_t guest_at_save) {
+    pthread_mutex_lock(&g_gfz_mu);
+    g_gfz_reasons = 0; atomic_store(&g_gfz_bg, 0);
+    atomic_store(&g_glag, now_ns() - guest_at_save); atomic_store(&g_gfz, 0);
+    pthread_cond_broadcast(&g_gfz_cv);
+    pthread_mutex_unlock(&g_gfz_mu);
 }

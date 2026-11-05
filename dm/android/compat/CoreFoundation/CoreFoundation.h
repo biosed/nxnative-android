@@ -9,3 +9,4 @@ const void *CFDictionaryGetValue(CFMutableDictionaryRef d, const void *k);
 void CFDictionarySetValue(CFMutableDictionaryRef d, const void *k, const void *v);
 void CFDictionaryRemoveValue(CFMutableDictionaryRef d, const void *k);
 CFIndex CFDictionaryGetCount(CFMutableDictionaryRef d);
+void CFDictionaryGetKeysAndValues(CFMutableDictionaryRef d, const void **keys, const void **values);

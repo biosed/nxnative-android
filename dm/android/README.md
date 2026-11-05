@@ -52,8 +52,9 @@ DM_GAMES_DIR=<NSP folder>/<id>_build/profile make -C dm/android GAME=<id> dmhost
 ```
 
 `NDK=` overrides the NDK (default: Homebrew's `android-ndk` cask). `dmhost` is the host as a command-line program
-(`cli/front_cli.c`, no window); the default target `libdmhost.so` is the library for the Android app (its front end
-is still to be written).
+(`cli/front_cli.c`, no window); the default target builds `libdmhost.so`, the library for the Android app, and
+`libdmboot.so`, the app's NativeActivity library (`boot/boot.c`), which loads `libdmhost.so` at a fixed address for
+hibernation (`DM_HIBERNATE`, [docs/development.md](../../docs/development.md#hibernation-save-state-to-disk)) and hands the activity to it.
 
 ## Run over adb
 
