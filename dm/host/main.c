@@ -1,5 +1,6 @@
 // Bootstrap: after loading the modules, initialize the SDK runtime in the real order of nn::init::Start (sdk+0x2b0470) in the SDK, then enter nnMain.
 #include "dm.h"
+#include "hle.h"
 #include "front.h"
 #include "../gfx/nvn/dmsh_chain.h"
 #include <CoreFoundation/CoreFoundation.h>
@@ -16,6 +17,7 @@ static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("missing symbo
 
 // Game arguments: argv[0] is fixed to "game", and whatever follows "--" is appended as is (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
 static char *g_argv[64] = {"game"}; static int g_argc = 1;
+HLE_HIB_EXPORT(g_argv)   // nn::os::SetHostArgv keeps it in the SDK's data
 
 static void guest_main(void) {
     guest_thread_init();

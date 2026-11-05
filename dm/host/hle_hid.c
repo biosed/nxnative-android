@@ -4,6 +4,7 @@
 // of its own, front_mac.m). A player whose npad the game does not support (SetSupportedNpadIdType) is not reported: in a one-player game it feeds player 1, otherwise it is not used.
 // Six-axis sensor: one per connected controller (two for handheld), at rest lying flat, player 1's shaken side to side while the front end holds DM_BTN_SHAKE (see the six-axis section below).
 // Vibration follows the player assignments through hle_haptics.c. Mouse and keyboard: not connected; the controller applet reports the connected players with player 1 selected.
+#include "hle_hib.h"
 #include "hle.h"
 #include "hle_haptics.h"
 #include "dm_input.h"
@@ -892,6 +893,7 @@ PALMA_FAIL("_ZN2nn3hid17ResetPalmaPlayLogERKNS0_21PalmaConnectionHandleERKt", "p
 // Hibernation (hle_hibsnap.c): what the game set and the sampling number in a snapshot. The sampling number goes on from the snapshot's: a game ignores a state older than the
 // last one it read, and a new process would count from the start again
 typedef struct { int64_t sampling; uint32_t ids_supported, styles_supported, hold_type, comm_mode, hh_mode, pad; uint64_t style_ev[DM_PLAYERS]; } hib_hid;
+uint32_t dm_hib_hid_fmt(void) { return HIB_FMT(1, sizeof(hib_hid)); }
 size_t dm_hib_hid_save(uint8_t **out) {
     hib_hid *h = calloc(1, sizeof *h);
     h->sampling = atomic_load(&g_sampling); h->ids_supported = atomic_load(&g_ids_supported); h->styles_supported = g_styles_supported;

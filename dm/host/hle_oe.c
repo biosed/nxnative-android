@@ -1,6 +1,7 @@
 // nn::oe (application operating environment): on the real device the console state is queried through the am/oe services; the host gives fixed state directly.
 // oe::Initialize is in hle_sdkinit.c, not here.
 // Environment switches: DM_OPMODE=0 handheld / 1 console (default: the profile's op_mode, console unless set; console corresponds to the console-mode render profile); DM_LANG=language code (default en-US; the iOS app sets it from the IPA's DMLanguage, main.m).
+#include "hle_hib.h"
 #include "hle.h"
 
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
@@ -271,6 +272,7 @@ HLE_FORCE("_ZN2nn2oe17GetPseudoDeviceIdEPNS_4util4UuidE", "pseudo device ID; a f
 // Hibernation (hle_hibsnap.c): this file's state in a snapshot. The queue, the event's binding and the switches the game set; the focus state the game saw is restored too, and
 // the front end reports the real one as the restored game comes back (a resume from the background)
 typedef struct { uint32_t mq[MQ]; int32_t mqh, mqn, ev_on, ntf_opmode, ntf_perfmode, focus_mode, seen, focus, opmode, applets, inactivity; } hib_oe;
+uint32_t dm_hib_oe_fmt(void) { return HIB_FMT(1, sizeof(hib_oe)); }
 size_t dm_hib_oe_save(uint8_t **out) {
     hib_oe *h = calloc(1, sizeof *h);
     pthread_mutex_lock(&g_mq_lock); memcpy(h->mq, g_mq, sizeof g_mq); h->mqh = g_mqh; h->mqn = g_mqn; pthread_mutex_unlock(&g_mq_lock);

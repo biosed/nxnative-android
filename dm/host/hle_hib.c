@@ -35,6 +35,7 @@ static size_t g_mod_used;              // bytes of the module window handed out
 static size_t g_arena_used;
 static pthread_mutex_t g_hib_lock = PTHREAD_MUTEX_INITIALIZER;
 
+uint32_t dm_hib_fmt_hash(const uint32_t *v, size_t n) { uint32_t h = 2166136261u; for (size_t i = 0; i < n; i++) h = (h ^ v[i]) * 16777619u; return h; }
 int dm_hib_on(void) {
     if (g_hib < 0) { const char *e = getenv("DM_HIBERNATE"); g_hib = e && atoi(e) > 0; }
     return g_hib;
@@ -155,6 +156,7 @@ static int arena_free(void *p) {
 // Hibernation's own state in a snapshot (section "arena"): the arena's allocation state and the restartable calls' stub slots (both come out the same in every process that
 // loads the same modules, checked on restore)
 typedef struct { uint64_t mod_used, arena_used; uint64_t free_[1024]; uint64_t rs[16]; int32_t nrs, pad; } hib_arena;
+uint32_t dm_hib_arena_fmt(void) { return HIB_FMT(1, sizeof(hib_arena)); }
 size_t dm_hib_arena_save(uint8_t **out) {
     hib_arena *h = calloc(1, sizeof *h);
     pthread_mutex_lock(&g_hib_lock);

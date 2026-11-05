@@ -29,6 +29,10 @@ typedef struct {
     char name[32];
 } hib_thr;
 
+// Section formats (hibernation across host builds): each section names its format by a hash of a version and the sizes of what it holds; a snapshot from another build is
+// restored only when every section's format is the same in this build. A change of a section's meaning that keeps the sizes bumps its version
+uint32_t dm_hib_fmt_hash(const uint32_t *v, size_t n);
+#define HIB_FMT(...) dm_hib_fmt_hash((const uint32_t[]){__VA_ARGS__}, sizeof((const uint32_t[]){__VA_ARGS__}) / sizeof(uint32_t))
 int dm_hib_on(void);   // DM_HIBERNATE=1 (hle_hib.c)
 int dm_hib_save(void);   // write the snapshot (hle_hibsnap.c): 0 done
 // Park and unpark every guest thread (hle_thread.c). The caller is not a guest thread. Returns 0 when every thread stopped within timeout_ms; otherwise -1 with why filled

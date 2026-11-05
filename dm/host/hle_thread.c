@@ -1465,6 +1465,7 @@ typedef struct { uint32_t nh, nev, nse, pad; uint64_t next_id, next_se_id, wseq;
 typedef struct { int32_t type, ev; uint64_t tid; } hib_h;   // ev: index into the events (event ends), tid: the thread's ID (thread handles)
 typedef struct { int32_t signaled, refs; } hib_ev;
 typedef struct { uint64_t ev, id; uint32_t wh, pad; } hib_se;
+uint32_t dm_hib_kernel_fmt(void) { return HIB_FMT(1, sizeof(hib_kern), sizeof(hib_h), sizeof(hib_ev), sizeof(hib_se), MAX_H); }
 size_t dm_hib_kernel_save(uint8_t **out) {   // G held
     event_t **evs = calloc(MAX_H, sizeof *evs); int nev = 0;
     hib_h *hs = calloc(MAX_H, sizeof *hs);

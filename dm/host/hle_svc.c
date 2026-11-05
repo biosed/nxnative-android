@@ -1,5 +1,6 @@
 // Horizon kernel system calls (triggered by the SDK runtime once the SDK is loaded). Only what the P1 boot chain needs is implemented: memory layout + heap + query + debug output + timing.
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
+#include "hle_hib.h"
 #include "dm.h"
 #include "hle.h"
 #include <sys/mman.h>
@@ -191,6 +192,7 @@ void svc_set_main_stack(uint64_t lo, uint64_t hi) { g_main_stack_lo = lo; g_main
 // The memory itself and its protections are the snapshot's memory chunks
 typedef struct { uint64_t heap_cur, alias_mapped, main_lo, main_hi, nbits, nexp; int32_t nmap, pad; } hib_svc;
 static void mem_init(void);
+uint32_t dm_hib_svc_fmt(void) { return HIB_FMT(1, sizeof(hib_svc), sizeof g_map[0]); }
 size_t dm_hib_svc_save(uint8_t **out) {
     mem_init();
     pthread_mutex_lock(&g_map_lock);

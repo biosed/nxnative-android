@@ -2,6 +2,7 @@
 // Host: real audio output = CoreAudio AudioUnit (Mac DefaultOutput / iOS RemoteIO), on Android an AAudio stream; silent sink = consumes buffers in real time (no sound, pacing matches the real device).
 //       iOS and Android default to real audio output (the product must have sound), tests that want silence set DM_AUDIO=0 explicitly; Mac defaults to the silent sink (replay / gate checks are silent), DM_AUDIO=1 for real audio output.
 // The contents of AudioOut / AudioOutBuffer / AudioOutParameter are read and written only through the interfaces below; the host defines its own internal layout and only writes the front part of the structs.
+#include "hle_hib.h"
 #include "hle.h"
 #ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>
@@ -622,6 +623,7 @@ void dm_audio_reset(void) {
 // Host outputs (the in-process audio renderer's) are not kept: hle_hibsnap.c refuses a snapshot while one is open
 typedef struct { uint64_t g, event, rel[RELMAX], q[QMAX], pos; int32_t ch, state, id, nq, nrel; uint32_t vol; } hib_ao;
 int dm_hib_audio_host_outputs(void) { int n = 0; pthread_mutex_lock(&g_aos_lock); for (int i = 0; i < AOMAX; i++) if (g_aos[i] && g_aos[i]->rel_sem) n++; pthread_mutex_unlock(&g_aos_lock); return n; }
+uint32_t dm_hib_audio_fmt(void) { return HIB_FMT(1, sizeof(hib_ao)); }
 size_t dm_hib_audio_save(uint8_t **out) {
     hib_ao *v = calloc(AOMAX, sizeof *v); int n = 0;
     pthread_mutex_lock(&g_aos_lock);

@@ -6,6 +6,7 @@
 // is full); free and realloc find the space by the address. A space grows from its start (dlmalloc's segment requests, UEH_GRAIN at least) and pages beyond what it has used stay
 // inaccessible, so the snapshot reads only what the heap touched. Memory is never given back to the system (no trim, no direct mappings): Unreal keeps its peak anyway.
 // Host state in a snapshot (section "ueheap"): the spaces' mspace addresses and how far each has grown.
+#include "hle_hib.h"
 #include "dm.h"
 #include "hle.h"
 #include <stdatomic.h>
@@ -120,6 +121,7 @@ void *dm_ueheap_realloc(void *p, size_t n) {
 
 // ---- hibernation (hle_hibsnap.c section "ueheap") ----
 typedef struct { uint32_t version, n; uint64_t base, space, ms[UEH_N], hw[UEH_N]; int32_t rr, pad; } hib_ueh;
+uint32_t dm_hib_ueheap_fmt(void) { return HIB_FMT(1, sizeof(hib_ueh)); }
 size_t dm_hib_ueheap_save(uint8_t **out) {
     hib_ueh *h = calloc(1, sizeof *h);
     h->version = 1; h->n = UEH_N; h->base = (uint64_t)(uintptr_t)g_base; h->space = UEH_SPACE; h->rr = atomic_load(&g_rr);

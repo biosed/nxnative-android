@@ -91,6 +91,7 @@ static uint32_t m_QuantizeSize32(void *self, uint32_t n, uint32_t a) { (void)sel
 static bool m_GetAllocationSize32(void *self, void *p, uint32_t *out) { (void)self; if (!p) return false; *out = (uint32_t)blk_size(p); return true; }
 static void m_Nothing(void *self) { (void)self; }   // Trim (its bool argument is ignored), the thread-local cache setup and teardown, DumpAllocatorStats
 static void *g_vt[NSLOT];
+HLE_HIB_EXPORT(g_vt)   // the guest's allocator object points to it (obj_made)
 static const char *g_what;
 
 // Observation gate OBS_UE_MALLOC, on the cut constructor call: the object in the register the gate number's upper bits name (x0), before anything calls it

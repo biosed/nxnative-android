@@ -10,6 +10,7 @@
 // With a window (the app, app/front_android.c) presented frames are scaled onto a swapchain, keeping the game's aspect unless DM_SCREEN_FIT=stretch; DM_SHOW_FPS=1 draws a frame-rate
 // counter, DM_FPS=30 holds every frame two vsyncs. Without one (the adb front end) nothing is shown: DM_VK_SHOTS=<frame>,<frame>,... writes those frames to DM_VK_SHOT_DIR as BMP files.
 #include "../../gfx/nvn/nvn_dirty.h"
+#include "hle_hib.h"
 #include "hle.h"
 #include "nvn_obj.h"
 #include "nvn_mtl.h"
@@ -3512,6 +3513,7 @@ void mtl_hib_readback(void) {   // inside a submission (hle_nvn.c dm_hib_nvn_pre
     free(rb); free(ts);
 }
 void nvn_dirty_add_range(const void *mem, size_t size);
+uint32_t mtl_hib_fmt(void) { return HIB_FMT(2, sizeof(hib_vk), sizeof(hib_vpool), sizeof(hib_vtreg), sizeof(hib_vsreg)); }
 size_t mtl_hib_save(uint8_t **out) {
     hib_vk h = {0};
     pthread_mutex_lock(&g_pool_mu); h.npool = (uint32_t)g_npool; pthread_mutex_unlock(&g_pool_mu);

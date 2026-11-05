@@ -373,6 +373,16 @@ static relocs_t relocs_of(const module_t *m) {
     return r;
 }
 
+// Hibernation across host builds (hle_hibrefs.c): every place the loader wrote a symbol's address into a module (GOT entries, ABS64 / GLOB_DAT words): the words there that
+// point into the host are the host's own bindings, which a restore by another build must map
+void dm_loader_bound_sites(void (*cb)(uint64_t site, void *ctx), void *ctx) {
+    for (int i = 0; i < g_nmod; i++) {
+        module_t *m = &g_mod[i]; if (!m->base || !m->dyn) continue;
+        relocs_t rl = relocs_of(m);
+        for (int t = 0; t < 2; t++) for (uint64_t k = 0; k < rl.n[t]; k++)
+            if (ELF64_R_TYPE(rl.tab[t][k].r_info) != R_AARCH64_RELATIVE) cb((uint64_t)(uintptr_t)(m->base + rl.tab[t][k].r_offset), ctx);
+    }
+}
 static void relocate(module_t *m) {
     relocs_t rl = relocs_of(m);
     int cnt[3] = {0}, nint = 0, nweak0 = 0;

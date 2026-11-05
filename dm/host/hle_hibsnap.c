@@ -29,7 +29,10 @@ void svc_guest_range(uint8_t **base, size_t *size);
 uintptr_t dm_hib_image_base(void);
 
 enum { HIB_C_MEM = 1, HIB_C_THREADS = 2, HIB_C_SECTION = 3 };
-#define HIB_VERSION 1
+// Host references (hle_hibrefs.c): recorded while the snapshot is written, mapped when another build restores it
+void dm_hibrefs_begin(const hib_thr *thr, int nt); void dm_hibrefs_scan(uint32_t chunk, uint64_t loc0, const void *p, size_t n); size_t dm_hibrefs_section(uint8_t **out);
+int dm_hibrefs_plan(const uint8_t *b, size_t n, char *why, size_t wn); int dm_hibrefs_patch_chunk(uint32_t chunk, uint8_t *d, size_t n); int dm_hibrefs_apply_mem(void);
+#define HIB_VERSION 2             // 2: section formats (each section chunk names its format), host references for another build (section hostrefs)
 #define MEM_PIECE (1u << 20)          // memory chunks cover at most 1 MB
 #define ZPAGE 4096                    // zero pages are left out at this granularity (Android's page size; the Mac's 16 KB pages are four of them)
 
@@ -37,7 +40,7 @@ typedef struct {
     char magic[8]; uint32_t version, hdr_size;
     char game[24];
     uint64_t image_base; uint8_t image_id[20];   // the host executable: its address and its identity (Mach-O LC_UUID / ELF build ID)
-    uint32_t pad0;
+    uint32_t fmt;                     // the thread records' and the file's own format (HIB_FMT): another build restores only the same
     uint64_t win, win_len, guest_as, guest_len, arena, arena_used, mod_used;
     uint32_t nmod, pad1;
     struct { char name[16]; uint64_t base, size; char build_id[40]; } mod[8];
@@ -47,6 +50,7 @@ typedef struct {
 } hib_hdr;
 typedef struct { uint32_t type, flags; uint64_t addr, raw_len, stored_len; uint32_t crc, pad; } hib_chunk;
 typedef struct { uint64_t off; uint32_t type, crc; uint64_t addr, raw_len, stored_len; } hib_tab;
+static uint32_t file_fmt(void) { return HIB_FMT(HIB_VERSION, sizeof(hib_hdr), sizeof(hib_thr), sizeof(hib_chunk), sizeof(hib_tab), MEM_PIECE, ZPAGE); }
 
 // ---- CRC-32C (the arm64 CRC instructions) ----
 __attribute__((target("crc"))) static uint32_t crc32c(uint32_t c, const void *p, size_t n) {
@@ -182,6 +186,7 @@ static void *mem_worker(void *arg) {
             const uint64_t *p = (const uint64_t *)(uintptr_t)(pc->a + o); uint64_t acc = 0;
             for (size_t k = 0; k < ZPAGE / 8; k++) acc |= p[k];
             if (!acc) continue;
+            dm_hibrefs_scan(0xFFFFFFFFu, pc->a + o, p, ZPAGE);   // host references in memory (hle_hibrefs.c)
             bm[o / ZPAGE / 8] |= (uint8_t)(1u << (o / ZPAGE % 8));
             memcpy(data + nd, p, ZPAGE); nd += ZPAGE;
         }
@@ -240,24 +245,28 @@ static int statics_restore(const uint8_t *b, size_t n) {
 }
 static size_t movie_save(uint8_t **out) { int32_t *v = malloc(4); *v = dm_hib_movie_defer_thread(-1); *out = (uint8_t *)v; return 4; }
 static int movie_restore(const uint8_t *b, size_t n) { if (n != 4) return -1; int32_t v; memcpy(&v, b, 4); dm_hib_movie_defer_thread(v); return 0; }
-static const struct { const char *name; size_t (*save)(uint8_t **); int (*restore)(const uint8_t *, size_t); } g_sec[] = {
-    {"kernel", dm_hib_kernel_save, NULL},   // restored with the thread records (dm_hib_restore_prepare)
-    {"svc", dm_hib_svc_save, dm_hib_svc_restore},
-    {"arena", dm_hib_arena_save, dm_hib_arena_restore_state},
-    {"ueheap", dm_hib_ueheap_save, dm_hib_ueheap_restore},
-    {"statics", statics_save, statics_restore},
-    {"oe", dm_hib_oe_save, dm_hib_oe_restore},
-    {"fs", dm_hib_fs_save, dm_hib_fs_restore},
-    {"movie", movie_save, movie_restore},
-    {"audio", dm_hib_audio_save, dm_hib_audio_restore},
-    {"nvn", dm_hib_nvn_save, dm_hib_nvn_restore},
-    {"hid", dm_hib_hid_save, dm_hib_hid_restore},
+uint32_t dm_hib_kernel_fmt(void), dm_hib_svc_fmt(void), dm_hib_arena_fmt(void), dm_hib_ueheap_fmt(void), dm_hib_oe_fmt(void), dm_hib_fs_fmt(void), dm_hib_audio_fmt(void),
+         dm_hib_nvn_fmt(void), dm_hib_hid_fmt(void), dm_hib_hostrefs_fmt(void);
+static uint32_t fmt_one(void) { return 1; }   // statics (each by name and size) and the movie section
+static const struct { const char *name; size_t (*save)(uint8_t **); int (*restore)(const uint8_t *, size_t); uint32_t (*fmt)(void); } g_sec[] = {
+    {"kernel", dm_hib_kernel_save, NULL, dm_hib_kernel_fmt},   // restored with the thread records (dm_hib_restore_prepare)
+    {"svc", dm_hib_svc_save, dm_hib_svc_restore, dm_hib_svc_fmt},
+    {"arena", dm_hib_arena_save, dm_hib_arena_restore_state, dm_hib_arena_fmt},
+    {"ueheap", dm_hib_ueheap_save, dm_hib_ueheap_restore, dm_hib_ueheap_fmt},
+    {"statics", statics_save, statics_restore, fmt_one},
+    {"oe", dm_hib_oe_save, dm_hib_oe_restore, dm_hib_oe_fmt},
+    {"fs", dm_hib_fs_save, dm_hib_fs_restore, dm_hib_fs_fmt},
+    {"movie", movie_save, movie_restore, fmt_one},
+    {"audio", dm_hib_audio_save, dm_hib_audio_restore, dm_hib_audio_fmt},
+    {"nvn", dm_hib_nvn_save, dm_hib_nvn_restore, dm_hib_nvn_fmt},
+    {"hid", dm_hib_hid_save, dm_hib_hid_restore, dm_hib_hid_fmt},
 };
 static void wr_sections(wr_t *w, int with_g) {   // with_g: the kernel's section, with G held; the others before G is taken (their locks come before G)
     for (size_t i = 0; i < sizeof g_sec / sizeof *g_sec; i++) {
         if ((g_sec[i].save == dm_hib_kernel_save) != with_g) continue;
         uint8_t *blob; size_t n = g_sec[i].save(&blob);
-        uint8_t *c = malloc(16 + n); memset(c, 0, 16); snprintf((char *)c, 16, "%s", g_sec[i].name); memcpy(c + 16, blob, n);
+        uint8_t *c = malloc(16 + n); memset(c, 0, 16); snprintf((char *)c, 12, "%s", g_sec[i].name); uint32_t f = g_sec[i].fmt(); memcpy(c + 12, &f, 4); memcpy(c + 16, blob, n);
+        dm_hibrefs_scan(w->n, 16, blob, n);   // host references in the section (another build maps them: hle_hibrefs.c)
         wr_chunk(w, HIB_C_SECTION, i, c, 16 + n);
         free(c); free(blob);
     }
@@ -308,7 +317,7 @@ int dm_hib_save_ex(int gfx_closed) {
     else {
         wr_t w = {.fd = fd};
         hib_hdr h; memset(&h, 0, sizeof h);
-        memcpy(h.magic, "DMHIBSN1", 8); h.version = HIB_VERSION; h.hdr_size = sizeof h;
+        memcpy(h.magic, "DMHIBSN1", 8); h.version = HIB_VERSION; h.hdr_size = sizeof h; h.fmt = file_fmt();
         snprintf(h.game, sizeof h.game, "%s", DM_GAME_ID);
         h.image_base = dm_hib_image_base(); image_id(h.image_id);
         uint8_t *gb; size_t gs; svc_guest_range(&gb, &gs);
@@ -320,13 +329,18 @@ int dm_hib_save_ex(int gfx_closed) {
         h.created_unix = (uint64_t)time(NULL); h.save_fp = save_fingerprint(); h.guest_ns = guest_ns();
         h.keys[0] = (uint32_t)g_key18; h.keys[1] = (uint32_t)g_keytls; h.keys[2] = (uint32_t)g_keytlr; h.keys[3] = (uint32_t)g_keygate;
         wr_bytes(&w, &h, sizeof h);
+        dm_hibrefs_begin(NULL, 0);
         wr_sections(&w, 0);
         dm_hib_hold(1);   // no thread finishes an SVC while memory and the threads are written
         static hib_thr thr[512]; int nt = dm_hib_threads(thr, 512);
+        dm_hibrefs_begin(thr, nt);   // their live stacks
+        dm_hibrefs_scan(w.n, 0, thr, (size_t)nt * sizeof *thr);
         wr_chunk(&w, HIB_C_THREADS, (uint64_t)nt, thr, (size_t)nt * sizeof *thr);
         wr_sections(&w, 1);
         wr_memory(&w);
         dm_hib_hold(0);
+        { uint8_t *rb; size_t rn = dm_hibrefs_section(&rb); uint8_t *c = malloc(16 + rn); memset(c, 0, 16); snprintf((char *)c, 12, "hostrefs"); uint32_t f = dm_hib_hostrefs_fmt();
+          memcpy(c + 12, &f, 4); memcpy(c + 16, rb, rn); wr_chunk(&w, HIB_C_SECTION, 99, c, 16 + rn); free(c); free(rb); }
         uint64_t toff = w.off;
         wr_bytes(&w, w.tab, (size_t)w.n * sizeof *w.tab);
         struct { uint64_t off; uint32_t n, crc; char magic[8]; } tr = {toff, w.n, crc32c(0, w.tab, (size_t)w.n * sizeof *w.tab), {'D','M','H','I','B','E','N','D'}};
@@ -469,11 +483,13 @@ int dm_hib_verify(const char *path) {
 static int g_restoring; static int g_nrthr;
 int dm_hib_restoring(void) { return g_restoring; }
 void dm_hib_clock_restore(uint64_t guest_at_save);
-static int hdr_check(const hib_hdr *h, char *why, size_t n) {
+static int hdr_check(const hib_hdr *h, char *why, size_t n, int *cross) {
     uint8_t *win, *arena; size_t win_len, mod_used, arena_used; dm_hib_layout(&win, &win_len, &mod_used, &arena, &arena_used);
     uint8_t id[20]; image_id(id); uint8_t *gb; size_t gs; svc_guest_range(&gb, &gs);
     if (strcmp(h->game, DM_GAME_ID)) { snprintf(why, n, "written for game %s", h->game); return -1; }
-    if (h->image_base != dm_hib_image_base() || memcmp(h->image_id, id, 20)) { snprintf(why, n, "written by another host build or at another address (%#llx)", (unsigned long long)h->image_base); return -1; }
+    if (h->image_base != dm_hib_image_base()) { snprintf(why, n, "the host was at another address (%#llx)", (unsigned long long)h->image_base); return -1; }
+    if (h->fmt != file_fmt()) { snprintf(why, n, "thread records or file of another format"); return -1; }
+    *cross = memcmp(h->image_id, id, 20) != 0;   // another build of the host (an app update): its host references are mapped (hle_hibrefs.c)
     if (!win || h->win != (uint64_t)(uintptr_t)win || h->win_len != win_len || h->mod_used != mod_used || h->arena != (uint64_t)(uintptr_t)arena) { snprintf(why, n, "another address layout"); return -1; }
     if (h->nmod != (uint32_t)g_nmod) { snprintf(why, n, "%u modules, this host loaded %d", h->nmod, g_nmod); return -1; }
     for (uint32_t i = 0; i < h->nmod; i++)
@@ -551,7 +567,9 @@ int dm_hib_restore_prepare(void) {
     rd_t r;
     if (access(p, F_OK)) { LOG("hibernate: no snapshot at %s: the game starts as usual", p); return 0; }
     if (rd_open(&r, p, why, sizeof why)) { refused(p, why); return 0; }
-    if (hdr_check(&r.h, why, sizeof why)) { rd_close(&r); refused(p, why); return 0; }
+    int cross = 0;
+    if (hdr_check(&r.h, why, sizeof why, &cross)) { rd_close(&r); refused(p, why); return 0; }
+    if (cross) LOG("hibernate: snapshot %s was written by another host build: mapping its host references", p);
     // everything is read and checked before anything is changed: a damaged chunk leaves the process as it was
     void **chunks = calloc(r.n + 1, sizeof *chunks); size_t *lens = calloc(r.n + 1, sizeof *lens); int ok = 1;
     for (uint32_t i = 0; i < r.n && ok; i++) if (!(chunks[i] = rd_chunk(&r, i, &lens[i]))) { snprintf(why, sizeof why, "chunk %u damaged", i); ok = 0; }
@@ -562,6 +580,21 @@ int dm_hib_restore_prepare(void) {
         if (r.tab[i].type == HIB_C_SECTION && !strcmp((const char *)chunks[i], "kernel")) { kern = (const uint8_t *)chunks[i] + 16; kern_n = lens[i] - 16; }
     }
     if (ok && (!recs || !kern)) { snprintf(why, sizeof why, "no threads or no kernel state"); ok = 0; }
+    // every section in a format this build reads (another build may have changed one: then the snapshot is not restored)
+    int refs = -1;
+    for (uint32_t i = 0; i < r.n && ok; i++) if (r.tab[i].type == HIB_C_SECTION) {
+        const char *nm = chunks[i]; uint32_t f; memcpy(&f, (const uint8_t *)chunks[i] + 12, 4);
+        if (!strcmp(nm, "hostrefs")) { refs = (int)i; if (f != dm_hib_hostrefs_fmt()) { snprintf(why, sizeof why, "host references of another format"); ok = 0; } continue; }
+        size_t k = 0; while (k < sizeof g_sec / sizeof *g_sec && strcmp(nm, g_sec[k].name)) k++;
+        if (k == sizeof g_sec / sizeof *g_sec) { snprintf(why, sizeof why, "section %.11s is not known to this build", nm); ok = 0; }
+        else if (f != g_sec[k].fmt()) { snprintf(why, sizeof why, "section %.11s has another format in this build", nm); ok = 0; }
+    }
+    // another build: every host reference mapped before anything changes, and the sections and thread records patched (memory follows once it is back)
+    if (ok && cross) {
+        if (refs < 0) { snprintf(why, sizeof why, "written by another host build, without host references"); ok = 0; }
+        else if (dm_hibrefs_plan((const uint8_t *)chunks[refs] + 16, lens[refs] - 16, why, sizeof why)) ok = 0;
+        for (uint32_t i = 0; i < r.n && ok; i++) if (r.tab[i].type != HIB_C_MEM && dm_hibrefs_patch_chunk(i, chunks[i], lens[i])) { snprintf(why, sizeof why, "host references do not fit chunk %u", i); ok = 0; }
+    }
     if (!ok) { for (uint32_t i = 0; i < r.n; i++) free(chunks[i]); free(chunks); free(lens); rd_close(&r); refused(p, why); return 0; }
     // from here on the process is the snapshot's: a failure stops it. The snapshot is marked used first, so that a crash while it is put back cannot make a launch loop
     { char used[1100]; snprintf(used, sizeof used, "%s.restored", p); rename(p, used); }
@@ -571,6 +604,7 @@ int dm_hib_restore_prepare(void) {
         if (mem_apply(chunks[i], lens[i], r.tab[i].addr, (uint64_t)(uintptr_t)win + mod_used)) die("hibernate: memory chunk at %#llx does not fit", (unsigned long long)r.tab[i].addr);
         pages++;
     }
+    if (cross && dm_hibrefs_apply_mem()) die("hibernate: host references in memory do not match the snapshot");
     if (dm_hib_kernel_restore(kern, kern_n, recs, nrec)) die("hibernate: the kernel state does not fit the threads");   // before the subsystems: an audio output signals its events at once
     for (uint32_t i = 0; i < r.n; i++) if (r.tab[i].type == HIB_C_SECTION) {   // after memory: a subsystem may start reading guest memory as soon as it is back (an audio output)
         const char *nm = chunks[i];

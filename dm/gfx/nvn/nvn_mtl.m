@@ -10,6 +10,7 @@
 #include <mach/mach.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
+#include "../../host/hle_hib.h"
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <fcntl.h>
@@ -12120,6 +12121,7 @@ typedef struct { uint64_t mem, size; } hib_mpool;
 typedef struct { int32_t idx, has_v, gone, pad; tex_t t; view_t v; } hib_mtreg;
 typedef struct { int32_t idx, pad; samp_par p; } hib_msreg;
 static void hm_keys(const nvn_hmap *m, uint64_t *out, uint32_t *n) { for (uint32_t i = 0; i < m->cap; i++) if (m->vals[i]) memcpy(&out[(*n)++], m->keys + (size_t)i * m->klen, 8); }
+uint32_t mtl_hib_fmt(void) { return HIB_FMT(1, sizeof(hib_mtl), sizeof(hib_mpool), sizeof(hib_mtreg), sizeof(hib_msreg), sizeof(hib_mcpu)); }
 size_t mtl_hib_save(uint8_t **out) {
     hib_mtl h = {0};
     pthread_mutex_lock(&g_mu); h.npool = (uint32_t)g_npool; pthread_mutex_unlock(&g_mu);

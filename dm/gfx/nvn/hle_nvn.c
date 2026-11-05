@@ -8,6 +8,7 @@
 // sync object = submit fence value, and waits are released only after the GPU completes.
 // Every implementation gets a compile-time signature check against the prototypes in nvn_protos.h (NVNboolean parameters are received as uint32_t, only the low 8 bits are looked at).
 // Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation.
+#include "../../host/hle_hib.h"
 #include "../../host/hle.h"
 #include "nvn_protos.h"
 #include "nvn_count.h"
@@ -2675,6 +2676,17 @@ const char *dm_hib_nvn_refuse(void) {
 }
 typedef struct { uint64_t serial; int32_t ntpb, nspb, tnext, snext, npk, nft, nfl, nwin; uint64_t mtl_len, win[8]; } hib_nvn;
 typedef struct { uint64_t prog; uint8_t key[6][8]; uint8_t ok, pad[7]; } hib_pk;
+// The section's format, with the layouts the host keeps in guest memory: the NVN objects the game allocates and the host fills, and the command records it writes into the
+// game's command memory (a snapshot's recorded command buffers are replayed by the restoring build); then the replay layer's own (mtl_hib_fmt)
+__attribute__((weak)) uint32_t mtl_hib_fmt(void);
+uint32_t dm_hib_nvn_fmt(void) {
+    return HIB_FMT(1, sizeof(hib_nvn), sizeof(hib_pk), sizeof(struct dpool_base), NDPOOL, sizeof(fl_span), mtl_hib_fmt ? mtl_hib_fmt() : 0, OP_COUNT_,
+                   sizeof(dev_t_), sizeof(queue_t), sizeof(pool_t), sizeof(dpool_t), sizeof(tex_builder_t), sizeof(tex_t), sizeof(view_t), sizeof(samp_par), sizeof(samp_t),
+                   sizeof(prog_t), sizeof(sync_t), sizeof(ev_t), sizeof(win_t), sizeof(cmd_t), sizeof(op_hdr), sizeof(color_st), sizeof(chmask_st), sizeof(poly_st), sizeof(va_st), sizeof(vs_st),
+                   sizeof(p_clear_color), sizeof(p_draw_tex), sizeof(p_render_cond), sizeof(p_clear_ds), sizeof(p_viewports), sizeof(p_scissor), sizeof(p_bind_program), sizeof(p_bind_state),
+                   sizeof(p_bind_vattr), sizeof(p_bind_vstream), sizeof(p_bind_vbuf), sizeof(p_bind_buf), sizeof(p_bind_ubo_small), sizeof(p_bind_handles), sizeof(p_stencil),
+                   sizeof(p_poly_offset), sizeof(p_dispatch), sizeof(p_set_pool), sizeof(p_copy_stride), sizeof(p_clear_buf), sizeof(p_tf_bind), sizeof(p_tf_state));
+}
 size_t dm_hib_nvn_save(uint8_t **out) {
     uint8_t *mb = NULL; size_t mn = mtl_hib_save ? mtl_hib_save(&mb) : 0;
     hib_nvn h = {atomic_load(&g_serial), 0, 0, 0, 0, 0, 0, 0, g_nhwin, mn, {0}};

@@ -4,6 +4,7 @@
 //   temp  → $DM_TEMP (default $DM_ROOT/run/platform/temp)
 // Paths look like "rom:/data/x". FileHandle / DirectoryHandle are 8 bytes passed by value, here they store the host fd (FH_OUT) / DIR*.
 // Struct layout follows the public Horizon ABI: DirectoryEntry = {char name[0x301], pad[3], s8 type, pad[3], s64 size} (0x310 bytes).
+#include "hle_hib.h"
 #include "hle.h"
 #include <mach/mach.h>
 #include "front.h"
@@ -1058,6 +1059,7 @@ HLE_FORCE("_ZN2nn2fs6detail18IsEnabledAccessLogEv", "fsp-srv; access log always 
 // names its mount by index, the same after the restore. A plain file comes back on the same descriptor number (the guest holds it), opened again by its path
 typedef struct { char name[32], dir[1024], overlay[4096], commit[1024]; int32_t ro, txn_root, poison, img; } hib_mnt;
 typedef struct { int32_t fd, mode, txn, pad; char path[1024]; } hib_fd;
+uint32_t dm_hib_fs_fmt(void) { return HIB_FMT(1, sizeof(hib_mnt), sizeof(hib_fd)); }
 size_t dm_hib_fs_save(uint8_t **out) {
     pthread_mutex_lock(&g_lock);
     int nfd = 0; for (int fd = 0; fd < 65536; fd++) if (g_fmode[fd]) nfd++;
