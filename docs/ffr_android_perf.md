@@ -63,6 +63,7 @@ Env "E": A with `DM_VK_MEM_LOW_MB=600 DM_MEM_PRETRIM_AVAIL_MB=700 DM_MEM_BUDGET_
 | R | vk19.54 | E + `DM_TOPO_AFFINITY=1` | 26.5–26.9 | | | | 27.2–27.8 | 12.3–12.6 | | 39–40.5 / 65–75 | placement by the guest threads' own tids, masks read back each second: every sched_setaffinity returned 0 yet the mask read back right after was all cores (no failure, 983 re-applications); RHIThread then ran on cores 2–3, GameThread on 7. Worse than Q: reverted to vk19.53. Our HLE sets no host affinity anywhere: the kernel / vendor layer ignores (or undoes) an app's affinity on these threads, and touching the game's real threads every second seems to cost their placement |
 | S | vk19.53 | E + `DM_TOPO_AFFINITY=1 DM_VK_RING_CAP_MB=160` | 26.6–26.8 | | | | 26.1–26.8 | | | 37.7–41.3 / 64–77 | confounded: the recording thread ran on cores 2–4 (22.2 fps). Across J′, Q, Q′, R, S the recording thread's core decides: on cpu7 (Q, Q′: 20 of 20 samples) rec 22.5 and ~25 fps, on cores 2–3 (J′, R, S) rec 25–27.8 and ~22 fps. The ring-cap A/B is to be redone once placement holds |
 | U1, U2 | vk19.55 | E + `DM_TOPO_SELF=1` | | | | | 27.4 / 27.8 | | | 38–41 / | the recording thread (tid with 297 of the last 300 submissions) set its own affinity to {7}: it reads back as every core, and it ran on cores 2–4 in both launches (22.0 fps). App affinity is a no-op on HyperOS 2 / Snapdragon 8s Gen 4, the thread's own call included: the cpu7 of Q, Q′ was the scheduler's choice. TOPO_SELF and TOPO_AFFINITY not kept |
+| V1, V2 | vk19.56 | E + `DM_UCLAMP_MIN=auto` (938) / `=1024` | | | | | 27.0–27.3 | | | / | sched_setattr(UTIL_CLAMP_MIN) on the recording thread: EPERM (reads back util_min 0); the cpu controller's uclamp files are not writable (cgroup cpuset:/top-app); the thread on cores 2–4 (22.2 / 22.3 fps). Not kept |
 
 ## Findings
 
@@ -102,6 +103,32 @@ Env "E": A with `DM_VK_MEM_LOW_MB=600 DM_MEM_PRETRIM_AVAIL_MB=700 DM_MEM_BUDGET_
 5. **Hibernate**: a snapshot section lists the backed ranges; restore re-allocates and re-maps them at the same addresses before the memory is written back.
 6. **Memory**: the mem lines show the backed MB; expected net about −200 MB of swappable memory (backed pools) against the rings and copies saved.
 7. **Rollout**: Z0 vertex / index streams only; Z1 + uniform / storage / texel reads with no in-submission writes; Z2 + GPU writes in place and update shadows; each with a verify switch comparing against the copy path.
+
+## Scheduler steering from the app: closed on this device
+
+On HyperOS 2 / Snapdragon 8s Gen 4 (Xiaomi Pad 8) an app cannot steer where its threads run or how fast the cores clock:
+
+- affinity is ignored: `sched_setaffinity` returns 0 for another thread's tid and for the thread itself, and the mask reads back as every core at once (R, U1, U2);
+- `sched_setattr` with `SCHED_FLAG_UTIL_CLAMP_MIN` is refused (EPERM), and the cpu controller's `uclamp` files are read-only (V1, V2);
+- ADPF hint sessions are accepted, every call returns 0, and the clocks do not move (N);
+- the Android game mode reads 2 (performance) without a visible effect on the clocks.
+
+The recording thread's core is the scheduler's (or the vendor's) choice, and it decides about ±3 fps on average: on the strongest core (Q, Q′) rec ~22.5 ms and ~25 fps, on the gold cores (J′, R, S, U, V) rec 25–27.8 ms and ~22 fps. The only lever seen to move the clocks is HyperOS GameTurbo's "Performance" toggle (Run G: CPU and GPU time both halved).
+
+## Opt-in switches of vk19.47–19.56 and their verdicts
+
+| Switch | Build | Verdict | Dead weight to remove later? |
+|---|---|---|---|
+| `DM_VK_REC_THREAD` | 19.47–19.49 | works (FenceSync fenced at submission) but p50 +8 ms (M3): off | keep (the queue is the base a parallel translation would need) |
+| thread names (15 characters) and named backend threads | 19.47 | kept, on by default | no |
+| `DM_ADPF_ALL` | 19.50 | no effect on the clocks (N): off | yes: the extra hint calls and the name scan (the plain ADPF session stays) |
+| `DM_VK_STORE_NONE` | 19.51 | +0.8 ms CPU, +0.9 ms GPU (O): off | candidate: the secondary-per-pass path (sec_begin / sec_end) unless the parallel translation reuses it |
+| `DM_VK_HTAB` | 19.52 | dset −0.3 ms, noise (Q′): off | yes: the handle table (tex_slot / samp_cached wrappers) |
+| `DM_TOPO_AFFINITY` | 19.53–19.54 | masks not applied by the kernel (R): off | yes: topo_tick, topo_place, the guest-thread registry (dm_guest_thread_named) |
+| `DM_TOPO_SELF` | 19.55 | the thread's own mask not applied either (U1, U2): off | yes: the affinity part of topo_self_tick |
+| `DM_UCLAMP_MIN` | 19.56 | EPERM (V1, V2): off | yes: uclamp_apply (the recording-thread identification is shared with the above) |
+| clock / thermal / game-mode line, game_mode_config | 19.45 | kept: it is what showed the above | no |
+| `DM_VK_ZEROCOPY` (Z0) | 19.46 | −0.6 ms rec, −230 MB MemAvailable (L): off | candidate: zc_back / zc_find / the AHB import (kept only if Z1/Z2 are ever tried) |
 
 ## Open
 
