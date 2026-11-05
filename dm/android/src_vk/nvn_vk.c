@@ -4383,7 +4383,7 @@ static long rd_long(const char *path) { FILE *f = fopen(path, "re"); long v = -1
 // is widened to the top two tiers until it recovers. Host affinity only: the guest's core masks (core_serial) are untouched. Applied once a second to new or moved threads
 _Atomic int g_rec_tid;
 static int topo_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_TOPO_AFFINITY"); v = e && atoi(e) != 0; } return v; }
-static cpu_set_t g_topo_top, g_topo_next, g_topo_top2; static int g_topo_ok = -1, g_topo_wide, g_topo_ntop;
+static cpu_set_t g_topo_top, g_topo_next, g_topo_top2; static int g_topo_ok = -1, g_topo_wide, g_topo_ntop; static long g_cap_top, g_cap_next;   // the two strongest capacities
 static void topo_init(void) {
     long cap[64]; int n = (int)sysconf(_SC_NPROCESSORS_CONF); if (n > 64) n = 64; if (n < 1) n = 1;
     int src = 0;
@@ -4392,7 +4392,7 @@ static void topo_init(void) {
     if (!src) { g_topo_ok = 0; LOG("vk: topology: neither cpu_capacity nor cpuinfo_max_freq readable: threads left where they are (DM_TOPO_AFFINITY)"); return; }
     long t1 = 0, t2 = 0; for (int c = 0; c < n; c++) if (cap[c] > t1) t1 = cap[c];
     for (int c = 0; c < n; c++) if (cap[c] < t1 && cap[c] > t2) t2 = cap[c];
-    CPU_ZERO(&g_topo_top); CPU_ZERO(&g_topo_next); CPU_ZERO(&g_topo_top2);
+    CPU_ZERO(&g_topo_top); CPU_ZERO(&g_topo_next); CPU_ZERO(&g_topo_top2); g_cap_top = t1; g_cap_next = t2;
     char b[256]; int o = 0;
     for (int c = 0; c < n; c++) { if (cap[c] == t1) { CPU_SET(c, &g_topo_top); CPU_SET(c, &g_topo_top2); g_topo_ntop++; } else if (cap[c] == t2) { CPU_SET(c, &g_topo_next); CPU_SET(c, &g_topo_top2); }
                                   o += snprintf(b + o, sizeof b - o, "%s%d:%ld", c ? " " : "", c, cap[c]); }
@@ -4470,8 +4470,37 @@ static void topo_tick(void) {
 // when it changed (counted). No other thread is touched
 static int topo_self_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_TOPO_SELF"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_TOPO_SELF=1: the recording thread places itself on the strongest cores"); } return v; }
 static uint64_t g_ts_applied, g_ts_reapplied;
+// DM_UCLAMP_MIN=<0..1024> or auto (vk19.56, opt-in): the recording thread (identified as above) sets its own utilisation floor with sched_setattr(SCHED_FLAG_UTIL_CLAMP_MIN, keeping
+// its policy and nice). App affinity is a no-op on this kernel (U1, U2: even the thread's own sched_setaffinity reads back as every core), but the energy-aware scheduler places
+// a task by its utilisation against each core's capacity and sets the frequency from it: a floor above the second-strongest tier's capacity makes the scheduler itself prefer the
+// strongest cores and keep their clock up. auto: halfway between the two strongest capacities, read at run time. Read back with sched_getattr; logged with errno; checked again
+// every 600 submissions. Also logged once, for the record: whether the cpu controller's uclamp files are writable
+struct dm_sched_attr { uint32_t size, sched_policy; uint64_t sched_flags; int32_t sched_nice; uint32_t sched_priority; uint64_t sched_runtime, sched_deadline, sched_period; uint32_t sched_util_min, sched_util_max; };
+static long uclamp_want(void) {   // -1: off
+    static long v = -2; if (v != -2) return v;
+    const char *e = getenv("DM_UCLAMP_MIN"); if (!e || !*e) return v = -1;
+    if (!strcmp(e, "auto")) { if (g_topo_ok < 0) topo_init(); v = g_topo_ok && g_cap_top > 0 ? (g_cap_next > 0 ? (g_cap_top + g_cap_next) / 2 : g_cap_top * 3 / 4) : 768; }
+    else { v = atol(e); if (v < 0) v = 0; if (v > 1024) v = 1024; }
+    LOG("vk: DM_UCLAMP_MIN=%s: the recording thread's utilisation floor %ld (capacities: strongest %ld, next %ld)", e, v, g_cap_top, g_cap_next);
+    return v;
+}
+static void uclamp_apply(int tid, int again) {
+    long want = uclamp_want(); if (want < 0) return;
+    struct dm_sched_attr a; memset(&a, 0, sizeof a); a.size = sizeof a;
+    if (again && syscall(SYS_sched_getattr, 0, &a, sizeof a, 0) == 0 && a.sched_util_min == (uint32_t)want) return;
+    memset(&a, 0, sizeof a); a.size = sizeof a; a.sched_flags = 0x18 /* KEEP_POLICY | KEEP_PARAMS */ | 0x20 /* UTIL_CLAMP_MIN */; a.sched_util_min = (uint32_t)want;
+    long r = syscall(SYS_sched_setattr, 0, &a, 0); int err = r ? errno : 0;
+    struct dm_sched_attr g; memset(&g, 0, sizeof g); g.size = sizeof g; long rg = syscall(SYS_sched_getattr, 0, &g, sizeof g, 0);
+    static int nl; if (nl++ < 12 || r) LOG("vk: DM_UCLAMP_MIN: tid %d %s: sched_setattr %s%s; reads back util_min %u, util_max %u (sched_getattr %s)", tid, again ? "again" : "set", r ? "failed: " : "0", r ? strerror(err) : "",
+                                        rg ? 0 : g.sched_util_min, rg ? 0 : g.sched_util_max, rg ? strerror(errno) : "0");
+    static int once; if (!once++) {   // for the record: the cpu controller's clamps
+        static const char *const f[] = {"/dev/cpuctl/top-app/cpu.uclamp.min", "/dev/cpuctl/cpu.uclamp.min", "/sys/fs/cgroup/cpu.uclamp.min"};
+        char cg[160] = ""; FILE *fc = fopen("/proc/self/cgroup", "re"); if (fc) { char ln[160]; while (fgets(ln, sizeof ln, fc)) if (strstr(ln, "cpu")) { ln[strcspn(ln, "\n")] = 0; snprintf(cg, sizeof cg, "%s", ln); break; } fclose(fc); }
+        LOG("vk: DM_UCLAMP_MIN: cgroup '%s'; %s %s, %s %s, %s %s", cg, f[0], access(f[0], W_OK) ? "not writable" : "writable", f[1], access(f[1], W_OK) ? "not writable" : "writable", f[2], access(f[2], W_OK) ? "not writable" : "writable");
+    }
+}
 void topo_self_tick(void) {
-    if (!topo_self_on()) return;
+    if (!topo_self_on() && uclamp_want() < 0) return;
     static int win_tid[8], win_cnt[8], win_n, subs, cand, streak, best_streak[8], winner; static uint64_t nsub;
     int t = (int)gettid(); nsub++;
     if (t != cand) { cand = t; streak = 0; } streak++;
@@ -4484,6 +4513,8 @@ void topo_self_tick(void) {
         subs = 0; win_n = 0;
     }
     if (t != winner) return;
+    if (uclamp_want() >= 0) { static uint64_t last_uc; static int uc_tid; if (uc_tid != t || nsub - last_uc >= 600) { uclamp_apply(t, uc_tid == t); uc_tid = t; last_uc = nsub; } }
+    if (!topo_self_on()) return;
     if (g_topo_ok < 0) topo_init();
     if (!g_topo_ok) return;
     static uint64_t last_chk, last_th; static int placed, wide;
