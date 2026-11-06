@@ -115,6 +115,26 @@ On HyperOS 2 / Snapdragon 8s Gen 4 (Xiaomi Pad 8) an app cannot steer where its 
 
 The recording thread's core is the scheduler's (or the vendor's) choice, and it decides about ±3 fps on average: on the strongest core (Q, Q′) rec ~22.5 ms and ~25 fps, on the gold cores (J′, R, S, U, V) rec 25–27.8 ms and ~22 fps. The only lever seen to move the clocks is HyperOS GameTurbo's "Performance" toggle (Run G: CPU and GPU time both halved).
 
+## Runs W, X: Path A S0, a free submission context (vk19.57, `DM_VK_CTX_PICK=1`)
+
+2026-11-06, Xiaomi Pad 8, dungeon spot (Earth Shrine), standing, env E. Alternated A/B/A/B on one install. Run X pins the resolution (`DM_UE_DRS=pinned:60`, 1040x584) in both arms; in W the game chose 80% in the base arm (W0b), which is why X was run.
+
+| Run | CTX_PICK | avg fps (last 120 s) | frame p50 (settled) | context wait / frame | GPU span | rec | copy regions |
+|---|---|---|---|---|---|---|---|
+| X0a | 0 | 23.6 | ~35.8 ms | 8.0–8.3 ms (a later reader) | 25.7–25.9 ms | 24.9 ms | ~1020 |
+| X1a | 1 | 48.5 | ~19.6 ms | 0 | 14.0 ms | 15.2 ms | 0 |
+| X0b | 0 | 23.9 | ~35.5 ms | 7.9–8.3 ms | 25.3–25.7 ms | 24.5 ms | ~1020 |
+| X1b | 1 | 50.0 | ~19–21 ms | 0 | 14.1 ms | 12.2 ms | 3–4 |
+| W0b | 0 (80% res) | 22.3 | ~35.6 ms | 10.5 ms | 29.8 ms | 24.1 ms | 1365 |
+| W1b | 1 | 49.0 | ~19.7 ms | 0 | 14.0 ms | 15.3 ms | 0 |
+
+- PICK=1 took a free context for 100% of 8.1–8.4 submissions a frame and never grew past the 20 contexts: no extra memory.
+- GPU span is busy time (top-of-pipe after the start barrier to bottom-of-pipe). Same 473 draws and 40 passes in both arms; every pass and dispatch runs ~0.55x the time with PICK=1, and recording ~0.6x. A uniform speed-up of both sides: most likely the clocks no longer drop, since the old ping-pong left each side idle ~10 ms a frame in ~8 chunks (the GPU clock is not readable without root, so not proven; reproduced 3 of 3 alternated, so not a one-off device state like G).
+- Copy regions / patches drop because writers finish before their readers are recorded, so the reads take guest memory (already written back); held reads 50 -> 10.8 a frame. Legitimate (ffr-perf, from the code).
+- The compute dispatch `cs bd0c385cb99a8e2c` (UE global shader, 0.4 a frame, 1.3–1.6 ms) runs in every PICK=0 run and in no PICK=1 run: the game stops issuing it (timing-dependent on the game side). Screenshots of both arms at the spot look the same (fog, lighting, crystals).
+- Known gap, older than 19.57, made likelier by PICK: a range whose write-back has started stays tracked without its snapshot until gw_expire, so a read in that window can miss the CPU's later rewrites for one frame. Fix proposed as vk19.58 (gw_del at the write-back).
+- Verdict: keep. Next: vk19.58 (the gap fix) and CTX_PICK on by default, each on the user's go.
+
 ## Opt-in switches of vk19.47–19.56 and their verdicts
 
 | Switch | Build | Verdict | Dead weight to remove later? |
@@ -128,11 +148,12 @@ The recording thread's core is the scheduler's (or the vendor's) choice, and it 
 | `DM_TOPO_SELF` | 19.55 | the thread's own mask not applied either (U1, U2): off | yes: the affinity part of topo_self_tick |
 | `DM_UCLAMP_MIN` | 19.56 | EPERM (V1, V2): off | yes: uclamp_apply (the recording-thread identification is shared with the above) |
 | clock / thermal / game-mode line, game_mode_config | 19.45 | kept: it is what showed the above | no |
+| `DM_VK_CTX_PICK` | 19.57 (default on from 19.58; `=0` turns it off) | avg fps 23.6/23.9 -> 48.5/50.0, context wait 8 -> 0 ms (X): kept, on by default | no |
 | `DM_VK_ZEROCOPY` (Z0) | 19.46 | −0.6 ms rec, −230 MB MemAvailable (L): off | candidate: zc_back / zc_find / the AHB import (kept only if Z1/Z2 are ever tried) |
 
 ## Open
 
-- CPU–GPU waiting (Path A S0, vk19.57, `DM_VK_CTX_PICK=1`): the recorder waits 8.4–8.6 ms a frame for a context a later submission still reads (runJ2); contexts are now picked free as on the Mac. A no-code A/B first: `DM_VK_GW_FORWARD=2` on the current build.
+- CPU–GPU waiting (Path A S0): done. `DM_VK_CTX_PICK` is on by default from vk19.58 (Run X); vk19.58 also ends a GPU-written range at its dispatch write-back (the gap found in the Run W review). To check on the tablet: `DM_VK_CTX_PICK=0` against the default at 60% resolution, and the 'entries ended at their write-back' count.
 
 - The render thread (Unreal's RHI work and the recording, ~100% of one core) runs on the 3.0 GHz A720 cores 2–4, whose clock swung 787–2803 MHz between windows, while the 3.2 GHz Cortex-X4 (cpu7) idled at 633 MHz: next, one A/B of pinning it to cpu7 (estimate: rec 24.5 → 16–19 ms, p50 35 → 27–30, then GPU-bound).
 
