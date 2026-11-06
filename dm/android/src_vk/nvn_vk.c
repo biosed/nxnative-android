@@ -3779,13 +3779,16 @@ static void ring_fit(ctx_t *c) {
     vkDestroyBuffer(g_dev, c->ring0, NULL); vkFreeMemory(g_dev, c->ringm0, NULL); atomic_fetch_sub(&g_ring0_bytes, c->ring0_size);
     c->ring0 = buf_new(want, ALL_BUF_USAGE, &c->ringm0, (void **)&c->ringp0); c->ring0_size = want; atomic_fetch_add(&g_ring0_bytes, want); g_ring_new++; g_ring_new_bytes += want;
 }
-// DM_VK_CTX_PICK=1 (vk19.57, opt-in; Path A S0), the Metal host's choice (nvn_mtl.m mtl_sub_begin: any finished allocator, a new one if none, a wait only at the cap). The
+// DM_VK_CTX_PICK (vk19.57, Path A S0; the default from vk19.58), the Metal host's choice (nvn_mtl.m mtl_sub_begin: any finished allocator, a new one if none, a wait only at the cap). The
 // contexts were taken round robin, and the one whose turn it was could be held by a later submission still reading its ring (GPU-written data used in place, gw_find): the
 // recorder waited 8.4-8.6 ms a frame for that reader, usually the newest submission, so CPU and GPU took turns. Now the least recently used context whose submission is done and
 // that no later one reads is taken; with none, a new one is made, up to DM_VK_CTX_MAX (default 32); only at the cap the recorder waits, for the context that frees first. Ring and
 // hold rules are unchanged. A context taken again ends the GPU-written copies forwarded into its ring (DM_VK_GW_FORWARD counted on round robin). Per 600 frames: picks free at
 // once, contexts made, waits by reason (its own submission, a later reader, at the cap) and the high-water count
-static int ctx_pick_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_CTX_PICK"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_CTX_PICK=1: a free submission context is taken, more are made up to DM_VK_CTX_MAX"); } return v; }
+// On by default from vk19.58 (Run X, resolution pinned at 60%, ABAB on one install: 23.6 / 23.9 -> 48.5 / 50.0 fps, the context wait 8 -> 0 ms a frame, GPU 25.7 -> 14.0 ms);
+// DM_VK_CTX_PICK=0 takes the contexts round robin again
+static int ctx_pick_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_CTX_PICK"); v = !(e && atoi(e) == 0);
+    if (v) LOG("vk: DM_VK_CTX_PICK on (the default): a free submission context is taken, more are made up to DM_VK_CTX_MAX"); else LOG("vk: DM_VK_CTX_PICK=0: submission contexts taken round robin"); } return v; }
 static uint64_t g_pick_free, g_pick_grow, g_pick_wait, g_pick_wait_fence, g_pick_wait_hold; static int g_pick_hw;
 static void ctx_pick(void) {
     static int cap; if (!cap) { const char *e = getenv("DM_VK_CTX_MAX"); cap = e && atoi(e) > 0 ? atoi(e) : NCTX_MAX; if (cap > NCTX_MAX) cap = NCTX_MAX; if (cap < NCTX) cap = NCTX; }

@@ -148,12 +148,12 @@ The recording thread's core is the scheduler's (or the vendor's) choice, and it 
 | `DM_TOPO_SELF` | 19.55 | the thread's own mask not applied either (U1, U2): off | yes: the affinity part of topo_self_tick |
 | `DM_UCLAMP_MIN` | 19.56 | EPERM (V1, V2): off | yes: uclamp_apply (the recording-thread identification is shared with the above) |
 | clock / thermal / game-mode line, game_mode_config | 19.45 | kept: it is what showed the above | no |
-| `DM_VK_CTX_PICK` | 19.57 | avg fps 23.6/23.9 -> 48.5/50.0, context wait 8 -> 0 ms (X): keep, default pending | no |
+| `DM_VK_CTX_PICK` | 19.57 (default on from 19.58; `=0` turns it off) | avg fps 23.6/23.9 -> 48.5/50.0, context wait 8 -> 0 ms (X): kept, on by default | no |
 | `DM_VK_ZEROCOPY` (Z0) | 19.46 | −0.6 ms rec, −230 MB MemAvailable (L): off | candidate: zc_back / zc_find / the AHB import (kept only if Z1/Z2 are ever tried) |
 
 ## Open
 
-- CPU–GPU waiting (Path A S0, vk19.57, `DM_VK_CTX_PICK=1`): the recorder waits 8.4–8.6 ms a frame for a context a later submission still reads (runJ2); contexts are now picked free as on the Mac. A no-code A/B first: `DM_VK_GW_FORWARD=2` on the current build.
+- CPU–GPU waiting (Path A S0): done. `DM_VK_CTX_PICK` is on by default from vk19.58 (Run X); vk19.58 also ends a GPU-written range at its dispatch write-back (the gap found in the Run W review). To check on the tablet: `DM_VK_CTX_PICK=0` against the default at 60% resolution, and the 'entries ended at their write-back' count.
 
 - The render thread (Unreal's RHI work and the recording, ~100% of one core) runs on the 3.0 GHz A720 cores 2–4, whose clock swung 787–2803 MHz between windows, while the 3.2 GHz Cortex-X4 (cpu7) idled at 633 MHz: next, one A/B of pinning it to cpu7 (estimate: rec 24.5 → 16–19 ms, p50 35 → 27–30, then GPU-bound).
 
