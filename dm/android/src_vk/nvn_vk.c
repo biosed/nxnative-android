@@ -17,6 +17,7 @@
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan.h>
 #include <android/native_window.h>
+#include <dlfcn.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <sched.h>
@@ -2597,10 +2598,11 @@ static void *pso_precreate(void *a) { pthread_setname_np("dm-psopre");
 // from DM_VK_CTL_FILE ("set <name> <value>", vk_ctl: the file is read again only when its modification time changes, at most once a frame). The value is an atomic; the
 // recording thread takes a copy of every value once per submission (tog_latch at mtl_sub_begin) and reads only that copy (tog), so a switch never changes in the middle
 // of a submission. A name not on the run-time list is refused when the file sets it (it is read at start only)
-enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_N };
+enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_PACE, TG_N };
 static struct { const char *name; int runtime; _Atomic int val; } g_tog[TG_N] = {
     [TG_SHADOW] = {"DM_VK_SHADOW", 1},   // diagnostic: what a persistent cache could save (copy_in / index-scan misses whose bytes an earlier copy already had)
     [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2)
+    [TG_PACE] = {"DM_VK_PRESENT_PACE", 0},   // vk19.63: one setFrameRate request for the cap at the first swapchain, FIFO when the cap is at most the panel's rate; start only
     [TG_LEAN] = {"DM_VK_LEAN", 0},   // vk19.62: small hot-path items (trace pointers, the memo hash, the timer conversion, sampled descriptor-set timing); start only
     [TG_FB_FAST] = {"DM_VK_FB_FAST", 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2)
 };
@@ -4286,6 +4288,30 @@ static void win_drop(void) {
     if (W.sc) { lk_(&g_qmu, LW_QMU); vkDeviceWaitIdle(g_dev); pthread_mutex_unlock(&g_qmu); for (uint32_t i = 0; i < W.n; i++) vkDestroyImageView(g_dev, W.view[i], NULL); vkDestroySwapchainKHR(g_dev, W.sc, NULL); W.sc = VK_NULL_HANDLE; }
     if (W.surf) { vkDestroySurfaceKHR(g_inst, W.surf, NULL); W.surf = VK_NULL_HANDLE; }
 }
+// DM_VK_PRESENT_PACE (vk19.63, plan v4 T2, off by default; read at start only). Nothing asked Android for a refresh rate and the swapchain was MAILBOX: the panel (modes
+// 30/48/50/60/90/120/144 Hz on the Xiaomi Pad 8) could run at 120/144 Hz while the game shows 60, so frames sat 2 or 3 refreshes (judder) and the display and compositor
+// ran at the high rate. With it on: the first swapchain asks for the frame cap (DM_FPS: 60, or 30 for the launcher's 30 fps profile) with
+// ANativeWindow_setFrameRateWithChangeStrategy(cap, FIXED_SOURCE, ALWAYS) -- once, so the panel never changes mode during play; a later swapchain (a new window after a
+// resume) asks again only if seamless (ONLY_IF_SEAMLESS) -- and the swapchain is FIFO when the cap is at most the panel's rate (read by the front end's activity thread,
+// dm_front_panel_mhz), so presents follow the panel's vsync instead of replacing each other. The host's pacing already sleeps (clock_nanosleep / usleep), it never spins.
+// The rate granted is in the heat-and-energy line (dm-stats asks the Display each window); displayed-frame p95/p99 in the present-to-present line
+__attribute__((weak)) int dm_front_panel_mhz(void) { return 0; }
+static void present_pace(ANativeWindow *aw, VkPresentModeKHR *mode) {
+    tog_init(); if (!atomic_load(&g_tog[TG_PACE].val)) return;
+    int cap = mtl_fps_target(), mhz = dm_front_panel_mhz();
+    static ANativeWindow *asked; static int nreq;
+    if (aw != asked) {
+        typedef int32_t (*sfr2_t)(ANativeWindow *, float, int8_t, int8_t); typedef int32_t (*sfr_t)(ANativeWindow *, float, int8_t);
+        void *h = dlopen("libnativewindow.so", RTLD_NOW); sfr2_t f2 = h ? (sfr2_t)dlsym(h, "ANativeWindow_setFrameRateWithChangeStrategy") : NULL; sfr_t f1 = h ? (sfr_t)dlsym(h, "ANativeWindow_setFrameRate") : NULL;
+        int8_t strategy = nreq ? 0 : 1;   // ONLY_IF_SEAMLESS after the first request, ALWAYS for the first
+        int32_t r = f2 ? f2(aw, (float)cap, 1 /* FIXED_SOURCE */, strategy) : (!nreq && f1) ? f1(aw, (float)cap, 1) : -1;
+        LOG("vk: DM_VK_PRESENT_PACE: %d Hz asked of the window (%s, fixed source, %s): %d; the panel %.2f Hz now", cap, f2 ? "setFrameRateWithChangeStrategy" : f1 ? "setFrameRate" : "no setFrameRate",
+            strategy ? "change always" : "only if seamless", (int)r, mhz / 1000.0);
+        asked = aw; nreq++;
+    }
+    if (mhz > 0 && cap * 1000 <= mhz + 500) *mode = VK_PRESENT_MODE_FIFO_KHR;
+    LOG("vk: DM_VK_PRESENT_PACE: %s (cap %d fps, panel %.2f Hz%s)", *mode == VK_PRESENT_MODE_FIFO_KHR ? "fifo" : "mailbox", cap, mhz / 1000.0, mhz ? "" : ": unknown, mailbox kept");
+}
 static int win_make(ANativeWindow *aw) {
     VkAndroidSurfaceCreateInfoKHR si = {VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, NULL, 0, aw};
     if (vkCreateAndroidSurfaceKHR(g_inst, &si, NULL, &W.surf) != VK_SUCCESS) { RED_ONCE(90, "no Vulkan surface for the window"); return 0; }
@@ -4295,6 +4321,7 @@ static int win_make(ANativeWindow *aw) {
     VkSurfaceFormatKHR pick = sf[0]; for (uint32_t i = 0; i < nf; i++) if (sf[i].format == VK_FORMAT_R8G8B8A8_UNORM || sf[i].format == VK_FORMAT_B8G8R8A8_UNORM) { pick = sf[i]; break; }
     uint32_t npm = 0; vkGetPhysicalDeviceSurfacePresentModesKHR(g_pd, W.surf, &npm, NULL); VkPresentModeKHR pm[8]; if (npm > 8) npm = 8; vkGetPhysicalDeviceSurfacePresentModesKHR(g_pd, W.surf, &npm, pm);
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR; for (uint32_t i = 0; i < npm; i++) if (pm[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = pm[i];   // the host paces presents itself; mailbox never blocks it
+    present_pace(aw, &mode);   // DM_VK_PRESENT_PACE (vk19.63): the panel's rate requested for the cap, FIFO when the cap fits it
     // The swapchain is made the window's way up and Android's compositor turns it (a phone whose screen is portrait by nature, playing in landscape, reports its
     // current extent and transform rotated); the window's own size is that way up
     // Upright or upside down the swapchain is made the screen's current way (180 degrees is turned by us, for free in the blit); a quarter turn is left to the compositor

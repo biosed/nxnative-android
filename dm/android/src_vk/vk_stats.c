@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 int dm_front_battery(long *charge_uah, long *current_ua, int *mv, int *plugged, int want_v) __attribute__((weak));
+int dm_front_panel_mhz_now(void) __attribute__((weak));   // the panel's refresh rate now (Display.getRefreshRate over JNI, this thread only; vk19.63)
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_req_frames;   // frames at the window's end (the present's count), 0: none asked
@@ -125,10 +126,10 @@ static void window_log(uint64_t frames, uint64_t dns) {
     char cl[512]; clusters(cl, sizeof cl);
     int mv = -1, pl = -1; long q = 0, cu = 0; if (dm_front_battery && dm_front_battery(&q, &cu, &mv, &pl, 1) && pl >= 0) g_plugged = pl;
     long dq = W.nq ? W.q_last - W.q0 : 0; double mean_ma = W.ncur ? W.cur_sum / W.ncur / 1000.0 : 0;
-    LOG("vk: heat and energy over the last %llu frames (%.1f s): clusters %s; thermal status %d (highest %d), headroom now %.3f (lowest %.3f), in 10 s %.3f (highest %.3f); battery %+ld uAh (%.0f mAh an hour), %s %.0f mA, %d mV (%.0f mW), plugged %d%s; memory map %d lines",
+    LOG("vk: heat and energy over the last %llu frames (%.1f s): clusters %s; thermal status %d (highest %d), headroom now %.3f (lowest %.3f), in 10 s %.3f (highest %.3f); battery %+ld uAh (%.0f mAh an hour), %s %.0f mA, %d mV (%.0f mW), plugged %d%s; panel %.2f Hz; memory map %d lines",
         (unsigned long long)frames, secs, cl, W.st, W.st_high, (double)W.h0, (double)(W.h0_low == INFINITY ? NAN : W.h0_low), (double)W.h10, (double)(W.h10_high == -INFINITY ? NAN : W.h10_high),
         dq, dq / 1000.0 / ps * 3600.0, g_plugged == 0 ? "drain mean" : "current mean (as reported)", mean_ma, mv, mv > 0 ? mean_ma * mv / 1000.0 : 0, pl,
-        dm_front_battery ? (W.ncur ? "" : " (no battery readings)") : " (no front end)", maps_lines());
+        dm_front_battery ? (W.ncur ? "" : " (no battery readings)") : " (no front end)", dm_front_panel_mhz_now ? dm_front_panel_mhz_now() / 1000.0 : 0.0, maps_lines());
     window_reset();
 }
 // A CPU's cluster, as its cpufreq policy's first CPU (related_cpus), read once: the recording thread's cluster in the present-to-present line (A/B windows on one cluster only)

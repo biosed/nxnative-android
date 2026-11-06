@@ -432,6 +432,11 @@ static void boot_env(const char *files, const char *ext) {
     else fprintf(stderr, "boot: no settings.env, the defaults apply\n");
     snprintf(p, sizeof p, "%s/env.txt", ext);   // diagnostics: switches in <external>/env.txt (one KEY=VALUE per line) win
     if ((f = fopen(p, "r"))) { char ln[1024]; while (fgets(ln, sizeof ln, f)) { ln[strcspn(ln, "\r\n")] = 0; char *eq = strchr(ln, '='); if (!eq || ln[0] == '#') continue; *eq = 0; setenv(ln, eq + 1, 1); fprintf(stderr, "boot: env %s=%s\n", ln, eq + 1); } fclose(f); }
+    {   // DM_VK_PRESENT_PACE (vk19.63): the launcher's 30 fps profile (DM_FPS=30) also caps the game itself at 30 (DM_FPS_TARGET: Unreal's t.MaxFPS, and its dynamic
+        // resolution's 16.67 ms budget no longer applies), unless DM_FPS_TARGET is set already
+        const char *pp = getenv("DM_VK_PRESENT_PACE"), *fp = getenv("DM_FPS");
+        if (pp && atoi(pp) && fp && atoi(fp) == 30 && !getenv("DM_FPS_TARGET")) { setenv("DM_FPS_TARGET", "30", 1); fprintf(stderr, "boot: DM_FPS_TARGET=30 (the 30 fps profile, DM_VK_PRESENT_PACE)\n"); }
+    }
     const char *sub[][2] = {{"DM_ROMFS", "romfs"}, {"DM_VK_DIR", "vk"}, {"DM_FONT_DIR", "font"}};
     for (int i = 0; i < 3; i++) { snprintf(p, sizeof p, "%s/%s", ext, sub[i][1]); setenv(sub[i][0], p, 0); }
     snprintf(p, sizeof p, "%s/save", files); mkdir(p, 0755); setenv("DM_SAVE", p, 0);
@@ -496,7 +501,8 @@ static void immersive(ANativeActivity *a) {
 }
 
 // ---------- Activity callbacks ----------
-static void on_window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; pthread_mutex_lock(&g_wmu); g_win = w; atomic_fetch_add(&g_win_gen, 1); pthread_mutex_unlock(&g_wmu); LOG("front end: window %dx%d", ANativeWindow_getWidth(w), ANativeWindow_getHeight(w)); }
+static void panel_read_activity(ANativeActivity *a);
+static void on_window_created(ANativeActivity *a, ANativeWindow *w) { panel_read_activity(a); pthread_mutex_lock(&g_wmu); g_win = w; atomic_fetch_add(&g_win_gen, 1); pthread_mutex_unlock(&g_wmu); LOG("front end: window %dx%d", ANativeWindow_getWidth(w), ANativeWindow_getHeight(w)); }
 // The window goes when the activity stops (screen off, another app): the swapchain and surface are released with it, before Android takes the window back
 static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; pthread_mutex_lock(&g_wmu); g_win = NULL; atomic_fetch_add(&g_win_gen, 1); dm_vk_window_lost(); pthread_mutex_unlock(&g_wmu); }
 static void on_window_resized(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; atomic_fetch_add(&g_win_gen, 1); }
@@ -581,6 +587,11 @@ static void game_mode_read(ANativeActivity *a) {
 // activity thread at onCreate (battery_init_activity): never g_act, whose ANativeActivity is freed when Android destroys the activity while the process stays (vk19.59c).
 // The thread attaches once, as a daemon. Every JNI call is followed by an exception check; a failed setup is not tried again. Returns 0 when there is nothing to read
 static JavaVM *g_vm; static jobject g_appctx;
+static JNIEnv *stats_env(void) {   // dm-stats only: attached once as a daemon (0 when there is no VM)
+    static JNIEnv *env; static int tried;
+    if (!env && !tried) { tried = 1; JavaVMAttachArgs aa = {JNI_VERSION_1_6, "dm-stats", NULL}; if (!g_vm || (*g_vm)->AttachCurrentThreadAsDaemon(g_vm, &env, &aa) != JNI_OK) env = NULL; }
+    return env;
+}
 static void battery_init_activity(ANativeActivity *a) {   // the activity thread, first onCreate of the process
     JNIEnv *env = a->env; g_vm = a->vm;
     jmethodID m = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "getApplicationContext", "()Landroid/content/Context;");
@@ -589,14 +600,44 @@ static void battery_init_activity(ANativeActivity *a) {   // the activity thread
     if (c) { g_appctx = (*env)->NewGlobalRef(env, c); (*env)->DeleteLocalRef(env, c); }
 }
 #define JX(env) ((*(env))->ExceptionCheck(env) ? ((*(env))->ExceptionClear(env), 1) : 0)
+// The panel's refresh rate (vk19.63, DM_VK_PRESENT_PACE): Display.getRefreshRate through the WindowManager, in millihertz. The activity thread reads it when a window is
+// made (panel_read_activity: the backend's swapchain chooses FIFO from it); dm-stats reads it again once a window (dm_front_panel_mhz_now: the rate actually granted after
+// the backend's setFrameRate request, for the heat-and-energy line). No game, guest or RHI thread calls into Java
+static _Atomic int g_panel_mhz;
+static int panel_query(JNIEnv *env, jobject ctx, int log_modes) {
+    int mhz = 0; jstring nm = (*env)->NewStringUTF(env, "window"); if ((*env)->ExceptionCheck(env) || !nm) { (*env)->ExceptionClear(env); return 0; }
+    jmethodID gss = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, ctx), "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    jobject wm = !(*env)->ExceptionCheck(env) && gss ? (*env)->CallObjectMethod(env, ctx, gss, nm) : NULL; (*env)->DeleteLocalRef(env, nm);
+    if ((*env)->ExceptionCheck(env) || !wm) { (*env)->ExceptionClear(env); return 0; }
+    jmethodID gd = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, wm), "getDefaultDisplay", "()Landroid/view/Display;");
+    jobject d = !(*env)->ExceptionCheck(env) && gd ? (*env)->CallObjectMethod(env, wm, gd) : NULL;
+    if ((*env)->ExceptionCheck(env) || !d) { (*env)->ExceptionClear(env); (*env)->DeleteLocalRef(env, wm); return 0; }
+    jclass dc = (*env)->GetObjectClass(env, d); jmethodID gr = (*env)->GetMethodID(env, dc, "getRefreshRate", "()F");
+    if (!(*env)->ExceptionCheck(env) && gr) { jfloat r = (*env)->CallFloatMethod(env, d, gr); if (!(*env)->ExceptionCheck(env)) mhz = (int)(r * 1000.0f + 0.5f); }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (log_modes) {   // the panel's modes, once (Display.getSupportedModes, API 23)
+        jmethodID gm = (*env)->GetMethodID(env, dc, "getSupportedModes", "()[Landroid/view/Display$Mode;"); jobjectArray ms = !(*env)->ExceptionCheck(env) && gm ? (*env)->CallObjectMethod(env, d, gm) : NULL;
+        if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); ms = NULL; }
+        char b[256] = ""; size_t o = 0; jsize n = ms ? (*env)->GetArrayLength(env, ms) : 0;
+        for (jsize i = 0; i < n && i < 24 && o < sizeof b - 12; i++) { jobject m = (*env)->GetObjectArrayElement(env, ms, i); if (!m) continue;
+            jmethodID mr = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, m), "getRefreshRate", "()F"); jfloat r = mr && !(*env)->ExceptionCheck(env) ? (*env)->CallFloatMethod(env, m, mr) : 0;
+            if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); r = 0; }
+            o += (size_t)snprintf(b + o, sizeof b - o, "%s%.0f", o ? " " : "", (double)r); (*env)->DeleteLocalRef(env, m); }
+        if (ms) (*env)->DeleteLocalRef(env, ms);
+        LOG("front end: panel refresh rate %.2f Hz now; modes %s Hz", mhz / 1000.0, o ? b : "?");
+    }
+    (*env)->DeleteLocalRef(env, d); (*env)->DeleteLocalRef(env, wm);
+    return mhz;
+}
+static void panel_read_activity(ANativeActivity *a) { static int logged; int m = panel_query(a->env, a->clazz, !logged++); if (m) atomic_store(&g_panel_mhz, m); }
+__attribute__((visibility("default"))) int dm_front_panel_mhz(void) { return atomic_load(&g_panel_mhz); }   // the activity thread's last reading (any thread may read it)
+__attribute__((visibility("default"))) int dm_front_panel_mhz_now(void) { JNIEnv *env = g_appctx ? stats_env() : NULL; return env ? panel_query(env, g_appctx, 0) : 0; }   // dm-stats only
 __attribute__((visibility("default"))) int dm_front_battery(long *charge_uah, long *current_ua, int *mv, int *plugged, int want_v) {
     static int state; static JNIEnv *env; static jobject bm, s_act, s_volt, s_plug; static jclass ifc; static jmethodID get_int, if_new, reg, get_extra;
     if (state < 0) return 0;
     if (!state) {
         state = -1;   // until the whole setup has worked: one try only
-        if (!g_vm || !g_appctx) return 0;
-        JavaVMAttachArgs aa = {JNI_VERSION_1_6, "dm-stats", NULL};
-        if ((*g_vm)->AttachCurrentThreadAsDaemon(g_vm, &env, &aa) != JNI_OK || !env) return 0;
+        if (!g_vm || !g_appctx || !(env = stats_env())) return 0;
         jclass cc = (*env)->GetObjectClass(env, g_appctx); if (JX(env) || !cc) return 0;
         jmethodID gss = (*env)->GetMethodID(env, cc, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"); if (JX(env) || !gss) return 0;
         reg = (*env)->GetMethodID(env, cc, "registerReceiver", "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;)Landroid/content/Intent;"); if (JX(env) || !reg) return 0;
