@@ -93,9 +93,16 @@ static uint64_t g_latch, g_prev; static uint64_t g_press_at[16];
 static pthread_mutex_t g_pmu = PTHREAD_MUTEX_INITIALIZER;
 static void pads_push_(void);
 static void pads_push(void) { pthread_mutex_lock(&g_pmu); pads_push_(); pthread_mutex_unlock(&g_pmu); }
+// DM_LATCH_BLOCK=1 (vk19.64, off by default): the thread sleeps on a condition while nothing is latched and − + is not held, woken by pads_push_ when either starts,
+// instead of waking every 4 ms whatever happens (profile P1: 93 ms of nanosleep in 750 frames, 250 wake-ups a second for nothing)
+static pthread_cond_t g_latch_cv = PTHREAD_COND_INITIALIZER; static int g_latch_block = -1;
 static void *latch_thread(void *a) {
     (void)a;
-    for (;;) { usleep(4000); pthread_mutex_lock(&g_pmu); if (g_latch || g_combo_since) pads_push_(); pthread_mutex_unlock(&g_pmu); }   // also times − and + held with no new events
+    if (g_latch_block < 0) { const char *e = getenv("DM_LATCH_BLOCK"); g_latch_block = e && atoi(e) != 0; if (g_latch_block) LOG("front end: DM_LATCH_BLOCK=1: the input latch thread sleeps while nothing is held"); }
+    for (;;) {
+        if (g_latch_block) { pthread_mutex_lock(&g_pmu); while (!g_latch && !g_combo_since) pthread_cond_wait(&g_latch_cv, &g_pmu); pthread_mutex_unlock(&g_pmu); }
+        usleep(4000); pthread_mutex_lock(&g_pmu); if (g_latch || g_combo_since) pads_push_(); pthread_mutex_unlock(&g_pmu);   // also times − and + held with no new events
+    }
     return NULL;
 }
 static void pads_push_(void) {
@@ -126,6 +133,7 @@ static void pads_push_(void) {
     if (!combo) g_combo_since = 0;
     else if (!g_combo_since) g_combo_since = now_ns();
     else if (now_ns() - g_combo_since > 2000000000ull) back_to_menu();
+    if (g_latch || g_combo_since) pthread_cond_signal(&g_latch_cv);   // DM_LATCH_BLOCK: the latch thread has something to time (g_pmu is held)
 }
 // ---------- On-screen controls ----------
 // Groups of buttons -- A B X Y bottom right (by position, as on the Switch), the D-pad bottom left, L / ZL and R / ZR in the top corners, − and + top centre -- and two

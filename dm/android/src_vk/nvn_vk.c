@@ -219,6 +219,8 @@ static uint64_t g_wgen;   // a new generation when the ring changes or the write
 static uint32_t g_nwlog;   // writes logged in this generation (wlog_add)
 static int g_lean_tr;   // DM_VK_LEAN for the submission (tog_latch): trace_add keeps pointers
 static uint64_t g_bgen[6], g_bgen_next = 1;   // a stage's binding generation: changes when its texture, image, sampler or storage-buffer bindings change (DM_VK_SEG_CACHE, DM_VK_FB_FAST)
+static _Atomic uint64_t g_cpr_ns, g_cpr_n, g_cpr_bufs, g_cpr_rec;   // command-pool resets: dm-complete's time and count, those done buffer by buffer, those left to the recording thread (vk19.64)
+static int pool_reset_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_POOL_RESET"); v = e ? atoi(e) : 0; if (v) LOG("vk: DM_VK_POOL_RESET=%d: command buffers reset one by one by dm-complete", v); } return v; }
 static uint64_t g_tex_draws_win;   // draws recorded in the 600-frame window (trace_add; tex_get calls per draw, vk19.59)
 static int zc_mode(void); static int zc_find(uint64_t addr, uint64_t n, VkBuffer *b, VkDeviceSize *off); static void zc_reap(uint64_t done);   // zero-copy pools (DM_VK_ZEROCOPY)
 static int g_zc_dev; static uint64_t g_zc_bytes, g_zc_hits, g_zc_miss_wlog;
@@ -740,8 +742,13 @@ static void ctx_complete(ctx_t *c) {
     c->nfb = 0;
     for (int i = 0; i < c->nbv; i++) vkDestroyBufferView(g_dev, c->bv[i], NULL);
     c->nbv = 0;
-    // The pools are idle now and the submit thread does not touch this context until g_done passes it (set after this returns): reset them here, off its time
-    VKCHECK(vkResetCommandPool(g_dev, c->pool, 0));
+    // The pools are idle now and the submit thread does not touch this context until g_done passes it (set after this returns): reset them here, off its time.
+    // DM_VK_POOL_RESET=1 (vk19.64): the two command buffers one by one (the pool made with RESET_COMMAND_BUFFER_BIT), the whole pool when secondaries were used. Timed (the
+    // profile put 1.56 ms a frame of dm-complete in vkResetCommandPool): the per-600 command-pool line
+    { uint64_t t0 = now_ns();
+      if (pool_reset_mode() == 1 && !c->nsec) { VKCHECK(vkResetCommandBuffer(c->cb, 0)); VKCHECK(vkResetCommandBuffer(c->up, 0)); atomic_fetch_add(&g_cpr_bufs, 1); }
+      else VKCHECK(vkResetCommandPool(g_dev, c->pool, 0));
+      atomic_fetch_add(&g_cpr_ns, now_ns() - t0); atomic_fetch_add(&g_cpr_n, 1); }
     for (int i = 0; i < c->ndp; i++) VKCHECK(vkResetDescriptorPool(g_dev, c->dps[i], 0));
     c->reset_done = 1;
 }
@@ -829,7 +836,7 @@ static void ctx_init(int i) {   // a submission context's pool, command buffers,
     // showed a third of the render thread in kgsl_sharedmem_alloc ioctls under vkCmdCopyBufferToImage (the driver allocating command memory again as the buffers grew), which
     // a transient pool invites. DM_VK_POOL_TRANSIENT=1: as before
     static int tr = -1; if (tr < 0) { const char *e = getenv("DM_VK_POOL_TRANSIENT"); tr = e && atoi(e) != 0; LOG("vk: command pools %s (DM_VK_POOL_TRANSIENT=%d)", tr ? "transient" : "kept warm", tr); }
-    VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, tr ? VK_COMMAND_POOL_CREATE_TRANSIENT_BIT : 0, g_qf};
+    VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, (tr ? VK_COMMAND_POOL_CREATE_TRANSIENT_BIT : 0) | (pool_reset_mode() == 1 ? VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT : 0), g_qf};
     VKCHECK(vkCreateCommandPool(g_dev, &pi, NULL, &c->pool));
     VkCommandBuffer cbs[2]; VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, c->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2};
     VKCHECK(vkAllocateCommandBuffers(g_dev, &ai, cbs)); c->cb = cbs[0]; c->up = cbs[1];
@@ -4053,7 +4060,7 @@ void mtl_sub_begin(void) {
     if (!C->reset_done) for (int i = 0; i < C->ndp; i++) VKCHECK(vkResetDescriptorPool(g_dev, C->dps[i], 0));   // normally done by the completion thread (ctx_complete)
     C->idp = 0;
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
-    if (!C->reset_done) VKCHECK(vkResetCommandPool(g_dev, C->pool, 0));   // both command buffers at once, their memory kept; normally done already by the completion thread
+    if (!C->reset_done) { VKCHECK(vkResetCommandPool(g_dev, C->pool, 0)); atomic_fetch_add(&g_cpr_rec, 1); }   // both command buffers at once, their memory kept; normally done already by the completion thread (counted: work on the recording thread)
     C->reset_done = 0;
     VKCHECK(vkBeginCommandBuffer(C->cb, &bi)); VKCHECK(vkBeginCommandBuffer(C->up, &bi)); C->nsec = 0; C->prim = VK_NULL_HANDLE;   // the pool's reset reset its secondaries too
     barrier_all(C->up); g_vbar_epoch++;   // after everything submitted before (see mtl_sub_commit: no semaphore wait between the game's submissions)
@@ -4915,6 +4922,9 @@ static void adpf_frame(uint64_t cpu_ns, uint64_t gpu_ns) {
 static uint32_t g_pp[600]; static uint64_t g_npp, g_pp_last;
 static int u32cmp(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
 static void meas_lines(void) {
+    { uint64_t n = atomic_exchange(&g_cpr_n, 0), ns = atomic_exchange(&g_cpr_ns, 0), nb = atomic_exchange(&g_cpr_bufs, 0), nr = atomic_exchange(&g_cpr_rec, 0);
+      LOG("vk: command pools per frame over the last 600 (DM_VK_POOL_RESET %d): %.1f reset by dm-complete (%.3f ms, %.1f of them buffer by buffer), %.2f left to the recording thread; %d submission contexts",
+          pool_reset_mode(), n / 600.0, ns / 600e6, nb / 600.0, nr / 600.0, NCTX); }
     uint64_t hit = 0, miss = 0, mb = 0; for (int i = 0; i < CI_N; i++) { hit += g_ci_hit[i]; miss += g_ci_miss[i]; mb += g_ci_mbytes[i]; }
     static const char *cn[CI_N] = {"vertex", "index", "index pool", "uniform", "storage", "texel", "image copy"};
     char cb[600]; size_t o = 0; cb[0] = 0;
