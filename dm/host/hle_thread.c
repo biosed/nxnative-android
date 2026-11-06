@@ -92,11 +92,11 @@ typedef struct thr {
     const uint32_t *whs; int whn;   // WaitSynchronization's handle array (guest memory, valid while the thread waits there): a signal wakes only waiters that hold the signalled object
     int ctx_ok; uint64_t ctx_x[29], ctx_fp, ctx_lr, ctx_sp, ctx_pc; uint32_t ctx_pstate, ctx_fpcr, ctx_fpsr; __uint128_t ctx_v[32];
     pthread_cond_t pcv;
-    uint64_t sy[20], sy_seen[20];   // guest synchronization counters (SY_*, vk19.59b), each changed by its own thread (or under G), read under G by dm_guest_sync_report
+    uint64_t sy[24], sy_seen[24];   // guest synchronization counters (SY_*, vk19.59b), each changed by its own thread (or under G), read under G by dm_guest_sync_report
 } thr_t;
 // Guest synchronization counters (vk19.59b; profile P1: svc_thread 7.9 ms a frame across the game's threads): plain counts on the hot paths, a clock only around a wait that
 // really sleeps (a futex wait already), reported per 600 frames by thread (dm_guest_sync_report)
-enum { SY_REL_NONE, SY_HANDOFF, SY_SIG_NONE, SY_SIG, SY_W_LOCK, SY_W_COND, SY_W_ADDR, SY_W_SYNC, SY_W_PRE, SY_W_SHORT, SY_W_LONG, SY_W_TIMEOUT, SY_W_TK, SY_NAP_PEER, SY_NAP_PRECISE, SY_NAP_DET, SY_NAP_BACKOFF, SY_N };
+enum { SY_REL_NONE, SY_HANDOFF, SY_SIG_NONE, SY_SIG, SY_W_LOCK, SY_W_COND, SY_W_ADDR, SY_W_SYNC, SY_W_PRE, SY_W_SHORT, SY_W_LONG, SY_W_TIMEOUT, SY_W_TK, SY_NAP_PEER, SY_NAP_PRECISE, SY_NAP_DET, SY_NAP_BACKOFF, SY_G_CONT, SY_G_TK, SY_HO_TK, SY_WAKE_N, SY_WAKE_TK, SY_N };   // G_*: G taken in a sync SVC after waiting, the ticks waited; HO_TK: ticks in lock_handoff; WAKE: pthread_cond_signal calls and ticks (vk19.66m)
 // The wait's length in the arm64 virtual counter's ticks (read in user space, no system call; converted at the report), else in ns
 static inline uint64_t sy_ticks(void) {
 #ifdef __aarch64__
@@ -123,9 +123,17 @@ static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 // waits in the kernel and on Android 15 also formats a ScopedTrace string (profile P1: NonPI::MutexLockWithTimeout 1.1 ms a frame, its snprintf 0.19). Spinning trades a
 // little CPU for the system call, the sleep and the wake-up; the counts are in the guest-sync line ('G taken by spinning')
 static int g_spin = -1; static _Atomic uint64_t g_spin_hit, g_spin_miss;
+static pthread_key_t g_keythr;   // declared again below (a tentative definition): g_lock_slow needs it
+static void g_lock_slow(void);
+static void g_lock_note(thr_t *me, uint64_t tk) { me->sy[SY_G_CONT]++; me->sy[SY_G_TK] += tk; }
 static inline void g_lock(void) {
+    if (!pthread_mutex_trylock(&G)) return;   // free: no wait (vk19.66m: only a contended G is timed)
+    g_lock_slow();
+}
+static void g_lock_slow(void) {
+    uint64_t t0 = sy_ticks();
     if (g_spin < 0) { const char *e = getenv("DM_G_SPIN"); int v = e ? atoi(e) : 0; g_spin = v < 0 ? 0 : v > 1000 ? 1000 : v;   /* at most 1,000 tries (vk19.63d) */ if (g_spin) LOG("DM_G_SPIN=%d: the synchronization SVCs try the kernel lock %d times before blocking", g_spin, g_spin); }
-    if (g_spin) { for (int i = 0; i < g_spin; i++) { if (!pthread_mutex_trylock(&G)) { if (i) atomic_fetch_add_explicit(&g_spin_hit, 1, memory_order_relaxed); return; }
+    if (g_spin) { for (int i = 0; i < g_spin; i++) { if (!pthread_mutex_trylock(&G)) { if (i) atomic_fetch_add_explicit(&g_spin_hit, 1, memory_order_relaxed); goto got; }
                       if ((i & 63) == 63) sched_yield();   // a real yield now and then: a preempted holder on this CPU gets to run (the CPU hint alone does not)
 #if defined(__aarch64__)
                       else __asm__ volatile("yield");
@@ -133,6 +141,8 @@ static inline void g_lock(void) {
                   }
                   atomic_fetch_add_explicit(&g_spin_miss, 1, memory_order_relaxed); }
     pthread_mutex_lock(&G);
+  got:;
+    thr_t *me = pthread_getspecific(g_keythr); if (me) g_lock_note(me, sy_ticks() - t0);   // holding G now
 }
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
@@ -254,7 +264,8 @@ static void note_runnable(thr_t *t) {
     if (t->prio < self->prio && t->mask == 1ull << (self->core & 63) && !(self->mask & ~t->mask)) self->yield_pending = 1;   // a waker that can run on another core is not held (dm_yield_to_core_peers)
 }
 static void wake(thr_t *t, int64_t res) {
-    wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv);
+    wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res;
+    { thr_t *me = pthread_getspecific(g_keythr); uint64_t t0 = me ? sy_ticks() : 0; pthread_cond_signal(&t->cv); if (me) { me->sy[SY_WAKE_N]++; me->sy[SY_WAKE_TK] += sy_ticks() - t0; } }   // the wake system call, timed for its caller (vk19.66m)
     note_runnable(t);
 }
 // ---------- One thread per core at a time (core_serial) ----------
@@ -391,7 +402,13 @@ static inline void st32(uint64_t a, uint32_t v) { __atomic_store_n((uint32_t *)a
 static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic_compare_exchange_n((uint32_t *)a, exp, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
 
 // Release the lock at addr: hand it to the first thread waiting on it, or clear it to zero (holding G)
-static void lock_handoff(uint64_t addr) {
+static void lock_handoff_(uint64_t addr);
+static void lock_handoff(uint64_t addr) {   // timed as a whole (vk19.66m): the walk of the wait chain, the lock word, the wake
+    thr_t *me = pthread_getspecific(g_keythr); uint64_t t0 = me ? sy_ticks() : 0;
+    lock_handoff_(addr);
+    if (me) me->sy[SY_HO_TK] += sy_ticks() - t0;
+}
+static void lock_handoff_(uint64_t addr) {
     thr_t *w = pick(1, addr); int more = 0; thr_t *me = pthread_getspecific(g_keythr);
     if (!w) { st32(addr, 0); if (me) me->sy[SY_REL_NONE]++; return; }   // released with nobody waiting (an SVC the waiters bit asked for in vain)
     if (me) me->sy[SY_HANDOFF]++;
@@ -1031,6 +1048,42 @@ int svc_thread(int num, uint64_t *regs) {
     if (me) { me->yield_pending = 0; me->hand_epoch++; }   // the handoff is complete: threads this one made runnable no longer hold it
     return r;
 }
+// Condition-wait timeouts (vk19.66m, measurement): every WaitProcessWideKeyAtomic's requested timeout by size, and for timed ones the guest call site -- the SVC's
+// return address and the next two return addresses up the frame-pointer chain (read with vm_read_overwrite; a bad chain stops the walk) -- in a table of 64 sites with
+// how many timed out (session 1: GameThread 16.2 timed-out condition waits a frame). Under G. Reported with the guest-sync line
+enum { CVB_INF, CVB_0, CVB_100US, CVB_1MS, CVB_5MS, CVB_20MS, CVB_MORE, CVB_N };
+static uint64_t g_cvb[CVB_N];
+static struct { uint64_t lr[3], n, tout, b[CVB_N]; char who[24]; } g_cvs[64]; static int g_ncvs;
+static int cv_site_note(thr_t *t, int64_t ns, const uint64_t *regs) {   // holding G
+    int b = ns < 0 ? CVB_INF : ns == 0 ? CVB_0 : ns < 100000 ? CVB_100US : ns < 1000000 ? CVB_1MS : ns < 5000000 ? CVB_5MS : ns < 20000000 ? CVB_20MS : CVB_MORE;
+    g_cvb[b]++;
+    if (ns <= 0) return -1;
+    uint64_t lr[3] = {regs[30], 0, 0}, fp = regs[29];
+    for (int d = 1; d < 3 && fp && !(fp & 7); d++) { uint64_t w[2]; vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof w, (vm_address_t)w, &got) != KERN_SUCCESS || got != sizeof w) break;
+        lr[d] = w[1]; if (w[0] <= fp) break; fp = w[0]; }
+    int k = 0; for (; k < g_ncvs; k++) if (!memcmp(g_cvs[k].lr, lr, sizeof lr)) break;
+    if (k == g_ncvs) { if (g_ncvs == 64) k = 63; else { k = g_ncvs++; memset(&g_cvs[k], 0, sizeof g_cvs[k]); memcpy(g_cvs[k].lr, lr, sizeof lr); char nb[48]; snprintf(g_cvs[k].who, sizeof g_cvs[k].who, "%s", thr_name(t, nb, sizeof nb)); } }
+    g_cvs[k].n++; g_cvs[k].b[b]++;
+    return k;
+}
+static size_t cv_report(char *out, size_t n, double fr) {   // holding G; resets the counts
+    static const char *bn[CVB_N] = {"none", "0", "<0.1 ms", "<1 ms", "<5 ms", "<20 ms", ">=20 ms"};
+    size_t o = (size_t)snprintf(out, n, "; condition-wait timeouts asked: none %.1f, 0 %.1f, <0.1 ms %.1f, <1 ms %.1f, <5 ms %.1f, <20 ms %.1f, >=20 ms %.1f; the busiest timed sites:",
+                                g_cvb[0] / fr, g_cvb[1] / fr, g_cvb[2] / fr, g_cvb[3] / fr, g_cvb[4] / fr, g_cvb[5] / fr, g_cvb[6] / fr);
+    for (int r = 0; r < 6 && o < n; r++) {
+        int best = -1; for (int k = 0; k < g_ncvs; k++) if (g_cvs[k].n && (best < 0 || g_cvs[k].n > g_cvs[best].n)) best = k;
+        if (best < 0) break;
+        int mb = 0; for (int i = 1; i < CVB_N; i++) if (g_cvs[best].b[i] > g_cvs[best].b[mb]) mb = i;
+        o += (size_t)snprintf(out + o, n - o, " '%s'", g_cvs[best].who);
+        for (int d = 0; d < 3 && o < n; d++) { uint64_t a = g_cvs[best].lr[d]; if (!a) break; module_t *m = module_of((void *)a);
+            o += (size_t)snprintf(out + o, n - o, "%s%s+%#llx", d ? " < " : " ", m ? m->name : "?", (unsigned long long)(m ? a - (uint64_t)m->base : a)); }
+        if (o < n) o += (size_t)snprintf(out + o, n - o, " %.1f (timed out %.1f, mostly %s)", g_cvs[best].n / fr, g_cvs[best].tout / fr, bn[mb]);
+        g_cvs[best].n = 0;   // taken: the next round finds the next one
+    }
+    memset(g_cvb, 0, sizeof g_cvb); g_ncvs = 0;
+    return o;
+}
 static int svc_thread_impl(int num, uint64_t *regs) {
     { thr_t *me = pthread_getspecific(g_keythr); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->nsvc++; } }
     if (g_flag.thr && num != 0x0B) { thr_t *me = pthread_getspecific(g_keythr); LOG("[%#x] svc %#x x0=%#llx x1=%#llx x2=%#llx x3=%#llx", me ? me->handle : 0, num, regs[0], regs[1], regs[2], regs[3]); }
@@ -1164,7 +1217,9 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         st32(key, 1);
         t->wkey = key; t->waddr = addr; t->wtag = (uint32_t)regs[2];
 #endif
+        int cvs = cv_site_note(t, (int64_t)regs[3], regs);   // the timeout asked, and where from (vk19.66m)
         int64_t r = block(t, 2, poll_wait_begin((int64_t)regs[3]));   // Timeout: the lock is not re-acquired (user mode takes it itself)
+        if (cvs >= 0 && r == R_TIMEOUT) g_cvs[cvs].tout++;
         pthread_mutex_unlock(&G);
         poll_wait_end((int64_t)regs[3], r);
         regs[0] = (uint64_t)r; return 1;
@@ -1376,14 +1431,18 @@ void dm_guest_sync_report(char *out, size_t n, uint64_t frames) {
     for (int i = 0; i < 8 && top[i] && key[i] && o < n; i++) {
         thr_t *t = top[i]; uint64_t d[SY_N]; for (int k = 0; k < SY_N; k++) d[k] = t->sy[k] - t->sy_seen[k];
         char nb[48]; const char *nm = thr_name(t, nb, sizeof nb);
-        o += (size_t)snprintf(out + o, n - o, "%s'%s': releases no waiter %.1f / hand-off %.1f, signals no waiter %.1f / woke %.1f, waits lock %.1f cond %.1f addr %.1f obj %.1f (pre %.1f, <1 ms %.1f, >=1 ms %.1f, timeout %.1f; %.2f ms), naps peer %.1f back-off %.1f precise %.1f det %.1f",
+        o += (size_t)snprintf(out + o, n - o, "%s'%s': releases no waiter %.1f / hand-off %.1f, signals no waiter %.1f / woke %.1f, waits lock %.1f cond %.1f addr %.1f obj %.1f (pre %.1f, <1 ms %.1f, >=1 ms %.1f, timeout %.1f; %.2f ms), naps peer %.1f back-off %.1f precise %.1f det %.1f; G waited %.1f (%.3f ms), in lock_handoff %.3f ms, wakes %.1f (%.3f ms)",
                               i ? "; " : "", nm, d[SY_REL_NONE] / fr, d[SY_HANDOFF] / fr, d[SY_SIG_NONE] / fr, d[SY_SIG] / fr, d[SY_W_LOCK] / fr, d[SY_W_COND] / fr, d[SY_W_ADDR] / fr, d[SY_W_SYNC] / fr,
-                              d[SY_W_PRE] / fr, d[SY_W_SHORT] / fr, d[SY_W_LONG] / fr, d[SY_W_TIMEOUT] / fr, d[SY_W_TK] / tms / fr, d[SY_NAP_PEER] / fr, d[SY_NAP_BACKOFF] / fr, d[SY_NAP_PRECISE] / fr, d[SY_NAP_DET] / fr);
+                              d[SY_W_PRE] / fr, d[SY_W_SHORT] / fr, d[SY_W_LONG] / fr, d[SY_W_TIMEOUT] / fr, d[SY_W_TK] / tms / fr, d[SY_NAP_PEER] / fr, d[SY_NAP_BACKOFF] / fr, d[SY_NAP_PRECISE] / fr, d[SY_NAP_DET] / fr,
+                              d[SY_G_CONT] / fr, d[SY_G_TK] / tms / fr, d[SY_HO_TK] / tms / fr, d[SY_WAKE_N] / fr, d[SY_WAKE_TK] / tms / fr);
     }
     for (thr_t *t = g_all; t; t = t->all) memcpy(t->sy_seen, t->sy, sizeof t->sy);
+    static char cvr[1600]; cv_report(cvr, sizeof cvr, fr);
     pthread_mutex_unlock(&G);
-    if (o < n) snprintf(out + o, n - o, "%sall threads: releases no waiter %.1f / hand-off %.1f, signals no waiter %.1f / woke %.1f, waits %.1f (pre %.1f, <1 ms %.1f, >=1 ms %.1f, timeout %.1f; %.2f ms), naps peer %.1f back-off %.1f precise %.1f det %.1f",
+    if (o < n) snprintf(out + o, n - o, "%sall threads: releases no waiter %.1f / hand-off %.1f, signals no waiter %.1f / woke %.1f, waits %.1f (pre %.1f, <1 ms %.1f, >=1 ms %.1f, timeout %.1f; %.2f ms), naps peer %.1f back-off %.1f precise %.1f det %.1f; G waited %.1f (%.3f ms), in lock_handoff %.3f ms, wakes %.1f (%.3f ms)",
                          o ? " || " : "", all[SY_REL_NONE] / fr, all[SY_HANDOFF] / fr, all[SY_SIG_NONE] / fr, all[SY_SIG] / fr, (all[SY_W_LOCK] + all[SY_W_COND] + all[SY_W_ADDR] + all[SY_W_SYNC]) / fr,
-                         all[SY_W_PRE] / fr, all[SY_W_SHORT] / fr, all[SY_W_LONG] / fr, all[SY_W_TIMEOUT] / fr, all[SY_W_TK] / tms / fr, all[SY_NAP_PEER] / fr, all[SY_NAP_BACKOFF] / fr, all[SY_NAP_PRECISE] / fr, all[SY_NAP_DET] / fr);
+                         all[SY_W_PRE] / fr, all[SY_W_SHORT] / fr, all[SY_W_LONG] / fr, all[SY_W_TIMEOUT] / fr, all[SY_W_TK] / tms / fr, all[SY_NAP_PEER] / fr, all[SY_NAP_BACKOFF] / fr, all[SY_NAP_PRECISE] / fr, all[SY_NAP_DET] / fr,
+                         all[SY_G_CONT] / fr, all[SY_G_TK] / tms / fr, all[SY_HO_TK] / tms / fr, all[SY_WAKE_N] / fr, all[SY_WAKE_TK] / tms / fr);
+    { size_t l = strlen(out); if (l < n) snprintf(out + l, n - l, "%s", cvr); }
     if (g_spin > 0) { size_t l = strlen(out); if (l < n) snprintf(out + l, n - l, "; DM_G_SPIN %d: G taken by spinning %.1f, spins that gave up %.1f", g_spin, atomic_exchange(&g_spin_hit, 0) / fr, atomic_exchange(&g_spin_miss, 0) / fr); }
 }
