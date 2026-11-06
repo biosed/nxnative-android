@@ -929,7 +929,8 @@ static void vk_init_(void) {
         g_tl ? "submissions chained by a timeline semaphore" : "no timeline semaphore (presents wait for the GPU)");
 }
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
-static void vk_init(void) { pthread_once(&g_once, vk_init_); }
+static void tog_init(void);
+static void vk_init(void) { pthread_once(&g_once, vk_init_); tog_init(); }
 static _Atomic int g_ndp_total;
 // A descriptor pool of modest size: Unreal's shaders bind a dozen texel buffers, an array of 32 more and an array of 32 samplers a stage, so a submission with many draws chains
 // several (dset_alloc); one pool sized for the worst case per context held hundreds of thousands of descriptors in eight contexts
@@ -1268,7 +1269,7 @@ static int late_fill(const tex_t *t, const fmt_t *f) {
 static uint64_t mem_hash(const uint8_t *p, uint64_t n) { uint64_t h = 0x9e3779b97f4a7c15ull, x, i = 0; for (; i + 8 <= n; i += 8) { memcpy(&x, p + i, 8); h = (h ^ x) * 0x100000001b3ull; } for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull; return h; }
 static int g_occ_over;
 static _Atomic uint64_t g_presents;   // frames presented (mtl_present)
-static _Atomic uint64_t g_texget_n;   // tex_get calls (the vk19.59 counters: per draw)
+static uint64_t g_texget_n;   // tex_get calls (the vk19.59 counters: per draw; a plain counter, the recording thread)
 static uint64_t g_rcore[8];   // the recording thread's core at each submission's start (sched_getcpu; the vk19.59 counters)
 static uint64_t g_evicted, g_remade;   // textures evicted / made again from their storage (the memory line)
 static int tex_remake(vtex *v, const tex_t *t);
@@ -1306,7 +1307,7 @@ static int tex_clean_now(vtex *v, const tex_t *t) {
     return 1;
 }
 static vtex *tex_get(const tex_t *t, int for_rt) {
-    atomic_fetch_add_explicit(&g_texget_n, 1, memory_order_relaxed);   // calls per draw (the vk19.59 counters)
+    g_texget_n++;   // calls per draw (the vk19.59 counters)
     // A texture object that is no longer one -- finalized, its memory reused for other data -- is never made into an image (as nvn_mtl.m tex_mtl_ checks the magic): FINAL
     // FANTASY RESONANCE registers texture objects whose memory holds half-float constants by then (serial 0x3c003c003c003c00), and their slots and image bindings stay bound.
     // An unknown format used to stop them by chance; a plausible one would have made an image of garbage size from a garbage storage pointer
@@ -2603,11 +2604,12 @@ static struct { const char *name; int runtime; _Atomic int val; } g_tog[TG_N] = 
     [TG_FB_FAST] = {"DM_VK_FB_FAST", 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2)
 };
 static int g_tog_lat[TG_N];
-static void tog_init(void) {
-    static int done; if (done) return; done = 1;
+static void tog_init_(void) {
     for (int i = 0; i < TG_N; i++) { const char *e = getenv(g_tog[i].name); int v = e ? atoi(e) : 0; atomic_store(&g_tog[i].val, v); if (v) LOG("vk: %s=%d (from the environment%s)", g_tog[i].name, v, g_tog[i].runtime ? "; may be changed at run time" : ""); }
 }
-static void tog_latch(void) { tog_init(); for (int i = 0; i < TG_N; i++) g_tog_lat[i] = atomic_load_explicit(&g_tog[i].val, memory_order_relaxed); g_lean_tr = g_tog_lat[TG_LEAN]; }
+static pthread_once_t g_tog_once = PTHREAD_ONCE_INIT;
+static void tog_init(void) { pthread_once(&g_tog_once, tog_init_); }   // vk_init, and the control file's first set (vk19.59c: once, whichever thread)
+static void tog_latch(void) { for (int i = 0; i < TG_N; i++) g_tog_lat[i] = atomic_load_explicit(&g_tog[i].val, memory_order_relaxed); g_lean_tr = g_tog_lat[TG_LEAN]; }
 static inline int tog(int i) { return g_tog_lat[i]; }
 static void tog_set(const char *name, int v, uint64_t frame) {   // the control file (present thread)
     tog_init();
@@ -2627,8 +2629,9 @@ static uint64_t g_ic_hit, g_ic_scan, g_ic_idx, g_ic_same, g_ic_coll, g_ic_new, g
 static _Atomic uint64_t g_bv_made;   // texel buffer views made (bview)
 static int pool_class(uint64_t addr);
 // Shadow mode (DM_VK_SHADOW=1, diagnostic, off by default): each copy_in miss and each index scan hashes the bytes it took and looks the (address, size) up in a table of
-// earlier ones: the same bytes copied before in another submission of this frame, or in an earlier frame, are what a cache kept across submissions could have saved (the
-// exact upper bound of any persistent cache, before building one); the same submission counts apart (a better per-submission cache). Off: no cost beyond one branch
+// earlier ones: the same bytes copied before in another submission of this frame, or in an earlier frame, are what a cache kept across submissions could have saved (an
+// estimate of a persistent cache's reach before building one: the table is direct-mapped, 64K entries, and matches the exact address and length only, so a range pushed
+// out of its slot or read at another offset or length is not counted); the same submission counts apart (a better per-submission cache). Off: no cost beyond one branch
 enum { NSH = 1 << 16 };
 static struct { uint64_t addr, h, sub, frame; uint32_t len; uint8_t kind; } *g_shw;
 static uint64_t g_shw_n[2][3], g_shw_b[2][3], g_shw_all[2], g_shw_ns;   // [copy, scan][same submission, another of this frame, an earlier frame]
@@ -2654,7 +2657,9 @@ static void shadow_note(int kind, uint64_t addr, uint64_t len) {   // kind 0 a c
 // scan does: it is the largest value, so the minimum over raw lanes is right unless every index is a restart (then the minimum is the restart itself: answered as none), and
 // the maximum is taken over lanes with restarts cleared (v & ~(v == restart)), which only lowers them to 0, never above the true maximum. =2 (verify): both scans, the scalar
 // result used, differences counted and the first 8 logged
+#if defined(__aarch64__)
 #include <arm_neon.h>
+#endif
 static uint64_t g_neon_chk, g_neon_bad;
 static void idx_scan_scalar(const void *src, int32_t n, uint32_t isz, uint32_t *plo, uint32_t *phi) {
     uint32_t lo = UINT32_MAX, hi = 0;
@@ -2663,6 +2668,7 @@ static void idx_scan_scalar(const void *src, int32_t n, uint32_t isz, uint32_t *
     else { const uint32_t *p = src; for (int32_t i = 0; i < n; i++) { uint32_t v = p[i]; if (v == 0xffffffffu) continue; if (v < lo) lo = v; if (v > hi) hi = v; } }
     *plo = lo; *phi = hi;
 }
+#if defined(__aarch64__)
 static void idx_scan_neon(const void *src, int32_t n, uint32_t isz, uint32_t *plo, uint32_t *phi) {
     uint32_t lo, hi; int32_t i = 0;
     if (isz == 2) {
@@ -2688,6 +2694,9 @@ static void idx_scan_neon(const void *src, int32_t n, uint32_t isz, uint32_t *pl
     if (lo == UINT32_MAX) hi = 0;   // every index a restart: as the scalar scan (none)
     *plo = lo; *phi = hi;
 }
+#else
+static void idx_scan_neon(const void *src, int32_t n, uint32_t isz, uint32_t *plo, uint32_t *phi) { idx_scan_scalar(src, n, isz, plo, phi); }   // no NEON: the scalar scan
+#endif
 static void idx_scan(const void *src, int32_t n, uint32_t isz, uint32_t *plo, uint32_t *phi) {
     int m = tog(TG_IDX_NEON);
     if (!m) { idx_scan_scalar(src, n, isz, plo, phi); return; }
@@ -2706,7 +2715,7 @@ static void ic_key(uint64_t a, int32_t n, uint32_t isz) {
         if (!g_ick[h].a) { g_ick[h].a = a; g_ick[h].n = n; g_ick[h].isz = (uint8_t)isz; g_ic_keys++; return; } }
     g_ic_keys_over++;
 }
-typedef struct { uint64_t addr, size, gen; VkDeviceSize off; uint32_t seq; } dcopy;
+typedef struct { uint64_t addr, size, gen; VkDeviceSize off; uint32_t seq; uint8_t cls; } dcopy;   // cls: the range's pool class (PC_*; PC_N not looked up), for the copy counters
 #define NDC 4096
 static dcopy g_dc[NDC]; static int g_ndc;
 // The in-order writes of this generation (wlog_add: inline uniform updates, buffer copies and fills), by range: a cached copy stays good unless one written after it overlaps it.
@@ -2726,10 +2735,13 @@ static VkDeviceSize copy_in(uint64_t addr, uint64_t size, VkDeviceSize align, in
         if (k == g_nwlog) { if (size >= e->size) e->seq = g_nwlog; g_ci_hit[caller]++; return e->off; }   // good up to now: the next lookup scans only later writes
         why = MR_WLOG;
     } else why = !e->gen ? MR_EMPTY : e->addr != addr ? MR_OTHER : e->gen != g_wgen || e->seq > g_nwlog ? MR_GEN : e->size < size ? MR_SIZE : MR_ALIGN;
-    g_ci_miss[caller]++; g_ci_mbytes[caller] += size; g_ci_why[why]++; g_ci_pool[pool_class(addr)]++;
+    g_ci_miss[caller]++; g_ci_mbytes[caller] += size; g_ci_why[why]++;
+    // the pool class (vk19.59c): the entry's when it held this address, else looked up for one miss in 8 and counted for 8 (no lock and pool scan on every miss)
+    static uint32_t pc_tick; int cls = e->addr == addr && e->cls < PC_N ? e->cls : PC_N;
+    if (cls < PC_N) g_ci_pool[cls]++; else if (!(pc_tick++ & 7)) { cls = pool_class(addr); g_ci_pool[cls] += 8; }
     shadow_note(0, addr, size);
     VkDeviceSize o = ring_put((const void *)(uintptr_t)addr, size, align);
-    if (o != VK_WHOLE_SIZE) *e = (dcopy){addr, size, g_wgen, o, g_nwlog};
+    if (o != VK_WHOLE_SIZE) *e = (dcopy){addr, size, g_wgen, o, g_nwlog, (uint8_t)cls};
     return o;
 }
 static uint64_t g_tex_miss[4];   // texture slots read as the black dummy: 0 no handle bound, 1 handle not registered, 2 texture not created, 3 no view (logged with the frame stats)
@@ -3300,12 +3312,15 @@ static int ctl_skip(uint32_t didx, const char *vk, const char *fk) {
     for (int i = 0; i < g_nskip_key; i++) { size_t l = strlen(g_skip_key[i]); if ((vk && !strncmp(vk, g_skip_key[i], l)) || (fk && !strncmp(fk, g_skip_key[i], l))) return 1; }
     return 0;
 }
-static void vk_ctl(uint64_t n) {   // every frame: the file is read again only when its modification time or size changed (vk19.59; it was read every 30 frames)
+// Read again when its inode, size, modification or change time differ (each frame: one stat), and in full every 30 frames whatever they say (vk19.59c): "set X 0" -> "set X 1"
+// keeps the size, and shared storage may keep coarse times. Write it as a new file and rename it over the old (adb shell: echo ... > f.tmp && mv f.tmp f), so no read sees half of it
+static void vk_ctl(uint64_t n) {
     static const char *path = (const char *)1; if (path == (const char *)1) path = getenv("DM_VK_CTL_FILE");
     if (!path) return;
-    static struct timespec mt; static off_t msz = -1; struct stat st;
+    static struct timespec mt, ct; static off_t msz = -1; static ino_t ino; struct stat st;
     if (stat(path, &st)) { if (msz == -1) return; msz = -1; memset(&mt, 0, sizeof mt); }   // gone: as an empty file (every draw in; switches keep their values)
-    else { if (st.st_mtim.tv_sec == mt.tv_sec && st.st_mtim.tv_nsec == mt.tv_nsec && st.st_size == msz) return; mt = st.st_mtim; msz = st.st_size; }
+    else { if (n % 30 && st.st_ino == ino && st.st_mtim.tv_sec == mt.tv_sec && st.st_mtim.tv_nsec == mt.tv_nsec && st.st_ctim.tv_sec == ct.tv_sec && st.st_ctim.tv_nsec == ct.tv_nsec && st.st_size == msz) return;
+           mt = st.st_mtim; ct = st.st_ctim; ino = st.st_ino; msz = st.st_size; }
     FILE *f = msz >= 0 ? fopen(path, "re") : NULL; uint32_t lo = 1, hi = 0; int nk = 0; char ln[160], k[17], nm[64];
     if (f) { while (fgets(ln, sizeof ln, f)) { unsigned a, b; int v;
         if (sscanf(ln, "skip %u-%u", &a, &b) == 2) { lo = a; hi = b; } else if (sscanf(ln, "skipkey %16s", k) == 1 && nk < 8) strcpy(g_skip_key[nk++], k);
@@ -4862,26 +4877,30 @@ static void meas_lines(void) {
     char cb[600]; size_t o = 0; cb[0] = 0;
     for (int i = 0; i < CI_N; i++) o += (size_t)snprintf(cb + o, sizeof cb - o, "%s%s %.1f/%.1f (%.2f MB)", i ? ", " : "", cn[i], g_ci_hit[i] / 600.0, g_ci_miss[i] / 600.0, g_ci_mbytes[i] / 600.0 / 1048576.0);
     LOG("vk: copy_in per frame over the last 600: %.1f reused, %.1f copied (%.2f MB); reused/copied by caller: %s; copies by reason: free slot %.1f, slot held by another range %.1f, earlier submission %.1f, larger %.1f,"
-        " alignment %.1f, written since %.1f; by pool: GPU-only %.1f, CPU cached %.1f, CPU uncached %.1f, unknown %.1f", hit / 600.0, miss / 600.0, mb / 600.0 / 1048576.0, cb,
+        " alignment %.1f, written since %.1f; by pool (estimate: one miss in 8 looked up): GPU-only %.1f, CPU cached %.1f, CPU uncached %.1f, unknown %.1f", hit / 600.0, miss / 600.0, mb / 600.0 / 1048576.0, cb,
         g_ci_why[MR_EMPTY] / 600.0, g_ci_why[MR_OTHER] / 600.0, g_ci_why[MR_GEN] / 600.0, g_ci_why[MR_SIZE] / 600.0, g_ci_why[MR_ALIGN] / 600.0, g_ci_why[MR_WLOG] / 600.0,
         g_ci_pool[PC_GPU] / 600.0, g_ci_pool[PC_CACHED] / 600.0, g_ci_pool[PC_UNCACHED] / 600.0, g_ci_pool[PC_NONE] / 600.0);
     uint64_t draws = g_tex_draws_win ? g_tex_draws_win : 1;
     LOG("vk: index ranges per frame over the last 600: %.1f reused, %.1f scanned (%.0f indices); scans of the same range again %.1f, over another live range %.1f, into a free or old slot %.1f;"
         " %llu distinct ranges in the 600 frames%s; texel buffer views made %.1f a frame; tex_get %.1f a draw", g_ic_hit / 600.0, g_ic_scan / 600.0, g_ic_idx / 600.0, g_ic_same / 600.0, g_ic_coll / 600.0, g_ic_new / 600.0,
-        (unsigned long long)g_ic_keys, g_ic_keys_over ? " (the set was full: more)" : "", atomic_exchange(&g_bv_made, 0) / 600.0, atomic_exchange(&g_texget_n, 0) / (double)draws);
+        (unsigned long long)g_ic_keys, g_ic_keys_over ? " (the set was full: more)" : "", atomic_exchange(&g_bv_made, 0) / 600.0, g_texget_n / (double)draws); g_texget_n = 0;
     if (g_fbf_draws) { LOG("vk: DM_VK_FB_FAST per frame over the last 600: %.1f draws looked at, %.1f answered from the shader cache, %.1f by texture serials alone, %.1f with the full way for a matching serial%s",
                            g_fbf_draws / 600.0, g_fbf_cached / 600.0, g_fbf_serial / 600.0, g_fbf_full / 600.0, "");
                        if (g_fbf_chk) LOG("vk: DM_VK_FB_FAST=2 over the last 600 frames: %llu draws checked against the full way, %llu differed", (unsigned long long)g_fbf_chk, (unsigned long long)g_fbf_bad);
                        g_fbf_draws = g_fbf_cached = g_fbf_serial = g_fbf_full = g_fbf_chk = g_fbf_bad = 0; }
     if (g_neon_chk) { LOG("vk: DM_VK_IDX_NEON=2 over the last 600 frames: %llu scans checked against the scalar scan, %llu differed", (unsigned long long)g_neon_chk, (unsigned long long)g_neon_bad); g_neon_chk = g_neon_bad = 0; }
     if (g_shw_all[0] || g_shw_all[1])
-        LOG("vk: DM_VK_SHADOW per frame over the last 600: copies whose bytes an earlier copy of the range had: same submission %.1f (%.2f MB), another submission of the frame %.1f (%.2f MB), an earlier frame %.1f (%.2f MB)"
+        LOG("vk: DM_VK_SHADOW per frame over the last 600 (an estimate: a direct-mapped table of 64K, exact address and length only): copies whose bytes an earlier copy of the range had: same submission %.1f (%.2f MB), another submission of the frame %.1f (%.2f MB), an earlier frame %.1f (%.2f MB)"
             " of %.1f copies; index scans likewise: %.1f, %.1f, %.1f of %.1f (%.0f / %.0f / %.0f indices' bytes KB); hashing %.2f ms",
             g_shw_n[0][0] / 600.0, g_shw_b[0][0] / 600.0 / 1048576.0, g_shw_n[0][1] / 600.0, g_shw_b[0][1] / 600.0 / 1048576.0, g_shw_n[0][2] / 600.0, g_shw_b[0][2] / 600.0 / 1048576.0, g_shw_all[0] / 600.0,
             g_shw_n[1][0] / 600.0, g_shw_n[1][1] / 600.0, g_shw_n[1][2] / 600.0, g_shw_all[1] / 600.0, g_shw_b[1][0] / 600.0 / 1024.0, g_shw_b[1][1] / 600.0 / 1024.0, g_shw_b[1][2] / 600.0 / 1024.0, g_shw_ns / 600e6);
     { uint32_t v[600]; uint64_t k = g_npp < 600 ? g_npp : 600; memcpy(v, g_pp, k * sizeof *v); qsort(v, k, sizeof *v, u32cmp);
       uint64_t rc = 0; for (int i = 0; i < 8; i++) rc += g_rcore[i]; char cc[160]; size_t q = 0; cc[0] = 0;
       for (int i = 0; i < 8; i++) if (g_rcore[i]) q += (size_t)snprintf(cc + q, sizeof cc - q, "%scpu%d %.0f%%", q ? " " : "", i, 100.0 * g_rcore[i] / (rc ? rc : 1));
+      int vk_stats_cluster_of(int cpu); uint64_t cn[8] = {0}; int best = -1;   // the cluster it ran on most (an A/B compares windows on the same one)
+      for (int i = 0; i < 8; i++) { int f = vk_stats_cluster_of(i); if (f >= 0 && f < 8) cn[f] += g_rcore[i]; }
+      for (int i = 0; i < 8; i++) if (cn[i] && (best < 0 || cn[i] > cn[best])) best = i;
+      if (best >= 0) q += (size_t)snprintf(cc + q, sizeof cc - q, "; mostly on the cluster of cpu%d (%.0f%%)", best, 100.0 * cn[best] / (rc ? rc : 1));
       if (k) LOG("vk: present to present over the last %llu frames: p50 %.2f ms, p95 %.2f, p99 %.2f, longest %.2f; the recording thread at submission starts: %s", (unsigned long long)k,
                  v[k / 2] / 1e3, v[k * 95 / 100] / 1e3, v[k * 99 / 100] / 1e3, v[k - 1] / 1e3, cc);
       memset(g_rcore, 0, sizeof g_rcore); g_npp = 0; }

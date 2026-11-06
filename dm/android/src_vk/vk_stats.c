@@ -1,7 +1,7 @@
 // Heat and energy, measured off the game's threads (vk19.59, improvement plan v4 Build 1 "T0"): a sampling thread "dm-stats" that wakes once a second for the thermal
 // headroom and the battery, and at the end of each 600-frame window (vk_stats_window, from the present) for the per-thread CPU time of the whole process, the CPU
 // clusters' clock (time_in_state) and limits (scaling_max_freq), and the size of the process's memory map. It logs two lines per window:
-//   vk: CPU per frame over the last N frames (T s): X ms in all threads; the busiest: <name> a, ...
+//   vk: CPU per frame over the last N frames (T s): X ms in all threads (a second, cores busy); RHIThread / the host's dm threads / the game's, per frame and a second; the busiest 8
 //   vk: heat and energy over the last N frames (T s): clusters <cpus> avg MHz (limit MHz) ...; thermal status s, headroom now h0 (lowest l0), in 10 s h10 (highest seen m10);
 //       battery -Q uAh (q mAh/h), current mean I mA, V mV, plugged p; memory map L lines
 // The thermal headroom is asked at most once a second (Android answers NaN to faster calls): the present value and the 10-second forecast on alternate seconds. The battery
@@ -93,24 +93,49 @@ static void thermal_init(void) {
     g_tm = acq ? acq() : NULL;
 }
 static void window_reset(void) { W.h0_low = INFINITY; W.h10_high = -INFINITY; W.st_high = -1; W.q0 = W.q_last; W.nq = 0; W.cur_sum = 0; W.ncur = 0; }
+// The battery's units and sign, decided once from readings (vk19.59c): vendors report CURRENT_NOW in uA or mA and CHARGE_COUNTER in uAh or mAh, and the sign while
+// discharging differs. A current under 50,000 in magnitude is taken as mA (a tablet draws hundreds to thousands of mA); a charge counter under 200,000 as mAh. While
+// unplugged the drain is the magnitude whatever the sign; the sign seen then is logged once
+static int g_cur_ma = -1, g_q_mah = -1, g_plugged = -1, g_sign_logged;
+static double cur_ua(long i) { return g_cur_ma == 1 ? i * 1000.0 : (double)i; }
+static long q_uah(long q) { return g_q_mah == 1 ? q * 1000 : q; }
 static void second_tick(uint64_t k) {
-    if (g_tm && g_thr) { float v = g_thr(g_tm, k & 1 ? 10 : 0);
+    if (g_tm && g_thr) { float v = g_thr(g_tm, k & 1 ? 10 : 0);   // one call a second (Android answers NaN to faster ones): now and the 10 s forecast on alternate seconds
         if (!isnan(v)) { if (k & 1) { W.h10 = v; if (v > W.h10_high) W.h10_high = v; } else { W.h0 = v; if (v < W.h0_low) W.h0_low = v; } } }
     if (g_tm && g_tst) { W.st = g_tst(g_tm); if (W.st > W.st_high) W.st_high = W.st; }
-    if (dm_front_battery) { long q = 0, i = 0; int mv = 0, pl = 0;
-        if (dm_front_battery(&q, &i, &mv, &pl, 0)) { if (!W.nq++ && W.q0 == 0) W.q0 = q; W.q_last = q; W.cur_sum += (double)i; W.ncur++; } }
+    if (dm_front_battery) { long q = 0, i = 0; int mv = -1, pl = -1;
+        if (dm_front_battery(&q, &i, &mv, &pl, g_plugged < 0)) {   // the plug state with the first reading, then once a window
+            if (pl >= 0) g_plugged = pl;
+            if (g_cur_ma < 0 && i) g_cur_ma = labs(i) < 50000; if (g_q_mah < 0 && q > 0) g_q_mah = q < 200000;
+            if (!g_sign_logged && g_plugged == 0 && i && g_cur_ma >= 0) { g_sign_logged = 1;
+                LOG("vk: battery readings: current in %s, %s while discharging (%ld); charge counter in %s (%ld)", g_cur_ma ? "mA" : "uA", i < 0 ? "negative" : "positive", i, g_q_mah == 1 ? "mAh" : "uAh", q); }
+            q = q_uah(q); if (!W.nq++ && W.q0 == 0) W.q0 = q; W.q_last = q;
+            double c = cur_ua(i); W.cur_sum += g_plugged == 0 ? fabs(c) : c; W.ncur++; } }   // unplugged: the drain, whatever the sign
+}
+// Thread groups (vk19.59c): the recording thread (RHIThread, the critical path), the host's own threads (dm-*, dm hitch…), and the game's (every other thread of the process)
+static void groups(uint64_t g[3]) {
+    g[0] = g[1] = g[2] = 0;
+    for (int i = 0; i < g_nth; i++) { const char *c = g_th[i].comm; int k = !strcmp(c, "RHIThread") ? 0 : !strncmp(c, "dm-", 3) || !strncmp(c, "dm ", 3) ? 1 : 2; g[k] += g_th[i].d; }
 }
 static void window_log(uint64_t frames, uint64_t dns) {
-    double fr = frames ? (double)frames : 1, secs = dns / 1e9;
-    uint64_t sum = cpu_window(); char top[1024]; busiest(top, sizeof top, fr);
-    LOG("vk: CPU per frame over the last %llu frames (%.1f s): %.2f ms in all threads (%.2f cores busy); the busiest: %s", (unsigned long long)frames, secs, sum / 1e6 / fr, secs > 0 ? sum / 1e9 / secs : 0, top);
+    double fr = frames ? (double)frames : 1, secs = dns / 1e9, ps = secs > 0 ? secs : 1;
+    uint64_t sum = cpu_window(), g[3]; groups(g); char top[1024]; busiest(top, sizeof top, fr);
+    LOG("vk: CPU per frame over the last %llu frames (%.1f s): %.2f ms in all threads (%.0f ms a second, %.2f cores busy); RHIThread %.2f (%.0f a second), the host's dm threads %.2f (%.0f), the game's %.2f (%.0f); the busiest: %s",
+        (unsigned long long)frames, secs, sum / 1e6 / fr, sum / 1e6 / ps, sum / 1e9 / ps, g[0] / 1e6 / fr, g[0] / 1e6 / ps, g[1] / 1e6 / fr, g[1] / 1e6 / ps, g[2] / 1e6 / fr, g[2] / 1e6 / ps, top);
     char cl[512]; clusters(cl, sizeof cl);
-    int mv = -1, pl = -1; long q = 0, cu = 0; if (dm_front_battery) dm_front_battery(&q, &cu, &mv, &pl, 1);
+    int mv = -1, pl = -1; long q = 0, cu = 0; if (dm_front_battery && dm_front_battery(&q, &cu, &mv, &pl, 1) && pl >= 0) g_plugged = pl;
     long dq = W.nq ? W.q_last - W.q0 : 0; double mean_ma = W.ncur ? W.cur_sum / W.ncur / 1000.0 : 0;
-    LOG("vk: heat and energy over the last %llu frames (%.1f s): clusters %s; thermal status %d (highest %d), headroom now %.3f (lowest %.3f), in 10 s %.3f (highest %.3f); battery %+ld uAh (%.0f mAh an hour), current mean %.0f mA, %d mV, plugged %d%s; memory map %d lines",
+    LOG("vk: heat and energy over the last %llu frames (%.1f s): clusters %s; thermal status %d (highest %d), headroom now %.3f (lowest %.3f), in 10 s %.3f (highest %.3f); battery %+ld uAh (%.0f mAh an hour), %s %.0f mA, %d mV (%.0f mW), plugged %d%s; memory map %d lines",
         (unsigned long long)frames, secs, cl, W.st, W.st_high, (double)W.h0, (double)(W.h0_low == INFINITY ? NAN : W.h0_low), (double)W.h10, (double)(W.h10_high == -INFINITY ? NAN : W.h10_high),
-        dq, secs > 0 ? dq / 1000.0 / secs * 3600.0 : 0, mean_ma, mv, pl, dm_front_battery ? (W.ncur ? "" : " (no battery readings)") : " (no front end)", maps_lines());
+        dq, dq / 1000.0 / ps * 3600.0, g_plugged == 0 ? "drain mean" : "current mean (as reported)", mean_ma, mv, mv > 0 ? mean_ma * mv / 1000.0 : 0, pl,
+        dm_front_battery ? (W.ncur ? "" : " (no battery readings)") : " (no front end)", maps_lines());
     window_reset();
+}
+// A CPU's cluster, as its cpufreq policy's first CPU (related_cpus), read once: the recording thread's cluster in the present-to-present line (A/B windows on one cluster only)
+int vk_stats_cluster_of(int cpu) {
+    static int first[16], done;
+    if (!done) { done = 1; for (int c = 0; c < 16; c++) { char p[96], b[64]; first[c] = c; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/related_cpus", c); if (read_small(p, b, sizeof b) > 0) first[c] = atoi(b); } }
+    return cpu >= 0 && cpu < 16 ? first[cpu] : cpu;
 }
 static void *stats_thread(void *a) {
     (void)a; pthread_setname_np("dm-stats");

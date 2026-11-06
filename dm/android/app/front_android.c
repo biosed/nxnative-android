@@ -552,42 +552,59 @@ static void game_mode_read(ANativeActivity *a) {
     if (mode != dm_game_mode) LOG("front end: Android game mode %d (0 unsupported, 1 standard, 2 performance, 3 battery, 4 custom)", mode);
     dm_game_mode = mode;
 }
-// The battery for the backend's heat-and-energy line (vk19.59, src_vk/vk_stats.c), from its sampling thread: BatteryManager's CHARGE_COUNTER (uAh) and CURRENT_NOW (uA, the
-// sign as the device reports it), and the sticky ACTION_BATTERY_CHANGED intent's voltage (mV) and plugged state when want_v. The calling thread is attached to the VM once and
-// stays attached (it lives as long as the process). 0 when there is no activity or a call failed
+// The battery for the backend's heat-and-energy line (vk19.59, src_vk/vk_stats.c), from its sampling thread dm-stats only (never a game, guest or RHI thread; at most once a
+// second): BatteryManager's CHARGE_COUNTER and CURRENT_NOW (binder calls into the health HAL, which can block for milliseconds: hence that thread), and the sticky
+// ACTION_BATTERY_CHANGED intent's voltage (mV) and plugged state when want_v. It uses the JavaVM and a global reference to the application context, both taken once on the
+// activity thread at onCreate (battery_init_activity): never g_act, whose ANativeActivity is freed when Android destroys the activity while the process stays (vk19.59c).
+// The thread attaches once, as a daemon. Every JNI call is followed by an exception check; a failed setup is not tried again. Returns 0 when there is nothing to read
+static JavaVM *g_vm; static jobject g_appctx;
+static void battery_init_activity(ANativeActivity *a) {   // the activity thread, first onCreate of the process
+    JNIEnv *env = a->env; g_vm = a->vm;
+    jmethodID m = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "getApplicationContext", "()Landroid/content/Context;");
+    jobject c = !(*env)->ExceptionCheck(env) && m ? (*env)->CallObjectMethod(env, a->clazz, m) : NULL;
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); c = NULL; }
+    if (c) { g_appctx = (*env)->NewGlobalRef(env, c); (*env)->DeleteLocalRef(env, c); }
+}
+#define JX(env) ((*(env))->ExceptionCheck(env) ? ((*(env))->ExceptionClear(env), 1) : 0)
 __attribute__((visibility("default"))) int dm_front_battery(long *charge_uah, long *current_ua, int *mv, int *plugged, int want_v) {
-    static __thread JNIEnv *tenv; static jobject bm; static jmethodID get_int; static jclass ifc; static jmethodID if_new, reg, get_extra; static jstring s_act, s_volt, s_plug;
-    if (!g_act || !g_act->vm) return 0;
-    if (!tenv) { JavaVMAttachArgs aa = {JNI_VERSION_1_6, "dm-stats", NULL}; if ((*g_act->vm)->AttachCurrentThread(g_act->vm, &tenv, &aa) != JNI_OK) { tenv = NULL; return 0; } }
-    JNIEnv *env = tenv;
-    if (!bm) {
-        jstring nm = (*env)->NewStringUTF(env, "batterymanager");
-        jobject o = (*env)->CallObjectMethod(env, g_act->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, g_act->clazz), "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"), nm);
-        (*env)->DeleteLocalRef(env, nm);
-        if ((*env)->ExceptionCheck(env) || !o) { (*env)->ExceptionClear(env); return 0; }
-        get_int = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, o), "getIntProperty", "(I)I");
-        jclass c = (*env)->FindClass(env, "android/content/IntentFilter"); if ((*env)->ExceptionCheck(env) || !c) { (*env)->ExceptionClear(env); return 0; }
-        ifc = (*env)->NewGlobalRef(env, c); if_new = (*env)->GetMethodID(env, ifc, "<init>", "(Ljava/lang/String;)V");
-        reg = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, g_act->clazz), "registerReceiver", "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;)Landroid/content/Intent;");
-        jclass ic = (*env)->FindClass(env, "android/content/Intent"); get_extra = ic ? (*env)->GetMethodID(env, ic, "getIntExtra", "(Ljava/lang/String;I)I") : NULL;
-        s_act = (*env)->NewGlobalRef(env, (*env)->NewStringUTF(env, "android.intent.action.BATTERY_CHANGED"));
-        s_volt = (*env)->NewGlobalRef(env, (*env)->NewStringUTF(env, "voltage")); s_plug = (*env)->NewGlobalRef(env, (*env)->NewStringUTF(env, "plugged"));
-        if ((*env)->ExceptionCheck(env) || !get_int || !if_new || !reg || !get_extra) { (*env)->ExceptionClear(env); get_int = NULL; return 0; }
-        bm = (*env)->NewGlobalRef(env, o); (*env)->DeleteLocalRef(env, o);
+    static int state; static JNIEnv *env; static jobject bm, s_act, s_volt, s_plug; static jclass ifc; static jmethodID get_int, if_new, reg, get_extra;
+    if (state < 0) return 0;
+    if (!state) {
+        state = -1;   // until the whole setup has worked: one try only
+        if (!g_vm || !g_appctx) return 0;
+        JavaVMAttachArgs aa = {JNI_VERSION_1_6, "dm-stats", NULL};
+        if ((*g_vm)->AttachCurrentThreadAsDaemon(g_vm, &env, &aa) != JNI_OK || !env) return 0;
+        jclass cc = (*env)->GetObjectClass(env, g_appctx); if (JX(env) || !cc) return 0;
+        jmethodID gss = (*env)->GetMethodID(env, cc, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"); if (JX(env) || !gss) return 0;
+        reg = (*env)->GetMethodID(env, cc, "registerReceiver", "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;)Landroid/content/Intent;"); if (JX(env) || !reg) return 0;
+        jstring nm = (*env)->NewStringUTF(env, "batterymanager"); if (JX(env) || !nm) return 0;
+        jobject o = (*env)->CallObjectMethod(env, g_appctx, gss, nm); (*env)->DeleteLocalRef(env, nm); if (JX(env) || !o) return 0;
+        get_int = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, o), "getIntProperty", "(I)I"); if (JX(env) || !get_int) return 0;
+        jclass fc = (*env)->FindClass(env, "android/content/IntentFilter"); if (JX(env) || !fc) return 0;
+        if_new = (*env)->GetMethodID(env, fc, "<init>", "(Ljava/lang/String;)V"); if (JX(env) || !if_new) return 0;
+        jclass ic = (*env)->FindClass(env, "android/content/Intent"); if (JX(env) || !ic) return 0;
+        get_extra = (*env)->GetMethodID(env, ic, "getIntExtra", "(Ljava/lang/String;I)I"); if (JX(env) || !get_extra) return 0;
+        jstring a1 = (*env)->NewStringUTF(env, "android.intent.action.BATTERY_CHANGED"), a2 = (*env)->NewStringUTF(env, "voltage"), a3 = (*env)->NewStringUTF(env, "plugged");
+        if (JX(env) || !a1 || !a2 || !a3) return 0;
+        // every lookup worked: the global references, made once
+        bm = (*env)->NewGlobalRef(env, o); ifc = (*env)->NewGlobalRef(env, fc); s_act = (*env)->NewGlobalRef(env, a1); s_volt = (*env)->NewGlobalRef(env, a2); s_plug = (*env)->NewGlobalRef(env, a3);
+        (*env)->DeleteLocalRef(env, o); (*env)->DeleteLocalRef(env, fc); (*env)->DeleteLocalRef(env, ic); (*env)->DeleteLocalRef(env, a1); (*env)->DeleteLocalRef(env, a2); (*env)->DeleteLocalRef(env, a3);
+        if (!bm || !ifc || !s_act || !s_volt || !s_plug) return 0;
+        state = 1;
     }
-    if (!get_int) return 0;
-    *charge_uah = (*env)->CallIntMethod(env, bm, get_int, 1);   // BATTERY_PROPERTY_CHARGE_COUNTER
-    *current_ua = (*env)->CallIntMethod(env, bm, get_int, 2);   // BATTERY_PROPERTY_CURRENT_NOW
-    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return 0; }
+    jint q = (*env)->CallIntMethod(env, bm, get_int, 1); if (JX(env)) return 0;   // BATTERY_PROPERTY_CHARGE_COUNTER
+    jint i = (*env)->CallIntMethod(env, bm, get_int, 2); if (JX(env)) return 0;   // BATTERY_PROPERTY_CURRENT_NOW
+    *charge_uah = q; *current_ua = i;
     if (want_v) {
-        jobject f = (*env)->NewObject(env, ifc, if_new, s_act); jobject in = f ? (*env)->CallObjectMethod(env, g_act->clazz, reg, NULL, f) : NULL;
-        if (!(*env)->ExceptionCheck(env) && in) { *mv = (*env)->CallIntMethod(env, in, get_extra, s_volt, -1); *plugged = (*env)->CallIntMethod(env, in, get_extra, s_plug, -1); }
-        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-        if (in) (*env)->DeleteLocalRef(env, in);
+        jobject f = (*env)->NewObject(env, ifc, if_new, s_act); if (JX(env)) f = NULL;
+        jobject in = f ? (*env)->CallObjectMethod(env, g_appctx, reg, NULL, f) : NULL; if (JX(env)) in = NULL;
+        if (in) { jint v = (*env)->CallIntMethod(env, in, get_extra, s_volt, -1); if (!JX(env)) *mv = v;
+                  jint p = (*env)->CallIntMethod(env, in, get_extra, s_plug, -1); if (!JX(env)) *plugged = p; (*env)->DeleteLocalRef(env, in); }
         if (f) (*env)->DeleteLocalRef(env, f);
     }
     return 1;
 }
+#undef JX
 static void on_pause(ANativeActivity *a) { (void)a; dm_focus_set(2); }   // still visible behind something (a dialog, a split screen): out of focus, running
 static void on_focus(ANativeActivity *a, int f) { if (f) immersive(a); else input_release_all(); dm_focus_set(f ? 1 : 2); }
 // Destroyed by the player leaving (− and + held, back_to_menu, finish) the game ends; destroyed by Android while the process stays (to reclaim memory, its activity
@@ -612,7 +629,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     ANativeActivity_setWindowFlags(a, 0x80 /* KEEP_SCREEN_ON */ | 0x400 /* FULLSCREEN */, 0);
     immersive(a);
     if (g_booted) return;   // the activity can be made again (rotation, a return): the host runs once per process
-    trim_watch(a); game_mode_read(a);
+    trim_watch(a); game_mode_read(a); battery_init_activity(a);
     snprintf(g_files, sizeof g_files, "%s", a->internalDataPath);
     mallopt(M_DECAY_TIME, 1);   // freed memory (Unreal's heap runs on host malloc) goes back to the system after about a second instead of being kept
     char mk[600]; marker_path(mk, sizeof mk, "game_running");
