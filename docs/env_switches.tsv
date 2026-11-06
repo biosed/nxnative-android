@@ -1,5 +1,6 @@
 name	class	meaning
 DM_AB	diagnostic	`=<frames>` splits the run into phases of that many frames and alternates every switch set to `ab` (on in the odd phases); logs an `[ab]` line per phase with GPU and frame time and attachment traffic
+DM_ADPF	switch	Android: `0` turns off the Android Dynamic Performance Framework session (the per-frame work-duration hints); on by default
 DM_ADPF_ALL	switch	Android: `1` (opt-in) puts the game's RHIThread, RenderThread, GameThread, RHIInterrupt and the backend's dm-complete / dm-record in the hint session (by name, again every 600 frames), turns power-efficiency preference off and notifies workload increases on frames over 25 ms
 DM_ALIAS_SIZE	diagnostic	`=<bytes>` gives the guest an alias region of that size instead of the profile's (at least 256 MB, whole host pages; the heap and stacks stay as they are): `0x1000000000`, the Switch's 64 GB, holds what a game reserves unchanged; the NSP script's address region check sets it (Mac only: an iPhone has no room)
 DM_ALIAS_WINDOWS	diagnostic	`=<MB>` logs every 30 s how much of each window of that size in the alias region is mapped (windows aligned to their size in absolute addresses)
@@ -78,10 +79,10 @@ DM_MEASURE_LOCK	path	`=<file>`: `scripts/regress.py`'s default `--lock`, the mea
 DM_MEMSTAT	diagnostic	`=<tsv>` writes one line per second of memory accounting: footprint, Metal allocation and resident and charged memory by region class (guest, code, malloc, gpu, …)
 DM_MEMSTAT_DUMP	diagnostic	`=<seconds>`: with `DM_MEMSTAT`, at that second writes every VM region of 1 MiB or more to `<tsv>.regions`
 DM_MEM_BUDGET_MB	switch	Android: the process's resident memory plus the Vulkan backend's device memory (MB, default 0 = off; was 2000) past which the backend trims as on low memory (idle textures evicted, rings to their minimum, pools emptied, heap pages returned)
-DM_MEM_PRETRIM	switch	Android: early trim, default `1` (on); `0` off. The Vulkan backend trims at once (at most every 2 s) when the game heap grew DM_MEM_PRETRIM_MB since the last one-second check or MemAvailable fell twice that in a second, then keeps nothing for reuse for 10 s
-DM_MEM_PRETRIM_MB	switch	Android: the game-heap growth (MB, default 100) that triggers an early trim (DM_MEM_PRETRIM)
-DM_MEM_PRETRIM_AVAIL_MB	switch	Android: MemAvailable (MB, default 900; was 1600) below which the backend trims as at DM_VK_MEM_LOW_MB (at most every 5 s), with DM_MEM_PRETRIM on
 DM_MEM_CAP_GB	switch	`=<GB>`: the memory watchdog exits when resident memory exceeds that many GB (default 24 on the Mac, none on iOS; `0` turns it off)
+DM_MEM_PRETRIM	switch	Android: early trim, default `1` (on); `0` off. The Vulkan backend trims at once (at most every 2 s) when the game heap grew DM_MEM_PRETRIM_MB since the last one-second check or MemAvailable fell twice that in a second, then keeps nothing for reuse for 10 s
+DM_MEM_PRETRIM_AVAIL_MB	switch	Android: MemAvailable (MB, default 900; was 1600) below which the backend trims as at DM_VK_MEM_LOW_MB (at most every 5 s), with DM_MEM_PRETRIM on
+DM_MEM_PRETRIM_MB	switch	Android: the game-heap growth (MB, default 100) that triggers an early trim (DM_MEM_PRETRIM)
 DM_METAL_CAPTURE	diagnostic	`=1` makes `build_ipa.sh` produce a build that can write GPU frame captures (`MetalCaptureEnabled` in `Info.plist`), for `DM_GPU_CAPTURE`
 DM_METAL_HUD	player	`1` shows Apple's Metal performance HUD over the game (frame rate, frame and GPU time, memory)
 DM_MOTION	switch	`0` ignores live motion: every six-axis sensor lies flat as before (a shake still plays), and neither controllers' motion sensors nor the phone's device motion are switched on (`hle_hid.c`, `motion_apple.h`, `DmGamepad.m`); the NSP script's `--no-motion` (`MOTION = False`) builds it in
@@ -330,6 +331,8 @@ DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.p
 DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (r.Streaming.PoolSize) is raised to when smaller (iOS / Mac / Android); `-<MB>` caps a larger one at <MB> instead (a device short of memory); the value the game runs with is logged every 600 presents
 DM_VK_BARRIER_HOLD	switch	Android: `0` makes every NVN barrier end the open render pass, as before vk19.19; default 1 keeps the pass open when the next work is a draw (the pass then counts as merged: a draw sampling an attachment it wrote ends it first)
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
+DM_VK_COPYLOG	diagnostic	Android: `<n>` logs the first n copies into textures (source, destination, size)
+DM_VK_CTL_FILE	path	Android: a control file read while the game runs: `skip <a>-<b>` / `skipkey <prefix>` leave out draws (bisection with screenshots), `set <DM_VK_…> <value>` flips a switch on the run-time list (vk19.59, see DM_VK_SHADOW); read when its modification time changes, at most once a frame
 DM_VK_CTX	test	Android: `=<n>` (4..32, default 20) submission contexts: how far the CPU may record ahead of the GPU; each holds a ring (4 MB and up)
 DM_VK_CTX_MAX	switch	Android: the most submission contexts DM_VK_CTX_PICK may make (default 32, the maximum; not below DM_VK_CTX)
 DM_VK_CTX_PICK	switch	Android: on by default from vk19.58 (Run X: 23.6/23.9 -> 48.5/50.0 fps at 60% resolution); takes the least recently used submission context whose submission is done and whose ring no later submission reads, makes a new one when none is free (up to DM_VK_CTX_MAX) and waits only at the cap, for the one that frees first (the Metal host's policy). `0` takes them round robin again
@@ -338,6 +341,7 @@ DM_VK_DIR	path	Android: the folder of the shaders' SPIR-V (`<key>.spv`, `<key>.v
 DM_VK_DIRTY_ONCE	switch	Android: `1` (default) asks once a submission whether a packaged texture's storage was written since its upload (a scan of its pages), and not at all when it was uploaded this frame; `0` asks at every binding
 DM_VK_DISPATCH_DEFER	test	Android: `1` records a dispatch met inside an open render pass after that pass instead of ending it, when it reads none of the pass's attachments; a draw reading what it writes ends the pass first. Default 0
 DM_VK_DSET_CACHE2	switch	Android: `1` (default) keeps the driver segment and constant blocks put into the ring by content for the submission, so descriptor sets can be reused, and compares a reused set's whole key; `0` as before
+DM_VK_DUMP_FILE	path	Android: when this file appears (checked every 30 frames) the next frame is pass-logged and its render targets written; the file is removed
 DM_VK_EVICT_AGE	switch	Android: frames a storage-backed texture stays unused before its image is evicted (default 300; made again from its storage at its next use)
 DM_VK_EVICT_FAST	switch	Android: the age in frames (default 30) at which an early trim for fast game-heap growth (DM_MEM_PRETRIM) evicts idle textures; other trims use 60
 DM_VK_GPU_TS	test	Android: `0` gives every counter timestamp of a submission its completion time, as before vk19.14 (now TIMESTAMP_TOP takes the submission's GPU start)
@@ -354,6 +358,7 @@ DM_VK_PASSLOG	diagnostic	Android: `=<frame>[+]` logs that frame's passes, draws,
 DM_VK_PASS_BARRIER	test	Android: `1` leaves vertex shaders out of each pass end's barrier (the next pass's vertex work may overlap); a vertex shader that samples such a pass's target gets a barrier first. Default 0
 DM_VK_PATCH_VERIFY	diagnostic	Android: `1` checks each compute stale patch (DM_VK_STALE_PATCH=2) word by word against the staged words when its submission completes, and logs the counts and the first mismatches
 DM_VK_POOL_TRANSIENT	test	Android: `1` creates the command pools VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, as before vk19.20 (default 0: kept warm, reset without releasing their memory)
+DM_VK_PREWARM	switch	Android: `0` skips the pipeline pre-warm screen before the game starts (pipelines of earlier runs made again from pipeline_keys.bin); on by default
 DM_VK_PREWARM_KEEP	test	Android: `1` makes the shader pre-warm keep every pipeline alive (RSS +~500 MB in FINAL FANTASY RESONANCE). Default 0 since vk19.13: each is destroyed right after it is made (only the driver's pipeline cache stays warm) and made again from that cache at its first use
 DM_VK_REC_THREAD	test	Android: `1` (opt-in) queues QueueSubmitCommands and QueuePresentTexture (handles copied) and replays them in order on a record thread, so the Vulkan translation leaves the game's RHI thread; at most 48 submissions and 2 presents queued; QueueFinish and the graphics suspend drain it first
 DM_VK_REUP_CAP_MB	switch	Android: while memory is low, re-uploads of written textures wait once a submission has this many MB of uploads (default 16; 0 no cap); first uploads never wait
@@ -367,6 +372,7 @@ DM_VK_RTDUMP_DEC	diagnostic	Android: with DM_VK_RTDUMP, also writes the textures
 DM_VK_RT_HOLD	test	Android: `0` turns the SetRenderTargets detour hold off: every SetRenderTargets ends the open pass
 DM_VK_RT_SPLIT	test	Android: `0` leaves out vk19.4's split: a held pass is not ended for a draw that samples one of its attachments (the castle wall's contact shadow flickers again)
 DM_VK_SEG_CACHE	switch	Android: `1` (default) takes a 4 KB driver segment built earlier in the submission while the stage's texture, sampler, image and storage-buffer bindings are unchanged; `0` builds it for every set
+DM_VK_SHADOW	diagnostic	Android (vk19.59): `1` hashes the bytes of every copy_in miss and index scan and counts those an earlier copy of the same range already had (same submission, another submission of the frame, an earlier frame): the upper bound of a persistent cache, logged per 600 frames ('vk: DM_VK_SHADOW per frame …'). Costs the hashing (its ms are in the line). On the run-time list: `set DM_VK_SHADOW 1` in DM_VK_CTL_FILE
 DM_VK_SHOTS	diagnostic	Android: `=<frame>,…` writes the presented image of those frames into DM_VK_SHOT_DIR
 DM_VK_SHOT_DIR	path	Android: where DM_VK_SHOTS and DM_VK_RTDUMP write (default: the current folder)
 DM_VK_SKIP	diagnostic	Android: `=<mask>` leaves out kinds of GPU work (1 buffer→texture, 2 texture→texture, 4 texture→buffer, 8 clears, 16 uploads, 32 draws / dispatches), for bisecting a wrong picture
@@ -375,6 +381,7 @@ DM_VK_STALE_PATCH	test	Android: `0` leaves out vk19.3's stale-read patch: a read
 DM_VK_STATE_SKIP	switch	Android: `1` (default) takes the last draw's pipeline when its key is the same and leaves out a pipeline bind or dynamic state (viewport, scissor, depth bias, blend constants, stencil) equal to what the command buffer has; `0` records all for every draw; from vk19.44 also vertex buffers bound in runs and only when changed, the ring bound once as the index buffer (firstIndex), descriptor sets left bound when unchanged
 DM_VK_STORE_NONE	test	Android: `1` (opt-in, dynamic rendering) records each pass into a secondary command buffer and begins it at the pass's end with STORE for the attachments the pass wrote and STORE_OP_NONE for the rest (loads unchanged)
 DM_VK_TEXCOUNT	diagnostic	Android: set, every 600 presents logs the live textures by kind and how many share their storage start with an older one
+DM_VK_TEXLOG	diagnostic	Android: `<n>` logs the first n textures made (size, format, layout)
 DM_VK_TRIM_STEADY_S	switch	Android: while memory stays low without falling, the backend trims again only after this many seconds (default 60; 5 as before); rings go back to their minimum and malloc is purged only under real pressure
 DM_VK_UBWC	test	Android: `2` (opt-in) keeps compression only for render targets nothing is uploaded into; `1` makes images whose views never reinterpret the format keep the GPU's compression: a format list (own format and its sRGB / UNORM twin) or not mutable at all; storage images unchanged. Default 0; keep it off: with it on, texture streaming into compressed images ate untracked driver memory and the low-memory killer ended FINAL FANTASY RESONANCE 4 times in 4
 DM_VK_VTXIDX_FIX	test	Android: `0` leaves out vk19.10's VertexIndex bias (vertex shaders that read VertexIndex get the draw's first copied vertex added back through a push constant)
