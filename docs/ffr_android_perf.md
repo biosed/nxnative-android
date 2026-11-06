@@ -135,6 +135,20 @@ The recording thread's core is the scheduler's (or the vendor's) choice, and it 
 - Known gap, older than 19.57, made likelier by PICK: a range whose write-back has started stays tracked without its snapshot until gw_expire, so a read in that window can miss the CPU's later rewrites for one frame. Fix proposed as vk19.58 (gw_del at the write-back).
 - Verdict: keep. Next: vk19.58 (the gap fix) and CTX_PICK on by default, each on the user's go.
 
+## Run Y: vk19.58 (write-back window fix, CTX_PICK on by default)
+
+2026-11-06, same spot and protocol as Run X (`DM_UE_DRS=pinned:60`), alternated on one install; stopped by the user after 3 of 4 runs.
+
+| Run | CTX_PICK | avg fps (last 120 s) | context wait / frame | GPU span | rec | entries ended at their write-back / frame |
+|---|---|---|---|---|---|---|
+| Y0a | 0 | 23.7 | 8.2 ms | 26.4 ms | 24.9 ms | 36.2 |
+| Y1a | default (on) | 45.9 | 0 | 19.2 ms | 17.5 ms | 33.0 |
+| Y0b | 0 | 23.6 | 8.2 ms | 26.4 ms | 24.8 ms | 36.3 |
+
+- The fix is active in both arms ("GPU-written ranges end at their write-back (vk19.58)"); the boot line names the mode ("on (the default)" / "=0 ... round robin").
+- Y1a's average includes the settling after the load (windows at p50 ~22–23 ms); the user saw it hold above 50 fps after a few minutes of play. Y1a's GPU span (19.2 ms) is above Run X's 14.0: one run, not repeated.
+- Verdict: vk19.58 kept as installed (installed 22:44:07).
+
 ## Opt-in switches of vk19.47–19.56 and their verdicts
 
 | Switch | Build | Verdict | Dead weight to remove later? |
