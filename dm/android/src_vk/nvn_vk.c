@@ -804,6 +804,28 @@ static void pcache_save(void) {
 }
 static int g_dynrend; static PFN_vkCmdBeginRenderingKHR p_begin_rendering; static PFN_vkCmdEndRenderingKHR p_end_rendering;
 static VkDescriptorPool dpool_new(void);
+static void ctx_init(int i) {   // a submission context's pool, command buffers, fence, ring, descriptor pool and query pools
+        ctx_t *c = &g_ctx[i];
+    // Reset as a whole each submission (ctx_complete / mtl_sub_begin), without releasing its memory. It was made TRANSIENT: a profile of FINAL FANTASY RESONANCE on the Adreno 825
+    // showed a third of the render thread in kgsl_sharedmem_alloc ioctls under vkCmdCopyBufferToImage (the driver allocating command memory again as the buffers grew), which
+    // a transient pool invites. DM_VK_POOL_TRANSIENT=1: as before
+    static int tr = -1; if (tr < 0) { const char *e = getenv("DM_VK_POOL_TRANSIENT"); tr = e && atoi(e) != 0; LOG("vk: command pools %s (DM_VK_POOL_TRANSIENT=%d)", tr ? "transient" : "kept warm", tr); }
+    VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, tr ? VK_COMMAND_POOL_CREATE_TRANSIENT_BIT : 0, g_qf};
+    VKCHECK(vkCreateCommandPool(g_dev, &pi, NULL, &c->pool));
+    VkCommandBuffer cbs[2]; VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, c->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2};
+    VKCHECK(vkAllocateCommandBuffers(g_dev, &ai, cbs)); c->cb = cbs[0]; c->up = cbs[1];
+    VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT};
+    VKCHECK(vkCreateFence(g_dev, &fi, NULL, &c->fence));
+    c->ring = c->ring0 = buf_new(RING_MIN, ALL_BUF_USAGE, &c->ringm, (void **)&c->ringp); c->ringm0 = c->ringm; c->ringp0 = c->ringp;
+    c->ring0_size = c->ring_size = RING_MIN; atomic_fetch_add(&g_ring0_bytes, RING_MIN);
+    c->dps = malloc(sizeof *c->dps); c->dps[0] = dpool_new(); c->ndp = 1;
+    VkQueryPoolCreateInfo qi2 = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 3};   // the submission's start, its end, the upload command buffer's end
+    VKCHECK(vkCreateQueryPool(g_dev, &qi2, NULL, &c->qp));
+    VkQueryPoolCreateInfo qi3 = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_OCCLUSION, NOQ};
+    VKCHECK(vkCreateQueryPool(g_dev, &qi3, NULL, &c->oq));
+    VkQueryPoolCreateInfo qi4 = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, NTQ};
+    VKCHECK(vkCreateQueryPool(g_dev, &qi4, NULL, &c->tq));
+    }
 static void vk_init_(void) {
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "nxnative", 1, "dmhost", 1, VK_API_VERSION_1_3};
     const char *iext[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME};
@@ -879,28 +901,7 @@ static void vk_init_(void) {
         if (!p_begin_rendering || !p_end_rendering) g_dynrend = 0;
     }
     { const char *e = getenv("DM_VK_CTX"); if (e && *e) { int n = atoi(e); NCTX = n < 4 ? 4 : n > NCTX_MAX ? NCTX_MAX : n; } LOG("vk: %d submission contexts (DM_VK_CTX)", NCTX); }
-    for (int i = 0; i < NCTX; i++) {
-        ctx_t *c = &g_ctx[i];
-        // Reset as a whole each submission (ctx_complete / mtl_sub_begin), without releasing its memory. It was made TRANSIENT: a profile of FINAL FANTASY RESONANCE on the Adreno 825
-        // showed a third of the render thread in kgsl_sharedmem_alloc ioctls under vkCmdCopyBufferToImage (the driver allocating command memory again as the buffers grew), which
-        // a transient pool invites. DM_VK_POOL_TRANSIENT=1: as before
-        static int tr = -1; if (tr < 0) { const char *e = getenv("DM_VK_POOL_TRANSIENT"); tr = e && atoi(e) != 0; LOG("vk: command pools %s (DM_VK_POOL_TRANSIENT=%d)", tr ? "transient" : "kept warm", tr); }
-        VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, tr ? VK_COMMAND_POOL_CREATE_TRANSIENT_BIT : 0, g_qf};
-        VKCHECK(vkCreateCommandPool(g_dev, &pi, NULL, &c->pool));
-        VkCommandBuffer cbs[2]; VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, c->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2};
-        VKCHECK(vkAllocateCommandBuffers(g_dev, &ai, cbs)); c->cb = cbs[0]; c->up = cbs[1];
-        VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT};
-        VKCHECK(vkCreateFence(g_dev, &fi, NULL, &c->fence));
-        c->ring = c->ring0 = buf_new(RING_MIN, ALL_BUF_USAGE, &c->ringm, (void **)&c->ringp); c->ringm0 = c->ringm; c->ringp0 = c->ringp;
-        c->ring0_size = c->ring_size = RING_MIN; atomic_fetch_add(&g_ring0_bytes, RING_MIN);
-        c->dps = malloc(sizeof *c->dps); c->dps[0] = dpool_new(); c->ndp = 1;
-        VkQueryPoolCreateInfo qi2 = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 3};   // the submission's start, its end, the upload command buffer's end
-        VKCHECK(vkCreateQueryPool(g_dev, &qi2, NULL, &c->qp));
-        VkQueryPoolCreateInfo qi3 = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_OCCLUSION, NOQ};
-        VKCHECK(vkCreateQueryPool(g_dev, &qi3, NULL, &c->oq));
-        VkQueryPoolCreateInfo qi4 = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, NTQ};
-        VKCHECK(vkCreateQueryPool(g_dev, &qi4, NULL, &c->tq));
-    }
+    for (int i = 0; i < NCTX; i++) ctx_init(i);
     dummies();
     pthread_t th; if (pthread_create(&th, NULL, completion_thread, NULL)) die("Vulkan: cannot start the completion thread"); pthread_detach(th);
     LOG("vk: dual-source blending %s, wide lines %s (%.1f-%.1f px), BC textures %s", g_feat.dualSrcBlend ? "yes" : "no", g_feat.wideLines ? "yes" : "no", g_props.limits.lineWidthRange[0], g_props.limits.lineWidthRange[1],
@@ -3771,6 +3772,34 @@ static void ring_fit(ctx_t *c) {
     vkDestroyBuffer(g_dev, c->ring0, NULL); vkFreeMemory(g_dev, c->ringm0, NULL); atomic_fetch_sub(&g_ring0_bytes, c->ring0_size);
     c->ring0 = buf_new(want, ALL_BUF_USAGE, &c->ringm0, (void **)&c->ringp0); c->ring0_size = want; atomic_fetch_add(&g_ring0_bytes, want); g_ring_new++; g_ring_new_bytes += want;
 }
+// DM_VK_CTX_PICK=1 (vk19.57, opt-in; Path A S0), the Metal host's choice (nvn_mtl.m mtl_sub_begin: any finished allocator, a new one if none, a wait only at the cap). The
+// contexts were taken round robin, and the one whose turn it was could be held by a later submission still reading its ring (GPU-written data used in place, gw_find): the
+// recorder waited 8.4-8.6 ms a frame for that reader, usually the newest submission, so CPU and GPU took turns. Now the least recently used context whose submission is done and
+// that no later one reads is taken; with none, a new one is made, up to DM_VK_CTX_MAX (default 32); only at the cap the recorder waits, for the context that frees first. Ring and
+// hold rules are unchanged. A context taken again ends the GPU-written copies forwarded into its ring (DM_VK_GW_FORWARD counted on round robin). Per 600 frames: picks free at
+// once, contexts made, waits by reason (its own submission, a later reader, at the cap) and the high-water count
+static int ctx_pick_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_CTX_PICK"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_CTX_PICK=1: a free submission context is taken, more are made up to DM_VK_CTX_MAX"); } return v; }
+static uint64_t g_pick_free, g_pick_grow, g_pick_wait, g_pick_wait_fence, g_pick_wait_hold; static int g_pick_hw;
+static void ctx_pick(void) {
+    static int cap; if (!cap) { const char *e = getenv("DM_VK_CTX_MAX"); cap = e && atoi(e) > 0 ? atoi(e) : NCTX_MAX; if (cap > NCTX_MAX) cap = NCTX_MAX; if (cap < NCTX) cap = NCTX; }
+    lk_(&g_mu, LW_MU);
+    int best = -1, soon = -1; uint64_t soon_at = UINT64_MAX;
+    for (int k = 0; k < NCTX; k++) { ctx_t *c = &g_ctx[k]; if (c == C) continue;   // the one just committed: its fence is not done yet anyway
+        uint64_t f = c->fence_val > c->hold ? c->fence_val : c->hold;
+        if (f <= g_done) { if (best < 0 || c->fence_val < g_ctx[best].fence_val) best = k; }
+        else if (f < soon_at) { soon_at = f; soon = k; } }
+    int grow = best < 0 && NCTX < cap;
+    pthread_mutex_unlock(&g_mu);
+    if (best >= 0) { g_ci = best; g_pick_free++; }
+    else if (grow) { ctx_init(NCTX); lk_(&g_mu, LW_MU); g_ci = NCTX; NCTX++; pthread_mutex_unlock(&g_mu); g_pick_grow++; if (NCTX > g_pick_hw) g_pick_hw = NCTX;
+                     static int nl; if (nl++ < 12) LOG("vk: DM_VK_CTX_PICK: no free context: context %d made", g_ci); }
+    else { g_ci = soon >= 0 ? soon : (g_ci + 1) % NCTX; g_pick_wait++;   // at the cap: the one that frees first (the wait itself is counted below, as before)
+           if (g_ctx[g_ci].hold > g_ctx[g_ci].fence_val) g_pick_wait_hold++; else g_pick_wait_fence++; }
+    if (g_pick_hw < NCTX) g_pick_hw = NCTX;
+    lk_(&g_gwmu, LW_GWMU);   // copies forwarded into this context's ring are its old submission's: forgotten
+    for (int i = 0; i < g_ngw; i++) if (g_gw[i].ffence && g_gw[i].fci == g_ci) g_gw[i].ffence = 0;
+    pthread_mutex_unlock(&g_gwmu);
+}
 void mtl_sub_begin(void) {
     vk_init(); g_sub_up_bytes = 0;
     { void topo_self_tick(void); topo_self_tick(); }   // DM_TOPO_SELF: the recording thread places itself
@@ -3778,8 +3807,10 @@ void mtl_sub_begin(void) {
       if (t != cand) { cand = t; streak = 0; } if (++streak >= 30 && atomic_load_explicit(&g_rec_tid, memory_order_relaxed) != t) atomic_store(&g_rec_tid, t); }
     if (zc_mode()) zc_reap(g_done);
     ds_last_newcb();   // a new command buffer: no state recorded in it yet
-    g_ci = (g_ci + 1) % NCTX; ctx_t *c = &g_ctx[g_ci];
     uint64_t w0 = now_ns();
+    if (ctx_pick_on()) ctx_pick();
+    else g_ci = (g_ci + 1) % NCTX;
+    ctx_t *c = &g_ctx[g_ci];
     lk_(&g_mu, LW_MU);
     { uint64_t t1 = now_ns(); while (c->fence_val > g_done) pthread_cond_wait(&g_cv, &g_mu); uint64_t t2 = now_ns(); while (c->hold > g_done) pthread_cond_wait(&g_cv, &g_mu);
       atomic_fetch_add(&g_wait_fence_ns, t2 - t1); atomic_fetch_add(&g_wait_hold_ns, now_ns() - t2); }   // its own submission still running / a later one still reading its ring
@@ -4734,7 +4765,11 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0 && (ubwc_on() || pass_barrier_on())) { LOG("vk: DM_VK_UBWC %d: %llu images made with a format list or not mutable so far, %llu views outside the list, copies into them: %llu from buffers, %llu from images, %llu uploads; DM_VK_PASS_BARRIER %d: %.1f pass ends a frame without vertex shaders, %.1f vertex-shader barriers a frame",
         ubwc_on(), (unsigned long long)g_ubwc_imgs, (unsigned long long)g_ubwc_fallback, (unsigned long long)g_ubwc_b2t, (unsigned long long)g_ubwc_t2t, (unsigned long long)g_ubwc_up, pass_barrier_on(), g_nbar_narrow / 600.0, g_nbar_vs / 600.0); g_nbar_narrow = g_nbar_vs = 0; }
     if (n % 600 == 0) { LOG("vk: waiting for a free submission context per frame: %.2f ms for its own submission, %.2f ms for a later one still reading its ring (%d contexts)",
-                        atomic_exchange(&g_wait_fence_ns, 0) / 600e6, atomic_exchange(&g_wait_hold_ns, 0) / 600e6, NCTX); }
+                        atomic_exchange(&g_wait_fence_ns, 0) / 600e6, atomic_exchange(&g_wait_hold_ns, 0) / 600e6, NCTX);
+                        if (ctx_pick_on()) { uint64_t tot = g_pick_free + g_pick_grow + g_pick_wait;
+                            LOG("vk: DM_VK_CTX_PICK per frame over the last 600: %.1f submissions, %.1f took a free context at once (%.0f%%), %.2f made a new one, %.2f waited at the cap (%.2f for its own submission, %.2f for a later reader); contexts %d, at most %d",
+                                tot / 600.0, g_pick_free / 600.0, tot ? 100.0 * g_pick_free / tot : 0.0, g_pick_grow / 600.0, g_pick_wait / 600.0, g_pick_wait_fence / 600.0, g_pick_wait_hold / 600.0, NCTX, g_pick_hw);
+                            g_pick_free = g_pick_grow = g_pick_wait = g_pick_wait_fence = g_pick_wait_hold = 0; } }
     if (n % 600 == 0) { LOG("vk: per frame over the last 600: GPU %.2f ms, recording %.2f ms, waiting for the GPU %.2f ms, present waiting %.2f ms", atomic_exchange(&g_gpu_ns, 0) / 600e6,
                             atomic_exchange(&g_rec_ns, 0) / 600e6, atomic_exchange(&g_wait_ns, 0) / 600e6, atomic_exchange(&g_pwait_ns, 0) / 600e6); }
     if (t) shot(t, n);
