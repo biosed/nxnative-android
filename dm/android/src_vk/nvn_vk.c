@@ -55,10 +55,15 @@ static _Atomic uint64_t g_fbs_bytes;   // the same-pass feedback snapshots' imag
 #define RED_ONCE(id, ...) do { static int once_; if (!once_++) LOG("[RED] vk: " __VA_ARGS__); } while (0)
 // Timers of the per-frame statistics (vk19.38): the arm64 virtual counter read in user space, not clock_gettime (3.8% of the render thread in a profile: two calls for every
 // descriptor set, draw and pipeline lookup). Statistics only: waits, fences and deadlines keep now_ns
+// DM_VK_LEAN (vk19.62, read at start only): the counter converted with one 64x64->128 multiply by a factor taken once (1e9 * 2^64 / frequency), not two divisions. The mode
+// is fixed at the first call, so a start and an end of one measurement always use the same conversion (the two differ by up to a nanosecond)
 static inline uint64_t stat_ns(void) {
 #ifdef __aarch64__
-    static uint64_t f; uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
-    if (!f) { uint64_t q; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(q)); f = q ? q : 1; }
+    static uint64_t f; static int lean = -1; static unsigned __int128 mul; uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    int l = __atomic_load_n(&lean, __ATOMIC_ACQUIRE);
+    if (l < 0) { uint64_t q; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(q)); f = q ? q : 1; const char *e = getenv("DM_VK_LEAN");   // the first calls (any thread): all compute the same
+                 mul = ((unsigned __int128)1000000000ull << 64) / f; l = e && atoi(e) != 0; __atomic_store_n(&lean, l, __ATOMIC_RELEASE); }
+    if (l) return (uint64_t)(((unsigned __int128)v * mul) >> 64);
     return v / f * 1000000000ull + v % f * 1000000000ull / f;
 #else
     return now_ns();
@@ -198,7 +203,7 @@ typedef struct {
     int reset_done;   // its command and descriptor pools were reset by the completion thread (ctx_complete), off the submit thread (each reset took ~9% of it)
     uint64_t hold;   // the last later submission that reads this one's ring (gw_find): the ring is not reused, nor its extra rings freed, before that one is done too
     // The work recorded into it (draws and dispatches), the last TRN kept and the heaviest noted: dumped when the GPU is lost (trace_dump), to name what hung it
-    struct trace { char kind, gpu_ind; char a[17], b[17]; uint32_t n0, n1, n2, zero_tb; } tr[48]; uint32_t ntr, ndraw, ndisp, max_groups; struct trace heavy;
+    struct trace { char kind, gpu_ind; char a[17], b[17]; const char *pa, *pb; uint32_t n0, n1, n2, zero_tb; } tr[48]; uint32_t ntr, ndraw, ndisp, max_groups; struct trace heavy;   // pa / pb: the shader keys themselves (DM_VK_LEAN; shaders are never freed), else copied into a / b
 } ctx_t;
 enum { TRN = 48 };
 static _Atomic uint64_t g_gpu_ns, g_gpu_cum;   // g_gpu_cum: never reset (the long-frame lines)
@@ -211,6 +216,7 @@ static int g_pend[NCTX_MAX], g_npend;   // contexts submitted and not yet comple
 
 static uint64_t g_wgen;   // a new generation when the ring changes or the write log overflows: the per-submission copies are reused only within one (and only where no write since overlaps them, copy_in)
 static uint32_t g_nwlog;   // writes logged in this generation (wlog_add)
+static int g_lean_tr;   // DM_VK_LEAN for the submission (tog_latch): trace_add keeps pointers
 static uint64_t g_bgen[6], g_bgen_next = 1;   // a stage's binding generation: changes when its texture, image, sampler or storage-buffer bindings change (DM_VK_SEG_CACHE, DM_VK_FB_FAST)
 static uint64_t g_tex_draws_win;   // draws recorded in the 600-frame window (trace_add; tex_get calls per draw, vk19.59)
 static int zc_mode(void); static int zc_find(uint64_t addr, uint64_t n, VkBuffer *b, VkDeviceSize *off); static void zc_reap(uint64_t done);   // zero-copy pools (DM_VK_ZEROCOPY)
@@ -744,16 +750,18 @@ static void trace_dump(const char *why) {
     for (int k = 0; k < NCTX; k++) {
         ctx_t *c = &g_ctx[k]; if (c->fence_val <= g_done && c != C) continue;
         LOG("vk:  submission %llu%s: %u draws, %u dispatches, largest dispatch %u groups (%s %ux%ux%u)", (unsigned long long)c->fence_val, c == C ? " (being recorded)" : "", c->ndraw, c->ndisp,
-            c->max_groups, c->heavy.a, c->heavy.n0, c->heavy.n1, c->heavy.n2);
+            c->max_groups, c->heavy.pa ? c->heavy.pa : c->heavy.a, c->heavy.n0, c->heavy.n1, c->heavy.n2);
         uint32_t n = c->ntr < TRN ? c->ntr : TRN;
         for (uint32_t i = 0; i < n; i++) { const struct trace *t = &c->tr[(c->ntr - n + i) % TRN];
-            if (t->kind == 'd') LOG("vk:   draw vs %s fs %s count %u x%u%s%s", t->a, t->b[0] ? t->b : "-", t->n0, t->n1, t->gpu_ind ? " (indirect, GPU args)" : "", t->zero_tb ? " zero texel buffers" : "");
-            else LOG("vk:   dispatch cs %s %ux%ux%u%s%s", t->a, t->n0, t->n1, t->n2, t->gpu_ind ? " (indirect, GPU args)" : "", t->zero_tb ? " zero texel buffers" : ""); }
+            const char *ta = t->pa ? t->pa : t->a, *tb = t->pa ? t->pb : t->b;
+            if (t->kind == 'd') LOG("vk:   draw vs %s fs %s count %u x%u%s%s", ta, tb[0] ? tb : "-", t->n0, t->n1, t->gpu_ind ? " (indirect, GPU args)" : "", t->zero_tb ? " zero texel buffers" : "");
+            else LOG("vk:   dispatch cs %s %ux%ux%u%s%s", ta, t->n0, t->n1, t->n2, t->gpu_ind ? " (indirect, GPU args)" : "", t->zero_tb ? " zero texel buffers" : ""); }
     }
 }
 static void trace_add(char kind, const char *a, const char *b, uint32_t n0, uint32_t n1, uint32_t n2, int gpu_ind, uint32_t zero_tb) {
     struct trace *t = &C->tr[C->ntr++ % TRN]; t->kind = kind; t->gpu_ind = (char)gpu_ind; t->zero_tb = zero_tb; t->n0 = n0; t->n1 = n1; t->n2 = n2;
-    snprintf(t->a, sizeof t->a, "%s", a ? a : "-"); snprintf(t->b, sizeof t->b, "%s", b ? b : "");
+    if (g_lean_tr) { t->pa = a ? a : "-"; t->pb = b ? b : ""; }   // DM_VK_LEAN: two pointers, the text only when a trace is dumped
+    else { snprintf(t->a, sizeof t->a, "%s", a ? a : "-"); snprintf(t->b, sizeof t->b, "%s", b ? b : ""); t->pa = t->pb = NULL; }
     if (kind == 'd') { C->ndraw++; g_tex_draws_win++; } else { C->ndisp++; uint64_t g = (uint64_t)n0 * n1 * n2; if (g > C->max_groups) { C->max_groups = g > UINT32_MAX ? UINT32_MAX : (uint32_t)g; C->heavy = *t; } }
 }
 static void garbage_free(uint64_t done);
@@ -2587,10 +2595,11 @@ static void *pso_precreate(void *a) { pthread_setname_np("dm-psopre");
 // from DM_VK_CTL_FILE ("set <name> <value>", vk_ctl: the file is read again only when its modification time changes, at most once a frame). The value is an atomic; the
 // recording thread takes a copy of every value once per submission (tog_latch at mtl_sub_begin) and reads only that copy (tog), so a switch never changes in the middle
 // of a submission. A name not on the run-time list is refused when the file sets it (it is read at start only)
-enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_N };
+enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_N };
 static struct { const char *name; int runtime; _Atomic int val; } g_tog[TG_N] = {
     [TG_SHADOW] = {"DM_VK_SHADOW", 1},   // diagnostic: what a persistent cache could save (copy_in / index-scan misses whose bytes an earlier copy already had)
     [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2)
+    [TG_LEAN] = {"DM_VK_LEAN", 0},   // vk19.62: small hot-path items (trace pointers, the memo hash, the timer conversion, sampled descriptor-set timing); start only
     [TG_FB_FAST] = {"DM_VK_FB_FAST", 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2)
 };
 static int g_tog_lat[TG_N];
@@ -2598,7 +2607,7 @@ static void tog_init(void) {
     static int done; if (done) return; done = 1;
     for (int i = 0; i < TG_N; i++) { const char *e = getenv(g_tog[i].name); int v = e ? atoi(e) : 0; atomic_store(&g_tog[i].val, v); if (v) LOG("vk: %s=%d (from the environment%s)", g_tog[i].name, v, g_tog[i].runtime ? "; may be changed at run time" : ""); }
 }
-static void tog_latch(void) { tog_init(); for (int i = 0; i < TG_N; i++) g_tog_lat[i] = atomic_load_explicit(&g_tog[i].val, memory_order_relaxed); }
+static void tog_latch(void) { tog_init(); for (int i = 0; i < TG_N; i++) g_tog_lat[i] = atomic_load_explicit(&g_tog[i].val, memory_order_relaxed); g_lean_tr = g_tog_lat[TG_LEAN]; }
 static inline int tog(int i) { return g_tog_lat[i]; }
 static void tog_set(const char *name, int v, uint64_t frame) {   // the control file (present thread)
     tog_init();
@@ -2976,6 +2985,11 @@ static VkDeviceSize ring_put_memo(const void *src, uint32_t len, VkDeviceSize al
     *buf = VK_NULL_HANDLE;
     if (!dset_cache2() || len > MEMO_MAX) { VkDeviceSize o = ring_put(src, len, align); if (o != VK_WHOLE_SIZE) *buf = C->ring; return o; }
     uint64_t h = 0xcbf29ce484222325ull, x; uint32_t i = 0;
+    if (tog(TG_LEAN)) {   // DM_VK_LEAN: four independent lanes over 32 bytes a step (the one-lane chain waits a multiply per 8 bytes); a match is still checked byte by byte below
+        uint64_t l0 = h, l1 = h ^ 0x9e3779b97f4a7c15ull, l2 = h ^ 0xc2b2ae3d27d4eb4full, l3 = h ^ 0x165667b19e3779f9ull, y[4];
+        for (; i + 32 <= len; i += 32) { memcpy(y, (const uint8_t *)src + i, 32); l0 = (l0 ^ y[0]) * 0x100000001b3ull; l1 = (l1 ^ y[1]) * 0x100000001b3ull; l2 = (l2 ^ y[2]) * 0x100000001b3ull; l3 = (l3 ^ y[3]) * 0x100000001b3ull; }
+        h = (l0 ^ (l1 << 1 | l1 >> 63) ^ (l2 << 2 | l2 >> 62) ^ (l3 << 3 | l3 >> 61)) * 0xff51afd7ed558ccdull; h ^= h >> 33;
+    }
     for (; i + 8 <= len; i += 8) { memcpy(&x, (const uint8_t *)src + i, 8); h = (h ^ x) * 0x100000001b3ull; }
     for (; i < len; i++) h = (h ^ ((const uint8_t *)src)[i]) * 0x100000001b3ull;
     h ^= len;
@@ -3206,7 +3220,8 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
         if (!dset_cache2() || (ce->key2 == key2 && ce->nk == nk && (nk > KMAX || !memcmp(ce->km, km, (size_t)nk * 8)))) { g_dsc_hit++; wsc_keep(&nc, fit, s, stage, ce->ds); return ce->ds; }
         g_dsc_rej++;   // the same 64-bit hash, other bindings: a new set
     }
-    uint64_t tm0 = stat_ns();
+    static uint32_t nmiss; int timed = !tog(TG_LEAN) || !(nmiss++ & 7);   // DM_VK_LEAN: one miss in 8 timed (the line's average per set stays)
+    uint64_t tm0 = timed ? stat_ns() : 0;
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, C->dps[C->idp], 1, &s->dsl};
     while (vkAllocateDescriptorSets(g_dev, &ai, &ds) != VK_SUCCESS) {   // this pool is full: the next of the chain, made when there is none
         if (++C->idp == C->ndp) { if (C->ndp >= 256) { RED_ONCE(20, "256 descriptor pools in one submission: draws are dropped"); C->idp--; return VK_NULL_HANDLE; }
@@ -3216,7 +3231,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
     for (int k = 0; k < nw; k++) w[k].dstSet = ds;
     vkUpdateDescriptorSets(g_dev, (uint32_t)nw, w, 0, NULL);
     ce->key = key; ce->gen = g_bvgen; ce->dsl = s->dsl; ce->ds = ds; ce->key2 = key2; ce->nk = nk; if (nk <= KMAX) memcpy(ce->km, km, (size_t)nk * 8); g_dsc_miss++;
-    g_dsc_miss_ns += stat_ns() - tm0; g_dsc_nmiss_t++;
+    if (timed) { g_dsc_miss_ns += stat_ns() - tm0; g_dsc_nmiss_t++; }
     wsc_keep(&nc, fit, s, stage, ds);
     return ds;
 }
