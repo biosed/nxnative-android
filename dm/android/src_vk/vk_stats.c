@@ -107,11 +107,15 @@ static void second_tick(uint64_t k) {
     if (dm_front_battery) { long q = 0, i = 0; int mv = -1, pl = -1;
         if (dm_front_battery(&q, &i, &mv, &pl, g_plugged < 0)) {   // the plug state with the first reading, then once a window
             if (pl >= 0) g_plugged = pl;
-            if (g_cur_ma < 0 && i) g_cur_ma = labs(i) < 50000; if (g_q_mah < 0 && q > 0) g_q_mah = q < 200000;
+            int i_ok = i != INT32_MIN, q_ok = q != INT32_MIN && q > 0;   // Integer.MIN_VALUE: the property is not supported (no reading)
+            // the current's unit only from an unplugged reading clear of the overlap (vk19.63b): 100 <= |i| < 50,000 is mA, |i| >= 100,000 is uA, anything else waits
+            // (plugged in at 100% a uA current can be under 50,000)
+            if (g_cur_ma < 0 && i_ok && g_plugged == 0) { long a = labs(i); if (a >= 100 && a < 50000) g_cur_ma = 1; else if (a >= 100000) g_cur_ma = 0; }
+            if (g_q_mah < 0 && q_ok) g_q_mah = q < 200000;
             if (!g_sign_logged && g_plugged == 0 && i && g_cur_ma >= 0) { g_sign_logged = 1;
                 LOG("vk: battery readings: current in %s, %s while discharging (%ld); charge counter in %s (%ld)", g_cur_ma ? "mA" : "uA", i < 0 ? "negative" : "positive", i, g_q_mah == 1 ? "mAh" : "uAh", q); }
-            q = q_uah(q); if (!W.nq++ && W.q0 == 0) W.q0 = q; W.q_last = q;
-            double c = cur_ua(i); W.cur_sum += g_plugged == 0 ? fabs(c) : c; W.ncur++; } }   // unplugged: the drain, whatever the sign
+            if (q_ok && g_q_mah >= 0) { q = q_uah(q); if (!W.nq++ && W.q0 == 0) W.q0 = q; W.q_last = q; }
+            if (i_ok && g_cur_ma >= 0) { double c = cur_ua(i); W.cur_sum += g_plugged == 0 ? fabs(c) : c; W.ncur++; } } }   // until the unit is known: not averaged   // unplugged: the drain, whatever the sign
 }
 // Thread groups (vk19.59c): the recording thread (RHIThread, the critical path), the host's own threads (dm-*, dm hitch…), and the game's (every other thread of the process)
 static void groups(uint64_t g[3]) {
@@ -125,11 +129,12 @@ static void window_log(uint64_t frames, uint64_t dns) {
         (unsigned long long)frames, secs, sum / 1e6 / fr, sum / 1e6 / ps, sum / 1e9 / ps, g[0] / 1e6 / fr, g[0] / 1e6 / ps, g[1] / 1e6 / fr, g[1] / 1e6 / ps, g[2] / 1e6 / fr, g[2] / 1e6 / ps, top);
     char cl[512]; clusters(cl, sizeof cl);
     int mv = -1, pl = -1; long q = 0, cu = 0; if (dm_front_battery && dm_front_battery(&q, &cu, &mv, &pl, 1) && pl >= 0) g_plugged = pl;
+    int pmhz = dm_front_panel_mhz_now ? dm_front_panel_mhz_now() : 0; { void vk_pace_rate_reported(int mhz); vk_pace_rate_reported(pmhz); }   // DM_VK_PRESENT_PACE only (0 otherwise)
     long dq = W.nq ? W.q_last - W.q0 : 0; double mean_ma = W.ncur ? W.cur_sum / W.ncur / 1000.0 : 0;
-    LOG("vk: heat and energy over the last %llu frames (%.1f s): clusters %s; thermal status %d (highest %d), headroom now %.3f (lowest %.3f), in 10 s %.3f (highest %.3f); battery %+ld uAh (%.0f mAh an hour), %s %.0f mA, %d mV (%.0f mW), plugged %d%s; panel %.2f Hz; memory map %d lines",
+    LOG("vk: heat and energy over the last %llu frames (%.1f s): clusters %s; thermal status %d (highest %d), headroom now %.3f (lowest %.3f), in 10 s %.3f (highest %.3f); battery %+ld uAh (%.0f mAh an hour), %s %.0f mA, %d mV (%.0f mW), plugged %d%s; panel %.2f Hz reported (0: not asked); memory map %d lines",
         (unsigned long long)frames, secs, cl, W.st, W.st_high, (double)W.h0, (double)(W.h0_low == INFINITY ? NAN : W.h0_low), (double)W.h10, (double)(W.h10_high == -INFINITY ? NAN : W.h10_high),
         dq, dq / 1000.0 / ps * 3600.0, g_plugged == 0 ? "drain mean" : "current mean (as reported)", mean_ma, mv, mv > 0 ? mean_ma * mv / 1000.0 : 0, pl,
-        dm_front_battery ? (W.ncur ? "" : " (no battery readings)") : " (no front end)", dm_front_panel_mhz_now ? dm_front_panel_mhz_now() / 1000.0 : 0.0, maps_lines());
+        dm_front_battery ? (W.ncur ? "" : " (no battery readings)") : " (no front end)", pmhz / 1000.0, maps_lines());
     window_reset();
 }
 // A CPU's cluster, as its cpufreq policy's first CPU (related_cpus), read once: the recording thread's cluster in the present-to-present line (A/B windows on one cluster only)
