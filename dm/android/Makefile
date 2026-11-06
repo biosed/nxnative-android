@@ -24,7 +24,7 @@ SRC := $(HOST)/main.c $(HOST)/loader.c $(HOST)/hle.c $(HOST)/crash.c $(HOST)/pro
        ../gfx/hle_nv.c ../gfx/hle_vi.c $(sort $(wildcard ../gfx/nvn/*.c ../gfx/nvn/*.S ../gfx/tex/*.c))
 # Graphics backend: BACKEND=vk (default, src/nvn_vk.c) or null (null/nvn_null.c: nothing drawn, the game runs)
 BACKEND ?= vk
-LOCAL := compat/compat.c $(sort $(wildcard src/*.c)) $(if $(filter null,$(BACKEND)),null/nvn_null.c,src_vk/nvn_vk.c)
+LOCAL := compat/compat.c $(sort $(wildcard src/*.c)) $(if $(filter null,$(BACKEND)),null/nvn_null.c,src_vk/nvn_vk.c src_vk/vk_stats.c)
 OBJ := $(patsubst ../%,$(OUT)/obj/%.o,$(SRC)) $(patsubst %,$(OUT)/obj/android/%.o,$(LOCAL))
 VPX := ../third_party/libvpx
 VPX_OBJ := $(patsubst $(VPX)/%.c,gen/vpx/%.o,$(sort $(shell find $(VPX) -name '*.c')))

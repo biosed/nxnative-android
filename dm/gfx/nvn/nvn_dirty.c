@@ -88,12 +88,29 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
         if (!busy_wait(r, p)) return 0;
     }
 }
+// Faults by thread (Android, vk19.59 measurement): a fixed table claimed by compare-and-swap, safe in the fault path (gettid is a plain system call); a thread past the
+// table's 32 slots is counted in the last one
+enum { NFT = 32 };
+static struct { _Atomic int tid; _Atomic uint64_t n; } g_ft[NFT];
+static void fault_by_thread(void) {
+#if defined(__ANDROID__)
+    int t = (int)gettid();
+    for (int i = 0; i < NFT; i++) { int c = atomic_load_explicit(&g_ft[i].tid, memory_order_relaxed);
+        if (!c) { int z = 0; if (atomic_compare_exchange_strong(&g_ft[i].tid, &z, t)) c = t; else c = z; }
+        if (c == t || i == NFT - 1) { atomic_fetch_add_explicit(&g_ft[i].n, 1, memory_order_relaxed); return; } }
+#endif
+}
+int nvn_dirty_thread_faults(int *tid, uint64_t *n, int max) {
+    int k = 0; for (int i = 0; i < NFT && k < max; i++) { int t = atomic_load(&g_ft[i].tid); if (!t) break; tid[k] = t; n[k] = atomic_load(&g_ft[i].n); k++; }
+    return k;
+}
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
     if (!is_write) return 0;
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
         { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
+    if (ours) fault_by_thread();
     return ours;
 }
 // Unprotect pages p..q of a range with one mprotect per run of protected pages (a host write over a whole texture, e.g. WriteTexels, used to make one system call per 16 KB page:

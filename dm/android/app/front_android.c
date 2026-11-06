@@ -575,6 +575,42 @@ static void game_mode_read(ANativeActivity *a) {
     if (mode != dm_game_mode) LOG("front end: Android game mode %d (0 unsupported, 1 standard, 2 performance, 3 battery, 4 custom)", mode);
     dm_game_mode = mode;
 }
+// The battery for the backend's heat-and-energy line (vk19.59, src_vk/vk_stats.c), from its sampling thread: BatteryManager's CHARGE_COUNTER (uAh) and CURRENT_NOW (uA, the
+// sign as the device reports it), and the sticky ACTION_BATTERY_CHANGED intent's voltage (mV) and plugged state when want_v. The calling thread is attached to the VM once and
+// stays attached (it lives as long as the process). 0 when there is no activity or a call failed
+__attribute__((visibility("default"))) int dm_front_battery(long *charge_uah, long *current_ua, int *mv, int *plugged, int want_v) {
+    static __thread JNIEnv *tenv; static jobject bm; static jmethodID get_int; static jclass ifc; static jmethodID if_new, reg, get_extra; static jstring s_act, s_volt, s_plug;
+    if (!g_act || !g_act->vm) return 0;
+    if (!tenv) { JavaVMAttachArgs aa = {JNI_VERSION_1_6, "dm-stats", NULL}; if ((*g_act->vm)->AttachCurrentThread(g_act->vm, &tenv, &aa) != JNI_OK) { tenv = NULL; return 0; } }
+    JNIEnv *env = tenv;
+    if (!bm) {
+        jstring nm = (*env)->NewStringUTF(env, "batterymanager");
+        jobject o = (*env)->CallObjectMethod(env, g_act->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, g_act->clazz), "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"), nm);
+        (*env)->DeleteLocalRef(env, nm);
+        if ((*env)->ExceptionCheck(env) || !o) { (*env)->ExceptionClear(env); return 0; }
+        get_int = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, o), "getIntProperty", "(I)I");
+        jclass c = (*env)->FindClass(env, "android/content/IntentFilter"); if ((*env)->ExceptionCheck(env) || !c) { (*env)->ExceptionClear(env); return 0; }
+        ifc = (*env)->NewGlobalRef(env, c); if_new = (*env)->GetMethodID(env, ifc, "<init>", "(Ljava/lang/String;)V");
+        reg = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, g_act->clazz), "registerReceiver", "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;)Landroid/content/Intent;");
+        jclass ic = (*env)->FindClass(env, "android/content/Intent"); get_extra = ic ? (*env)->GetMethodID(env, ic, "getIntExtra", "(Ljava/lang/String;I)I") : NULL;
+        s_act = (*env)->NewGlobalRef(env, (*env)->NewStringUTF(env, "android.intent.action.BATTERY_CHANGED"));
+        s_volt = (*env)->NewGlobalRef(env, (*env)->NewStringUTF(env, "voltage")); s_plug = (*env)->NewGlobalRef(env, (*env)->NewStringUTF(env, "plugged"));
+        if ((*env)->ExceptionCheck(env) || !get_int || !if_new || !reg || !get_extra) { (*env)->ExceptionClear(env); get_int = NULL; return 0; }
+        bm = (*env)->NewGlobalRef(env, o); (*env)->DeleteLocalRef(env, o);
+    }
+    if (!get_int) return 0;
+    *charge_uah = (*env)->CallIntMethod(env, bm, get_int, 1);   // BATTERY_PROPERTY_CHARGE_COUNTER
+    *current_ua = (*env)->CallIntMethod(env, bm, get_int, 2);   // BATTERY_PROPERTY_CURRENT_NOW
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return 0; }
+    if (want_v) {
+        jobject f = (*env)->NewObject(env, ifc, if_new, s_act); jobject in = f ? (*env)->CallObjectMethod(env, g_act->clazz, reg, NULL, f) : NULL;
+        if (!(*env)->ExceptionCheck(env) && in) { *mv = (*env)->CallIntMethod(env, in, get_extra, s_volt, -1); *plugged = (*env)->CallIntMethod(env, in, get_extra, s_plug, -1); }
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        if (in) (*env)->DeleteLocalRef(env, in);
+        if (f) (*env)->DeleteLocalRef(env, f);
+    }
+    return 1;
+}
 static void on_pause(ANativeActivity *a) { (void)a; dm_focus_set(2); }   // still visible behind something (a dialog, a split screen): out of focus, running
 static void on_focus(ANativeActivity *a, int f) { if (f) immersive(a); else input_release_all(); dm_focus_set(f ? 1 : 2); }
 // Destroyed by the player leaving (− and + held, back_to_menu, finish) the game ends; destroyed by Android while the process stays (to reclaim memory, its activity
