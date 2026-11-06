@@ -2610,7 +2610,7 @@ static struct { const char *name; int runtime; _Atomic int val; int def; } g_tog
     [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1, 0, 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2); on by default from vk19.65 (session 1: -1.0 ms)
     [TG_PACE] = {"DM_VK_PRESENT_PACE", 0},   // vk19.63: one setFrameRate request for the cap at the first swapchain, FIFO when the cap is at most the panel's rate; start only
     [TG_LEAN] = {"DM_VK_LEAN", 0},   // vk19.62: small hot-path items (trace pointers, the memo hash, the timer conversion, sampled descriptor-set timing); start only
-    [TG_FB_FAST] = {"DM_VK_FB_FAST", 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2)
+    [TG_FB_FAST] = {"DM_VK_FB_FAST", 1, 0, 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2); on by default from vk19.65 (session 1: -0.4 ms)
 };
 static int g_tog_lat[TG_N];
 static void tog_init_(void) {
