@@ -1773,6 +1773,7 @@ static _Atomic uint64_t g_itv2_since;   // start of the game's current run of in
 // Frame step (patch_nso.py FRAME_STEP: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0): the game no longer picks an interval. The host hands it each frame's step in whole vsyncs
 // (fstep_tick, nvn_fstep.h) and presents follow the hold k it decides with it
 __attribute__((weak)) uint8_t *dm_fps_state;   // loader.c; graphics unit tests have no loader
+__attribute__((weak)) int mtl_pace_fifo(void) { return 0; }   // the Vulkan backend (DM_VK_PRESENT_PACE's FIFO swapchain); 0 elsewhere
 __attribute__((weak)) void dm_fps_lock_tick(void) {}   // hle_fpslock.c: engine frame limits in game memory (Monster Hunter Rise); graphics unit tests have no host
 __attribute__((weak)) void dm_ue_cvar_tick(void) {}   // hle_uecvar.c: Unreal's texture streaming pool (profile ue_texture_pool)
 __attribute__((weak)) int dm_movie_playing(void) { return 0; }   // hle_movie.c: a movie's pictures are being handed out; graphics unit tests have no movie decoder
@@ -2099,10 +2100,13 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
     uint64_t period = present_period(o), now = dm_detclock_enabled() ? guest_ns() : now_ns();
     g_hold_ring[o->presents % 16] = (uint8_t)present_itv(o);
+    // Android, DM_VK_PRESENT_PACE's FIFO swapchain (mtl_pace_fifo, vk19.63c): the host paces 1/32 short of the period, so the panel's vsync sets the pace and one pacer is strict
+    // (two at one period drift across a vsync now and then: a frame shown one refresh too long)
+    uint64_t pp = period && mtl_pace_fifo() ? period - period / 32 : period;
     nvn_pacer pc = {o->pace};
-    uint64_t slot = now + nvn_pace(&pc, now, period);
+    uint64_t slot = now + nvn_pace(&pc, now, pp);
     o->pace = pc.target;
-    if (idx >= 0 && idx < 4) o->avail[idx] = period ? slot + period : 0;
+    if (idx >= 0 && idx < 4) o->avail[idx] = pp ? slot + pp : 0;
     static uint64_t prev_slot; if (prev_slot && period) trow(f, "@display_ms", (slot - prev_slot) / 1e6); prev_slot = slot;   // display interval between two adjacent frames on screen (this is the one to look at for dropped frames)
     // Actual presentation interval (windowed mode): taken 8 presents late (the presented callback has arrived by then), as the difference between the n-th and the (n−1)-th; −1 = discarded
     if (o->presents > 9) { uint64_t n = o->presents - 8; double a_ = mtl_presented_time(n), b_ = mtl_presented_time(n - 1);

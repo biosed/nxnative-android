@@ -4300,8 +4300,18 @@ static void win_drop(void) {
 // dm_front_panel_mhz), so presents follow the panel's vsync instead of replacing each other. The host's pacing already sleeps (clock_nanosleep / usleep), it never spins.
 // The rate granted is in the heat-and-energy line (dm-stats asks the Display each window); displayed-frame p95/p99 in the present-to-present line
 __attribute__((weak)) int dm_front_panel_mhz(void) { return 0; }
+// vk19.63c: g_pace_fifo -- the swapchain is FIFO because of the switch (the host then paces 1/32 short of the period so that FIFO's vsync sets the pace, one strict pacer;
+// at most minImageCount images, so the queue holds no extra frames of latency; acquire waits at most 100 ms). g_pace_low -- dm-stats saw the rate reported below the cap
+// (HyperOS's adaptive 48/50 Hz): the present thread makes the swapchain again as MAILBOX, for good
+static _Atomic int g_pace_fifo, g_pace_low;
+int mtl_pace_fifo(void) { return atomic_load_explicit(&g_pace_fifo, memory_order_relaxed); }   // hle_nvn.c (its pacing period) and the DM_FPS=30 sleep
+void vk_pace_rate_reported(int mhz) {   // dm-stats, once a window (vk_stats.c)
+    if (!mhz || !atomic_load(&g_pace_fifo) || atomic_load(&g_pace_low)) return;
+    int cap = mtl_fps_target();
+    if (mhz < cap * 1000 - 500) { atomic_store(&g_pace_low, 1); LOG("[RED] vk: DM_VK_PRESENT_PACE: the panel's rate reported %.2f Hz is below the %d fps cap: the swapchain goes back to mailbox", mhz / 1000.0, cap); }
+}
 static void present_pace(ANativeWindow *aw, VkPresentModeKHR *mode) {
-    tog_init(); if (!atomic_load(&g_tog[TG_PACE].val)) return;
+    tog_init(); atomic_store(&g_pace_fifo, 0); if (!atomic_load(&g_tog[TG_PACE].val)) return;
     int cap = mtl_fps_target(), mhz = dm_front_panel_mhz();
     static ANativeWindow *asked; static int nreq;
     if (aw != asked) {
@@ -4313,8 +4323,9 @@ static void present_pace(ANativeWindow *aw, VkPresentModeKHR *mode) {
             strategy ? "change always" : "only if seamless", (int)r, mhz / 1000.0);
         asked = aw; nreq++;
     }
-    if (mhz > 0 && cap * 1000 <= mhz + 500) *mode = VK_PRESENT_MODE_FIFO_KHR;
-    LOG("vk: DM_VK_PRESENT_PACE: %s (cap %d fps, panel %.2f Hz%s)", *mode == VK_PRESENT_MODE_FIFO_KHR ? "fifo" : "mailbox", cap, mhz / 1000.0, mhz ? "" : ": unknown, mailbox kept");
+    if (mhz > 0 && cap * 1000 <= mhz + 500 && !atomic_load(&g_pace_low)) { *mode = VK_PRESENT_MODE_FIFO_KHR; atomic_store(&g_pace_fifo, 1); }
+    LOG("vk: DM_VK_PRESENT_PACE: %s (cap %d fps, panel %.2f Hz reported%s)", atomic_load(&g_pace_fifo) ? "fifo" : "mailbox", cap, mhz / 1000.0,
+        atomic_load(&g_pace_low) ? ": below the cap, mailbox" : mhz ? "" : ": unknown, mailbox kept");
 }
 static int win_make(ANativeWindow *aw) {
     VkAndroidSurfaceCreateInfoKHR si = {VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, NULL, 0, aw};
@@ -4337,6 +4348,7 @@ static int win_make(ANativeWindow *aw) {
     if (W.ext.width < cap.minImageExtent.width) W.ext.width = cap.minImageExtent.width; if (W.ext.width > cap.maxImageExtent.width) W.ext.width = cap.maxImageExtent.width;
     if (W.ext.height < cap.minImageExtent.height) W.ext.height = cap.minImageExtent.height; if (W.ext.height > cap.maxImageExtent.height) W.ext.height = cap.maxImageExtent.height;
     uint32_t nimg = cap.minImageCount + 1; if (cap.maxImageCount && nimg > cap.maxImageCount) nimg = cap.maxImageCount;
+    if (atomic_load(&g_pace_fifo)) nimg = cap.minImageCount > 2 ? cap.minImageCount : 2;   // DM_VK_PRESENT_PACE's FIFO: no spare image, so a full queue blocks instead of adding latency
     VkCompositeAlphaFlagBitsKHR ca = cap.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR : VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, NULL, 0, W.surf, nimg, pick.format, pick.colorSpace, W.ext, 1,
                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, pre, ca, mode, VK_TRUE, VK_NULL_HANDLE};
@@ -4533,6 +4545,7 @@ static void win_present(const tex_t *t, const int crop[4]) {
     int gen; ANativeWindow *aw = front_native_window(&gen);
     front_window_lock(1);
     aw = front_native_window(&gen);
+    if (aw && W.sc && atomic_load(&g_pace_fifo) && atomic_load(&g_pace_low)) { W.gen = -1; W.why = "panel rate below the cap (DM_VK_PRESENT_PACE)"; }   // back to mailbox
     if (!aw || gen != W.gen) { win_drop(); W.gen = gen; if (aw) win_make(aw); }
     if (!aw || !W.sc) { front_window_lock(0); return; }
     lk_(&g_rmu, LW_RMU); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
@@ -4540,7 +4553,8 @@ static void win_present(const tex_t *t, const int crop[4]) {
     typeof(g_pres[0]) *P_ = &g_pres[g_pi]; g_pi = (g_pi + 1) % NPRES;
     { uint64_t w0 = now_ns(); vkWaitForFences(g_dev, 1, &P_->fence, VK_TRUE, UINT64_MAX); atomic_fetch_add(&g_pwait_ns, now_ns() - w0); }
     if (P_->fb) { vkDestroyFramebuffer(g_dev, P_->fb, NULL); P_->fb = VK_NULL_HANDLE; }
-    uint32_t idx; VkResult r = vkAcquireNextImageKHR(g_dev, W.sc, 1000000000ull, P_->acq, VK_NULL_HANDLE, &idx);
+    // under DM_VK_PRESENT_PACE's FIFO at most 100 ms (the window lock is held: a backgrounded window must not keep the activity thread's window-destroyed waiting a second); the frame is skipped
+    uint32_t idx; VkResult r = vkAcquireNextImageKHR(g_dev, W.sc, atomic_load(&g_pace_fifo) ? 100000000ull : 1000000000ull, P_->acq, VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.gen = -1; W.why = "out of date at acquire"; front_window_lock(0); return; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { front_window_lock(0); return; }
     if (r == VK_SUBOPTIMAL_KHR) win_suboptimal();
@@ -4596,7 +4610,8 @@ static void pw_draw(uint32_t done, uint32_t total) {   // one frame of the pre-w
     typeof(g_pres[0]) *P_ = &g_pres[g_pi]; g_pi = (g_pi + 1) % NPRES;
     vkWaitForFences(g_dev, 1, &P_->fence, VK_TRUE, UINT64_MAX);
     if (P_->fb) { vkDestroyFramebuffer(g_dev, P_->fb, NULL); P_->fb = VK_NULL_HANDLE; }
-    uint32_t idx; VkResult r = vkAcquireNextImageKHR(g_dev, W.sc, 1000000000ull, P_->acq, VK_NULL_HANDLE, &idx);
+    // under DM_VK_PRESENT_PACE's FIFO at most 100 ms (the window lock is held: a backgrounded window must not keep the activity thread's window-destroyed waiting a second); the frame is skipped
+    uint32_t idx; VkResult r = vkAcquireNextImageKHR(g_dev, W.sc, atomic_load(&g_pace_fifo) ? 100000000ull : 1000000000ull, P_->acq, VK_NULL_HANDLE, &idx);
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { if (r == VK_ERROR_OUT_OF_DATE_KHR) { W.gen = -1; W.why = "out of date at acquire"; } front_window_lock(0); return; }
     if (r == VK_SUBOPTIMAL_KHR) win_suboptimal();
     vkResetFences(g_dev, 1, &P_->fence);
@@ -4986,7 +5001,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n == 2) { pthread_t t; if (!pthread_create(&t, NULL, pso_precreate, NULL)) pthread_detach(t); }   // the pipelines earlier runs made, again, behind the game's first frames   // draws are numbered from 0 in each frame; the live control file (vk_ctl)
     {   // pacing for DM_FPS=30 (every frame two vsyncs) and the frame-rate counter's reading
         static uint64_t last, t0, n0; uint64_t now = now_ns();
-        if (mtl_fps_target() == 30 && last && now - last < 33333333ull) { usleep((useconds_t)((33333333ull - (now - last)) / 1000)); now = now_ns(); }
+        uint64_t per = atomic_load_explicit(&g_pace_fifo, memory_order_relaxed) ? 33333333ull - 33333333ull / 32 : 33333333ull;   // FIFO paces (vk19.63c): the host 1/32 short
+        if (mtl_fps_target() == 30 && last && now - last < per) { usleep((useconds_t)((per - (now - last)) / 1000)); now = now_ns(); }
         last = now; if (!t0) { t0 = now; n0 = n; } else if (now - t0 >= 1000000000ull) { g_fps_shown = (double)(n - n0) * 1e9 / (double)(now - t0); t0 = now; n0 = n; }
     }
     if (t && g_has_surface && !g_tl) mtl_finish();   // no timeline semaphore: the frame's work is done before its present reads the window texture
