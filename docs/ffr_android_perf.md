@@ -132,6 +132,8 @@ The recording thread's core is the scheduler's (or the vendor's) choice, and it 
 
 ## Open
 
+- CPU–GPU waiting (Path A S0, vk19.57, `DM_VK_CTX_PICK=1`): the recorder waits 8.4–8.6 ms a frame for a context a later submission still reads (runJ2); contexts are now picked free as on the Mac. A no-code A/B first: `DM_VK_GW_FORWARD=2` on the current build.
+
 - The render thread (Unreal's RHI work and the recording, ~100% of one core) runs on the 3.0 GHz A720 cores 2–4, whose clock swung 787–2803 MHz between windows, while the 3.2 GHz Cortex-X4 (cpu7) idled at 633 MHz: next, one A/B of pinning it to cpu7 (estimate: rec 24.5 → 16–19 ms, p50 35 → 27–30, then GPU-bound).
 
 - `DM_VK_STALE_PATCH=2` as the default (verified exact in Run I).
