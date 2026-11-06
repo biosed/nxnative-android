@@ -4311,7 +4311,10 @@ int mtl_pace_fifo(void) { return atomic_load_explicit(&g_pace_fifo, memory_order
 void vk_pace_rate_reported(int mhz) {   // dm-stats, once a window (vk_stats.c)
     if (!mhz || !atomic_load(&g_pace_fifo) || atomic_load(&g_pace_low)) return;
     int cap = mtl_fps_target();
-    if (mhz < cap * 1000 - 500) { atomic_store(&g_pace_low, 1); LOG("[RED] vk: DM_VK_PRESENT_PACE: the panel's rate reported %.2f Hz is below the %d fps cap: the swapchain goes back to mailbox", mhz / 1000.0, cap); }
+    static int nlow;   // two windows in a row (vk19.64c): a dip on a loading screen does not turn FIFO off for the session
+    if (mhz >= cap * 1000 - 500) { nlow = 0; return; }
+    if (++nlow < 2) { LOG("vk: DM_VK_PRESENT_PACE: the panel's rate reported %.2f Hz is below the %d fps cap (one window; mailbox after two in a row)", mhz / 1000.0, cap); return; }
+    atomic_store(&g_pace_low, 1); LOG("[RED] vk: DM_VK_PRESENT_PACE: the panel's rate reported %.2f Hz is below the %d fps cap for two windows: the swapchain goes back to mailbox", mhz / 1000.0, cap);
 }
 static void present_pace(ANativeWindow *aw, VkPresentModeKHR *mode) {
     tog_init(); atomic_store(&g_pace_fifo, 0); if (!atomic_load(&g_tog[TG_PACE].val)) return;
@@ -4351,7 +4354,10 @@ static int win_make(ANativeWindow *aw) {
     if (W.ext.width < cap.minImageExtent.width) W.ext.width = cap.minImageExtent.width; if (W.ext.width > cap.maxImageExtent.width) W.ext.width = cap.maxImageExtent.width;
     if (W.ext.height < cap.minImageExtent.height) W.ext.height = cap.minImageExtent.height; if (W.ext.height > cap.maxImageExtent.height) W.ext.height = cap.maxImageExtent.height;
     uint32_t nimg = cap.minImageCount + 1; if (cap.maxImageCount && nimg > cap.maxImageCount) nimg = cap.maxImageCount;
-    if (atomic_load(&g_pace_fifo)) nimg = cap.minImageCount > 2 ? cap.minImageCount : 2;   // DM_VK_PRESENT_PACE's FIFO: no spare image, so a full queue blocks instead of adding latency
+    if (atomic_load(&g_pace_fifo)) {   // DM_VK_PRESENT_PACE's FIFO: no spare image beyond minImageCount (a full queue blocks instead of adding latency), but at least 3 (vk19.64c):
+        // with two, FIFO locks a 45-58 fps game to every other vsync (~30 fps)
+        nimg = cap.minImageCount > 3 ? cap.minImageCount : 3; if (cap.maxImageCount && nimg > cap.maxImageCount) nimg = cap.maxImageCount;
+        LOG("vk: DM_VK_PRESENT_PACE: fifo with %u images (minImageCount %u, maxImageCount %u)", nimg, cap.minImageCount, cap.maxImageCount); }
     VkCompositeAlphaFlagBitsKHR ca = cap.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR : VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, NULL, 0, W.surf, nimg, pick.format, pick.colorSpace, W.ext, 1,
                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, pre, ca, mode, VK_TRUE, VK_NULL_HANDLE};
