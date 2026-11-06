@@ -92,7 +92,26 @@ typedef struct thr {
     const uint32_t *whs; int whn;   // WaitSynchronization's handle array (guest memory, valid while the thread waits there): a signal wakes only waiters that hold the signalled object
     int ctx_ok; uint64_t ctx_x[29], ctx_fp, ctx_lr, ctx_sp, ctx_pc; uint32_t ctx_pstate, ctx_fpcr, ctx_fpsr; __uint128_t ctx_v[32];
     pthread_cond_t pcv;
+    uint64_t sy[20], sy_seen[20];   // guest synchronization counters (SY_*, vk19.59b), each changed by its own thread (or under G), read under G by dm_guest_sync_report
 } thr_t;
+// Guest synchronization counters (vk19.59b; profile P1: svc_thread 7.9 ms a frame across the game's threads): plain counts on the hot paths, a clock only around a wait that
+// really sleeps (a futex wait already), reported per 600 frames by thread (dm_guest_sync_report)
+enum { SY_REL_NONE, SY_HANDOFF, SY_SIG_NONE, SY_SIG, SY_W_LOCK, SY_W_COND, SY_W_ADDR, SY_W_SYNC, SY_W_PRE, SY_W_SHORT, SY_W_LONG, SY_W_TIMEOUT, SY_W_TK, SY_NAP_PEER, SY_NAP_PRECISE, SY_NAP_DET, SY_NAP_BACKOFF, SY_N };
+// The wait's length in the arm64 virtual counter's ticks (read in user space, no system call; converted at the report), else in ns
+static inline uint64_t sy_ticks(void) {
+#ifdef __aarch64__
+    uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v;
+#else
+    return now_ns();
+#endif
+}
+static uint64_t sy_tick_hz(void) {
+#ifdef __aarch64__
+    uint64_t f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); return f ? f : 1;
+#else
+    return 1000000000ull;
+#endif
+}
 static thr_t *g_all;
 extern __thread _Atomic int dm_host_work;   // declared in hle.h too; defined in hle_nvn.c
 static _Atomic uint64_t g_preempt_n, g_preempt_ns;   // same-core handoffs: count and total wait (svc_thread)
@@ -176,7 +195,7 @@ int dm_yield_to_core_peers(int all) {
             if (t != self && t->started && !t->exited && !t->host_owned && t->mask == bit && t->prio < self->prio && thr_runnable(t) && (all || thr_in_handoff(t, self))) busy = 1;
         pthread_mutex_unlock(&G);
         if (!busy) return waited;
-        { struct timespec ts = {0, 50000}; nanosleep(&ts, 0); } waited = 1;
+        { struct timespec ts = {0, 50000}; nanosleep(&ts, 0); } waited = 1; self->sy[SY_NAP_PEER]++;
     }
 }
 // Take a host lock that an HLE call holds while it runs guest code. A guest thread waiting for it is in a native HLE wait (dm_thread_native_wait), blocked as it would be
@@ -317,7 +336,16 @@ static int64_t block(thr_t *t, int kind, int64_t ns) {   // the core's token is 
     core_acquire(t);
     return r;
 }
-static int64_t block_(thr_t *t, int kind, int64_t ns) {
+static int64_t block_x(thr_t *t, int kind, int64_t ns);
+static int64_t block_(thr_t *t, int kind, int64_t ns) {   // the counters around the wait (vk19.59b): which kind, and how it ended
+    if (kind >= 1 && kind <= 4) t->sy[SY_W_LOCK + kind - 1]++;
+    if (ns == 0) return block_x(t, kind, ns);
+    static uint64_t ms1; if (!ms1) ms1 = sy_tick_hz() / 1000;
+    uint64_t t0 = sy_ticks(); int64_t r = block_x(t, kind, ns); uint64_t d = sy_ticks() - t0;
+    t->sy[SY_W_TK] += d; t->sy[r == R_TIMEOUT ? SY_W_TIMEOUT : d < ms1 ? SY_W_SHORT : SY_W_LONG]++;
+    return r;
+}
+static int64_t block_x(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     hand_leave(t);
@@ -326,6 +354,7 @@ static int64_t block_(thr_t *t, int kind, int64_t ns) {
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
     if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
+    if (t->woke) t->sy[SY_W_PRE]++;   // woken before it slept (no futex wait)
     while (!t->woke) {
         int rc;
         if (det_wait) {
@@ -347,8 +376,9 @@ static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic
 
 // Release the lock at addr: hand it to the first thread waiting on it, or clear it to zero (holding G)
 static void lock_handoff(uint64_t addr) {
-    thr_t *w = pick(1, addr); int more = 0;
-    if (!w) { st32(addr, 0); return; }
+    thr_t *w = pick(1, addr); int more = 0; thr_t *me = pthread_getspecific(g_keythr);
+    if (!w) { st32(addr, 0); if (me) me->sy[SY_REL_NONE]++; return; }   // released with nobody waiting (an SVC the waiters bit asked for in vain)
+    if (me) me->sy[SY_HANDOFF]++;
     for (thr_t *t = g_wait; t; t = t->next) if (t != w && t->wkind == 1 && t->waddr == addr) { more = 1; break; }
     st32(addr, w->wtag | (more ? WAITERS_BIT : 0));
     wake(w, 0);
@@ -835,7 +865,7 @@ static uint64_t yield_backoff_ns(uint64_t run_ns) {
 // sched_yield, or a short sleep once the wait has lasted run_ns past the back-off's start
 static void yield_for(thr_t *me, uint64_t run_ns) {
     uint64_t bo = yield_backoff_ns(run_ns);
-    if (bo) { me->nbackoff++; me->sleeping = 1; struct timespec ts = {0, (long)bo}; nanosleep(&ts, 0); me->sleeping = 0; }
+    if (bo) { me->nbackoff++; me->sy[SY_NAP_BACKOFF]++; me->sleeping = 1; struct timespec ts = {0, (long)bo}; nanosleep(&ts, 0); me->sleeping = 0; }
     else sched_yield();
 }
 // One yield SVC of the calling thread (me may be NULL); regs = the guest registers at the SVC.
@@ -949,10 +979,11 @@ void dm_thread_cpu(char *out, size_t n, double secs) {
 // Metroid Dread's sound thread sleeps "33 ms minus this round's work" (main+0xf95b0), and on the host its period became 36.9 ms; cutscenes render a frame whenever the audio play position that thread updates moves, so they ran at about 27 fps (30 on the Switch).
 // Each step sleeps only 3/4 of the remaining time (the slack is at most about 25%, so it never oversleeps), looping until within 20 µs: a 33 ms sleep takes about 4 system calls with an error of tens of microseconds, and nothing spins
 static void sleep_precise(uint64_t dl) {
+    thr_t *me = pthread_getspecific(g_keythr);
     for (int i = 0; i < 16; i++) {
         uint64_t now = now_ns(); if (now + 20000 >= dl) return;
         uint64_t rem = dl - now, s = rem < 100000 ? rem : rem - rem / 4;
-        struct timespec ts = {(time_t)(s / 1000000000u), (long)(s % 1000000000u)}; nanosleep(&ts, 0);
+        struct timespec ts = {(time_t)(s / 1000000000u), (long)(s % 1000000000u)}; nanosleep(&ts, 0); if (me) me->sy[SY_NAP_PRECISE]++;
     }
 }
 // A guest thread sleeps ns nanoseconds the way SleepThread does: on the guest clock under the deterministic clock, else on time (sleep_precise). Also for host hooks that stand for a
@@ -961,7 +992,8 @@ void dm_guest_sleep_ns(int64_t ns) {
     if (ns <= 0) return;
     if (dm_detclock_enabled()) {
         uint64_t deadline = guest_ns() + (uint64_t)ns;
-        while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
+        thr_t *me = pthread_getspecific(g_keythr);
+        while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); if (me) me->sy[SY_NAP_DET]++; }
         return;
     }
     thr_t *me = pthread_getspecific(g_keythr); if (me) me->sleeping = 1;
@@ -1125,6 +1157,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
         pthread_mutex_lock(&G);
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // In kernel order; once turned into a lock wait or woken it is no longer kind 2
+        { thr_t *me = pthread_getspecific(g_keythr); if (me) me->sy[n ? SY_SIG : SY_SIG_NONE]++; }
         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
         if (!left) st32(key, 0);
         pthread_mutex_unlock(&G);
@@ -1161,7 +1194,8 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             if (!cas32(addr, &e, (uint32_t)nv)) r = R_BAD_STATE;
         }
         if (!r) { int n = 0;
-            for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(3, addr)); n++) wake(w, 0); }
+            for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(3, addr)); n++) wake(w, 0);
+            thr_t *me = pthread_getspecific(g_keythr); if (me) me->sy[n ? SY_SIG : SY_SIG_NONE]++; }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
@@ -1311,4 +1345,28 @@ void hle_clear_system_event(void *ev) {   // Clear a bound service-layer SystemE
         e->signaled = 0;
     }
     pthread_mutex_unlock(&G);
+}
+// The guest synchronization counters since the last call, per frame over `frames` (vk19.59b; the Vulkan backend's per-600 lines): the 8 threads with the most waits, naps
+// and releases, then all threads. Per thread: releases with no waiter / hand-offs, signals with no waiter / that woke one, waits by kind (lock, condition, address, object)
+// and how they ended (woken before sleeping, under 1 ms, 1 ms or more, timed out) with their ms, naps (peer wait 50 us, yield back-off, precise-sleep steps, deterministic-clock steps)
+void dm_guest_sync_report(char *out, size_t n, uint64_t frames) {
+    double fr = frames ? (double)frames : 1, tms = sy_tick_hz() / 1000.0; thr_t *top[8] = {0}; uint64_t key[8] = {0}, all[SY_N] = {0}; size_t o = 0; out[0] = 0;
+    pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t; t = t->all) {
+        uint64_t d[SY_N]; for (int k = 0; k < SY_N; k++) { d[k] = t->sy[k] - t->sy_seen[k]; all[k] += d[k]; }
+        uint64_t k = d[SY_REL_NONE] + d[SY_HANDOFF] + d[SY_SIG_NONE] + d[SY_SIG] + d[SY_W_LOCK] + d[SY_W_COND] + d[SY_W_ADDR] + d[SY_W_SYNC] + d[SY_NAP_PEER] + d[SY_NAP_PRECISE] + d[SY_NAP_DET] + d[SY_NAP_BACKOFF];
+        for (int i = 0; i < 8; i++) if (!top[i] || k > key[i]) { for (int j = 7; j > i; j--) { top[j] = top[j - 1]; key[j] = key[j - 1]; } top[i] = t; key[i] = k; break; }
+    }
+    for (int i = 0; i < 8 && top[i] && key[i] && o < n; i++) {
+        thr_t *t = top[i]; uint64_t d[SY_N]; for (int k = 0; k < SY_N; k++) d[k] = t->sy[k] - t->sy_seen[k];
+        char nb[48]; const char *nm = thr_name(t, nb, sizeof nb);
+        o += (size_t)snprintf(out + o, n - o, "%s'%s': releases no waiter %.1f / hand-off %.1f, signals no waiter %.1f / woke %.1f, waits lock %.1f cond %.1f addr %.1f obj %.1f (pre %.1f, <1 ms %.1f, >=1 ms %.1f, timeout %.1f; %.2f ms), naps peer %.1f back-off %.1f precise %.1f det %.1f",
+                              i ? "; " : "", nm, d[SY_REL_NONE] / fr, d[SY_HANDOFF] / fr, d[SY_SIG_NONE] / fr, d[SY_SIG] / fr, d[SY_W_LOCK] / fr, d[SY_W_COND] / fr, d[SY_W_ADDR] / fr, d[SY_W_SYNC] / fr,
+                              d[SY_W_PRE] / fr, d[SY_W_SHORT] / fr, d[SY_W_LONG] / fr, d[SY_W_TIMEOUT] / fr, d[SY_W_TK] / tms / fr, d[SY_NAP_PEER] / fr, d[SY_NAP_BACKOFF] / fr, d[SY_NAP_PRECISE] / fr, d[SY_NAP_DET] / fr);
+    }
+    for (thr_t *t = g_all; t; t = t->all) memcpy(t->sy_seen, t->sy, sizeof t->sy);
+    pthread_mutex_unlock(&G);
+    if (o < n) snprintf(out + o, n - o, "%sall threads: releases no waiter %.1f / hand-off %.1f, signals no waiter %.1f / woke %.1f, waits %.1f (pre %.1f, <1 ms %.1f, >=1 ms %.1f, timeout %.1f; %.2f ms), naps peer %.1f back-off %.1f precise %.1f det %.1f",
+                         o ? " || " : "", all[SY_REL_NONE] / fr, all[SY_HANDOFF] / fr, all[SY_SIG_NONE] / fr, all[SY_SIG] / fr, (all[SY_W_LOCK] + all[SY_W_COND] + all[SY_W_ADDR] + all[SY_W_SYNC]) / fr,
+                         all[SY_W_PRE] / fr, all[SY_W_SHORT] / fr, all[SY_W_LONG] / fr, all[SY_W_TIMEOUT] / fr, all[SY_W_TK] / tms / fr, all[SY_NAP_PEER] / fr, all[SY_NAP_BACKOFF] / fr, all[SY_NAP_PRECISE] / fr, all[SY_NAP_DET] / fr);
 }

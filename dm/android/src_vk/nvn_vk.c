@@ -4916,6 +4916,8 @@ static void meas_lines(void) {
       memcpy(ptid, tid, sizeof tid); memcpy(pnf, nf, sizeof nf); pk = k;
       LOG("vk: guest-memory protection per frame over the last 600: page faults %.2f (%s); mprotect %.1f calls, %.3f ms", all / 600.0, q ? fb : "none", (mc - pmc) / 600.0, (mns - pmns) / 600e6);
       pmc = mc; pmns = mns; }
+    { void dm_guest_sync_report(char *out, size_t n, uint64_t frames); static char gs[4096]; dm_guest_sync_report(gs, sizeof gs, 600);   // hle_thread.c (vk19.59b)
+      LOG("vk: guest sync per frame over the last 600, the 8 busiest threads: %s", gs); }
     memset(g_ci_hit, 0, sizeof g_ci_hit); memset(g_ci_miss, 0, sizeof g_ci_miss); memset(g_ci_mbytes, 0, sizeof g_ci_mbytes); memset(g_ci_why, 0, sizeof g_ci_why); memset(g_ci_pool, 0, sizeof g_ci_pool);
     g_ic_hit = g_ic_scan = g_ic_idx = g_ic_same = g_ic_coll = g_ic_new = g_ic_keys = g_ic_keys_over = 0; memset(g_ick, 0, sizeof g_ick); g_tex_draws_win = 0;
     memset(g_shw_n, 0, sizeof g_shw_n); memset(g_shw_b, 0, sizeof g_shw_b); memset(g_shw_all, 0, sizeof g_shw_all); g_shw_ns = 0;
