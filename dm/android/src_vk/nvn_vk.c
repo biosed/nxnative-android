@@ -2587,9 +2587,10 @@ static void *pso_precreate(void *a) { pthread_setname_np("dm-psopre");
 // from DM_VK_CTL_FILE ("set <name> <value>", vk_ctl: the file is read again only when its modification time changes, at most once a frame). The value is an atomic; the
 // recording thread takes a copy of every value once per submission (tog_latch at mtl_sub_begin) and reads only that copy (tog), so a switch never changes in the middle
 // of a submission. A name not on the run-time list is refused when the file sets it (it is read at start only)
-enum { TG_SHADOW, TG_N };
+enum { TG_SHADOW, TG_IDX_NEON, TG_N };
 static struct { const char *name; int runtime; _Atomic int val; } g_tog[TG_N] = {
     [TG_SHADOW] = {"DM_VK_SHADOW", 1},   // diagnostic: what a persistent cache could save (copy_in / index-scan misses whose bytes an earlier copy already had)
+    [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2)
 };
 static int g_tog_lat[TG_N];
 static void tog_init(void) {
@@ -2637,6 +2638,53 @@ static void shadow_note(int kind, uint64_t addr, uint64_t len) {   // kind 0 a c
     if (e->addr == addr && e->len == len && e->kind == kind && e->h == h) { int w = e->sub == sub ? 0 : e->frame == fr ? 1 : 2; g_shw_n[kind][w]++; g_shw_b[kind][w] += len; }
     *e = (typeof(*e)){addr, h, sub, fr, (uint32_t)(len > UINT32_MAX ? UINT32_MAX : len), (uint8_t)kind};
     g_shw_ns += now_ns() - t0;
+}
+// DM_VK_IDX_NEON (vk19.60, plan v4 C1, off by default; on the run-time list): the lowest and highest vertex an index range uses, by NEON min/max over 16 / 8 / 4 lanes,
+// the index size chosen once outside the loop (the scalar scan tests it per index through IDX). The restart index (all ones at the index's size) is left out as the scalar
+// scan does: it is the largest value, so the minimum over raw lanes is right unless every index is a restart (then the minimum is the restart itself: answered as none), and
+// the maximum is taken over lanes with restarts cleared (v & ~(v == restart)), which only lowers them to 0, never above the true maximum. =2 (verify): both scans, the scalar
+// result used, differences counted and the first 8 logged
+#include <arm_neon.h>
+static uint64_t g_neon_chk, g_neon_bad;
+static void idx_scan_scalar(const void *src, int32_t n, uint32_t isz, uint32_t *plo, uint32_t *phi) {
+    uint32_t lo = UINT32_MAX, hi = 0;
+    if (isz == 1) { const uint8_t *p = src; for (int32_t i = 0; i < n; i++) { uint32_t v = p[i]; if (v == 0xff) continue; if (v < lo) lo = v; if (v > hi) hi = v; } }
+    else if (isz == 2) { const uint16_t *p = src; for (int32_t i = 0; i < n; i++) { uint32_t v = p[i]; if (v == 0xffff) continue; if (v < lo) lo = v; if (v > hi) hi = v; } }
+    else { const uint32_t *p = src; for (int32_t i = 0; i < n; i++) { uint32_t v = p[i]; if (v == 0xffffffffu) continue; if (v < lo) lo = v; if (v > hi) hi = v; } }
+    *plo = lo; *phi = hi;
+}
+static void idx_scan_neon(const void *src, int32_t n, uint32_t isz, uint32_t *plo, uint32_t *phi) {
+    uint32_t lo, hi; int32_t i = 0;
+    if (isz == 2) {
+        const uint16_t *p = src; uint16x8_t mn0 = vdupq_n_u16(0xffff), mn1 = mn0, mx0 = vdupq_n_u16(0), mx1 = mx0; const uint16x8_t r = vdupq_n_u16(0xffff);
+        for (; i + 16 <= n; i += 16) { uint16x8_t a = vld1q_u16(p + i), b = vld1q_u16(p + i + 8);
+            mn0 = vminq_u16(mn0, a); mn1 = vminq_u16(mn1, b); mx0 = vmaxq_u16(mx0, vbicq_u16(a, vceqq_u16(a, r))); mx1 = vmaxq_u16(mx1, vbicq_u16(b, vceqq_u16(b, r))); }
+        lo = vminvq_u16(vminq_u16(mn0, mn1)); hi = vmaxvq_u16(vmaxq_u16(mx0, mx1));
+        for (; i < n; i++) { uint32_t v = p[i]; if (v < lo) lo = v; if (v != 0xffff && v > hi) hi = v; }
+        if (lo == 0xffff) lo = UINT32_MAX;
+    } else if (isz == 4) {
+        const uint32_t *p = src; uint32x4_t mn0 = vdupq_n_u32(0xffffffffu), mn1 = mn0, mx0 = vdupq_n_u32(0), mx1 = mx0; const uint32x4_t r = vdupq_n_u32(0xffffffffu);
+        for (; i + 8 <= n; i += 8) { uint32x4_t a = vld1q_u32(p + i), b = vld1q_u32(p + i + 4);
+            mn0 = vminq_u32(mn0, a); mn1 = vminq_u32(mn1, b); mx0 = vmaxq_u32(mx0, vbicq_u32(a, vceqq_u32(a, r))); mx1 = vmaxq_u32(mx1, vbicq_u32(b, vceqq_u32(b, r))); }
+        lo = vminvq_u32(vminq_u32(mn0, mn1)); hi = vmaxvq_u32(vmaxq_u32(mx0, mx1));
+        for (; i < n; i++) { uint32_t v = p[i]; if (v < lo) lo = v; if (v != 0xffffffffu && v > hi) hi = v; }
+    } else {
+        const uint8_t *p = src; uint8x16_t mn = vdupq_n_u8(0xff), mx = vdupq_n_u8(0); const uint8x16_t r = vdupq_n_u8(0xff);
+        for (; i + 16 <= n; i += 16) { uint8x16_t a = vld1q_u8(p + i); mn = vminq_u8(mn, a); mx = vmaxq_u8(mx, vbicq_u8(a, vceqq_u8(a, r))); }
+        lo = vminvq_u8(mn); hi = vmaxvq_u8(mx);
+        for (; i < n; i++) { uint32_t v = p[i]; if (v < lo) lo = v; if (v != 0xff && v > hi) hi = v; }
+        if (lo == 0xff) lo = UINT32_MAX;
+    }
+    if (lo == UINT32_MAX) hi = 0;   // every index a restart: as the scalar scan (none)
+    *plo = lo; *phi = hi;
+}
+static void idx_scan(const void *src, int32_t n, uint32_t isz, uint32_t *plo, uint32_t *phi) {
+    int m = tog(TG_IDX_NEON);
+    if (!m) { idx_scan_scalar(src, n, isz, plo, phi); return; }
+    idx_scan_neon(src, n, isz, plo, phi);
+    if (m == 2) { uint32_t lo, hi; idx_scan_scalar(src, n, isz, &lo, &hi); g_neon_chk++;
+        if (lo != *plo || hi != *phi) { g_neon_bad++; static int nl; if (nl++ < 8) LOG("[RED] vk: DM_VK_IDX_NEON=2: %d indices of %u bytes at %p: NEON %u-%u, scalar %u-%u", n, isz, src, *plo, *phi, lo, hi); }
+        *plo = lo; *phi = hi; }
 }
 // Distinct index ranges (address, count, index size) scanned in a 600-frame window: an open-addressed set, emptied at each window's line; full: counted as over
 enum { NICK = 1 << 14 };
@@ -3420,8 +3468,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             if (k == g_nwlog) { e->seq = g_nwlog; lo = e->lo; hi = e->hi; hit = 1; }
         }
         if (!hit) {
-            uint32_t restart = isz == 1 ? 0xff : isz == 2 ? 0xffff : 0xffffffffu;
-            for (int32_t i = 0; i < di->count; i++) { uint32_t v = IDX(i); if (v == restart) continue; if (v < lo) lo = v; if (v > hi) hi = v; }
+            idx_scan(isrc, di->count, isz, &lo, &hi);   // scalar, or NEON with DM_VK_IDX_NEON (vk19.60)
             g_ic_scan++; g_ic_idx += (uint64_t)di->count; ic_key(ia, di->count, isz);
             if (e->a == ia && e->n == di->count && e->isz == isz) g_ic_same++; else if (e->a && e->gen == g_wgen) g_ic_coll++; else g_ic_new++;   // the same key again (earlier submission or written since) / a live key pushed out / a free or old slot
             shadow_note(1, ia, (uint64_t)di->count * isz);
@@ -4772,6 +4819,7 @@ static void meas_lines(void) {
     LOG("vk: index ranges per frame over the last 600: %.1f reused, %.1f scanned (%.0f indices); scans of the same range again %.1f, over another live range %.1f, into a free or old slot %.1f;"
         " %llu distinct ranges in the 600 frames%s; texel buffer views made %.1f a frame; tex_get %.1f a draw", g_ic_hit / 600.0, g_ic_scan / 600.0, g_ic_idx / 600.0, g_ic_same / 600.0, g_ic_coll / 600.0, g_ic_new / 600.0,
         (unsigned long long)g_ic_keys, g_ic_keys_over ? " (the set was full: more)" : "", atomic_exchange(&g_bv_made, 0) / 600.0, atomic_exchange(&g_texget_n, 0) / (double)draws);
+    if (g_neon_chk) { LOG("vk: DM_VK_IDX_NEON=2 over the last 600 frames: %llu scans checked against the scalar scan, %llu differed", (unsigned long long)g_neon_chk, (unsigned long long)g_neon_bad); g_neon_chk = g_neon_bad = 0; }
     if (g_shw_all[0] || g_shw_all[1])
         LOG("vk: DM_VK_SHADOW per frame over the last 600: copies whose bytes an earlier copy of the range had: same submission %.1f (%.2f MB), another submission of the frame %.1f (%.2f MB), an earlier frame %.1f (%.2f MB)"
             " of %.1f copies; index scans likewise: %.1f, %.1f, %.1f of %.1f (%.0f / %.0f / %.0f indices' bytes KB); hashing %.2f ms",
