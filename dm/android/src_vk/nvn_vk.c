@@ -3244,7 +3244,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
         if (!dset_cache2() || (ce->key2 == key2 && ce->nk == nk && (nk > KMAX || !memcmp(ce->km, km, (size_t)nk * 8)))) { g_dsc_hit++; wsc_keep(&nc, fit, s, stage, ce->ds); return ce->ds; }
         g_dsc_rej++;   // the same 64-bit hash, other bindings: a new set
     }
-    static uint32_t nmiss; int timed = !tog(TG_LEAN) || !(nmiss++ & 7);   // DM_VK_LEAN: one miss in 8 timed (the line's average per set stays)
+    static uint32_t nmiss; int timed = !tog(TG_LEAN) || nmiss++ % 7 == 0;   // DM_VK_LEAN: one miss in 7 timed (an odd period: misses alternate between stages; the line's average per set stays)
     uint64_t tm0 = timed ? stat_ns() : 0;
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, C->dps[C->idp], 1, &s->dsl};
     while (vkAllocateDescriptorSets(g_dev, &ai, &ds) != VK_SUCCESS) {   // this pool is full: the next of the chain, made when there is none

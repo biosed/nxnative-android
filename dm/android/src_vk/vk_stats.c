@@ -107,11 +107,15 @@ static void second_tick(uint64_t k) {
     if (dm_front_battery) { long q = 0, i = 0; int mv = -1, pl = -1;
         if (dm_front_battery(&q, &i, &mv, &pl, g_plugged < 0)) {   // the plug state with the first reading, then once a window
             if (pl >= 0) g_plugged = pl;
-            if (g_cur_ma < 0 && i) g_cur_ma = labs(i) < 50000; if (g_q_mah < 0 && q > 0) g_q_mah = q < 200000;
+            int i_ok = i != INT32_MIN, q_ok = q != INT32_MIN && q > 0;   // Integer.MIN_VALUE: the property is not supported (no reading)
+            // the current's unit only from an unplugged reading clear of the overlap (vk19.63b): 100 <= |i| < 50,000 is mA, |i| >= 100,000 is uA, anything else waits
+            // (plugged in at 100% a uA current can be under 50,000)
+            if (g_cur_ma < 0 && i_ok && g_plugged == 0) { long a = labs(i); if (a >= 100 && a < 50000) g_cur_ma = 1; else if (a >= 100000) g_cur_ma = 0; }
+            if (g_q_mah < 0 && q_ok) g_q_mah = q < 200000;
             if (!g_sign_logged && g_plugged == 0 && i && g_cur_ma >= 0) { g_sign_logged = 1;
                 LOG("vk: battery readings: current in %s, %s while discharging (%ld); charge counter in %s (%ld)", g_cur_ma ? "mA" : "uA", i < 0 ? "negative" : "positive", i, g_q_mah == 1 ? "mAh" : "uAh", q); }
-            q = q_uah(q); if (!W.nq++ && W.q0 == 0) W.q0 = q; W.q_last = q;
-            double c = cur_ua(i); W.cur_sum += g_plugged == 0 ? fabs(c) : c; W.ncur++; } }   // unplugged: the drain, whatever the sign
+            if (q_ok && g_q_mah >= 0) { q = q_uah(q); if (!W.nq++ && W.q0 == 0) W.q0 = q; W.q_last = q; }
+            if (i_ok && g_cur_ma >= 0) { double c = cur_ua(i); W.cur_sum += g_plugged == 0 ? fabs(c) : c; W.ncur++; } } }   // until the unit is known: not averaged   // unplugged: the drain, whatever the sign
 }
 // Thread groups (vk19.59c): the recording thread (RHIThread, the critical path), the host's own threads (dm-*, dm hitch…), and the game's (every other thread of the process)
 static void groups(uint64_t g[3]) {
