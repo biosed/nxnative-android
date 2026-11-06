@@ -211,6 +211,7 @@ static int g_pend[NCTX_MAX], g_npend;   // contexts submitted and not yet comple
 
 static uint64_t g_wgen;   // a new generation when the ring changes or the write log overflows: the per-submission copies are reused only within one (and only where no write since overlaps them, copy_in)
 static uint32_t g_nwlog;   // writes logged in this generation (wlog_add)
+static uint64_t g_bgen[6], g_bgen_next = 1;   // a stage's binding generation: changes when its texture, image, sampler or storage-buffer bindings change (DM_VK_SEG_CACHE, DM_VK_FB_FAST)
 static uint64_t g_tex_draws_win;   // draws recorded in the 600-frame window (trace_add; tex_get calls per draw, vk19.59)
 static int zc_mode(void); static int zc_find(uint64_t addr, uint64_t n, VkBuffer *b, VkDeviceSize *off); static void zc_reap(uint64_t done);   // zero-copy pools (DM_VK_ZEROCOPY)
 static int g_zc_dev; static uint64_t g_zc_bytes, g_zc_hits, g_zc_miss_wlog;
@@ -2587,10 +2588,11 @@ static void *pso_precreate(void *a) { pthread_setname_np("dm-psopre");
 // from DM_VK_CTL_FILE ("set <name> <value>", vk_ctl: the file is read again only when its modification time changes, at most once a frame). The value is an atomic; the
 // recording thread takes a copy of every value once per submission (tog_latch at mtl_sub_begin) and reads only that copy (tog), so a switch never changes in the middle
 // of a submission. A name not on the run-time list is refused when the file sets it (it is read at start only)
-enum { TG_SHADOW, TG_IDX_NEON, TG_N };
+enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_N };
 static struct { const char *name; int runtime; _Atomic int val; } g_tog[TG_N] = {
     [TG_SHADOW] = {"DM_VK_SHADOW", 1},   // diagnostic: what a persistent cache could save (copy_in / index-scan misses whose bytes an earlier copy already had)
     [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2)
+    [TG_FB_FAST] = {"DM_VK_FB_FAST", 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2)
 };
 static int g_tog_lat[TG_N];
 static void tog_init(void) {
@@ -2819,9 +2821,8 @@ static fbsnap_t *fb_snap_for(vtex *v, int i) {   // the snapshot image for attac
     e->src = v; e->lv = lv; e->ly = ly; P.cwr[i] = 0; g_fb_copies++;
     return e;
 }
-static void fb_prepare(shader_t *fs) {   // before a draw (pass open): find the sampled colour attachments it writes, snapshot them, and have write_set bind the snapshots
-    g_fb_n = 0;
-    int want[8] = {0}, any = 0;
+static int fb_want_full(shader_t *fs, int want[8]) {   // the attachments the draw samples: each texture binding through tex_get, compared with the pass's attachments
+    int any = 0;
     for (int i = 0; i < fs->nb; i++) {
         const sbind *b = &fs->b[i];
         // a bound slot, or a handle read from a uniform buffer: FINAL FANTASY XII THE ZODIAC AGE's full-screen passes sample their own attachment through such handles
@@ -2832,6 +2833,53 @@ static void fb_prepare(shader_t *fs) {   // before a draw (pass open): find the 
         vtex *v = tex_get(&tr.t, 0); if (!v) continue;
         for (int a = 0; a < P.n; a++) if (P.ct[a] == v && P.cv[a] && v->d <= 1 && (S.chmask.mask >> (4 * a) & 0xf)) { want[a] = 1; any = 1; }
     }
+    return any;
+}
+// DM_VK_FB_FAST (vk19.61, plan v4 C2, off by default; on the run-time list): the same answer without a registration copy and a tex_get per texture binding of every draw.
+// The bindings' texture serials are read under one lock and compared with the pass's attachments' serials (two IDs can name one texture: the serial is the texture's); only
+// a binding whose serial matches goes the full way (tex_get, the pointer compare as before), so the answer is the full way's. A draw that samples none is remembered per
+// fragment shader with what decides it -- its stage's bindings (g_bgen[1]), the registrations (g_reg_gen), the texture pool base, the pass's attachments, views and colour
+// mask -- and the next draw with all of them the same skips even the serials. Shaders reading texture handles from a uniform buffer (K_TEXU) are not remembered: their handles
+// change with the buffer's bytes. =2 (verify): both ways, the full way's answer used, differences counted
+static uint64_t g_fbf_draws, g_fbf_cached, g_fbf_serial, g_fbf_full, g_fbf_chk, g_fbf_bad;
+static struct { shader_t *fs; uint64_t bgen, reg; int tb, n; vtex *ct[8]; VkImageView cv[8]; uint64_t mask; } g_fbc[256];
+static int fb_want_fast(shader_t *fs, int want[8]) {
+    uint64_t reg = atomic_load_explicit(&g_reg_gen, memory_order_relaxed), mask = S.chmask.mask;
+    typeof(g_fbc[0]) *c = &g_fbc[((uintptr_t)fs >> 4 ^ (uintptr_t)fs >> 12) % 256];
+    if (c->fs == fs && c->bgen == g_bgen[1] && c->reg == reg && c->tb == S.tex_base && c->n == P.n && c->mask == mask &&
+        !memcmp(c->ct, P.ct, sizeof c->ct) && !memcmp(c->cv, P.cv, sizeof c->cv)) { g_fbf_cached++; return 0; }
+    uint64_t ser[8]; int na = 0, cand[64], nc = 0, texu = 0;
+    for (int a = 0; a < P.n; a++) ser[a] = P.ct[a] && P.cv[a] && P.ct[a]->d <= 1 && (mask >> (4 * a) & 0xf) ? P.ct[a]->serial : 0, na += ser[a] != 0;
+    if (na) {
+        lk_(&g_rmu, LW_RMU);
+        for (int i = 0; i < fs->nb; i++) {
+            const sbind *b = &fs->b[i];
+            if (b->type != BT_CIS || !((b->kind == K_TEX && b->reg >= 0 && b->reg < NTEX) || (b->kind == K_TEXU && b->count == 1))) continue;
+            if (b->kind == K_TEXU) texu = 1;
+            int tid = (int)((b->kind == K_TEXU ? texu_slot(1, b) : S.tex[1][b->reg]) & 0xfffff); if (!tid || tid >= g_ntreg || !g_treg[tid].ok) continue;
+            uint64_t s = g_treg[tid].t.serial; for (int a = 0; a < P.n; a++) if (ser[a] && ser[a] == s) { if (nc < 64) cand[nc++] = tid; break; }
+        }
+        pthread_mutex_unlock(&g_rmu);
+    } else for (int i = 0; i < fs->nb; i++) if (fs->b[i].type == BT_CIS && fs->b[i].kind == K_TEXU) texu = 1;
+    int any = 0;
+    for (int k = 0; k < nc; k++) {   // the full way for these few
+        lk_(&g_rmu, LW_RMU); treg_t tr = cand[k] < g_ntreg ? g_treg[cand[k]] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
+        if (!tr.ok) continue;
+        vtex *v = tex_get(&tr.t, 0); if (!v) continue;
+        for (int a = 0; a < P.n; a++) if (P.ct[a] == v && P.cv[a] && v->d <= 1 && (mask >> (4 * a) & 0xf)) { want[a] = 1; any = 1; }
+    }
+    if (nc) g_fbf_full++; else g_fbf_serial++;
+    if (!any && !texu) { c->fs = fs; c->bgen = g_bgen[1]; c->reg = reg; c->tb = S.tex_base; c->n = P.n; c->mask = mask; memcpy(c->ct, P.ct, sizeof c->ct); memcpy(c->cv, P.cv, sizeof c->cv); }
+    return any;
+}
+static void fb_prepare(shader_t *fs) {   // before a draw (pass open): find the sampled colour attachments it writes, snapshot them, and have write_set bind the snapshots
+    g_fb_n = 0;
+    int want[8] = {0}, any, m = tog(TG_FB_FAST);
+    if (!m) any = fb_want_full(fs, want);
+    else { g_fbf_draws++; any = fb_want_fast(fs, want);
+        if (m == 2) { int w2[8] = {0}, a2 = fb_want_full(fs, w2); g_fbf_chk++;
+            if (a2 != any || memcmp(w2, want, sizeof w2)) { g_fbf_bad++; static int nl; if (nl++ < 8) LOG("[RED] vk: DM_VK_FB_FAST=2: shader %s: fast %d, full %d", fs->key, any, a2); }
+            any = a2; memcpy(want, w2, sizeof w2); } }
     if (!any) return;
     int need = 0; for (int a = 0; a < P.n; a++) if (want[a] && P.cwr[a]) need = 1;
     if (need) pass_end();
@@ -2912,7 +2960,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage);
 // DM_VK_SEG_CACHE (vk19.38, default 1): the 4 KB driver segment is a function of the stage's texture, image, sampler and storage-buffer bindings and of its kind. g_bgen[stage]
 // changes with any bind of those (OP_BIND_TEX / SAMP / IMG / SSBO, the state reset); a segment built in this submission from the same generation is taken as it was, without
 // building, hashing and comparing its 4 KB again (two or three of them for every draw)
-static uint64_t g_bgen[6], g_bgen_next = 1, g_segc_hit, g_segc_miss;
+static uint64_t g_segc_hit, g_segc_miss;   // g_bgen: declared near the top (fb_prepare reads it too)
 static struct { uint64_t gen, bgen; VkBuffer b; VkDeviceSize off; } g_segc[6][3];
 static int seg_cache_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SEG_CACHE"); v = !e || atoi(e) != 0; } return v; }
 // DM_VK_DSET_CACHE2 (vk19.36, default 1). The descriptor-set cache (g_dsc) keys a set by what its bindings resolved to, and two kinds of binding were put into the ring anew
@@ -4819,6 +4867,10 @@ static void meas_lines(void) {
     LOG("vk: index ranges per frame over the last 600: %.1f reused, %.1f scanned (%.0f indices); scans of the same range again %.1f, over another live range %.1f, into a free or old slot %.1f;"
         " %llu distinct ranges in the 600 frames%s; texel buffer views made %.1f a frame; tex_get %.1f a draw", g_ic_hit / 600.0, g_ic_scan / 600.0, g_ic_idx / 600.0, g_ic_same / 600.0, g_ic_coll / 600.0, g_ic_new / 600.0,
         (unsigned long long)g_ic_keys, g_ic_keys_over ? " (the set was full: more)" : "", atomic_exchange(&g_bv_made, 0) / 600.0, atomic_exchange(&g_texget_n, 0) / (double)draws);
+    if (g_fbf_draws) { LOG("vk: DM_VK_FB_FAST per frame over the last 600: %.1f draws looked at, %.1f answered from the shader cache, %.1f by texture serials alone, %.1f with the full way for a matching serial%s",
+                           g_fbf_draws / 600.0, g_fbf_cached / 600.0, g_fbf_serial / 600.0, g_fbf_full / 600.0, "");
+                       if (g_fbf_chk) LOG("vk: DM_VK_FB_FAST=2 over the last 600 frames: %llu draws checked against the full way, %llu differed", (unsigned long long)g_fbf_chk, (unsigned long long)g_fbf_bad);
+                       g_fbf_draws = g_fbf_cached = g_fbf_serial = g_fbf_full = g_fbf_chk = g_fbf_bad = 0; }
     if (g_neon_chk) { LOG("vk: DM_VK_IDX_NEON=2 over the last 600 frames: %llu scans checked against the scalar scan, %llu differed", (unsigned long long)g_neon_chk, (unsigned long long)g_neon_bad); g_neon_chk = g_neon_bad = 0; }
     if (g_shw_all[0] || g_shw_all[1])
         LOG("vk: DM_VK_SHADOW per frame over the last 600: copies whose bytes an earlier copy of the range had: same submission %.1f (%.2f MB), another submission of the frame %.1f (%.2f MB), an earlier frame %.1f (%.2f MB)"
