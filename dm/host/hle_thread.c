@@ -118,6 +118,21 @@ static _Atomic uint64_t g_preempt_n, g_preempt_ns;   // same-core handoffs: coun
 static int g_core_preempt;   // also check already-runnable peers after every thread SVC (profile / DM_PREEMPT)
 
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
+// DM_G_SPIN=<n> (vk19.64, off by default): the synchronization SVCs (ArbitrateLock / Unlock, the condition and address waits and signals, WaitSynchronization) try G
+// up to n times, a CPU yield hint between tries, before the blocking lock. G is held for short stretches; a contended pthread_mutex_lock goes to bionic's slow path, which
+// waits in the kernel and on Android 15 also formats a ScopedTrace string (profile P1: NonPI::MutexLockWithTimeout 1.1 ms a frame, its snprintf 0.19). Spinning trades a
+// little CPU for the system call, the sleep and the wake-up; the counts are in the guest-sync line ('G taken by spinning')
+static int g_spin = -1; static _Atomic uint64_t g_spin_hit, g_spin_miss;
+static inline void g_lock(void) {
+    if (g_spin < 0) { const char *e = getenv("DM_G_SPIN"); int v = e ? atoi(e) : 0; g_spin = v < 0 ? 0 : v > 100000 ? 100000 : v; if (g_spin) LOG("DM_G_SPIN=%d: the synchronization SVCs try the kernel lock %d times before blocking", g_spin, g_spin); }
+    if (g_spin) { for (int i = 0; i < g_spin; i++) { if (!pthread_mutex_trylock(&G)) { if (i) atomic_fetch_add_explicit(&g_spin_hit, 1, memory_order_relaxed); return; }
+#if defined(__aarch64__)
+                      __asm__ volatile("yield");
+#endif
+                  }
+                  atomic_fetch_add_explicit(&g_spin_miss, 1, memory_order_relaxed); }
+    pthread_mutex_lock(&G);
+}
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
 static pthread_key_t g_keythr;
@@ -1114,7 +1129,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
 
     case 0x1A: {  // ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
         thr_t *t = cur(); uint64_t addr = regs[1];
-        pthread_mutex_lock(&G);
+        g_lock();
         int64_t r = 0;
         if (ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) { t->waddr = addr; t->wtag = (uint32_t)regs[2];
             // Under DM_QOS_MAP the owner runs at least at this thread's class until the lock is handed over (the Horizon kernel lends the waiter's priority the same way): a user-interactive
@@ -1126,10 +1141,10 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
-    case 0x1B: pthread_mutex_lock(&G); lock_handoff(regs[0]); pthread_mutex_unlock(&G); regs[0] = 0; return 1;
+    case 0x1B: g_lock(); lock_handoff(regs[0]); pthread_mutex_unlock(&G); regs[0] = 0; return 1;
     case 0x1C: {  // WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
         thr_t *t = cur(); uint64_t addr = regs[0], key = regs[1];
-        pthread_mutex_lock(&G);
+        g_lock();
         // The order matters: first set the condition key = 1, then release the mutex. The SDK's InternalConditionVariable::Signal first reads the condition key in user mode, and does not issue svc 0x1D if it is 0;
         // grabbing the mutex in user mode does not go through G either. It used to do lock_handoff first and set the key after: after the release and before the key was set, another thread could grab the lock in user mode, change the condition, read key 0 and not wake anyone,
         // and this thread would then link itself in and wait forever (under parallel load the resource table read-write lock main+0x320e5e0 deadlocked: reader count 0, lock free, writer condition key 1, writer still waiting).
@@ -1155,7 +1170,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     }
     case 0x1D: {  // SignalProcessWideKey(x0 condition key, w1 count, <=0 all)
         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
-        pthread_mutex_lock(&G);
+        g_lock();
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // In kernel order; once turned into a lock wait or woken it is no longer kind 2
         { thr_t *me = pthread_getspecific(g_keythr); if (me) me->sy[n ? SY_SIG : SY_SIG_NONE]++; }
         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
@@ -1167,7 +1182,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x34: {  // WaitForAddress(x0 address, w1 type, x2 value, x3 timeout): 0 wait if less than, 1 decrement if less than then wait, 2 wait if equal, 3 wait if the 64-bit value is equal
         // (Horizon 18; SDK 19's nn::os::WaitForAddress(const long*, long) uses it, which before fell into the 32-bit less-than test)
         thr_t *t = cur(); uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2];
-        pthread_mutex_lock(&G);
+        g_lock();
         int64_t r; uint32_t v = ld32(addr);
         int ok = type == 3 ? ld64(addr) == regs[2] : type == 2 ? (int32_t)v == val : (int32_t)v < val;
         if (ok && type == 1) { while (!cas32(addr, &v, v - 1)) if (!((int32_t)v < val)) { ok = 0; break; } }
@@ -1179,7 +1194,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     }
     case 0x35: {  // SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake
         uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
-        pthread_mutex_lock(&G);
+        g_lock();
         int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
         int64_t r = 0;
         if (type != 0) {
@@ -1223,7 +1238,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x18: {  // WaitSynchronization(→w1 index; x1 handle array, w2 count, x3 timeout)
         thr_t *t = cur(); const uint32_t *hs = (const uint32_t *)regs[1]; int n = (int)regs[2]; int64_t ns = poll_wait_begin((int64_t)regs[3]);
         int64_t deadline = ns > 0 ? (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
-        pthread_mutex_lock(&G);
+        g_lock();
         int64_t r; int idx = -1;
         for (;;) {
             if (t->cancel) { t->cancel = 0; r = R_CANCELLED; break; }
@@ -1241,7 +1256,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         regs[0] = (uint64_t)r; regs[1] = idx >= 0 ? (uint64_t)idx : 0; return 1;
     }
     case 0x19: {  // CancelSynchronization(w0 thread)
-        pthread_mutex_lock(&G);
+        g_lock();
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
         if (t) { t->cancel = 1; if (t->wkind == 4) wake(t, -1); }
         pthread_mutex_unlock(&G);
@@ -1369,4 +1384,5 @@ void dm_guest_sync_report(char *out, size_t n, uint64_t frames) {
     if (o < n) snprintf(out + o, n - o, "%sall threads: releases no waiter %.1f / hand-off %.1f, signals no waiter %.1f / woke %.1f, waits %.1f (pre %.1f, <1 ms %.1f, >=1 ms %.1f, timeout %.1f; %.2f ms), naps peer %.1f back-off %.1f precise %.1f det %.1f",
                          o ? " || " : "", all[SY_REL_NONE] / fr, all[SY_HANDOFF] / fr, all[SY_SIG_NONE] / fr, all[SY_SIG] / fr, (all[SY_W_LOCK] + all[SY_W_COND] + all[SY_W_ADDR] + all[SY_W_SYNC]) / fr,
                          all[SY_W_PRE] / fr, all[SY_W_SHORT] / fr, all[SY_W_LONG] / fr, all[SY_W_TIMEOUT] / fr, all[SY_W_TK] / tms / fr, all[SY_NAP_PEER] / fr, all[SY_NAP_BACKOFF] / fr, all[SY_NAP_PRECISE] / fr, all[SY_NAP_DET] / fr);
+    if (g_spin > 0) { size_t l = strlen(out); if (l < n) snprintf(out + l, n - l, "; DM_G_SPIN %d: G taken by spinning %.1f, spins that gave up %.1f", g_spin, atomic_exchange(&g_spin_hit, 0) / fr, atomic_exchange(&g_spin_miss, 0) / fr); }
 }
