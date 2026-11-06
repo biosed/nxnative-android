@@ -2651,6 +2651,8 @@ static uint64_t shadow_hash(const uint8_t *p, uint64_t n) {
     for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
     return h;
 }
+static uint64_t g_shw_cb[CI_N][2];   // copies' repeated bytes by caller: [another submission of the frame, an earlier frame] (vk19.66m)
+static int g_shw_caller = -1;   // the copy_in caller of the shadow_note in progress
 static void shadow_note(int kind, uint64_t addr, uint64_t len) {   // kind 0 a copy, 1 an index scan
     if (!tog(TG_SHADOW) || !addr || !len) return;
     uint64_t t0 = now_ns();
@@ -2658,7 +2660,8 @@ static void shadow_note(int kind, uint64_t addr, uint64_t len) {   // kind 0 a c
     uint64_t h = shadow_hash((const uint8_t *)(uintptr_t)addr, len), sub = g_bvgen, fr = atomic_load_explicit(&g_presents, memory_order_relaxed);
     typeof(g_shw[0]) *e = &g_shw[(addr >> 4 ^ addr >> 20 ^ len * 0x9e37u ^ (uint64_t)kind << 15) % NSH];
     g_shw_all[kind]++;
-    if (e->addr == addr && e->len == len && e->kind == kind && e->h == h) { int w = e->sub == sub ? 0 : e->frame == fr ? 1 : 2; g_shw_n[kind][w]++; g_shw_b[kind][w] += len; }
+    if (e->addr == addr && e->len == len && e->kind == kind && e->h == h) { int w = e->sub == sub ? 0 : e->frame == fr ? 1 : 2; g_shw_n[kind][w]++; g_shw_b[kind][w] += len;
+        if (!kind && w && g_shw_caller >= 0 && g_shw_caller < CI_N) g_shw_cb[g_shw_caller][w - 1] += len; }
     *e = (typeof(*e)){addr, h, sub, fr, (uint32_t)(len > UINT32_MAX ? UINT32_MAX : len), (uint8_t)kind};
     g_shw_ns += now_ns() - t0;
 }
@@ -2749,7 +2752,7 @@ static VkDeviceSize copy_in(uint64_t addr, uint64_t size, VkDeviceSize align, in
     // the pool class (vk19.59c): the entry's when it held this address, else looked up for one miss in 8 and counted for 8 (no lock and pool scan on every miss)
     static uint32_t pc_tick; int cls = e->addr == addr && e->cls < PC_N ? e->cls : PC_N;
     if (cls < PC_N) g_ci_pool[cls]++; else if (!(pc_tick++ & 7)) { cls = pool_class(addr); g_ci_pool[cls] += 8; }
-    shadow_note(0, addr, size);
+    g_shw_caller = caller; shadow_note(0, addr, size);
     VkDeviceSize o = ring_put((const void *)(uintptr_t)addr, size, align);
     if (o != VK_WHOLE_SIZE) *e = (dcopy){addr, size, g_wgen, o, g_nwlog, (uint8_t)cls};
     return o;
@@ -4968,6 +4971,9 @@ static void meas_lines(void) {
             " of %.1f copies; index scans likewise: %.1f, %.1f, %.1f of %.1f (%.0f / %.0f / %.0f indices' bytes KB); hashing %.2f ms",
             g_shw_n[0][0] / 600.0, g_shw_b[0][0] / 600.0 / 1048576.0, g_shw_n[0][1] / 600.0, g_shw_b[0][1] / 600.0 / 1048576.0, g_shw_n[0][2] / 600.0, g_shw_b[0][2] / 600.0 / 1048576.0, g_shw_all[0] / 600.0,
             g_shw_n[1][0] / 600.0, g_shw_n[1][1] / 600.0, g_shw_n[1][2] / 600.0, g_shw_all[1] / 600.0, g_shw_b[1][0] / 600.0 / 1024.0, g_shw_b[1][1] / 600.0 / 1024.0, g_shw_b[1][2] / 600.0 / 1024.0, g_shw_ns / 600e6);
+    if (g_shw_all[0]) { static const char *cn2[CI_N] = {"vertex", "index", "index pool", "uniform", "storage", "texel", "image copy"}; char b[600]; size_t o = 0; b[0] = 0;   // by caller (vk19.66m)
+        for (int i = 0; i < CI_N; i++) if (g_shw_cb[i][0] || g_shw_cb[i][1]) o += (size_t)snprintf(b + o, sizeof b - o, "%s%s %.2f / %.2f MB", o ? ", " : "", cn2[i], g_shw_cb[i][0] / 600.0 / 1048576.0, g_shw_cb[i][1] / 600.0 / 1048576.0);
+        LOG("vk: DM_VK_SHADOW copies' repeated bytes per frame by caller (another submission of the frame / an earlier frame): %s", o ? b : "none"); memset(g_shw_cb, 0, sizeof g_shw_cb); }
     { uint32_t v[600]; uint64_t k = g_npp < 600 ? g_npp : 600; memcpy(v, g_pp, k * sizeof *v); qsort(v, k, sizeof *v, u32cmp);
       uint64_t rc = 0; for (int i = 0; i < 8; i++) rc += g_rcore[i]; char cc[160]; size_t q = 0; cc[0] = 0;
       for (int i = 0; i < 8; i++) if (g_rcore[i]) q += (size_t)snprintf(cc + q, sizeof cc - q, "%scpu%d %.0f%%", q ? " " : "", i, 100.0 * g_rcore[i] / (rc ? rc : 1));
@@ -4987,7 +4993,7 @@ static void meas_lines(void) {
       memcpy(ptid, tid, sizeof tid); memcpy(pnf, nf, sizeof nf); pk = k;
       LOG("vk: guest-memory protection per frame over the last 600: page faults %.2f (%s); mprotect %.1f calls, %.3f ms", all / 600.0, q ? fb : "none", (mc - pmc) / 600.0, (mns - pmns) / 600e6);
       pmc = mc; pmns = mns; }
-    { void dm_guest_sync_report(char *out, size_t n, uint64_t frames); static char gs[4096]; dm_guest_sync_report(gs, sizeof gs, 600);   // hle_thread.c (vk19.59b)
+    { void dm_guest_sync_report(char *out, size_t n, uint64_t frames); static char gs[8192]; dm_guest_sync_report(gs, sizeof gs, 600);   // hle_thread.c (vk19.59b)
       LOG("vk: guest sync per frame over the last 600, the 8 busiest threads: %s", gs); }
     memset(g_ci_hit, 0, sizeof g_ci_hit); memset(g_ci_miss, 0, sizeof g_ci_miss); memset(g_ci_mbytes, 0, sizeof g_ci_mbytes); memset(g_ci_why, 0, sizeof g_ci_why); memset(g_ci_pool, 0, sizeof g_ci_pool);
     g_ic_hit = g_ic_scan = g_ic_idx = g_ic_same = g_ic_coll = g_ic_new = g_ic_keys = g_ic_keys_over = 0; memset(g_ick, 0, sizeof g_ick); g_tex_draws_win = 0;
