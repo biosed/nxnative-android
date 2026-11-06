@@ -133,10 +133,11 @@ static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 // little CPU for the system call, the sleep and the wake-up; the counts are in the guest-sync line ('G taken by spinning')
 static int g_spin = -1; static _Atomic uint64_t g_spin_hit, g_spin_miss;
 static inline void g_lock(void) {
-    if (g_spin < 0) { const char *e = getenv("DM_G_SPIN"); int v = e ? atoi(e) : 0; g_spin = v < 0 ? 0 : v > 100000 ? 100000 : v; if (g_spin) LOG("DM_G_SPIN=%d: the synchronization SVCs try the kernel lock %d times before blocking", g_spin, g_spin); }
+    if (g_spin < 0) { const char *e = getenv("DM_G_SPIN"); int v = e ? atoi(e) : 0; g_spin = v < 0 ? 0 : v > 1000 ? 1000 : v;   /* at most 1,000 tries (vk19.63d) */ if (g_spin) LOG("DM_G_SPIN=%d: the synchronization SVCs try the kernel lock %d times before blocking", g_spin, g_spin); }
     if (g_spin) { for (int i = 0; i < g_spin; i++) { if (!pthread_mutex_trylock(&G)) { if (i) atomic_fetch_add_explicit(&g_spin_hit, 1, memory_order_relaxed); return; }
+                      if ((i & 63) == 63) sched_yield();   // a real yield now and then: a preempted holder on this CPU gets to run (the CPU hint alone does not)
 #if defined(__aarch64__)
-                      __asm__ volatile("yield");
+                      else __asm__ volatile("yield");
 #endif
                   }
                   atomic_fetch_add_explicit(&g_spin_miss, 1, memory_order_relaxed); }
