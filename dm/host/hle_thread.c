@@ -1112,18 +1112,21 @@ int svc_thread(int num, uint64_t *regs) {
 // return address and the next two return addresses up the frame-pointer chain (read with vm_read_overwrite; a bad chain stops the walk) -- in a table of 64 sites with
 // how many timed out (session 1: GameThread 16.2 timed-out condition waits a frame). Under G. Reported with the guest-sync line
 enum { CVB_INF, CVB_0, CVB_100US, CVB_1MS, CVB_5MS, CVB_20MS, CVB_MORE, CVB_N };
-static uint64_t g_cvb[CVB_N];
-static struct { uint64_t lr[3], n, tout, b[CVB_N]; char who[24]; } g_cvs[64]; static int g_ncvs;
-static int cv_site_note(thr_t *t, int64_t ns, const uint64_t *regs) {   // holding G
-    int b = ns < 0 ? CVB_INF : ns == 0 ? CVB_0 : ns < 100000 ? CVB_100US : ns < 1000000 ? CVB_1MS : ns < 5000000 ? CVB_5MS : ns < 20000000 ? CVB_20MS : CVB_MORE;
-    g_cvb[b]++;
-    if (ns <= 0) return -1;
-    uint64_t lr[3] = {regs[30], 0, 0}, fp = regs[29];
+static uint64_t g_cvb[CVB_N], g_cv_gen;   // g_cv_gen: the report's generation (a slot noted before a report is not counted after it)
+static struct { uint64_t lr[3], n, tout, b[CVB_N]; char who[24]; } g_cvs[65]; static int g_ncvs;   // [64]: every site past the table's 64 ("other sites")
+// The call site's return addresses, read before G is taken (vk19.66n: the walk's vm_read_overwrite system calls must not lengthen G's hold, which this build measures)
+static void cv_site_walk(const uint64_t *regs, uint64_t lr[3]) {
+    lr[0] = regs[30]; lr[1] = lr[2] = 0; uint64_t fp = regs[29];
     for (int d = 1; d < 3 && fp && !(fp & 7); d++) { uint64_t w[2]; vm_size_t got = 0;
         if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof w, (vm_address_t)w, &got) != KERN_SUCCESS || got != sizeof w) break;
         lr[d] = w[1]; if (w[0] <= fp) break; fp = w[0]; }
-    int k = 0; for (; k < g_ncvs; k++) if (!memcmp(g_cvs[k].lr, lr, sizeof lr)) break;
-    if (k == g_ncvs) { if (g_ncvs == 64) k = 63; else { k = g_ncvs++; memset(&g_cvs[k], 0, sizeof g_cvs[k]); memcpy(g_cvs[k].lr, lr, sizeof lr); char nb[48]; snprintf(g_cvs[k].who, sizeof g_cvs[k].who, "%s", thr_name(t, nb, sizeof nb)); } }
+}
+static int cv_site_note(thr_t *t, int64_t ns, const uint64_t lr[3]) {   // holding G: the size bucket, and the site's slot (no system call)
+    int b = ns < 0 ? CVB_INF : ns == 0 ? CVB_0 : ns < 100000 ? CVB_100US : ns < 1000000 ? CVB_1MS : ns < 5000000 ? CVB_5MS : ns < 20000000 ? CVB_20MS : CVB_MORE;
+    g_cvb[b]++;
+    if (ns <= 0) return -1;
+    int k = 0; for (; k < g_ncvs; k++) if (!memcmp(g_cvs[k].lr, lr, 3 * sizeof *lr)) break;
+    if (k == g_ncvs) { if (g_ncvs == 64) k = 64; else { k = g_ncvs++; memset(&g_cvs[k], 0, sizeof g_cvs[k]); memcpy(g_cvs[k].lr, lr, 3 * sizeof *lr); char nb[48]; snprintf(g_cvs[k].who, sizeof g_cvs[k].who, "%s", thr_name(t, nb, sizeof nb)); } }
     g_cvs[k].n++; g_cvs[k].b[b]++;
     return k;
 }
@@ -1133,6 +1136,7 @@ static size_t cv_report(char *out, size_t n, double fr) {   // holding G; resets
                                 g_cvb[0] / fr, g_cvb[1] / fr, g_cvb[2] / fr, g_cvb[3] / fr, g_cvb[4] / fr, g_cvb[5] / fr, g_cvb[6] / fr);
     for (int r = 0; r < 6 && o < n; r++) {
         int best = -1; for (int k = 0; k < g_ncvs; k++) if (g_cvs[k].n && (best < 0 || g_cvs[k].n > g_cvs[best].n)) best = k;
+        if (best < 0 && g_cvs[64].n) { o += (size_t)snprintf(out + o, n - o, " other sites %.1f (timed out %.1f)", g_cvs[64].n / fr, g_cvs[64].tout / fr); g_cvs[64].n = 0; continue; }
         if (best < 0) break;
         int mb = 0; for (int i = 1; i < CVB_N; i++) if (g_cvs[best].b[i] > g_cvs[best].b[mb]) mb = i;
         o += (size_t)snprintf(out + o, n - o, " '%s'", g_cvs[best].who);
@@ -1141,7 +1145,8 @@ static size_t cv_report(char *out, size_t n, double fr) {   // holding G; resets
         if (o < n) o += (size_t)snprintf(out + o, n - o, " %.1f (timed out %.1f, mostly %s)", g_cvs[best].n / fr, g_cvs[best].tout / fr, bn[mb]);
         g_cvs[best].n = 0;   // taken: the next round finds the next one
     }
-    memset(g_cvb, 0, sizeof g_cvb); g_ncvs = 0;
+    if (g_cvs[64].n && o < n) o += (size_t)snprintf(out + o, n - o, "; other sites %.1f (timed out %.1f)", g_cvs[64].n / fr, g_cvs[64].tout / fr);
+    memset(g_cvb, 0, sizeof g_cvb); g_ncvs = 0; memset(&g_cvs[64], 0, sizeof g_cvs[64]); g_cv_gen++;
     return o;
 }
 static int svc_thread_impl(int num, uint64_t *regs) {
@@ -1258,6 +1263,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x1B: g_lock(); lock_handoff(regs[0]); pthread_mutex_unlock(&G); regs[0] = 0; return 1;
     case 0x1C: {  // WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
         thr_t *t = cur(); uint64_t addr = regs[0], key = regs[1];
+        uint64_t cvlr[3] = {0, 0, 0}; if ((int64_t)regs[3] > 0) cv_site_walk(regs, cvlr);   // before G (vk19.66n)
         g_lock();
         // The order matters: first set the condition key = 1, then release the mutex. The SDK's InternalConditionVariable::Signal first reads the condition key in user mode, and does not issue svc 0x1D if it is 0;
         // grabbing the mutex in user mode does not go through G either. It used to do lock_handoff first and set the key after: after the release and before the key was set, another thread could grab the lock in user mode, change the condition, read key 0 and not wake anyone,
@@ -1277,9 +1283,9 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         st32(key, 1);
         t->wkey = key; t->waddr = addr; t->wtag = (uint32_t)regs[2];
 #endif
-        int cvs = cv_site_note(t, (int64_t)regs[3], regs);   // the timeout asked, and where from (vk19.66m)
+        int cvs = cv_site_note(t, (int64_t)regs[3], cvlr); uint64_t cvg = g_cv_gen;   // the timeout asked, and where from (vk19.66m)
         int64_t r = block(t, 2, poll_wait_begin((int64_t)regs[3]));   // Timeout: the lock is not re-acquired (user mode takes it itself)
-        if (cvs >= 0 && r == R_TIMEOUT) g_cvs[cvs].tout++;
+        if (cvs >= 0 && r == R_TIMEOUT && g_cv_gen == cvg && (cvs == 64 || !memcmp(g_cvs[cvs].lr, cvlr, sizeof cvlr))) g_cvs[cvs].tout++;   // G is held again; not after a report reset the slot
         pthread_mutex_unlock(&G);
         poll_wait_end((int64_t)regs[3], r);
         regs[0] = (uint64_t)r; return 1;
