@@ -149,6 +149,30 @@ The recording thread's core is the scheduler's (or the vendor's) choice, and it 
 - Y1a's average includes the settling after the load (windows at p50 ~22–23 ms); the user saw it hold above 50 fps after a few minutes of play. Y1a's GPU span (19.2 ms) is above Run X's 14.0: one run, not repeated.
 - Verdict: vk19.58 kept as installed (installed 22:44:07).
 
+## Session 1 (vk19.64d): plan v4 Builds 1–6 and their switches
+
+APK `ffr_hib_vk19_64d.apk` (android-ffr 3839590b, hib 10f74320), Earth Shrine dungeon spot, `DM_UE_DRS=pinned:60`. HyperOS capped the clocks for the whole session (cpu7 limit 1228–1363 MHz, cpu2 1190), except during the HTAB run (limit ~2956/3014): only runs at the same limits are compared. Logs: `s1/` (A, A2, HTAB, LEAN, GSPIN, LATCH, POOL, PACE, H; marks*.txt has the toggle times).
+
+| Switch | Result | Verdict |
+|---|---|---|
+| `DM_VK_IDX_NEON=1` | run-time A/B in A2 (3 pairs, 300-frame windows): submit+present p50 18.5–18.8 ms on against 19.7–20.1 off (−1.0, 3/3); verify on the device 246,181 scans, 0 differences | win: on by default from vk19.65a |
+| `DM_VK_FB_FAST=1` | ≈19.3 ms on against ≈19.75 off (−0.4, 3/3); verify 240,590 draws, 0 differences | win: on by default from vk19.65b |
+| `DM_VK_LEAN=1` | against H at the same limits: RHIThread 20.18 against 21.19 ms (−1.0), all threads 53.4 against 54.4, recording 16.63 against 17.62 | win: on by default from vk19.65c |
+| `DM_VK_PRESENT_PACE=1` | RHIThread ≈, all threads −0.9, present p99 30.2 against 30.3; FIFO chosen at 120 Hz reported (SurfaceFlinger cur 120, min 30, max 144) | neutral: off; again when the game holds 60 |
+| `DM_LATCH_BLOCK=1` | all threads +2.7 (noise) | no gain: off |
+| `DM_VK_POOL_RESET=1` | RHIThread +0.7, all threads +3.7 | loss: off |
+| `DM_G_SPIN=200` | RHIThread ≈, all threads +1.5 (a slightly different clock limit) | no gain: off |
+| `DM_VK_HTAB=1` | its run had the clock limits lifted (GPU 15.1 against 19.2 ms) | confounded: test again |
+
+Counters (baseline H, per frame):
+- copy_in: 3,102 copies (20.6 MB); miss reasons: slot held by another range 1,136, earlier submission 1,965; every pool "CPU uncached".
+- Shadow (A): of 2,267 copies, 1,230 (7.4 MB) had the same bytes in an earlier frame and 574 (4.2 MB) in another submission of the frame.
+- Index ranges: 506 scans (727 K indices), but only 399 distinct ranges in 600 frames; texel buffer views made 784; tex_get 12.9 a draw.
+- Guest sync: RenderThread hand-offs 23.6 against releases with no waiter 5.0, waits under 1 ms 6.4 against 1 ms or more 1.1; GameThread 16.2 condition-wait timeouts; Foreground workers 15.3 condition waits, 14.3 of them under 1 ms.
+- Command pools: dm-complete 8.2 resets, 1.98 ms.
+- Page faults: 3.8.
+- The CPU line's RHIThread group read 0.00 (guest thread names carry the handle: "1018 RHIThread"); fixed in vk19.65d.
+
 ## Opt-in switches of vk19.47–19.56 and their verdicts
 
 | Switch | Build | Verdict | Dead weight to remove later? |
@@ -163,6 +187,14 @@ The recording thread's core is the scheduler's (or the vendor's) choice, and it 
 | `DM_UCLAMP_MIN` | 19.56 | EPERM (V1, V2): off | yes: uclamp_apply (the recording-thread identification is shared with the above) |
 | clock / thermal / game-mode line, game_mode_config | 19.45 | kept: it is what showed the above | no |
 | `DM_VK_CTX_PICK` | 19.57 (default on from 19.58; `=0` turns it off) | avg fps 23.6/23.9 -> 48.5/50.0, context wait 8 -> 0 ms (X): kept, on by default | no |
+| `DM_VK_IDX_NEON` | 19.60 (default on from 19.65) | −1.0 ms submit+present, 0 differences (session 1): kept, on by default | no |
+| `DM_VK_FB_FAST` | 19.61 (default on from 19.65) | −0.4 ms, 0 differences (session 1): kept, on by default | no |
+| `DM_VK_LEAN` | 19.62 (default on from 19.65) | RHIThread −1.0 ms (session 1): kept, on by default | no |
+| `DM_VK_PRESENT_PACE` | 19.63 | neutral at today's 45–58 fps (session 1): off | keep (again at 60 fps) |
+| `DM_LATCH_BLOCK` | 19.64 | no gain (session 1): off | candidate |
+| `DM_VK_POOL_RESET` | 19.64 | RHIThread +0.7, all threads +3.7 (session 1): off | yes |
+| `DM_G_SPIN` | 19.64 | no gain at 200 (session 1): off | candidate |
+| `DM_VK_SHADOW` | 19.59 | diagnostic | no |
 | `DM_VK_ZEROCOPY` (Z0) | 19.46 | −0.6 ms rec, −230 MB MemAvailable (L): off | candidate: zc_back / zc_find / the AHB import (kept only if Z1/Z2 are ever tried) |
 
 ## Open
