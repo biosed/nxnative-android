@@ -2862,12 +2862,13 @@ static int fb_want_full(shader_t *fs, int want[8]) {   // the attachments the dr
 // mask -- and the next draw with all of them the same skips even the serials. Shaders reading texture handles from a uniform buffer (K_TEXU) are not remembered: their handles
 // change with the buffer's bytes. =2 (verify): both ways, the full way's answer used, differences counted
 static uint64_t g_fbf_draws, g_fbf_cached, g_fbf_serial, g_fbf_full, g_fbf_chk, g_fbf_bad;
-static struct { shader_t *fs; uint64_t bgen, reg; int tb, n; vtex *ct[8]; VkImageView cv[8]; uint64_t mask; } g_fbc[256];
+static struct { shader_t *fs; uint64_t bgen, reg; int tb, n; vtex *ct[8]; VkImageView cv[8]; uint64_t ser[8], mask; } g_fbc[256];   // ser: the attachments' serials beside their pointers (a freed vtex's address reused: vk19.61b)
 static int fb_want_fast(shader_t *fs, int want[8]) {
-    uint64_t reg = atomic_load_explicit(&g_reg_gen, memory_order_relaxed), mask = S.chmask.mask;
+    uint64_t reg = atomic_load_explicit(&g_reg_gen, memory_order_relaxed), mask = S.chmask.mask, aser[8];
+    for (int a = 0; a < 8; a++) aser[a] = a < P.n && P.ct[a] ? P.ct[a]->serial : 0;
     typeof(g_fbc[0]) *c = &g_fbc[((uintptr_t)fs >> 4 ^ (uintptr_t)fs >> 12) % 256];
     if (c->fs == fs && c->bgen == g_bgen[1] && c->reg == reg && c->tb == S.tex_base && c->n == P.n && c->mask == mask &&
-        !memcmp(c->ct, P.ct, sizeof c->ct) && !memcmp(c->cv, P.cv, sizeof c->cv)) { g_fbf_cached++; return 0; }
+        !memcmp(c->ct, P.ct, sizeof c->ct) && !memcmp(c->cv, P.cv, sizeof c->cv) && !memcmp(c->ser, aser, sizeof aser)) { g_fbf_cached++; return 0; }
     uint64_t ser[8]; int na = 0, cand[64], nc = 0, texu = 0;
     for (int a = 0; a < P.n; a++) ser[a] = P.ct[a] && P.cv[a] && P.ct[a]->d <= 1 && (mask >> (4 * a) & 0xf) ? P.ct[a]->serial : 0, na += ser[a] != 0;
     if (na) {
@@ -2889,7 +2890,9 @@ static int fb_want_fast(shader_t *fs, int want[8]) {
         for (int a = 0; a < P.n; a++) if (P.ct[a] == v && P.cv[a] && v->d <= 1 && (mask >> (4 * a) & 0xf)) { want[a] = 1; any = 1; }
     }
     if (nc) g_fbf_full++; else g_fbf_serial++;
-    if (!any && !texu) { c->fs = fs; c->bgen = g_bgen[1]; c->reg = reg; c->tb = S.tex_base; c->n = P.n; c->mask = mask; memcpy(c->ct, P.ct, sizeof c->ct); memcpy(c->cv, P.cv, sizeof c->cv); }
+    // remembered only when no binding's serial matched (vk19.61b): a candidate whose tex_get failed or found another vtex (a remake failing under memory pressure, a released
+    // texture's vtex awaiting garbage_free beside its new one) answered "none" for a reason the key does not hold
+    if (!nc && !texu) { c->fs = fs; c->bgen = g_bgen[1]; c->reg = reg; c->tb = S.tex_base; c->n = P.n; c->mask = mask; memcpy(c->ct, P.ct, sizeof c->ct); memcpy(c->cv, P.cv, sizeof c->cv); memcpy(c->ser, aser, sizeof aser); }
     return any;
 }
 static void fb_prepare(shader_t *fs) {   // before a draw (pass open): find the sampled colour attachments it writes, snapshot them, and have write_set bind the snapshots
