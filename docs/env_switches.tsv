@@ -1,5 +1,6 @@
 name	class	meaning
 DM_AB	diagnostic	`=<frames>` splits the run into phases of that many frames and alternates every switch set to `ab` (on in the odd phases); logs an `[ab]` line per phase with GPU and frame time and attachment traffic
+DM_ADPF	switch	`=0` (Android) does not open the ADPF performance hint session for the render thread; by default each frame's CPU work (and on Android 15 and later its GPU part) is reported against a 16.7 ms target, so the governors raise the CPU and GPU clocks
 DM_ALIAS_SIZE	diagnostic	`=<bytes>` gives the guest an alias region of that size instead of the profile's (at least 256 MB, whole host pages; the heap and stacks stay as they are): `0x1000000000`, the Switch's 64 GB, holds what a game reserves unchanged; the NSP script's address region check sets it (Mac only: an iPhone has no room)
 DM_ALIAS_WINDOWS	diagnostic	`=<MB>` logs every 30 s how much of each window of that size in the alias region is mapped (windows aligned to their size in absolute addresses)
 DM_ALLOW_OTHER_METAL	switch	`1` lets `own_compilers.py` build the shader libraries with a Metal compiler other than the one in `dmsh_chain.lock` (it stops otherwise, GitHub issue #242); the NSP script sets it for `--allow-other-metal`
@@ -315,17 +316,21 @@ DM_UDC_SELFTEST	diagnostic	`=1` runs a start-up check of DontCare load and store
 DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.py`, for `shader_split.py` (default `ue_shaders` beside the RomFS); needed when the RomFS has Unreal paks
 DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (`r.Streaming.PoolSize`) is raised to, overriding the profile's `ue_texture_pool`; `0` keeps the game's own pool. On iOS only this switch turns it on (`Documents/env.txt`)
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
+DM_VK_CTL_FILE	diagnostic	`=<file>` (Android, Vulkan) reads the file every 30 frames: `skip <first>-<last>` drops those draws of each frame, `skipkey <prefix>` the draws of shaders whose key starts with it (up to 8), to find a wrong draw by bisection with screenshots, without input or a restart
 DM_VK_DIR	path	Android: the folder of the shaders' SPIR-V (`<key>.spv`, `<key>.vk.txt` from dm/android/tools/spv_android.py) and the pipeline cache
+DM_VK_DUMP_FILE	diagnostic	`=<file>` (Android, Vulkan): when the file appears (checked every 30 frames) the next frame is pass-logged and its render targets written, and the file is removed
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
 DM_VK_NO_DYNREND	test	Android: `1` uses render passes made per pass even where dynamic rendering is available (the path for Vulkan 1.1 / 1.2 GPUs without it)
 DM_VK_NO_TIMELINE	test	Android: set, submissions are not chained by a timeline semaphore even where the GPU has one
 DM_VK_PASSLOG	diagnostic	Android: `=<frame>[+]` logs that frame's passes, draws, copies and dispatches (targets, clears, shaders, depth / stencil / blend)
+DM_VK_PREWARM	switch	`=0` (Android, Vulkan) skips the pipeline prewarm before the game starts (pipeline_keys.bin beside `DM_VK_DIR`), which otherwise makes the pipelines of earlier runs behind a progress screen
 DM_VK_RTDUMP	diagnostic	Android: `=<frame>[,<frames>]` writes every render target of that frame (and the next ones) as raw files into DM_VK_SHOT_DIR
 DM_VK_RTDUMP_DEC	diagnostic	Android: with DM_VK_RTDUMP, also writes the textures decoded from BC4-7 on upload
 DM_VK_SHOTS	diagnostic	Android: `=<frame>,…` writes the presented image of those frames into DM_VK_SHOT_DIR
 DM_VK_SHOT_DIR	path	Android: where DM_VK_SHOTS and DM_VK_RTDUMP write (default: the current folder)
 DM_VK_SKIP	diagnostic	Android: `=<mask>` leaves out kinds of GPU work (1 buffer→texture, 2 texture→texture, 4 texture→buffer, 8 clears, 16 uploads, 32 draws / dispatches), for bisecting a wrong picture
 DM_VK_TEXCOUNT	diagnostic	Android: set, every 600 presents logs the live textures by kind and how many share their storage start with an older one
+DM_VK_TEXLOG	diagnostic	`=<n>` (Android, Vulkan) logs the first n textures made: size, levels, format, target, flags, stride, pool and how they are filled
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
 DM_WATCH	diagnostic	`=<s>` dumps all threads after that many seconds (SIGALRM) and turns on the stall watchdog; off unless set
 DM_WATCH_SAMPLE	diagnostic	`=<path>` (Mac): when the stall watchdog fires, samples the process for 1 s with `/usr/bin/sample` and writes the thread stacks to that path
