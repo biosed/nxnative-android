@@ -175,6 +175,7 @@ static int NCTX = 20;
 static uint64_t ring_cap(void) { static uint64_t v; if (!v) { const char *e = getenv("DM_VK_RING_CAP_MB"); long mb = e && atol(e) > 0 ? atol(e) : 96; v = (uint64_t)mb << 20; LOG("vk: rings capped at %ld MB in all (DM_VK_RING_CAP_MB)", mb); } return v; }
 #define RING_CAP ring_cap()
 typedef struct { int kind; void *dst; uint32_t mode, v; uint64_t addr; uint32_t type; const uint8_t *src; size_t n; } post_t;   // kind 5: n bytes from src where they differ from the snapshot at addr (4-byte words); kind 6: v rows of type bytes, mode apart
+static _Atomic uint64_t g_gw_wb_ended;   // GPU-written entries ended by their dispatch write-back (ctx_complete kind 5; the descriptor-set line)
 static uint64_t g_wb_words, g_wb_bytes;   // dispatch write-backs: words the GPU changed and written back / bytes of the ranges looked at (completion thread)   // kind 1 event, 2 counter, 3 copy ring → guest, 4 samples-passed report (src: n query indices; n == SIZE_MAX: unknown, reported visible)
 typedef struct vtex vtex;
 typedef struct {
@@ -701,7 +702,13 @@ static void ctx_complete(ctx_t *c) {
             const uint8_t *snap = (const uint8_t *)(uintptr_t)p->addr, *now = p->src; uint8_t *dst = p->dst; size_t i = 0, nw = 0;
             for (; i + 4 <= p->n; i += 4) if (memcmp(now + i, snap + i, 4)) { memcpy(dst + i, now + i, 4); nw++; }
             for (; i < p->n; i++) if (now[i] != snap[i]) dst[i] = now[i];
-            lk_(&g_gwmu, LW_GWMU); for (int k = 0; k < g_ngw; k++) if (g_gw[k].snap >= snap && g_gw[k].snap < snap + p->n) g_gw[k].snap = NULL; pthread_mutex_unlock(&g_gwmu);   // no reader compares against it any more
+            // Its entries end here, not at gw_expire below (vk19.58): guest memory holds the GPU's words and the CPU's rewrites now, so a later read copies it from there.
+            // Only the snapshot used to be cleared, and the entry lived on until the rest of the submission was written back: a read in between bound the ring's bytes
+            // without the CPU's rewrites (gw_cpu_dirty answers 0 with no snapshot), stale for a frame. gw_del moves the last entry into slot k: k is looked at again
+            { uint64_t ended = 0; lk_(&g_gwmu, LW_GWMU);
+              for (int k = 0; k < g_ngw;) if (g_gw[k].snap >= snap && g_gw[k].snap < snap + p->n) { gw_del(k); ended++; } else k++;
+              pthread_mutex_unlock(&g_gwmu);
+              if (ended) { atomic_fetch_add(&g_gw_wb_ended, ended); static int once; if (!once) { once = 1; LOG("vk: GPU-written ranges end at their write-back (vk19.58): %llu ended by the first one, submission %llu", (unsigned long long)ended, (unsigned long long)c->fence_val); } } }
             snap_free((void *)snap, p->n); g_wb_words += nw; g_wb_bytes += p->n;
         }
         else if (p->kind == 6) { for (uint32_t r = 0; r < p->v; r++) memcpy((uint8_t *)p->dst + (size_t)r * p->mode, p->src + (size_t)r * p->mode, p->type); }   // rows: v rows of type bytes, mode apart
@@ -4705,8 +4712,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             g_t_stale / 600e6, g_stale_bytes / 600.0 / 1048576.0, g_t_patch / 600e6, g_npatch / 600.0, g_patch_regions / 600.0, g_t_split / 600e6, g_vid_push / 600.0, g_vid_nz / 600.0, g_gw_calls / 600.0, g_gw_quick / 600.0, g_gw_walked / 600.0);
         g_wb_words = g_wb_bytes = 0; g_t_stale = g_stale_bytes = 0; g_t_patch = g_patch_regions = g_npatch = 0; g_vid_push = g_vid_nz = 0; g_t_split = 0; g_gw_calls = g_gw_quick = g_gw_walked = 0;
         { double miss_us = g_dsc_nmiss_t ? g_dsc_miss_ns / 1e3 / g_dsc_nmiss_t : 0;
-          LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame; texture storage scans %.1f a frame, %.1f left out as uploaded this frame (DM_VK_DIRTY_ONCE %d); driver segments taken as built %.1f, built %.1f (DM_VK_SEG_CACHE %d); stale patches by dispatch %.2f (%.0f runs); held reads %.1f, their writer %.1f submissions back on average, %llu at most; forwarded %.2f (%.2f MB) (DM_VK_GW_FORWARD %d)",
-              dset_cache2(), g_dsc_hit / 600.0, g_dsc_miss / 600.0, miss_us, g_dsc_rej / 600.0, g_memo_hit / 600.0, g_memo_miss / 600.0, g_dsc_hit * miss_us / 1e3 / 600.0, g_dirty_scans / 600.0, g_dirty_skips / 600.0, dirty_once(), g_segc_hit / 600.0, g_segc_miss / 600.0, seg_cache_on(), g_patch_disp / 600.0, g_patch_runs / 600.0, g_hold_n / 600.0, g_hold_n ? (double)g_hold_age_sum / g_hold_n : 0.0, (unsigned long long)g_hold_age_max, g_fwd_n / 600.0, g_fwd_bytes / 600.0 / 1048576.0, gw_forward_k());
+          LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame; texture storage scans %.1f a frame, %.1f left out as uploaded this frame (DM_VK_DIRTY_ONCE %d); driver segments taken as built %.1f, built %.1f (DM_VK_SEG_CACHE %d); stale patches by dispatch %.2f (%.0f runs); held reads %.1f, their writer %.1f submissions back on average, %llu at most; forwarded %.2f (%.2f MB) (DM_VK_GW_FORWARD %d); entries ended at their write-back %.1f",
+              dset_cache2(), g_dsc_hit / 600.0, g_dsc_miss / 600.0, miss_us, g_dsc_rej / 600.0, g_memo_hit / 600.0, g_memo_miss / 600.0, g_dsc_hit * miss_us / 1e3 / 600.0, g_dirty_scans / 600.0, g_dirty_skips / 600.0, dirty_once(), g_segc_hit / 600.0, g_segc_miss / 600.0, seg_cache_on(), g_patch_disp / 600.0, g_patch_runs / 600.0, g_hold_n / 600.0, g_hold_n ? (double)g_hold_age_sum / g_hold_n : 0.0, (unsigned long long)g_hold_age_max, g_fwd_n / 600.0, g_fwd_bytes / 600.0 / 1048576.0, gw_forward_k(), atomic_exchange(&g_gw_wb_ended, 0) / 600.0);
           g_memo_hit = g_memo_miss = g_dsc_rej = g_dsc_miss_ns = g_dsc_nmiss_t = 0; g_dirty_scans = g_dirty_skips = 0; g_segc_hit = g_segc_miss = 0; g_patch_disp = g_patch_runs = 0; g_hold_n = g_hold_age_sum = g_hold_age_max = 0; g_fwd_n = g_fwd_bytes = 0;
           if (htab_on()) { LOG("vk: handle table per frame over the last 600 (DM_VK_HTAB): texture slots %.1f from the table, %.1f looked up (first in the submission or a registration since), %.1f gone the full way (the image needed tex_get)",
               g_ht_hit / 600.0, g_ht_miss / 600.0, g_ht_slow / 600.0); g_ht_hit = g_ht_miss = g_ht_slow = 0; }
