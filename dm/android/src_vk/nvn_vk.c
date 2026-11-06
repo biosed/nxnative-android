@@ -2605,16 +2605,16 @@ static void *pso_precreate(void *a) { pthread_setname_np("dm-psopre");
 // recording thread takes a copy of every value once per submission (tog_latch at mtl_sub_begin) and reads only that copy (tog), so a switch never changes in the middle
 // of a submission. A name not on the run-time list is refused when the file sets it (it is read at start only)
 enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_PACE, TG_N };
-static struct { const char *name; int runtime; _Atomic int val; } g_tog[TG_N] = {
+static struct { const char *name; int runtime; _Atomic int val; int def; } g_tog[TG_N] = {   // def: the value without the variable (on by default after its A/B; =0 turns it off)
     [TG_SHADOW] = {"DM_VK_SHADOW", 1},   // diagnostic: what a persistent cache could save (copy_in / index-scan misses whose bytes an earlier copy already had)
-    [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2)
+    [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1, 0, 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2); on by default from vk19.65 (session 1: -1.0 ms)
     [TG_PACE] = {"DM_VK_PRESENT_PACE", 0},   // vk19.63: one setFrameRate request for the cap at the first swapchain, FIFO when the cap is at most the panel's rate; start only
     [TG_LEAN] = {"DM_VK_LEAN", 0},   // vk19.62: small hot-path items (trace pointers, the memo hash, the timer conversion, sampled descriptor-set timing); start only
     [TG_FB_FAST] = {"DM_VK_FB_FAST", 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2)
 };
 static int g_tog_lat[TG_N];
 static void tog_init_(void) {
-    for (int i = 0; i < TG_N; i++) { const char *e = getenv(g_tog[i].name); int v = e ? atoi(e) : 0; atomic_store(&g_tog[i].val, v); if (v) LOG("vk: %s=%d (from the environment%s)", g_tog[i].name, v, g_tog[i].runtime ? "; may be changed at run time" : ""); }
+    for (int i = 0; i < TG_N; i++) { const char *e = getenv(g_tog[i].name); int v = e ? atoi(e) : g_tog[i].def; atomic_store(&g_tog[i].val, v); if (v) LOG("vk: %s=%d (%s%s)", g_tog[i].name, v, e ? "from the environment" : "the default", g_tog[i].runtime ? "; may be changed at run time" : ""); else if (g_tog[i].def) LOG("vk: %s=0: off (on by default)", g_tog[i].name); }
 }
 static pthread_once_t g_tog_once = PTHREAD_ONCE_INIT;
 static void tog_init(void) { pthread_once(&g_tog_once, tog_init_); }   // vk_init, and the control file's first set (vk19.59c: once, whichever thread)
