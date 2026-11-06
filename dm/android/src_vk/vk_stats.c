@@ -120,7 +120,9 @@ static void second_tick(uint64_t k) {
 // Thread groups (vk19.59c): the recording thread (RHIThread, the critical path), the host's own threads (dm-*, dm hitch…), and the game's (every other thread of the process)
 static void groups(uint64_t g[3]) {
     g[0] = g[1] = g[2] = 0;
-    for (int i = 0; i < g_nth; i++) { const char *c = g_th[i].comm; int k = !strcmp(c, "RHIThread") ? 0 : !strncmp(c, "dm-", 3) || !strncmp(c, "dm ", 3) ? 1 : 2; g[k] += g_th[i].d; }
+    // guest threads are named "<handle in hex> <guest name>" (hle_thread.c, cut to 15 characters): the recording thread is "1018 RHIThread", matched by its suffix (vk19.65d)
+    for (int i = 0; i < g_nth; i++) { const char *c = g_th[i].comm; size_t l = strlen(c); int rhi = l >= 9 && !strcmp(c + l - 9, "RHIThread") && (l == 9 || c[l - 10] == ' ');
+        int k = rhi ? 0 : !strncmp(c, "dm-", 3) || !strncmp(c, "dm ", 3) ? 1 : 2; g[k] += g_th[i].d; }
 }
 static void window_log(uint64_t frames, uint64_t dns) {
     double fr = frames ? (double)frames : 1, secs = dns / 1e9, ps = secs > 0 ? secs : 1;
