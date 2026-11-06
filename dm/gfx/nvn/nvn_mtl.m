@@ -88,7 +88,16 @@ static id<MTL4CommandQueue> g_q4;
 static int g_classic_ok, g_classic;   // mtl_device_classic was asked / the device has no Metal 4 and only the classic part started (mtl_init)
 static dispatch_queue_t g_feedback_q;
 static _Atomic uint32_t g_present_qos;
-#define ALLOC_MAX 8
+#define ALLOC_MAX 32   // the arrays' size; the pool's cap is alloc_max()
+// DM_NVN_ALLOC_MAX: how many submissions may be in flight, each with its command allocator and visibility buffer (1 to 32, default 16). Below the game's submissions per frame,
+// one submission a frame waits for the previous frame's GPU work, and the CPU's encoding and the GPU take turns instead of overlapping: FINAL FANTASY RESONANCE submits 8 to 9 times
+// a frame, and with 8 its Earth Shrine (M1) waited 10.4 ms a frame here: 20.2 ms a frame, 49 fps, 61 of 300 frames on screen twice. With 16 (the pool grows to 14) and with 32 (13):
+// no wait, 16.7 ms, 59.8 fps, 0 to 2 of 300 on screen twice, submit wall clock 8.2 ms = its CPU time, 40 MB more GPU memory at most
+static int alloc_max(void) {
+    static int v; if (v) return v;
+    const char *e = getenv("DM_NVN_ALLOC_MAX"); int n = e && *e ? atoi(e) : 16; v = n < 1 ? 1 : n > ALLOC_MAX ? ALLOC_MAX : n;
+    return v;
+}
 static id<MTL4CommandAllocator> g_alloc4[ALLOC_MAX]; static int g_alloc_n, g_alloc_cur;   // Command allocator pool of the main submission: at start pick one the GPU has finished with, create a new one if there is none (wait only at the cap)
 static id<MTL4CommandAllocator> g_up_alloc4[3];
 static id<MTL4CommandAllocator> g_present_alloc4[3];
@@ -192,10 +201,16 @@ static void ws_fb(uint64_t fence, double gpu_end) {   // the fence's feedback ha
     ws_wake_pair(k);
 }
 static _Atomic uint64_t g_ws_post[5];
+static uint64_t g_ws_alloc_n, g_ws_alloc_back, g_ws_alloc_same;   // allocator waits: how many submissions back the waited one was, and how many waited on the current frame's own work
+static _Atomic uint64_t g_cur_frame;
+static void ws_alloc_note(uint64_t back, uint64_t frame) { g_ws_alloc_n++; g_ws_alloc_back += back; g_ws_alloc_same += frame == atomic_load(&g_cur_frame); }
 static void ws_report(uint64_t frame, uint64_t frames) {
     char line[2048]; size_t o = 0;
     { uint64_t e = atomic_exchange(&g_ws_post[1], 0), sp = atomic_exchange(&g_ws_post[2], 0), ts = atomic_exchange(&g_ws_post[3], 0), oc = atomic_exchange(&g_ws_post[4], 0);
       if (e + sp + ts + oc) o += snprintf(line + o, sizeof line - o, " CPU-side writes at GPU end: events %.2f, samples-passed reports %.2f, timestamp reports %.2f, other counter reports %.2f;", (double)e / frames, (double)sp / frames, (double)ts / frames, (double)oc / frames); }
+    { static uint64_t pf; uint64_t f = g_fence; if (pf) o += snprintf(line + o, sizeof line - o, " submissions %.2f;", (double)(f - pf) / frames); pf = f;
+      if (g_ws_alloc_n) o += snprintf(line + o, sizeof line - o, " allocator waits on the submission %.2f back, %.0f%% of them on this frame's own;", (double)g_ws_alloc_back / g_ws_alloc_n, 100.0 * g_ws_alloc_same / g_ws_alloc_n);
+      g_ws_alloc_n = g_ws_alloc_back = g_ws_alloc_same = 0; }
     uint64_t wn = atomic_exchange(&g_ws_wake_n, 0), wns = atomic_exchange(&g_ws_wake_ns, 0), fns = atomic_exchange(&g_ws_fb_ns, 0);
     if (wn) o += snprintf(line + o, sizeof line - o, " newest-fence SyncWait wakes %.3f ms after the GPU end (feedback handler at %.3f ms);", wns / 1e6 / wn, fns / 1e6 / wn);
     for (int i = 0; i < WS_N; i++) { uint64_t n = atomic_exchange(&g_ws_n[i], 0), b = atomic_exchange(&g_ws_blk[i], 0), ns = atomic_exchange(&g_ws_ns[i], 0);
@@ -751,6 +766,7 @@ static int g_blit_alias;
 static inline MTL4VisibilityOptions blit_vis(void) { return resource_vis() | (g_blit_alias ? MTL4VisibilityOptionResourceAlias : 0); }
 static NSMutableArray<dispatch_block_t> *g_commit_blocks;
 static uint64_t g_alloc_fence[ALLOC_MAX]; static uint64_t g_alloc_waits, g_alloc_grown;
+static uint64_t g_alloc_frame[ALLOC_MAX];   // the frame (g_cur_frame) each allocator's last submission was committed in: the wait ledger tells a wait on this frame's own work from one on an earlier frame's
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);
 static int mtl_wait_at(uint64_t fence, uint64_t timeout_ns, int site);
 static void up_flush(void);
@@ -799,10 +815,10 @@ void mtl_sub_begin(void) {
     // pick an allocator the GPU has finished with; if all are in use create a new one; only at the cap wait for the oldest one. How far ahead it runs is bounded by the wait where the game acquires the swapchain texture, same as the old interface.
     int alloc_i = -1; uint64_t done = g_done;
     for (int i = 0; i < g_alloc_n; i++) if (g_alloc_fence[i] <= done) { alloc_i = i; break; }
-    if (alloc_i < 0 && g_alloc_n < ALLOC_MAX) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
+    if (alloc_i < 0 && g_alloc_n < alloc_max()) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
         g_alloc4[g_alloc_n] = [g_dev newCommandAllocatorWithDescriptor:ad error:&ae]; if (!g_alloc4[g_alloc_n]) MDIE("failed to create a new MTL4CommandAllocator: %s", ae.localizedDescription.UTF8String);
         alloc_i = g_alloc_n++; g_alloc_grown++; }
-    if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; mtl_wait_at(g_alloc_fence[alloc_i], UINT64_MAX, WS_ALLOC); }
+    if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; if (ws_on()) ws_alloc_note(g_fence - g_alloc_fence[alloc_i], g_alloc_frame[alloc_i]); mtl_wait_at(g_alloc_fence[alloc_i], UINT64_MAX, WS_ALLOC); }
     g_alloc_cur = alloc_i;
     [g_alloc4[alloc_i] reset];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[alloc_i]];
@@ -813,8 +829,8 @@ void mtl_sub_begin(void) {
     zskip_clear(); g_zskip_count = 0;
     int pick = -1;
     for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].fence <= g_done) { pick = i; break; }
-    if (pick < 0 && g_vis_ring_n < VIS_RING) pick = g_vis_ring_n++;
-    if (pick < 0) { uint64_t oldest = UINT64_MAX; for (int i = 0; i < VIS_RING; i++) if (g_vis_ring[i].fence < oldest) { oldest = g_vis_ring[i].fence; pick = i; } if (oldest > g_done) mtl_wait_at(oldest, UINT64_MAX, WS_VIS); }
+    if (pick < 0 && g_vis_ring_n < alloc_max()) pick = g_vis_ring_n++;
+    if (pick < 0) { uint64_t oldest = UINT64_MAX; for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].fence < oldest) { oldest = g_vis_ring[i].fence; pick = i; } if (oldest > g_done) mtl_wait_at(oldest, UINT64_MAX, WS_VIS); }
     g_vis_ring_i = pick; g_vis_ring[pick].fence = UINT64_MAX;
     if (!g_vis_ring[pick].buf) { g_vis_ring[pick].buf = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis_ring[pick].buf); }
     g_vis = g_vis_ring[pick].buf;
@@ -1535,7 +1551,7 @@ uint64_t mtl_sub_commit(void) {
     rec_commit(g_cb, o);
     rec_signal(g_ev, fence);
     rec_drain();
-    g_alloc_fence[g_alloc_cur] = fence;
+    g_alloc_fence[g_alloc_cur] = fence; g_alloc_frame[g_alloc_cur] = atomic_load(&g_cur_frame);
     g_cb = nil;
     g_commit_blocks = nil;
     objc_autoreleasePoolPop(g_sub_pool); g_sub_pool = NULL;
