@@ -182,6 +182,15 @@ APK `ffr_hib_vk19_66n.apk` (android-ffr 06c84218, hib b494370c), network adb, pl
 - Condition-wait timeouts: one GameThread site, `sdk+0xc833b8 < sdk+0x13c004 < main+0x17150`, waits 17.3 times a frame with timeouts under 1 ms and times out 16.2 (~1,000 wake-ups a second); Foreground Worker #1 waits with timeouts of 20 ms or more, 5.2 a frame.
 - Copies' repeated bytes by caller (another submission of the frame / an earlier frame, MB a frame): vertex 1.17 / 1.23, index 0.45 / 0.45, index pool 2.00 / 2.00, uniform 0.11 / 0.19, storage 0 / 0.61, texel 0.17 / 2.50; in all 3.88 MB from another submission, 6.96 MB from an earlier frame. The index-pool store (C4′a) is worth about 2 MB a frame (~−0.3 ms), not the 6.95 MB its copies move.
 
+## Session 3 (vk19.68b): wakes after G, a two-way copy table
+
+APK `ffr_hib_vk19_68b.apk` (android-ffr 2b731986, hib e6d8e2e0). Logs: `s3/` (A, W, B; marks.txt). The clock limits swung again; windows at matched cpu7 ≈1600–1640 MHz are compared.
+
+| Switch | Result | Verdict |
+|---|---|---|
+| `DM_WAKE_AFTER_G=1` | G waited 22–31 times a frame (2.6–3.5 ms) → 7.8–9.9 (0.35–0.53 ms); all threads 49.1–49.9 → 46.4–48.5 ms (−2…−3), the game's threads 28.7–29.5 → 26.2–27.6; RHIThread ≈ (17.2–17.4 / 17.0–17.5); present p50 18.6–18.8 → 18.4–18.7, p99 25.4–27.5 / 22.9–30.8 (no pacing regression); 57–70 wakes a frame deferred | win: on by default on Android from vk19.71a |
+| `DM_VK_DC_WAYS2=1` | run-time A/B in A, 3 pairs: submit+present p50 ≈15.0–15.3 ms on and off | neutral: off, dead weight |
+
 ## Opt-in switches of vk19.47–19.56 and their verdicts
 
 | Switch | Build | Verdict | Dead weight to remove later? |
@@ -204,6 +213,9 @@ APK `ffr_hib_vk19_66n.apk` (android-ffr 06c84218, hib b494370c), network adb, pl
 | `DM_VK_POOL_RESET` | 19.64 | RHIThread +0.7, all threads +3.7 (session 1): off | yes |
 | `DM_G_SPIN` | 19.64 | no gain at 200 (session 1): off | candidate |
 | `DM_VK_SHADOW` | 19.59 | diagnostic | no |
+| `DM_WAKE_AFTER_G` | 19.68 (default on, Android, from 19.71) | all threads −2…−3 ms, G waits −85% (session 3): kept, on by default | no |
+| `DM_VK_DC_WAYS2` | 19.69 | neutral (session 3): off | yes: the two-way path in copy_in |
+| `DM_VK_TEXEL_STORE` | 19.70 | not measured yet (session 4: =2 verify, then =1) | — |
 | `DM_VK_ZEROCOPY` (Z0) | 19.46 | −0.6 ms rec, −230 MB MemAvailable (L): off | candidate: zc_back / zc_find / the AHB import (kept only if Z1/Z2 are ever tried) |
 
 ## Open

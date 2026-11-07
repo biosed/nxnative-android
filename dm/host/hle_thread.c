@@ -144,7 +144,14 @@ static void g_lock_note(thr_t *me, uint64_t tk) { me->sy[SY_G_CONT]++; me->sy[SY
 // would leave a queued signal pointing at freed memory: freed threads go to a graveyard instead, emptied under G when no queued signal is outstanding (g_pw_out).
 // Threads that are not guest threads (host threads waking guest threads) signal at once, as before
 static int g_wag = -1; static _Atomic int g_pw_out; static thr_t *g_grave; static uint64_t g_grave_n;
-static int wake_after_g(void) { if (g_wag < 0) { const char *e = getenv("DM_WAKE_AFTER_G"); g_wag = e && atoi(e) != 0; if (g_wag) LOG("DM_WAKE_AFTER_G=1: wakes are signalled after G is released"); } return g_wag; }
+// On by default on Android from vk19.71 (session 3 at matched cpu7 clocks: G waited 2.6-3.5 -> 0.35-0.53 ms a frame, all threads -2 to -3 ms, no pacing regression; the Mac
+// host keeps it off until it is measured there); DM_WAKE_AFTER_G=0 / =1 decides either way
+#ifdef __ANDROID__
+#define WAKE_AFTER_G_DEFAULT 1
+#else
+#define WAKE_AFTER_G_DEFAULT 0
+#endif
+static int wake_after_g(void) { if (g_wag < 0) { const char *e = getenv("DM_WAKE_AFTER_G"); g_wag = e ? atoi(e) != 0 : WAKE_AFTER_G_DEFAULT; if (g_wag) LOG("DM_WAKE_AFTER_G on: wakes are signalled after G is released"); else LOG("DM_WAKE_AFTER_G=0: wakes are signalled under G"); } return g_wag; }
 static void pw_send(thr_t *me) {   // the queued signals (with or without G)
     // reentrant (vk19.68b): SetThreadActivity's pause signal can interrupt this loop and send again from its own g_cond_wait; the list is taken and emptied first, so each
     // entry is signalled and counted once
