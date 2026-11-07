@@ -3043,6 +3043,19 @@ static fbsnap_t *fb_snap_for(vtex *v, int i) {   // the snapshot image for attac
     e->src = v; e->lv = lv; e->ly = ly; P.cwr[i] = 0; g_fb_copies++;
     return e;
 }
+// Whether a draw sampling texture v through the view tr holds really reads attachment a's level and layer (as nvn_mtl.m fb_prepare decides): a view whose levels or layers do
+// not include the attachment's is no feedback at all, and a view over several levels or layers is a mip-chain or layer pass -- level n drawn while level n-1 is sampled, the
+// view covering the chain -- which Metal leaves as is too. Snapshotting those split the pass and copied a level for every draw of every mip chain: Tomodachi Life: Living the
+// Dream builds 64x64 → 1x1 and 122x82 → 1x1 chains each frame, 287 render passes a frame on the Adreno (182 on the Mac), vkCmdBeginRendering ~28 ms a frame
+static uint64_t g_fb_chain;   // draws of mip-chain or layer passes left sampling their own image (counted beside the snapshots)
+static int fb_view_hits(const treg_t *tr, const vtex *v, int a) {
+    uint32_t bl = tr->has_v && tr->v.set_levels ? tr->v.base_level : 0, nl = tr->has_v && tr->v.set_levels ? tr->v.nlevels : (v->levels > bl ? v->levels - bl : 1);
+    uint32_t b0 = tr->has_v && tr->v.set_layers ? tr->v.min_layer : 0, nly = tr->has_v && tr->v.set_layers ? tr->v.nlayers : (v->layers > b0 ? v->layers - b0 : 1);
+    if (!nl) nl = 1; if (!nly) nly = 1;
+    if (P.clv[a] < bl || P.clv[a] >= bl + nl || P.cly[a] < b0 || P.cly[a] >= b0 + nly) return 0;   // another level or layer of the same texture
+    if (nl > 1 || nly > 1) { g_fb_chain++; static int once; if (!once++) LOG("vk: same-pass feedback: a view over levels %u+%u, layers %u+%u sampled while level %u layer %u is drawn: a mip-chain or layer pass, left as is (as on Metal)", bl, nl, b0, nly, P.clv[a], P.cly[a]); return 0; }
+    return 1;
+}
 static int fb_want_full(shader_t *fs, int want[8]) {   // the attachments the draw samples: each texture binding through tex_get, compared with the pass's attachments
     int any = 0;
     for (int i = 0; i < fs->nb; i++) {
@@ -3053,7 +3066,7 @@ static int fb_want_full(shader_t *fs, int want[8]) {   // the attachments the dr
         lk_(&g_rmu, LW_RMU); treg_t tr = tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
         if (!tr.ok) continue;
         vtex *v = tex_get(&tr.t, 0); if (!v) continue;
-        for (int a = 0; a < P.n; a++) if (P.ct[a] == v && P.cv[a] && v->d <= 1 && (S.chmask.mask >> (4 * a) & 0xf)) { want[a] = 1; any = 1; }
+        for (int a = 0; a < P.n; a++) if (P.ct[a] == v && P.cv[a] && v->d <= 1 && (S.chmask.mask >> (4 * a) & 0xf) && fb_view_hits(&tr, v, a)) { want[a] = 1; any = 1; }
     }
     return any;
 }
@@ -3089,7 +3102,7 @@ static int fb_want_fast(shader_t *fs, int want[8]) {
         lk_(&g_rmu, LW_RMU); treg_t tr = cand[k] < g_ntreg ? g_treg[cand[k]] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
         if (!tr.ok) continue;
         vtex *v = tex_get(&tr.t, 0); if (!v) continue;
-        for (int a = 0; a < P.n; a++) if (P.ct[a] == v && P.cv[a] && v->d <= 1 && (mask >> (4 * a) & 0xf)) { want[a] = 1; any = 1; }
+        for (int a = 0; a < P.n; a++) if (P.ct[a] == v && P.cv[a] && v->d <= 1 && (mask >> (4 * a) & 0xf) && fb_view_hits(&tr, v, a)) { want[a] = 1; any = 1; }
     }
     if (nc) g_fbf_full++; else g_fbf_serial++;
     // remembered only when no binding's serial matched (vk19.61b): a candidate whose tex_get failed or found another vtex (a remake failing under memory pressure, a released
@@ -5712,7 +5725,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     }
     if (n % 600 == 0) { uint64_t live = 0, held = 0; int nb = 0; lk_(&g_blkmu, LW_BLKMU); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) { nb++; held += g_blk[i].size; live += g_blk[i].live; } pthread_mutex_unlock(&g_blkmu);
                         LOG("vk: image memory: %d blocks of 64 MB (%.0f MB, %llu live images in them), big images %.0f MB now; rings %.0f MB extra", nb, held / 1048576.0, (unsigned long long)live, atomic_load(&g_big_bytes) / 1048576.0, atomic_load(&g_extra_ring_bytes) / 1048576.0); }
-    if (n % 600 == 0 && g_fb_copies) LOG("vk: same-pass feedback snapshots so far: %llu", (unsigned long long)g_fb_copies);
+    if (n % 600 == 0 && (g_fb_copies || g_fb_chain)) LOG("vk: same-pass feedback snapshots so far: %llu; mip-chain / layer pass draws left as they are: %llu", (unsigned long long)g_fb_copies, (unsigned long long)g_fb_chain);
     if (n % 600 == 0) LOG("vk: texture slots read as black so far: no handle %llu, handle not registered %llu, texture not created %llu, no view %llu; lookups of a dead texture object %llu (registrations of one %llu)", (unsigned long long)g_tex_miss[0],
                           (unsigned long long)g_tex_miss[1], (unsigned long long)g_tex_miss[2], (unsigned long long)g_tex_miss[3], (unsigned long long)g_tex_dead, (unsigned long long)g_treg_dead);
     if (n % 600 == 0) { extern uint64_t g_nsub_stat; static uint64_t ls;
