@@ -34,7 +34,8 @@ Nothing beyond the profile the NSP script's survey guessed and the depth mode: n
 Mac M1, `--platform mac` with `shader_half_clamp`, new save, driven with `DM_CTL`. Nothing black, missing, flickering or wrongly coloured found:
 - **Seen:** title, character creation (eyes correct), the intro and the first forest, the dream farm with its crops, butterflies and harvest prompts, the waking-up dialogue, and the real farm's prologue (Carol's close-ups, the Soilbot machine, tutorial pop-ups).
 - **Frame by frame (DM_CTL `shots`, a frame difference test plus contact sheets):** 150 consecutive frames still and 150 while panning in the first forest, 120 in the dream farm, 120 on the real farm. No object vanished and came back.
-- **Not reached:** menus (the in-game menu stays closed during the dream sequence) and an indoor scene.
+- **Also seen in a second run:** the in-game menu (tips pages, options, save screen), the HUD (clock, stamina, minimap), and the village houses and farm buildings in a full camera turn. The menu opens only after the dream sequence.
+- **Not reached:** an indoor scene. On the first morning Carol stops the player from leaving the farm until the tutorial jobs are done (Soilbot, tilling, sowing, watering).
 - **Only red line:** `nvnTextureViewCompare`.
 
 ## Open
