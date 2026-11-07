@@ -589,6 +589,17 @@ static void gw_patch(const gw_t *e, uint64_t lo, uint64_t hi, VkBuffer dst, VkDe
 // submissions are done by then). Each source ring is held until this submission is done. Parts this submission itself writes are not in it (no such case met). Caller holds g_gwmu
 static void pass_end_(int line); static int pass_begin(void); static int g_pass_open_(void);
 #define pass_end() pass_end_(__LINE__)   // the line that ends a pass is counted per pass signature (gsig_end: the per-pass table names why its passes end)
+// DM_VK_GW_SHADOW (Harvest Moon's culled vegetation; off by default). Each of the ~92 cull dispatches a frame writes a 16-byte header and then the visible instances into
+// its storage buffer [X, X + n); the draws' vertex shaders read [X + 16, X + n): inside the dispatch's range, but 16 bytes off minStorageBufferOffsetAlignment, so each read was
+// composed, with a render-pass break (hm10: 88 a frame). A misaligned read of a dispatch's range is remembered (address, size of the range; offset, size of the read); the next
+// time a dispatch writes that range, a GPU copy of the read's part is made right after it (outside any pass, after its barrier) into an aligned ring block, registered as this
+// submission's exact entry over the read's range. The reads then fit that newer entry and are bound in place. A later write over the range in the submission is a newer entry
+// still (the read composes as before). Per-600 line 'vk: DM_VK_GW_SHADOW'
+static int gw_shadow_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_SHADOW"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_SHADOW=1: misaligned reads of a dispatch's range get an aligned copy made right after the dispatch"); } return v; }
+enum { NSHL = 1024 };
+static struct { uint64_t ea, es, ro, rs; } g_shl[NSHL]; static uint64_t g_shl_learn, g_shl_made;
+static void shl_learn(uint64_t ea, uint64_t es, uint64_t ro, uint64_t rs) { unsigned h = (unsigned)((ea >> 4 ^ ea >> 14) % NSHL); if (g_shl[h].ea != ea || g_shl[h].es != es || g_shl[h].ro != ro || g_shl[h].rs != rs) { g_shl[h].ea = ea; g_shl[h].es = es; g_shl[h].ro = ro; g_shl[h].rs = rs; g_shl_learn++; } }
+static int shl_find(uint64_t ea, uint64_t es, uint64_t *ro, uint64_t *rs) { unsigned h = (unsigned)((ea >> 4 ^ ea >> 14) % NSHL); if (g_shl[h].ea != ea || g_shl[h].es != es || g_shl[h].ro + g_shl[h].rs > es) return 0; *ro = g_shl[h].ro; *rs = g_shl[h].rs; return 1; }
 // H0: a read about to be composed (gw_compose), against the entry that sent it there: why it does not fit, by caller; the first 16 in full. Caller holds g_gwmu
 static void h0_compose(uint64_t addr, uint64_t size, VkDeviceSize align, const gw_t *e) {
     int nov = 0, cur = 0;
@@ -694,6 +705,7 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
             }
             atomic_fetch_add(&g_gw_held, 1);
         } else if (!fits) {   // this submission's own write, not covering the read (or at an offset the binding cannot take): composed (gw_compose)
+            if (inside && gw_shadow_on() && !e->exact) shl_learn(e->addr, e->size, addr - e->addr, size);   // DM_VK_GW_SHADOW: next time the dispatch is recorded, this read gets its own aligned copy
             if (may_hold) { h0_compose(addr, size, align, e); VkDeviceSize ro = gw_compose(addr, size, align < 16 ? 16 : align);
                             if (ro != VK_WHOLE_SIZE) { *buf = C->ring; *off = ro; if (p) *p = C->ringp + ro; g_gw_ci = g_ci; hit = 1; atomic_fetch_add(&g_gw_copied, 1); break; } }
             why = 2; atomic_fetch_add(&g_gw_why[2], 1); RED_ONCE(63, "a read overlaps a GPU-written buffer range of this submission without fitting in it: read from guest memory, which is stale until the write completes"); break; }
@@ -4167,6 +4179,13 @@ static void dispatch(const p_dispatch *d) {
             post_add((post_t){3, (void *)(uintptr_t)w->addr, 0, 0, (uint64_t)(uintptr_t)h0s, 0, w->p, w->size}); }
     }
     g_gw_add_dfr = 0;
+    if (gw_shadow_on() && !dfr) for (int i = 0; i < g_nwb; i++) {   // DM_VK_GW_SHADOW: the remembered misaligned reads of these ranges, copied aligned now (after barrier_cs, no pass open)
+        gw_t *w = &g_wb[i]; uint64_t ro, rs; if (!w->buf || !shl_find(w->addr, w->size, &ro, &rs)) continue;
+        VkDeviceSize al = g_props.limits.minStorageBufferOffsetAlignment > 256 ? g_props.limits.minStorageBufferOffsetAlignment : 256;
+        VkDeviceSize o = ring_alloc(rs, al); if (o == VK_WHOLE_SIZE) continue;
+        VkBufferCopy bc = {w->off + ro, o, rs}; vkCmdCopyBuffer(C->cb, w->buf, C->ring, 1, &bc); barrier_xfer(C->cb);
+        gw_add(w->addr + ro, rs, C->ring, o, C->ringp + o, g_fence + 1, g_ci, NULL, 1); g_shl_made++;
+    }
     g_stat_draws++;
 }
 static void clear_color(const p_clear_color *c) {
@@ -5512,6 +5531,7 @@ static void h0_tick(uint64_t n) {
 }
 // H0 (Harvest Moon plan v2): the per-600 lines; counters zeroed after. Called on the presenting thread with the other per-600 lines
 static void h0_lines(void) {
+    if (gw_shadow_on()) { LOG("vk: DM_VK_GW_SHADOW per frame over the last 600: aligned copies made after dispatches %.1f, reads remembered (new or changed) %.2f", g_shl_made / 600.0, g_shl_learn / 600.0); g_shl_made = g_shl_learn = 0; }
     if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: windows made %.1f, small copies into a window %.1f, earlier submissions' parts put into new windows %.1f; not padded: no pool %.1f, this submission's other GPU writes there %.1f, no room %.1f",
                            g_pad_n / 600.0, g_pad_into / 600.0, g_pad_over / 600.0, g_pad_why[1] / 600.0, g_pad_why[2] / 600.0, g_pad_why[3] / 600.0); g_pad_n = g_pad_into = g_pad_over = 0; memset(g_pad_why, 0, sizeof g_pad_why); }
     if (idxpool_once_mode()) { LOG("vk: DM_VK_IDXPOOL_ONCE per frame over the last 600: pool copies %.2f (%.2f MB), draws bound to one %.1f, left to the old copy %.2f, copied again after a write-back landed in it %.2f, verify differences %.2f",
