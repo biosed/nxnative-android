@@ -1,7 +1,7 @@
 # Harvest Moon: Echoes of Teradea (`0100839022642000`)
 
 Update 1.2.0 (v131072, over the base v0). Unity 6000.3.7f1 IL2CPP, FMOD, SDK 20.5.24, NVN. Modules `main`, `subsdk0` (NintendoSDK_movie) and `sdk`.
-Plays on the Mac from the title through character creation and the intro into the first forest. Android: in progress. iOS: untested.
+Plays on the Mac from the title through character creation and the intro into the first forest. Android: first APK built (untested on a device). iOS: untested.
 
 ## What it needs
 
@@ -18,7 +18,7 @@ Nothing beyond the profile the NSP script's survey guessed and the depth mode: n
 - RomFS: 2,329 files, 2.28 GB; 2,300 UnityFS bundles under `Data/StreamingAssets/aa/Switch` (Addressables).
 - The split finds 26,763 stage shaders (13,330 vertex / pixel pairs). All build for the Mac.
 - The first Mac shader build used Xcode 27.2's Metal compiler (metal 32023.922), not the tested 27.1 (`--allow-other-metal`): the Mac libraries come from an untested compiler. The Android SPIR-V path does not use them.
-- Movies: H.264 1920x1080 with AAC sound (the intro), decoded by VideoToolbox on the Mac. The Android host has no AAC decoder yet: the picture plays, the movie's sound is silent there.
+- Movies: H.264 1920x1080 with AAC sound (the intro), decoded by VideoToolbox on the Mac. On Android the sound goes through MediaCodec's AAC decoder (the three `Movie audio on Android` commits from main, made for FINAL FANTASY XII, are on this branch).
 
 ## Frame rate and memory (Mac, M1)
 
@@ -33,4 +33,4 @@ Nothing beyond the profile the NSP script's survey guessed and the depth mode: n
 
 - **The characters' eyes render as white glowing blobs** (character creation and the forest): not investigated yet (an eye material's texture or shader).
 - `nvnTextureViewCompare` is unimplemented (`[RED]`, about 100 calls in a 10-minute run), as in Silver Pines; no visible effect found.
-- Android: APK not built or tested yet. iOS: untested.
+- Android: the first APK (`make_apk.py`, game files outside the APK) is built but not yet run on a device. Shaders: 26,763 SPIR-V modules from `spv_android.py` (`DMSH_SKIP_METAL=1`; 1.27 GB of `.spv` + `.vk.txt`). iOS: untested.
