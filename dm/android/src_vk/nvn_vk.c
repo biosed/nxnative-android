@@ -2647,7 +2647,23 @@ static VkPipeline pso_create(const pso_key *k, VkPipelineLayout pl) {
     uint64_t t0 = now_ns();
     VkPipeline p; VkResult r = vkCreateGraphicsPipelines(g_dev, g_pcache, 1, &gi, NULL, &p);
     atomic_fetch_add(&g_pso_ns, now_ns() - t0);
-    if (r != VK_SUCCESS) { LOG("[RED] vk: pipeline for %s / %s not created (%d)", k->vs->key, k->fs ? k->fs->key : "-", (int)r); p = VK_NULL_HANDLE; }
+    if (r != VK_SUCCESS) {
+        LOG("[RED] vk: pipeline for %s / %s not created (%d)", k->vs->key, k->fs ? k->fs->key : "-", (int)r); p = VK_NULL_HANDLE;
+        // What the driver refused (Tomodachi Life's c0b81b887fb0137d / d317a98e994ca9dd: -13 on the Adreno, both modules valid SPIR-V): the state, then the same pipeline without the
+        // pixel shader, which tells a fragment-stage refusal from the rest. The first 4 failures only
+        static _Atomic int nd; if (atomic_fetch_add(&nd, 1) < 4) {
+            char ln[768]; int o = snprintf(ln, sizeof ln, "vk: refused pipeline: stages %u%s prim %d topology %d restart %d, vs inputs %#x, %u attributes", nst, k->gs ? " (geometry)" : "", k->prim, (int)ia.topology, k->restart, k->vs->vin_mask, nva);
+            for (uint32_t i = 0; i < nva && o < (int)sizeof ln - 40; i++) o += snprintf(ln + o, sizeof ln - o, " [loc %u bind %u fmt %d off %u]", va[i].location, va[i].binding, (int)va[i].format, va[i].offset);
+            o += snprintf(ln + o, sizeof ln - o, ", %d targets", k->nc);
+            for (int i = 0; i < k->nc && o < (int)sizeof ln - 24; i++) o += snprintf(ln + o, sizeof ln - o, " fmt %d blend %d", (int)k->cf[i], (int)ba[i].blendEnable);
+            snprintf(ln + o, sizeof ln - o, ", depth fmt %d stencil %d, samples %d, dual %d, line %g, dynamic rendering %d", (int)k->df, k->stencil, k->samples, k->dual, k->line_w, g_dynrend);
+            LOG("%s", ln);
+            if (k->fs && nst > 1) { VkGraphicsPipelineCreateInfo g2 = gi; g2.stageCount = nst - 1; VkPipeline p2 = VK_NULL_HANDLE;
+                VkResult r2 = vkCreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &g2, NULL, &p2);
+                LOG("vk: refused pipeline without its pixel shader: %d (%s)", (int)r2, r2 == VK_SUCCESS ? "the pixel shader is what the driver refuses" : "refused without it too");
+                if (p2) vkDestroyPipeline(g_dev, p2, NULL); }
+        }
+    }
     return p;
 }
 // Pipelines by their key: a hash table of entries (each allocated once, so a worker can fill one in while the table grows). A new one is made on a worker thread (pso_worker) when

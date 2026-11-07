@@ -38,3 +38,6 @@ shader_note	FINAL FANTASY XII THE ZODIAC AGE shaders (provisional profile)
 # The 3D scene drew black silhouettes with 10 packaged texture uploads in the whole run: the engine fills its textures from the CPU in place (as FINAL FANTASY TACTICS)
 tex_flush_upload	on
 # tex_dirty_upload	on   (off: write-protecting the BC textures hung the loading after the first fault)
+
+# Android: hibernation was brought up on this game (the menu offers it, checked by default)
+hibernate	on
