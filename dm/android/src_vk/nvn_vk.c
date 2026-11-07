@@ -2978,12 +2978,17 @@ static uint64_t g_tbuf_miss[3]; static uint32_t g_ws_zero_tb;   // g_ws_zero_tb:
 // hle_fs ReadFile / ReadFileExact / ReadFileOpt (pread) and hle_cheats' vm_write prepare first; no host code recv()s or ioctl()s into guest memory; arc4random_buf copies in user space
 static int gw_any(uint64_t a, uint64_t n);
 static VkBuffer g_ts_buf; static VkDeviceMemory g_ts_mem; static uint8_t *g_ts_p; static uint32_t g_ts_ngran, g_ts_next; static uint8_t *g_ts_used; static int g_ts_dropping;
-enum { TS_GRAN = 4096, TS_NENT = 4096, TS_NCAND = 8192, TS_NRET = 2048 };
+enum { TS_GRAN = 4096, TS_NENT = 4096, TS_NCAND = 8192 };
 typedef struct { VkFormat f; VkDeviceSize n; VkBufferView v; } ts_view_t;
 typedef struct { uint64_t addr, len, regid, stamp, fence, tick, serial; const void *span; uint32_t off_g, ng; uint8_t used, dirty, nv; ts_view_t v[4]; uint8_t *shadow; } ts_ent;
 static ts_ent g_ts[TS_NENT];
-static struct { uint64_t addr, len, h, hframe, bl_until; } g_tc[TS_NCAND];
-static struct { VkBufferView v[4]; int nv; uint32_t off_g, ng; uint64_t fence; } g_ts_ret[TS_NRET]; static int g_ts_nret;
+static struct { uint64_t addr, len, h, hframe, bl_until; uint32_t nmis; } g_tc[TS_NCAND];   // nmis: hashes that differed from the last (vk19.70b: 3 and it is refused for 10 s)
+typedef struct { VkBufferView v[4]; int nv; uint32_t off_g, ng; uint64_t fence; } ts_ret_t;
+static ts_ret_t *g_ts_ret; static int g_ts_nret, g_ts_cret;   // blocks and views waiting for their readers: grows as needed (vk19.70b: a block is never forgotten)
+static ts_ret_t *ts_ret_push(void) {
+    if (g_ts_nret == g_ts_cret) { int c = g_ts_cret ? 2 * g_ts_cret : 256; ts_ret_t *n = realloc(g_ts_ret, (size_t)c * sizeof *n); if (!n) die("texel store: retired-block list allocation failed"); g_ts_ret = n; g_ts_cret = c; }
+    return &g_ts_ret[g_ts_nret++];
+}
 static uint64_t g_ts_tick, g_ts_serial, g_ts_hit, g_ts_hit_b, g_ts_miss, g_ts_adm, g_ts_recopy, g_ts_evict, g_ts_bl, g_ts_vmade, g_ts_vreuse, g_ts_vchk, g_ts_vbad, g_ts_refused, g_ts_drops;
 static uint32_t g_ts_inuse;   // granules in use
 static struct { uint64_t mem, size; } g_ts_pdel[64]; static _Atomic int g_ts_npdel;   // deleted pools to drop (under g_pool_mu)
@@ -3009,13 +3014,12 @@ static int ts_gran_alloc(uint32_t n) {   // next fit over the granule map: -1 wh
 }
 static void ts_retire(ts_ent *e) {   // the block and its views go when its readers are done
     if (!e->used) return;
-    if (g_ts_nret == TS_NRET) { RED_ONCE(111, "texel store: more than %d blocks waiting for their readers: the store is dropped", TS_NRET); }
-    else { typeof(g_ts_ret[0]) *r = &g_ts_ret[g_ts_nret++]; r->nv = e->nv; for (int i = 0; i < e->nv; i++) r->v[i] = e->v[i].v; r->off_g = e->off_g; r->ng = e->ng; r->fence = e->fence; }
+    { ts_ret_t *r = ts_ret_push(); r->nv = e->nv; for (int i = 0; i < e->nv; i++) r->v[i] = e->v[i].v; r->off_g = e->off_g; r->ng = e->ng; r->fence = e->fence; }
     free(e->shadow); memset(e, 0, sizeof *e);
 }
 static void ts_reap(void) {   // blocks whose readers are done: views destroyed, granules freed; a dropped store's buffer last
     uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < g_ts_nret;) { typeof(g_ts_ret[0]) *r = &g_ts_ret[i];
+    for (int i = 0; i < g_ts_nret;) { ts_ret_t *r = &g_ts_ret[i];
         if (r->fence > done) { i++; continue; }
         for (int k = 0; k < r->nv; k++) vkDestroyBufferView(g_dev, r->v[k], NULL);
         ts_gran_set(r->off_g, r->ng, 0); g_ts_ret[i] = g_ts_ret[--g_ts_nret]; }
@@ -3037,7 +3041,7 @@ static VkBufferView ts_view(ts_ent *e, VkFormat f, VkDeviceSize n) {
     VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, NULL, 0, g_ts_buf, f, (VkDeviceSize)e->off_g * TS_GRAN, n};
     VkBufferView v; if (vkCreateBufferView(g_dev, &ci, NULL, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
     g_ts_vmade++;
-    if (e->nv == 4) { if (g_ts_nret < TS_NRET) { typeof(g_ts_ret[0]) *r = &g_ts_ret[g_ts_nret++]; r->nv = 1; r->v[0] = e->v[0].v; r->off_g = 0; r->ng = 0; r->fence = e->fence; } memmove(e->v, e->v + 1, 3 * sizeof *e->v); e->nv = 3; }
+    if (e->nv == 4) { ts_ret_t *r = ts_ret_push(); r->nv = 1; r->v[0] = e->v[0].v; r->off_g = 0; r->ng = 0; r->fence = e->fence; memmove(e->v, e->v + 1, 3 * sizeof *e->v); e->nv = 3; }
     e->v[e->nv++] = (ts_view_t){f, n, v};
     return v;
 }
@@ -3067,7 +3071,7 @@ static int ts_fill(ts_ent *e, uint64_t addr, uint64_t len, const void *span, uin
 }
 static void ts_blacklist(uint64_t addr, uint64_t len) {
     typeof(g_tc[0]) *c = &g_tc[(addr >> 6 ^ addr >> 19 ^ len * 0x9e3779b1u) % TS_NCAND];
-    c->addr = addr; c->len = len; c->h = 0; c->hframe = 0; c->bl_until = ts_now_s() + 10; g_ts_bl++;
+    c->addr = addr; c->len = len; c->h = 0; c->hframe = 0; c->nmis = 0; c->bl_until = ts_now_s() + 10; g_ts_bl++;
 }
 void ts_pool_deleted(const void *mem, uint64_t size) {   // mtl_pool_del (any thread), holding g_pool_mu: the recording thread drops its blocks at its next lookup
     int n = atomic_load(&g_ts_npdel); if (n < 64) { g_ts_pdel[n].mem = (uint64_t)(uintptr_t)mem; g_ts_pdel[n].size = size; atomic_store(&g_ts_npdel, n + 1); }
@@ -3103,12 +3107,14 @@ static int ts_lookup(uint64_t addr, uint64_t n, VkFormat f, VkDeviceSize al, VkB
     }
     g_ts_miss++;
     typeof(g_tc[0]) *c = &g_tc[(addr >> 6 ^ addr >> 19 ^ n * 0x9e3779b1u) % TS_NCAND];
-    if (c->addr != addr || c->len != n) { if (c->bl_until > ts_now_s()) return 0; c->addr = addr; c->len = n; c->h = 0; c->hframe = 0; c->bl_until = 0; return 0; }   // its first miss: noted, not hashed
+    if (c->addr != addr || c->len != n) { if (c->bl_until > ts_now_s()) return 0; c->addr = addr; c->len = n; c->h = 0; c->hframe = 0; c->bl_until = 0; c->nmis = 0; return 0; }   // its first miss: noted, not hashed
     if (c->bl_until && c->bl_until > ts_now_s()) return 0;
     uint64_t fr = atomic_load_explicit(&g_presents, memory_order_relaxed);
     if (c->hframe == fr) return 0;   // hashed in this frame already
     uint64_t h = ts_span_hash(addr, n);
-    if (!(c->hframe && c->hframe + 1 == fr && c->h == h)) { c->h = h; c->hframe = fr; return 0; }
+    if (!(c->hframe && c->hframe + 1 == fr && c->h == h)) {
+        if (c->hframe && c->h != h && ++c->nmis >= 3) { ts_blacklist(addr, n); return 0; }   // never stable: not hashed again for 10 s (a hash costs about a copy)
+        c->h = h; c->hframe = fr; return 0; }
     // the same bytes in two consecutive frames: admitted, if it qualifies
     const void *span = nvn_dirty_span((const void *)(uintptr_t)addr, (size_t)n); uint64_t rid = nvn_dirty_span_regid(span);
     if (!span || !rid || gw_any(addr, n) || pool_class(addr) == PC_GPU) { g_ts_refused++; ts_blacklist(addr, n); return 0; }
