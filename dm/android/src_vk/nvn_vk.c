@@ -324,7 +324,7 @@ static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) g = now_ns();
 // (ctx_complete, when the bytes are back in guest memory)
 typedef struct { uint64_t addr, size; VkBuffer buf; VkDeviceSize off; uint8_t *p; uint64_t fence; int ci;   // ci: the context whose ring holds it
                  const uint8_t *snap; int exact; uint64_t chk; int dirty; uint8_t dfr;
-                 VkBuffer fbuf; VkDeviceSize foff; uint8_t *fp; uint64_t ffence; int fci; } gw_t;   // f*: its forwarded copy (DM_VK_GW_FORWARD): in the ring of submission ffence, context fci   // dfr: written by a dispatch deferred past the open pass (defer_flush), not recorded yet
+                 VkBuffer fbuf; VkDeviceSize foff; uint8_t *fp; uint64_t ffence; int fci; uint8_t pad; } gw_t;   // pad: a padded window of small copies (DM_VK_GW_PAD)   // f*: its forwarded copy (DM_VK_GW_FORWARD): in the ring of submission ffence, context fci   // dfr: written by a dispatch deferred past the open pass (defer_flush), not recorded yet
 // snap: the guest's bytes the dispatch was recorded with (its post kind 5 owns them; cleared here before they are freed), to tell which words the CPU rewrote since (gw_cpu_dirty);
 // exact: an exact write (a texture-to-buffer or buffer copy writes every byte of its range), not a dispatch's whole bound storage buffer; chk / dirty: gw_cpu_dirty's answer for a submission
 enum { NGW = 512 };
@@ -355,13 +355,14 @@ static int gw_index_on(void) { static int v = -1; if (v < 0) { const char *e = g
 #define GW_MISS(i, lo, n) (gw_index_on() ? ((lo) >= g_gwe[i] || (lo) + (n) <= g_gwa[i]) : ((lo) >= g_gw[i].addr + g_gw[i].size || (lo) + (n) <= g_gw[i].addr))   // entry i does not overlap [lo, lo + n)
 static void gw_del(int i) { gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] = g_gw[--g_ngw]; g_gwa[i] = g_gwa[g_ngw]; g_gwe[i] = g_gwe[g_ngw]; }   // caller holds g_gwmu
 static int g_gw_add_dfr;   // gw_add: the entry is a deferred dispatch's (see defer_on)
+static int g_gw_add_pad;   // gw_add: the entry is a padded window (DM_VK_GW_PAD)
 static int g_defer_haz;   // a draw's resources include what a deferred dispatch writes: the pass ends and the dispatches are recorded before the draw (DRAWQ)
 static void gw_add(uint64_t addr, uint64_t size, VkBuffer buf, VkDeviceSize off, uint8_t *p, uint64_t fence, int ci, const uint8_t *snap, int exact) {
     lk_(&g_gwmu, LW_GWMU);
     for (int i = 0; i < g_ngw; i++) if (g_gw[i].addr == addr && g_gw[i].size == size) { gw_del(i); break; }   // the newer write of one range replaces the older
     if (g_ngw == NGW) { RED_ONCE(62, "more than %d GPU-written buffer ranges in flight: the oldest is forgotten", NGW); gw_pg_mark(g_gw[0].addr, g_gw[0].size, -1); memmove(g_gw, g_gw + 1, (NGW - 1) * sizeof *g_gw); memmove(g_gwa, g_gwa + 1, (NGW - 1) * 8); memmove(g_gwe, g_gwe + 1, (NGW - 1) * 8); g_ngw--; }
     g_gwa[g_ngw] = addr; g_gwe[g_ngw] = addr + size;
-    g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0, (uint8_t)g_gw_add_dfr}; gw_pg_mark(addr, size, 1);
+    g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0, (uint8_t)g_gw_add_dfr}; g_gw[g_ngw - 1].pad = (uint8_t)g_gw_add_pad; gw_pg_mark(addr, size, 1);
     pthread_mutex_unlock(&g_gwmu);
 }
 // The ring range holding what the GPU wrote at [addr, addr + size), when an entry covers it and the offset in it keeps `align`. An entry of the submission being recorded is
@@ -392,7 +393,7 @@ static int stale_patch_on(void) { return stale_patch_mode() != 0; }
 // the CPU's words kept (which the whole write-back overwrote before) and of words both the CPU and the GPU wrote (the GPU's kept, as before). Per-600 line 'vk: chained GPU-written ranges'
 static int chain_snap_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_CHAIN_SNAP"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 1;
     if (v) LOG("vk: DM_VK_GW_CHAIN_SNAP=%d: a dispatch's range bound from a running submission's GPU-written range gets a snapshot and goes back by changed words%s", v, v == 2 ? " (with counts of the CPU's words kept)" : ""); } return v; }
-static uint64_t g_cs_n, g_cs_b;   // chained ranges given a snapshot (recording thread)
+static uint64_t g_cs_n, g_cs_b, g_cs_b2b;   // chained ranges given a snapshot (recording thread); GPU-written buffer copies whose CPU-side bytes went into live snapshots
 static _Atomic uint64_t g_cs_prop_b, g_cs_prop_n, g_cs_kept_w, g_cs_both_w, g_cs_wb_n;   // completion: bytes put into later snapshots (writes), CPU words kept, words both wrote, chained write-backs
 // Host write-backs into guest memory (post kinds 3, 5, 6 at completion), logged with a sequence number: DM_VK_IDXPOOL_ONCE drops a pool copy one of them landed in since it was
 // made (hm9's verify differences: the completion thread writes back while the next submission is recorded)
@@ -4525,29 +4526,50 @@ void mtl_exec_rest(const uint64_t *handles, int n) { g_rest = handles; g_nrest =
 // the entry and is bound in place. The entry has a snapshot (the guest's bytes), so it goes back by changed words (post kind 5) and the CPU's later rewrites of the padding are
 // patched into later reads (gw_cpu_dirty), as for any dispatch range. Counted in the per-600 line 'vk: DM_VK_GW_PAD'
 static int gw_pad_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_PAD"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_PAD=1: small copies of GPU-written bytes padded with the guest's bytes around them"); } return v; }
-static uint64_t g_pad_n, g_pad_no;
+static uint64_t g_pad_n, g_pad_into, g_pad_over, g_pad_why[4];   // windows made, copies into a window, earlier submissions' parts put into new windows; not padded: 1 no pool, 2 this submission's other GPU writes, 3 no room
 static uint64_t pool_range(uint64_t addr, uint64_t *size);
 static int gw_any(uint64_t a, uint64_t n) { int r = 0; if (!gw_pg_any(a, n)) return 0; lk_(&g_gwmu, LW_GWMU); for (int i = 0; i < g_ngw && !r; i++) r = !GW_MISS(i, a, n); pthread_mutex_unlock(&g_gwmu); return r; }
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     memmove((void *)dst, (const void *)src, n); wlog_add(dst, n);
     if (!n || !g_ngw || !gw_any(src, n)) return;
+    if (chain_snap_mode()) { lk_(&g_gwmu, LW_GWMU); gw_snap_follow((const uint8_t *)(uintptr_t)dst, n, (const uint8_t *)(uintptr_t)dst, NULL, 0); pthread_mutex_unlock(&g_gwmu); g_cs_b2b++; }   // the CPU-side copy of GPU-written bytes above is stale, not a CPU rewrite: the live snapshots over dst take it too (gw_cpu_dirty would patch it over the GPU's bytes)
     pass_end();
     g_h0_caller = H0C_COPY; VkBuffer sb; VkDeviceSize so; if (!gw_find(src, n, 16, &sb, &so, NULL)) { memmove((void *)dst, (const void *)src, n); return; }   // complete now (gw_find waited for it): in guest memory
-    if (gw_pad_on() && n <= 256) {   // DM_VK_GW_PAD: a small copy's entry padded with the guest's bytes around it, so reads of the record it sits in fit (no compose, no pass break)
-        uint64_t psz = 0, base = pool_range(dst, &psz), lo = dst > 64 ? (dst - 64) & ~(uint64_t)255 : 0, hi = (dst + n + 64 + 255) & ~(uint64_t)255;
+    if (gw_pad_on() && n <= 256) {   // DM_VK_GW_PAD: small copies into a padded 4 KB window of the guest's bytes, so reads of the records around them fit (no compose, no pass break)
+        uint64_t psz = 0, base = pool_range(dst, &psz), lo = dst & ~(uint64_t)4095, hi = lo + 4096;
         if (base && lo < base) lo = base; if (base && hi > base + psz) hi = base + psz;
-        if (base && lo <= dst && hi >= dst + n && !gw_any(lo, hi - lo)) {   // nothing else GPU-written there (the padding is the guest's bytes)
-            VkDeviceSize ro = ring_alloc(hi - lo, 256);
-            uint8_t *snap = ro != VK_WHOLE_SIZE ? snap_alloc(hi - lo) : NULL;
-            if (snap) {
-                memcpy(C->ringp + ro, (const void *)(uintptr_t)lo, hi - lo); memcpy(snap, (const void *)(uintptr_t)lo, hi - lo);
-                VkBufferCopy bc = {so, ro + (dst - lo), n}; vkCmdCopyBuffer(C->cb, sb, C->ring, 1, &bc); barrier_xfer(C->cb);
-                gw_add(lo, hi - lo, C->ring, ro, C->ringp + ro, g_fence + 1, g_ci, snap, 1);
-                post_add((post_t){5, (void *)(uintptr_t)lo, 0, 0, (uint64_t)(uintptr_t)snap, 0, C->ringp + ro, hi - lo});   // back by changed words: the padding's CPU writes stay
-                atomic_fetch_add(&g_gw_b2b, 1); g_pad_n++; return;
-            }
+        int why = !base || dst < lo || dst + n > hi ? 1 : 0;
+        if (!why) {
+            lk_(&g_gwmu, LW_GWMU);
+            for (int i = g_ngw - 1; i >= 0; i--) { gw_t *e = &g_gw[i];   // this submission's window already holding dst: the copy goes into it
+                if (e->pad && e->fence == g_fence + 1 && dst >= e->addr && dst + n <= e->addr + e->size) {
+                    VkBuffer eb = e->buf; VkDeviceSize eo = e->off + (dst - e->addr);
+                    if (e->snap) memcpy((uint8_t *)(uintptr_t)e->snap + (dst - e->addr), (const void *)(uintptr_t)dst, n);   // the CPU-side copy above is not a CPU rewrite
+                    pthread_mutex_unlock(&g_gwmu);
+                    VkBufferCopy bc = {so, eo, n}; vkCmdCopyBuffer(C->cb, sb, eb, 1, &bc); barrier_xfer(C->cb);
+                    atomic_fetch_add(&g_gw_b2b, 1); g_pad_into++; return;
+                } }
+            for (int i = 0; i < g_ngw && !why; i++) if (!GW_MISS(i, lo, hi - lo) && g_gw[i].fence == g_fence + 1) why = 2;   // this submission's other GPU writes there: not padded
+            pthread_mutex_unlock(&g_gwmu);
         }
-        g_pad_no++;
+        VkDeviceSize ro = !why ? ring_alloc(hi - lo, 256) : VK_WHOLE_SIZE; uint8_t *snap = ro != VK_WHOLE_SIZE ? snap_alloc(hi - lo) : NULL;
+        if (!why && !snap) why = 3;
+        if (!why) {
+            VkBuffer rb = C->ring; memcpy(C->ringp + ro, (const void *)(uintptr_t)lo, hi - lo); memcpy(snap, (const void *)(uintptr_t)lo, hi - lo);
+            lk_(&g_gwmu, LW_GWMU);   // an earlier submission's GPU writes in the window (still running): their bytes over the guest's, at this submission's start, as gw_compose does
+            for (int i = 0; i < g_ngw; i++) { if (GW_MISS(i, lo, hi - lo)) continue; gw_t *e = &g_gw[i]; if (e->fence == g_fence + 1) continue;
+                uint64_t a0 = e->addr > lo ? e->addr : lo, a1 = e->addr + e->size < hi ? e->addr + e->size : hi;
+                VkBufferCopy bc = {e->off + (a0 - e->addr), ro + (a0 - lo), a1 - a0}; vkCmdCopyBuffer(C->up, e->buf, rb, 1, &bc); C->up_used = 1;
+                if (gw_cpu_dirty(e, a0, a1)) gw_patch(e, a0, a1, rb, ro + (a0 - lo));
+                ctx_t *o = &g_ctx[e->ci]; if (o->hold < g_fence + 1) o->hold = g_fence + 1; xr_raise(e->buf, g_fence + 1); g_pad_over++; }
+            pthread_mutex_unlock(&g_gwmu);
+            VkBufferCopy bc = {so, ro + (dst - lo), n}; vkCmdCopyBuffer(C->cb, sb, rb, 1, &bc); barrier_xfer(C->cb);
+            g_gw_add_pad = 1; gw_add(lo, hi - lo, rb, ro, C->ringp + ro, g_fence + 1, g_ci, snap, 1); g_gw_add_pad = 0;
+            post_add((post_t){5, (void *)(uintptr_t)lo, 0, 0, (uint64_t)(uintptr_t)snap, 0, C->ringp + ro, hi - lo});   // back by changed words: the CPU's writes to the window stay
+            atomic_fetch_add(&g_gw_b2b, 1); g_pad_n++; return;
+        }
+        if (snap) snap_free(snap, hi - lo);
+        g_pad_why[why]++;
     }
     VkDeviceSize ro = ring_alloc(n, 16); if (ro == VK_WHOLE_SIZE) { RED_ONCE(93, "a buffer copy of GPU-written bytes found no room in the ring: copied from guest memory"); return; }
     VkBufferCopy bc = {so, ro, n}; vkCmdCopyBuffer(C->cb, sb, C->ring, 1, &bc); barrier_xfer(C->cb);
@@ -5442,14 +5464,15 @@ static void h0_tick(uint64_t n) {
 }
 // H0 (Harvest Moon plan v2): the per-600 lines; counters zeroed after. Called on the presenting thread with the other per-600 lines
 static void h0_lines(void) {
-    if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: small GPU-written copies padded %.1f, not padded (something GPU-written near, no pool or no room) %.1f", g_pad_n / 600.0, g_pad_no / 600.0); g_pad_n = g_pad_no = 0; }
+    if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: windows made %.1f, small copies into a window %.1f, earlier submissions' parts put into new windows %.1f; not padded: no pool %.1f, this submission's other GPU writes there %.1f, no room %.1f",
+                           g_pad_n / 600.0, g_pad_into / 600.0, g_pad_over / 600.0, g_pad_why[1] / 600.0, g_pad_why[2] / 600.0, g_pad_why[3] / 600.0); g_pad_n = g_pad_into = g_pad_over = 0; memset(g_pad_why, 0, sizeof g_pad_why); }
     if (idxpool_once_mode()) { LOG("vk: DM_VK_IDXPOOL_ONCE per frame over the last 600: pool copies %.2f (%.2f MB), draws bound to one %.1f, left to the old copy %.2f, copied again after a write-back landed in it %.2f, verify differences %.2f",
                                    g_ipo_copy / 600.0, g_ipo_bytes / 600.0 / 1048576.0, g_ipo_hit / 600.0, g_ipo_fallback / 600.0, g_ipo_hwl / 600.0, g_ipo_bad / 600.0); g_ipo_copy = g_ipo_bytes = g_ipo_hit = g_ipo_fallback = g_ipo_bad = g_ipo_hwl = 0; }
     if (ring_reuse_on()) { LOG("vk: DM_VK_RING_REUSE over the last 600 frames: rings of idle contexts given back %llu, extra rings sized from the overflow %llu (recent overflow %.1f MB); %d extra rings kept (%.0f MB)",
                                (unsigned long long)g_h05_shrunk, (unsigned long long)g_h05_sized, g_h05_over / 1048576.0, g_nxc, g_xc_bytes / 1048576.0); g_h05_shrunk = g_h05_sized = 0; }
     if (chain_snap_mode()) { uint64_t pb = atomic_exchange(&g_cs_prop_b, 0), pn = atomic_exchange(&g_cs_prop_n, 0), kw = atomic_exchange(&g_cs_kept_w, 0), bw = atomic_exchange(&g_cs_both_w, 0), wn = atomic_exchange(&g_cs_wb_n, 0);
-        LOG("vk: chained GPU-written ranges per frame over the last 600 (DM_VK_GW_CHAIN_SNAP %d): given a snapshot %.1f (%.2f MB), written back by changed words %.1f; earlier write-backs put into later snapshots %.0f bytes (%.1f snapshots)%s",
-            chain_snap_mode(), g_cs_n / 600.0, g_cs_b / 600.0 / 1048576.0, wn / 600.0, pb / 600.0, pn / 600.0, "");
+        LOG("vk: chained GPU-written ranges per frame over the last 600 (DM_VK_GW_CHAIN_SNAP %d): given a snapshot %.1f (%.2f MB), written back by changed words %.1f; earlier write-backs put into later snapshots %.0f bytes (%.1f snapshots); buffer copies of GPU-written bytes kept out of the CPU's rewrites %.1f",
+            chain_snap_mode(), g_cs_n / 600.0, g_cs_b / 600.0 / 1048576.0, wn / 600.0, pb / 600.0, pn / 600.0, g_cs_b2b / 600.0); g_cs_b2b = 0;
         if (chain_snap_mode() == 2) LOG("vk: chained GPU-written ranges (verify): the CPU's words kept that the whole write-back overwrote before %.0f bytes a frame; words both the CPU and the GPU wrote (the GPU's kept) %.0f bytes a frame", kw * 4 / 600.0, bw * 4 / 600.0);
         g_cs_n = g_cs_b = 0; }
     static const char *cn[H0C_N] = {"vertex", "uniform", "storage", "texel", "indirect", "buffer copy", "image copy", "other"};
