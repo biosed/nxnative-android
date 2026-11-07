@@ -2999,7 +2999,8 @@ static int ts_mode(void) { return tog(TG_TSTORE); }
 static int ts_kmode(int kind) { return kind == TSK_TEXEL ? tog(TG_TSTORE) : tog(TG_BSTORE); }   // the switch of a kind of range (vk19.72)
 static int ts_any(void) { return tog(TG_TSTORE) || tog(TG_BSTORE); }
 static uint64_t g_ts_khit[3], g_ts_khit_b[3], g_ts_kadm[3];   // per kind (the store line)
-static uint64_t ts_now_s(void) { return now_ns() / 1000000000ull; }
+static uint64_t g_ts_sec, g_ts_frame;   // the clock (s) and the present count, taken once a submission (ts_tick, vk19.74c)
+static uint64_t ts_now_s(void) { return g_ts_sec; }
 static int ts_init(void) {
     if (g_ts_buf) return 1;
     if (zc_mode()) { RED_ONCE(110, "DM_VK_TEXEL_STORE is refused together with DM_VK_ZEROCOPY"); return 0; }
@@ -3092,17 +3093,23 @@ void ts_pool_deleted(const void *mem, uint64_t size) {   // mtl_pool_del (any th
     else { g_ts_pdel[63].mem = 0; g_ts_pdel[63].size = UINT64_MAX; }   // too many at once: every block goes
 }
 static pthread_mutex_t g_pool_mu;
-// The range's block in the store (filled now if just admitted or written since), NULL: the caller copies as before. kind: texel buffer, vertex stream, indirect index pool
-static ts_ent *ts_get(uint64_t addr, uint64_t n, VkDeviceSize al, int kind) {
-    int mode = ts_kmode(kind); if (!mode || zc_mode()) return NULL;
-    if (g_mem_low || g_mem_tight) { if (g_ts_buf && !g_ts_dropping) ts_drop_all(); if (g_ts_buf) ts_reap(); return NULL; }
-    if (g_ts_dropping) { ts_reap(); return NULL; }
-    if (!g_ts_buf && !ts_init()) return NULL;
+// The store's upkeep, once a submission at mtl_sub_begin (vk19.74c: it ran in every lookup, ~3,000 a frame with vertex streams): the clock and the present count for the
+// lookups, memory pressure (the whole store dropped), its making, the blocks of deleted pools, and the blocks whose readers are done
+static void ts_tick(void) {
+    if (!ts_any() || zc_mode()) return;
+    g_ts_sec = now_ns() / 1000000000ull; g_ts_frame = atomic_load_explicit(&g_presents, memory_order_relaxed);
+    if (g_mem_low || g_mem_tight) { if (g_ts_buf && !g_ts_dropping) ts_drop_all(); if (g_ts_buf) ts_reap(); return; }
+    if (g_ts_dropping) { ts_reap(); return; }
+    if (!g_ts_buf && !ts_init()) return;
     if (atomic_load(&g_ts_npdel)) {   // pools deleted since: their blocks go
         pthread_mutex_lock(&g_pool_mu); int k = atomic_load(&g_ts_npdel);
         for (int j = 0; j < k; j++) for (int i = 0; i < TS_NENT; i++) if (g_ts[i].used && g_ts[i].addr + g_ts[i].len > g_ts_pdel[j].mem && g_ts[i].addr < g_ts_pdel[j].mem + g_ts_pdel[j].size) ts_retire(&g_ts[i]);
         atomic_store(&g_ts_npdel, 0); pthread_mutex_unlock(&g_pool_mu); }
     ts_reap();
+}
+// The range's block in the store (filled now if just admitted or written since), NULL: the caller copies as before. kind: texel buffer, vertex stream, indirect index pool
+static ts_ent *ts_get(uint64_t addr, uint64_t n, VkDeviceSize al, int kind) {
+    int mode = ts_kmode(kind); if (!mode || !g_ts_buf || g_ts_dropping || g_mem_low || g_mem_tight) return NULL;   // the store's upkeep runs once a submission (ts_tick)
     if (al > TS_GRAN || !n || n > (64u << 20) || (g_ts_ngran && n > (uint64_t)g_ts_ngran * TS_GRAN / 4)) return NULL;   // at most a quarter of the store a range
     if (kind != TSK_TEXEL && n > (2u << 20)) return NULL;   // vk19.74a: vertex streams and the index pool at most 2 MB a range (an 8 MB index pool cost 1.5-2.5 ms a hash and as much a copy when written)
     ts_ent *e = ts_slot(addr, n, kind);
@@ -3123,7 +3130,7 @@ static ts_ent *ts_get(uint64_t addr, uint64_t n, VkDeviceSize al, int kind) {
     typeof(g_tc[0]) *c = &g_tc[ts_cand(addr, n, kind)];
     if (c->addr != addr || c->len != n || c->kind != kind) { if (c->bl_until > ts_now_s()) return NULL; c->addr = addr; c->len = n; c->kind = (uint8_t)kind; c->h = 0; c->hframe = 0; c->bl_until = 0; c->nmis = 0; c->nbl = 0; return NULL; }   // its first miss: noted, not hashed
     if (c->bl_until && c->bl_until > ts_now_s()) return NULL;
-    uint64_t fr = atomic_load_explicit(&g_presents, memory_order_relaxed);
+    uint64_t fr = g_ts_frame;
     if (c->hframe == fr) return NULL;   // hashed in this frame already
     uint64_t h = ts_span_hash(addr, n);
     if (!(c->hframe && c->hframe + 1 == fr && c->h == h)) {
@@ -4246,6 +4253,7 @@ void mtl_sub_begin(void) {
     if (zc_mode()) zc_reap(g_done);
     ds_last_newcb();   // a new command buffer: no state recorded in it yet
     tog_latch();   // the run-time switches, for this whole submission
+    ts_tick();   // the range store's upkeep (vk19.74c)
     { int cpu = sched_getcpu(); if (cpu >= 0 && cpu < 8) g_rcore[cpu]++; }
     uint64_t w0 = now_ns();
     if (ctx_pick_on()) ctx_pick();
