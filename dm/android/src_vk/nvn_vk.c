@@ -2770,7 +2770,23 @@ static VkPipeline pso_create(const pso_key *k, VkPipelineLayout pl) {
     uint64_t t0 = now_ns();
     VkPipeline p; VkResult r = vkCreateGraphicsPipelines(g_dev, g_pcache, 1, &gi, NULL, &p);
     atomic_fetch_add(&g_pso_ns, now_ns() - t0);
-    if (r != VK_SUCCESS) { LOG("[RED] vk: pipeline for %s / %s not created (%d)", k->vs->key, k->fs ? k->fs->key : "-", (int)r); p = VK_NULL_HANDLE; }
+    if (r != VK_SUCCESS) {
+        LOG("[RED] vk: pipeline for %s / %s not created (%d)", k->vs->key, k->fs ? k->fs->key : "-", (int)r); p = VK_NULL_HANDLE;
+        // What the driver refused (Tomodachi Life's c0b81b887fb0137d / d317a98e994ca9dd: -13 on the Adreno, both modules valid SPIR-V): the state, then the same pipeline without the
+        // pixel shader, which tells a fragment-stage refusal from the rest. The first 4 failures only
+        static _Atomic int nd; if (atomic_fetch_add(&nd, 1) < 4) {
+            char ln[768]; int o = snprintf(ln, sizeof ln, "vk: refused pipeline: stages %u%s prim %d topology %d restart %d, vs inputs %#x, %u attributes", nst, k->gs ? " (geometry)" : "", k->prim, (int)ia.topology, k->restart, k->vs->vin_mask, nva);
+            for (uint32_t i = 0; i < nva && o < (int)sizeof ln - 40; i++) o += snprintf(ln + o, sizeof ln - o, " [loc %u bind %u fmt %d off %u]", va[i].location, va[i].binding, (int)va[i].format, va[i].offset);
+            o += snprintf(ln + o, sizeof ln - o, ", %d targets", k->nc);
+            for (int i = 0; i < k->nc && o < (int)sizeof ln - 24; i++) o += snprintf(ln + o, sizeof ln - o, " fmt %d blend %d", (int)k->cf[i], (int)ba[i].blendEnable);
+            snprintf(ln + o, sizeof ln - o, ", depth fmt %d stencil %d, samples %d, dual %d, line %g, dynamic rendering %d", (int)k->df, k->stencil, k->samples, k->dual, k->line_w, g_dynrend);
+            LOG("%s", ln);
+            if (k->fs && nst > 1) { VkGraphicsPipelineCreateInfo g2 = gi; g2.stageCount = nst - 1; VkPipeline p2 = VK_NULL_HANDLE;
+                VkResult r2 = vkCreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &g2, NULL, &p2);
+                LOG("vk: refused pipeline without its pixel shader: %d (%s)", (int)r2, r2 == VK_SUCCESS ? "the pixel shader is what the driver refuses" : "refused without it too");
+                if (p2) vkDestroyPipeline(g_dev, p2, NULL); }
+        }
+    }
     return p;
 }
 // Pipelines by their key: a hash table of entries (each allocated once, so a worker can fill one in while the table grows). A new one is made on a worker thread (pso_worker) when
@@ -4941,6 +4957,10 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
 void mtl_finish(void) { if (g_rec_drain) g_rec_drain(); mtl_wait(g_fence, UINT64_MAX); }
 void mtl_drain(void) { mtl_finish(); pcache_save(); }   // going to the background: the pipelines made so far are kept for the next run
 
+// The picture as last presented (its crop's size, and whether it is stretched over the window): app/front_android.c maps a finger on the window onto the game's touch screen
+// with it (touch_map.h), the same letterbox the blit below draws. 0 until the first present
+static _Atomic uint64_t g_pic_wh;
+int dm_vk_picture(int *w, int *h) { uint64_t v = atomic_load(&g_pic_wh); *w = (int)(v >> 32 & 0x7fffffff); *h = (int)(uint32_t)v; return (int)(v >> 63); }
 // ---------- Presentation: counted; DM_VK_SHOTS writes chosen frames as BMP files ----------
 // Only the window crop is written, the part of the texture the screen shows (win_present's source rectangle): a game in handheld mode renders 1280x720 into the top left of
 // a 1920x1080 swapchain texture (Harvest Moon: Echoes of Teradea, WindowCrop 0,0 1280x720), and the whole texture made a shot with the picture in one corner
@@ -5326,6 +5346,7 @@ static void win_present(const tex_t *t, const int crop[4]) {
     vkCmdClearColorImage(cb, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rr);
     int32_t sx = crop ? crop[0] : 0, sy = crop ? crop[1] : 0, sw = crop && crop[2] ? crop[2] : (int32_t)v->w, sh = crop && crop[3] ? crop[3] : (int32_t)v->h;
     static int stretch = -1; if (stretch < 0) { const char *e = getenv("DM_SCREEN_FIT"); stretch = e && !strcmp(e, "stretch"); }
+    atomic_store(&g_pic_wh, (uint64_t)(uint32_t)sw << 32 | (uint32_t)sh | (stretch ? 1ull << 63 : 0));   // what the front end maps fingers onto (dm_vk_picture)
     int32_t dw = (int32_t)W.ext.width, dh = (int32_t)W.ext.height, dx = 0, dy = 0;
     if (!stretch) { if ((int64_t)dw * sh > (int64_t)dh * sw) { dw = (int32_t)((int64_t)dh * sw / sh); dx = ((int32_t)W.ext.width - dw) / 2; } else { dh = (int32_t)((int64_t)dw * sh / sw); dy = ((int32_t)W.ext.height - dh) / 2; } }
     VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{sx, sy, 0}, {sx + sw, sy + sh, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
@@ -5846,6 +5867,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)period_s;
     uint64_t n = atomic_fetch_add(&g_presents, 1) + 1;
     g_frame_draw = 0; vk_ctl(n);
+    { extern _Atomic uint64_t dm_present_ns; atomic_store(&dm_present_ns, now_ns()); }   // hle_thread.c: DM_HITCH_DUMP measures stalls from it (nvn_mtl.m sets it on Apple; never set here before, so the dump never fired on Android)
     { uint64_t now = now_ns(); if (g_pp_last) g_pp[g_npp++ % 600] = (uint32_t)((now - g_pp_last) / 1000 > UINT32_MAX ? UINT32_MAX : (now - g_pp_last) / 1000); g_pp_last = now; }   // present to present (us)
     if (n == 1 || n % 600 == 0) { void vk_stats_window(uint64_t frames); vk_stats_window(n); }   // heat and energy (vk_stats.c): started at the first frame, a window each 600
     {   // the frame's work for the hint session: the time since the last present (its CPU side) and the GPU time per frame of the last completed submissions
