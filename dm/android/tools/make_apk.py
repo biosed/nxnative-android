@@ -53,8 +53,9 @@ MANIFEST = '''<?xml version="1.0" encoding="utf-8"?>
 </manifest>
 '''
 
+sys.path.insert(0, os.path.join(ANDROID, '..', 'games'))
 def profile_txt(gid):   # the game profile's keys the menu reads (dm/games/game.py; a provisional profile through DM_GAMES_DIR): one "key value" line each
-    sys.path.insert(0, os.path.join(ANDROID, '..', 'games')); import game
+    import game
     g = game.load(gid)
     return f"hibernate {1 if g.get('hibernate', 'off') == 'on' else 0}\n"
 

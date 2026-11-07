@@ -271,9 +271,10 @@ public class MenuActivity extends Activity {
         } catch (Exception e) { /* no profile file: off */ }
         return false;
     }
-    private boolean hibernationOn() {
+    private boolean hibernationOn() {   // as the game process decides it (front_android.c boot_env): settings.env counts only for a game whose profile offers hibernation
         String v = null;
-        for (File f : new File[] { new File(getFilesDir(), "settings.env"), new File(getExternalFilesDir(null), "env.txt") }) {
+        File[] files = profileFlag("hibernate") ? new File[] { new File(getFilesDir(), "settings.env"), new File(getExternalFilesDir(null), "env.txt") } : new File[] { new File(getExternalFilesDir(null), "env.txt") };
+        for (File f : files) {
             try (BufferedReader r = new BufferedReader(new InputStreamReader(new java.io.FileInputStream(f), StandardCharsets.UTF_8))) {
                 String l; while ((l = r.readLine()) != null) if (l.startsWith("DM_HIBERNATE=")) v = l.substring(13).trim();
             } catch (Exception e) { /* not there */ }

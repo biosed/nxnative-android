@@ -436,7 +436,14 @@ static void boot_env(const char *files, const char *ext) {
     if (freopen(p, "w", stderr)) setvbuf(stderr, NULL, _IOLBF, 0);
     snprintf(p, sizeof p, "%s/settings.env", files);   // KEY=VALUE lines from MenuActivity
     FILE *f = fopen(p, "r");
-    if (f) { char ln[1024]; while (fgets(ln, sizeof ln, f)) { ln[strcspn(ln, "\r\n")] = 0; char *eq = strchr(ln, '='); if (!eq || ln[0] == '#') continue; *eq = 0; setenv(ln, eq + 1, 1); fprintf(stderr, "boot: %s=%s\n", ln, eq + 1); } fclose(f); }
+#ifndef DM_GAME_HIBERNATE
+#define DM_GAME_HIBERNATE 0
+#endif
+    // A game whose profile does not offer hibernation (game.py hibernate) takes DM_HIBERNATE from env.txt only: a settings.env written before the menu stopped offering it
+    // (Tomodachi Life ran with it on) is not rewritten while the menu is skipped, and would keep the game hibernating
+    if (f) { char ln[1024]; while (fgets(ln, sizeof ln, f)) { ln[strcspn(ln, "\r\n")] = 0; char *eq = strchr(ln, '='); if (!eq || ln[0] == '#') continue; *eq = 0;
+                 if (!DM_GAME_HIBERNATE && !strcmp(ln, "DM_HIBERNATE")) { fprintf(stderr, "boot: %s=%s ignored (the profile offers no hibernation; env.txt can set it)\n", ln, eq + 1); continue; }
+                 setenv(ln, eq + 1, 1); fprintf(stderr, "boot: %s=%s\n", ln, eq + 1); } fclose(f); }
     else fprintf(stderr, "boot: no settings.env, the defaults apply\n");
     snprintf(p, sizeof p, "%s/env.txt", ext);   // diagnostics: switches in <external>/env.txt (one KEY=VALUE per line) win
     if ((f = fopen(p, "r"))) { char ln[1024]; while (fgets(ln, sizeof ln, f)) { ln[strcspn(ln, "\r\n")] = 0; char *eq = strchr(ln, '='); if (!eq || ln[0] == '#') continue; *eq = 0; setenv(ln, eq + 1, 1); fprintf(stderr, "boot: env %s=%s\n", ln, eq + 1); } fclose(f); }
