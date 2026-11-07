@@ -224,7 +224,7 @@ typedef struct {
     VkQueryPool tq; uint32_t ntq, ntq_prev; int tq_init; uint8_t tkind[NTQ / 2]; uint64_t tsig[NTQ / 2]; uint32_t tdraws[NTQ / 2];   // GPU timestamps around each pass / dispatch / copy (gpu_mark): a pair per region, its kind   // occlusion queries of this submission (one per draw made while NVN's samples-passed counter counts), reset at its start
     VkFramebuffer *fb; int nfb, cfb;   // render passes' framebuffers (no dynamic rendering), destroyed when the submission is done
     VkBuffer ring0; VkDeviceMemory ringm0; uint8_t *ringp0;   // the context's own ring; ring / ringp move to extra rings when a submission outgrows it (loading screens upload hundreds of MB)
-    VkDeviceSize ring0_size, ring_size, total, last_total, win_max; uint32_t nwin; uint64_t trim_seen;   // ring_size: of the ring in use; total: bytes this submission took from rings
+    VkDeviceSize ring0_size, ring_size, total, last_total, win_max; uint32_t nwin; uint64_t trim_seen; uint64_t h05_last;   // h05_last: the submission that last took it (DM_VK_RING_REUSE)   // ring_size: of the ring in use; total: bytes this submission took from rings
     struct { VkBuffer b; VkDeviceMemory m; VkDeviceSize size; } *extra; int nextra;
     VkDescriptorPool *dps; int ndp, idp;   // descriptor pools, chained as a submission needs more (reset together at its start)
     int plog;   // a pass-logged frame recorded into it: its small write-backs are logged at completion (the values a dispatch computed, e.g. Unreal's exposure)
@@ -255,12 +255,22 @@ static int zc_mode(void); static int zc_find(uint64_t addr, uint64_t n, VkBuffer
 static int g_zc_dev; static uint64_t g_zc_bytes, g_zc_hits, g_zc_miss_wlog;
 // Extra rings made and freed every few frames were fresh device memory each time (vkAllocateMemory, mapped: page faults as the CPU first writes them). Freed ones are kept (at most
 // 4, 64 MB in all) and taken again by the next submission that outgrows its ring; the mapping of each live one is remembered by its memory (xring_*)
-static struct { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceSize size; } g_xc[8]; static int g_nxc; static VkDeviceSize g_xc_bytes;
+// DM_VK_RING_REUSE (Harvest Moon heavy scene, H0.5 of docs/hm_android_perf_plan.md; off by default). The pprof of the heavy scene: 30% of the recording thread in vkAllocateMemory
+// (kgsl_sharedmem_alloc) for fresh extra rings and most of dm-complete in freeing them again, every frame: the frame's ~110-150 MB of copies outgrew the 4 MB rings of 20 contexts
+// taken in turn, and the keep pool held 8 rings / 64 MB. With it on: (a) ctx_pick takes the most recently freed context (whose completion work is done first), so a game with
+// one submission a frame works in 2-3 contexts; (b) ring_fit grows a hot context's ring to the largest power of two under the cap, the cap counting only bytes above each context's
+// RING_MIN, and contexts unused for 300 submissions go back to RING_MIN; (c) the keep pool holds up to 32 extra rings, DM_VK_XRING_KEEP_MB 256 by default; (d) a submission's first
+// extra ring is sized from the recent overflow (x 1.25, in 32 MB steps), so one ring usually takes the rest of a submission. Nothing changes in what is copied or bound
+static int ring_reuse_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RING_REUSE"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_RING_REUSE=1: recent contexts first, rings grown under the cap, up to 32 extra rings kept (DM_VK_XRING_KEEP_MB), extra rings sized from the overflow"); } return v; }
+static VkDeviceSize g_h05_over;   // the recent overflow past a context's own ring (bytes; decays by 1/8 a submission)
+static uint64_t g_h05_shrunk, g_h05_sized;   // rings of idle contexts given back; extra rings sized from the overflow
+enum { NXC = 32 };
+static struct { VkBuffer b; VkDeviceMemory m; void *p; VkDeviceSize size; } g_xc[NXC]; static int g_nxc; static VkDeviceSize g_xc_bytes;
 // DM_VK_XRING_KEEP_MB (vk19.40, default 64; was 4 rings and 32 MB): the extra rings kept for reuse. With the rings at their 96 MB cap, the dungeon's submissions took about two
 // extra rings a frame (48-64 MB live), and those the 32 MB could not keep were fresh mappings each time, every page faulted on its first write (~2,500 faults a frame left after
 // the trims stopped). Kept rings are let go under real pressure (g_mem_tight) and by the trims. g_xr_fresh / g_ring_new: fresh extra rings and context rings made again (the per-600 line)
 static uint64_t g_xr_fresh, g_xr_fresh_bytes, g_ring_new, g_ring_new_bytes;
-static VkDeviceSize xring_keep(void) { static VkDeviceSize v; if (!v) { const char *e = getenv("DM_VK_XRING_KEEP_MB"); long mb = e && atol(e) >= 0 ? atol(e) : 64; v = ((VkDeviceSize)mb << 20) | 1; } return v & ~(VkDeviceSize)1; }
+static VkDeviceSize xring_keep(void) { static VkDeviceSize v; if (!v) { const char *e = getenv("DM_VK_XRING_KEEP_MB"); long mb = e && atol(e) >= 0 ? atol(e) : ring_reuse_on() ? 256 : 64; v = ((VkDeviceSize)mb << 20) | 1; } return v & ~(VkDeviceSize)1; }
 static int g_mem_low;   // the system is short of memory (mem_watch): nothing is kept for reuse
 static int g_mem_tight;   // real pressure (a burst, or under half the low mark): extra rings are not kept, rings go back to their minimum (vk19.38)
 static _Atomic uint64_t g_ring_trim_gen;
@@ -277,8 +287,8 @@ static VkBuffer xring_get(VkDeviceSize want, VkDeviceSize *size, VkDeviceMemory 
 static void xring_put(VkBuffer b, VkDeviceMemory m, VkDeviceSize size) {   // a freed extra ring: kept for reuse, or destroyed
     pthread_mutex_lock(&g_xcmu); void *p = NULL; int k = 0;
     for (; k < g_nxmap; k++) if (g_xmap[k].m == m) { p = g_xmap[k].p; break; }
-    if (p && g_nxc < 8 && g_xc_bytes + size <= xring_keep() && !g_mem_tight) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); return; }
-    atomic_fetch_add(&g_h0_xr_nokeep[!p ? 0 : g_nxc >= 8 ? 1 : g_xc_bytes + size > xring_keep() ? 2 : 3], 1);   // H0: why it was not kept
+    if (p && g_nxc < (ring_reuse_on() ? NXC : 8) && g_xc_bytes + size <= xring_keep() && !g_mem_tight) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); return; }
+    atomic_fetch_add(&g_h0_xr_nokeep[!p ? 0 : g_nxc >= (ring_reuse_on() ? NXC : 8) ? 1 : g_xc_bytes + size > xring_keep() ? 2 : 3], 1);   // H0: why it was not kept
     if (k < g_nxmap) g_xmap[k] = g_xmap[--g_nxmap];
     pthread_mutex_unlock(&g_xcmu);
     vkDestroyBuffer(g_dev, b, NULL); vkFreeMemory(g_dev, m, NULL);
@@ -288,6 +298,9 @@ static VkDeviceSize ring_alloc(VkDeviceSize n, VkDeviceSize align) {
     if (o + n > C->ring_size) {   // full: an extra ring for the rest of this submission (what was recorded keeps its buffer), freed when the submission is done
         if (n > RING_XMAX) { RED_ONCE(1, "one copy of %llu MB is larger than a ring buffer: dropped", (unsigned long long)(n >> 20)); return VK_WHOLE_SIZE; }
         VkDeviceSize xs = C->ring0_size > RING_MIN ? C->ring0_size : 16u << 20; while (xs < n) xs *= 2; if (xs > RING_XMAX) xs = RING_XMAX;
+        if (ring_reuse_on() && !C->nextra && g_h05_over) {   // DM_VK_RING_REUSE: the first extra ring takes what the recent submissions overflowed by
+            VkDeviceSize w = g_h05_over + g_h05_over / 4; if (w < n) w = n; w = (w + (32u << 20) - 1) & ~(VkDeviceSize)((32u << 20) - 1); if (w > RING_XMAX) w = RING_XMAX;
+            if (w > xs) { xs = w; g_h05_sized++; } }
         C->extra = realloc(C->extra, (C->nextra + 1) * sizeof *C->extra);
         C->extra[C->nextra].b = xring_get(xs, &xs, &C->extra[C->nextra].m, &C->ringp); C->extra[C->nextra].size = xs; C->ring = C->extra[C->nextra++].b;
         { uint64_t now_x = atomic_fetch_add(&g_extra_ring_bytes, xs) + xs, pk = atomic_load(&g_xr_peak); while (now_x > pk && !atomic_compare_exchange_weak(&g_xr_peak, &pk, now_x)) {} }
@@ -4354,7 +4367,8 @@ static void ring_fit(ctx_t *c) {
     VkDeviceSize want = c->ring0_size; uint64_t tg = atomic_load(&g_ring_trim_gen);
     if (c->trim_seen != tg) { c->trim_seen = tg; want = RING_MIN; c->win_max = 0; c->nwin = 0; }
     else if (c->last_total > c->ring0_size && c->ring0_size < RING_MAX) { while (want < c->last_total && want < RING_MAX) want *= 2;
-                                                                         if (atomic_load(&g_ring0_bytes) + (want - c->ring0_size) > RING_CAP) want = c->ring0_size; }
+                                                                         if (!ring_reuse_on()) { if (atomic_load(&g_ring0_bytes) + (want - c->ring0_size) > RING_CAP) want = c->ring0_size; }
+                                                                         else while (want > c->ring0_size && atomic_load(&g_ring0_bytes) + (want - c->ring0_size) > RING_CAP + (uint64_t)NCTX * RING_MIN) want /= 2; }   // DM_VK_RING_REUSE: the largest that fits, above each context's minimum
     else if (++c->nwin >= 120) { if (c->win_max * 4 < c->ring0_size && c->ring0_size > RING_MIN && (!ring_keep() || g_mem_low)) want = c->ring0_size / 2; c->win_max = 0; c->nwin = 0; }   // DM_VK_RING_KEEP=1: halved only while memory is low
     if (want == c->ring0_size) return;
     vkDestroyBuffer(g_dev, c->ring0, NULL); vkFreeMemory(g_dev, c->ringm0, NULL); atomic_fetch_sub(&g_ring0_bytes, c->ring0_size);
@@ -4377,11 +4391,20 @@ static void ctx_pick(void) {
     int best = -1, soon = -1; uint64_t soon_at = UINT64_MAX;
     for (int k = 0; k < NCTX; k++) { ctx_t *c = &g_ctx[k]; if (c == C) continue;   // the one just committed: its fence is not done yet anyway
         uint64_t f = c->fence_val > c->hold ? c->fence_val : c->hold;
-        if (f <= g_done) { if (best < 0 || c->fence_val < g_ctx[best].fence_val) best = k; }
+        if (f <= g_done) { if (best < 0) best = k;
+                           else if (!ring_reuse_on()) { if (c->fence_val < g_ctx[best].fence_val) best = k; }
+                           else if (c->reset_done > g_ctx[best].reset_done || (c->reset_done == g_ctx[best].reset_done && c->fence_val > g_ctx[best].fence_val)) best = k; }   // DM_VK_RING_REUSE: the most recent
         else if (f < soon_at) { soon_at = f; soon = k; } }
     int grow = best < 0 && NCTX < cap;
     pthread_mutex_unlock(&g_mu);
     if (best >= 0) { g_ci = best; g_pick_free++; }
+    if (ring_reuse_on()) {   // DM_VK_RING_REUSE: contexts unused for 300 submissions give their grown ring back (checked every 64 submissions)
+        static uint64_t n; if (!(++n & 63)) for (int k = 0; k < NCTX; k++) { ctx_t *c = &g_ctx[k];
+            if (k == g_ci || c == C || c->ring0_size <= RING_MIN || c->h05_last + 300 > g_fence) continue;
+            lk_(&g_mu, LW_MU); int idle = (c->fence_val > c->hold ? c->fence_val : c->hold) <= g_done && c->reset_done; pthread_mutex_unlock(&g_mu); if (!idle) continue;
+            vkDestroyBuffer(g_dev, c->ring0, NULL); vkFreeMemory(g_dev, c->ringm0, NULL); atomic_fetch_sub(&g_ring0_bytes, c->ring0_size);
+            c->ring0 = buf_new(RING_MIN, ALL_BUF_USAGE, &c->ringm0, (void **)&c->ringp0); c->ring0_size = RING_MIN; atomic_fetch_add(&g_ring0_bytes, RING_MIN); c->win_max = 0; c->nwin = 0; g_h05_shrunk++; }
+    }
     else if (grow) { ctx_init(NCTX); lk_(&g_mu, LW_MU); g_ci = NCTX; NCTX++; pthread_mutex_unlock(&g_mu); g_pick_grow++; if (NCTX > g_pick_hw) g_pick_hw = NCTX;
                      static int nl; if (nl++ < 12) LOG("vk: DM_VK_CTX_PICK: no free context: context %d made", g_ci); }
     else { g_ci = soon >= 0 ? soon : (g_ci + 1) % NCTX; g_pick_wait++;   // at the cap: the one that frees first (the wait itself is counted below, as before)
@@ -4401,6 +4424,7 @@ void mtl_sub_begin(void) {
     tog_latch();   // the run-time switches, for this whole submission
     ts_tick();   // the range store's upkeep (vk19.74c)
     { int cpu = sched_getcpu(); if (cpu >= 0 && cpu < 8) g_rcore[cpu]++; }
+    if (C && ring_reuse_on()) { VkDeviceSize ov = C->total > C->ring0_size ? C->total - C->ring0_size : 0; g_h05_over -= g_h05_over / 8; if (ov > g_h05_over) g_h05_over = ov; }   // DM_VK_RING_REUSE: the last submission's overflow
     uint64_t w0 = now_ns();
     if (ctx_pick_on()) ctx_pick();
     else g_ci = (g_ci + 1) % NCTX;
@@ -4411,7 +4435,7 @@ void mtl_sub_begin(void) {
     pthread_mutex_unlock(&g_mu);
     lk_(&g_gwmu, LW_GWMU); c->hold = 0; pthread_mutex_unlock(&g_gwmu);
     atomic_fetch_add(&g_wait_ns, now_ns() - w0); atomic_fetch_add(&g_wait_cum, now_ns() - w0);
-    ring_fit(c);
+    ring_fit(c); c->h05_last = g_fence;
     C = c;
     { void tex_evict_hook(void); tex_evict_hook(); } C->used = 0; C->up_used = 0; g_ndc = 0; g_wgen++; g_nwlog = 0; g_h0_gen[0]++; g_h0_sub_gen0 = g_wgen; g_h0_ctx_used |= 1u << (g_ci & 31); C->nh0ip = 0;
     { uint64_t gb = 0; int gn; lk_(&g_gwmu, LW_GWMU); gn = g_ngw; for (int i = 0; i < g_ngw; i++) gb += g_gw[i].size; pthread_mutex_unlock(&g_gwmu);   // H0: GPU-written entries live now
@@ -5330,6 +5354,8 @@ static void h0_tick(uint64_t n) {
 }
 // H0 (Harvest Moon plan v2): the per-600 lines; counters zeroed after. Called on the presenting thread with the other per-600 lines
 static void h0_lines(void) {
+    if (ring_reuse_on()) { LOG("vk: DM_VK_RING_REUSE over the last 600 frames: rings of idle contexts given back %llu, extra rings sized from the overflow %llu (recent overflow %.1f MB); %d extra rings kept (%.0f MB)",
+                               (unsigned long long)g_h05_shrunk, (unsigned long long)g_h05_sized, g_h05_over / 1048576.0, g_nxc, g_xc_bytes / 1048576.0); g_h05_shrunk = g_h05_sized = 0; }
     if (chain_snap_mode()) { uint64_t pb = atomic_exchange(&g_cs_prop_b, 0), pn = atomic_exchange(&g_cs_prop_n, 0), kw = atomic_exchange(&g_cs_kept_w, 0), bw = atomic_exchange(&g_cs_both_w, 0), wn = atomic_exchange(&g_cs_wb_n, 0);
         LOG("vk: chained GPU-written ranges per frame over the last 600 (DM_VK_GW_CHAIN_SNAP %d): given a snapshot %.1f (%.2f MB), written back by changed words %.1f; earlier write-backs put into later snapshots %.0f bytes (%.1f snapshots)%s",
             chain_snap_mode(), g_cs_n / 600.0, g_cs_b / 600.0 / 1048576.0, wn / 600.0, pb / 600.0, pn / 600.0, "");
