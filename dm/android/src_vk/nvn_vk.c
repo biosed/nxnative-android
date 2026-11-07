@@ -359,10 +359,12 @@ static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) g = now_ns();
 // (ctx_complete, when the bytes are back in guest memory)
 typedef struct { uint64_t addr, size; VkBuffer buf; VkDeviceSize off; uint8_t *p; uint64_t fence; int ci;   // ci: the context whose ring holds it
                  const uint8_t *snap; int exact; uint64_t chk; int dirty; uint8_t dfr;
-                 VkBuffer fbuf; VkDeviceSize foff; uint8_t *fp; uint64_t ffence; int fci; uint8_t pad; } gw_t;   // pad: a padded window of small copies (DM_VK_GW_PAD)   // f*: its forwarded copy (DM_VK_GW_FORWARD): in the ring of submission ffence, context fci   // dfr: written by a dispatch deferred past the open pass (defer_flush), not recorded yet
+                 VkBuffer fbuf; VkDeviceSize foff; uint8_t *fp; uint64_t ffence; int fci; uint8_t pad; uint64_t seq; } gw_t;   // pad: a padded window of small copies (DM_VK_GW_PAD)   // f*: its forwarded copy (DM_VK_GW_FORWARD): in the ring of submission ffence, context fci   // dfr: written by a dispatch deferred past the open pass (defer_flush), not recorded yet
 // snap: the guest's bytes the dispatch was recorded with (its post kind 5 owns them; cleared here before they are freed), to tell which words the CPU rewrote since (gw_cpu_dirty);
 // exact: an exact write (a texture-to-buffer or buffer copy writes every byte of its range), not a dispatch's whole bound storage buffer; chk / dirty: gw_cpu_dirty's answer for a submission
-enum { NGW = 512 };
+// seq: when the write was recorded (gw_add, steps of 256; a retired window's parts take the window's, pad_retire): the newest write over a byte is the one with the highest seq.
+// The slots' order says nothing (gw_del moves the last entry into the freed slot): gw_find, gw_compose and the window's lay-in go by seq (grill-risk re-check of d4bd5a20, HIGH)
+enum { NGW = 1024 };
 static gw_t g_gw[NGW]; static int g_ngw; static pthread_mutex_t g_gwmu = PTHREAD_MUTEX_INITIALIZER;
 static void xr_raise(VkBuffer b, uint64_t until);   // an extra ring a later submission reads stays until it is done (see g_xr)
 // Which megabytes of guest memory any entry covers (a count per megabyte, folded into 64K slots): a read touching none of them has no entry to find, and gw_find / gw_exact / gw_any
@@ -392,12 +394,19 @@ static void gw_del(int i) { gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] 
 static int g_gw_add_dfr;   // gw_add: the entry is a deferred dispatch's (see defer_on)
 static int g_gw_add_pad;   // gw_add: the entry is a padded window (DM_VK_GW_PAD)
 static int g_defer_haz;   // a draw's resources include what a deferred dispatch writes: the pass ends and the dispatches are recorded before the draw (DRAWQ)
+static uint64_t g_gw_seq;      // the last seq given (under g_gwmu)
+static uint64_t g_gw_add_seq;  // gw_add: the seq to give (a retired window's parts, pad_retire), 0: a new one
+static uint64_t g_gw_dropped;  // entries forgotten at NGW (the oldest by seq)
 static void gw_add(uint64_t addr, uint64_t size, VkBuffer buf, VkDeviceSize off, uint8_t *p, uint64_t fence, int ci, const uint8_t *snap, int exact) {
     lk_(&g_gwmu, LW_GWMU);
-    for (int i = 0; i < g_ngw; i++) if (g_gw[i].addr == addr && g_gw[i].size == size) { gw_del(i); break; }   // the newer write of one range replaces the older
-    if (g_ngw == NGW) { RED_ONCE(62, "more than %d GPU-written buffer ranges in flight: the oldest is forgotten", NGW); gw_pg_mark(g_gw[0].addr, g_gw[0].size, -1); memmove(g_gw, g_gw + 1, (NGW - 1) * sizeof *g_gw); memmove(g_gwa, g_gwa + 1, (NGW - 1) * 8); memmove(g_gwe, g_gwe + 1, (NGW - 1) * 8); g_ngw--; }
+    uint64_t seq = g_gw_add_seq ? g_gw_add_seq : (g_gw_seq += 256);
+    for (int i = 0; i < g_ngw; i++) if (g_gw[i].addr == addr && g_gw[i].size == size) {   // the newer write of one range replaces the older
+        if (g_gw[i].seq > seq) { pthread_mutex_unlock(&g_gwmu); return; }   // a retired window's part under a later write of the same range: that write has every byte
+        gw_del(i); break; }
+    if (g_ngw == NGW) { int o = 0; for (int i = 1; i < g_ngw; i++) if (g_gw[i].seq < g_gw[o].seq) o = i;
+        RED_ONCE(62, "more than %d GPU-written buffer ranges in flight: the oldest is forgotten", NGW); g_gw_dropped++; gw_del(o); }
     g_gwa[g_ngw] = addr; g_gwe[g_ngw] = addr + size;
-    g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0, (uint8_t)g_gw_add_dfr}; g_gw[g_ngw - 1].pad = (uint8_t)g_gw_add_pad; gw_pg_mark(addr, size, 1);
+    g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0, (uint8_t)g_gw_add_dfr}; g_gw[g_ngw - 1].pad = (uint8_t)g_gw_add_pad; g_gw[g_ngw - 1].seq = seq; gw_pg_mark(addr, size, 1);
     pthread_mutex_unlock(&g_gwmu);
 }
 // The ring range holding what the GPU wrote at [addr, addr + size), when an entry covers it and the offset in it keeps `align`. An entry of the submission being recorded is
@@ -651,12 +660,17 @@ static void h0_compose(uint64_t addr, uint64_t size, VkDeviceSize align, const g
             (unsigned long long)e->addr, (unsigned long long)e->size, e->exact ? "an exact copy's" : "a dispatch's", e->fence == g_fence + 1 ? "this" : "an earlier",
             (unsigned long long)((e->off + (addr > e->addr ? addr - e->addr : 0)) % (align ? align : 1)), nov, end > eend ? (long long)(end - eend) : 0LL, addr < e->addr ? (long long)(e->addr - addr) : 0LL); }
 }
+static int g_gw_ord[NGW];   // gw_ordered's answer (under g_gwmu)
+static int gw_ordered(uint64_t addr, uint64_t size) {   // the entries over [addr, addr + size), oldest first by seq, into g_gw_ord; caller holds g_gwmu
+    int n = 0;
+    for (int i = 0; i < g_ngw; i++) { if (GW_MISS(i, addr, size)) continue; int k = n++; while (k > 0 && g_gw[g_gw_ord[k - 1]].seq > g_gw[i].seq) { g_gw_ord[k] = g_gw_ord[k - 1]; k--; } g_gw_ord[k] = i; }
+    return n;
+}
 static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align) {
     VkDeviceSize ro = ring_put((const void *)(uintptr_t)addr, size, align); if (ro == VK_WHOLE_SIZE) return ro;
-    int cur = 0;
-    for (int i = 0; i < g_ngw; i++) {   // earlier submissions' parts, oldest first: copied at the start of this one (they are complete by then)
-        if (GW_MISS(i, addr, size)) continue;
-        gw_t *e = &g_gw[i];
+    int cur = 0, nord = gw_ordered(addr, size);
+    for (int x = 0; x < nord; x++) {   // earlier submissions' parts, oldest first (by seq): copied at the start of this one (they are complete by then)
+        gw_t *e = &g_gw[g_gw_ord[x]];
         if (e->fence == g_fence + 1) { cur = 1; continue; }
         uint64_t lo = e->addr > addr ? e->addr : addr, hi = e->addr + e->size < addr + size ? e->addr + e->size : addr + size;
         VkBuffer rb = C->ring; VkBufferCopy bc = {e->off + (lo - e->addr), ro + (lo - addr), hi - lo}; vkCmdCopyBuffer(C->up, e->buf, rb, 1, &bc); C->up_used = 1;
@@ -665,9 +679,8 @@ static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align)
     }
     if (cur) {   // parts this submission's own dispatches wrote: copied here, in order, after them (outside a render pass: the open one is ended and begun again)
         int was_open = g_pass_open_(); if (was_open) { pass_end(); g_h0_cmp_pass++; }
-        for (int i = 0; i < g_ngw; i++) {
-            if (GW_MISS(i, addr, size)) continue;
-            const gw_t *e = &g_gw[i]; if (e->fence != g_fence + 1) continue;
+        for (int x = 0; x < nord; x++) {   // oldest first by seq
+            const gw_t *e = &g_gw[g_gw_ord[x]]; if (e->fence != g_fence + 1) continue;
             uint64_t lo = e->addr > addr ? e->addr : addr, hi = e->addr + e->size < addr + size ? e->addr + e->size : addr + size;
             VkBufferCopy bc = {e->off + (lo - e->addr), ro + (lo - addr), hi - lo}; vkCmdCopyBuffer(C->cb, e->buf, C->ring, 1, &bc); g_h0_cmp_cur_bytes += hi - lo;
         }
@@ -689,8 +702,8 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
     if (!__atomic_load_n(&g_ngw, __ATOMIC_RELAXED)) return 0;
     g_gw_calls++; if (!gw_pg_any(addr, size)) { g_gw_quick++; return 0; }
     lk_(&g_gwmu, LW_GWMU); H0_GWH_T0(); g_gw_walked += (uint64_t)g_ngw; g_h0_look++; g_h0_walk += (uint64_t)g_ngw;
-    for (int i = g_ngw - 1; i >= 0 && !hit && !wait; i--) {
-        if (GW_MISS(i, addr, size)) continue;
+    int bi = -1; for (int i = 0; i < g_ngw; i++) if (!GW_MISS(i, addr, size) && (bi < 0 || g_gw[i].seq > g_gw[bi].seq)) bi = i;   // the newest write over the range decides
+    for (int i = bi; i >= 0; i = -1) {   // once (a loop for the breaks below)
         gw_t *e = &g_gw[i];
         if (e->dfr) g_defer_haz = 1;   // what a deferred dispatch writes: it is recorded first (DRAWQ / pass_end)
         int inside = addr >= e->addr && addr + size <= e->addr + e->size, fits = inside && (e->off + (addr - e->addr)) % align == 0;
@@ -3774,7 +3787,7 @@ static uint64_t hwl_now(void); static int hwl_since(uint64_t seq, uint64_t lo, u
 static int idxpool_keep_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_IDXPOOL_KEEP"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 1; if (v) LOG("vk: DM_VK_IDXPOOL_KEEP=%d: index pools of GPU-indirect indexed draws kept across frames, refreshed by written pages", v); } return v; }
 enum { IPK_NP = 8, IPK_NCMAX = 3 };
 typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; uint64_t stamp, fence; int valid; } ipk_copy;
-static struct { uint64_t base, size, regid, last; const void *span; ipk_copy c[IPK_NCMAX]; int cur; uint64_t cur_fence; int refused, hot; } g_ipk[IPK_NP];   // hot: syncs in a row that copied over half the pool
+static struct { uint64_t base, size, regid, last; const void *span; ipk_copy c[IPK_NCMAX]; int cur; uint64_t cur_fence; int refused, hot; uint64_t refused_ns; } g_ipk[IPK_NP];   // hot: syncs in a row that copied over half the pool
 static uint64_t g_ipk_hit, g_ipk_full, g_ipk_pages, g_ipk_syncs, g_ipk_fb_flight, g_ipk_fb_dirty, g_ipk_fb_other, g_ipk_bad, g_ipk_bytes_live;
 static int ipk_ncopies(void) { static int v; if (!v) { const char *e = getenv("DM_VK_IDXPOOL_KEEP_COPIES"); v = e && atoi(e) >= 1 ? atoi(e) : 2; if (v > IPK_NCMAX) v = IPK_NCMAX; } return v; }
 static void ipk_free_slot(int i) {   // every copy's fence done (the caller checked)
@@ -3782,6 +3795,10 @@ static void ipk_free_slot(int i) {   // every copy's fence done (the caller chec
     memset(&g_ipk[i], 0, sizeof g_ipk[i]);
 }
 static int ipk_idle(int i) { for (int k = 0; k < IPK_NCMAX; k++) if (g_ipk[i].c[k].b && g_ipk[i].c[k].fence > g_done) return 0; return 1; }
+static void ipk_free_copies(int i) {   // a refused pool's copies (the slot stays, refused): every copy's fence done (the caller checked)
+    for (int k = 0; k < IPK_NCMAX; k++) if (g_ipk[i].c[k].b) { vkDestroyBuffer(g_dev, g_ipk[i].c[k].b, NULL); vkFreeMemory(g_dev, g_ipk[i].c[k].m, NULL); g_ipk_bytes_live -= g_ipk[i].size; }
+    memset(g_ipk[i].c, 0, sizeof g_ipk[i].c); g_ipk[i].cur = 0; g_ipk[i].cur_fence = 0;
+}
 static int ipk_sync(int i, ipk_copy *c) {   // brings copy c of pool slot i up to date with guest memory; 0: refused (untracked or protection failed)
     uint64_t base = g_ipk[i].base, size = g_ipk[i].size; const void *span = g_ipk[i].span;
     uint64_t now = nvn_dirty_now();   // before protecting and reading: a write after it shows at the next sync
@@ -3799,7 +3816,7 @@ static int ipk_sync(int i, ipk_copy *c) {   // brings copy c of pool slot i up t
             memcpy(c->p + pg, (const void *)(uintptr_t)(base + pg), pl); g_ipk_pages++; np++; }
     }
     c->stamp = now; g_ipk_syncs++;
-    if (np * 4096 * 2 > size) { if (++g_ipk[i].hot >= 8) { g_ipk[i].refused = 1; LOG("vk: DM_VK_IDXPOOL_KEEP: pool %#llx +%llu is rewritten every frame (over half its pages, 8 times in a row): copied as before from now on", (unsigned long long)base, (unsigned long long)size); } }   // grill-risk M5
+    if (np * 4096 * 2 > size) { if (++g_ipk[i].hot >= 8) { g_ipk[i].refused = 1; g_ipk[i].refused_ns = now_ns(); LOG("vk: DM_VK_IDXPOOL_KEEP: pool %#llx +%llu is rewritten every frame (over half its pages, 8 times in a row): copied as before (its copies freed), tried again in 2 minutes", (unsigned long long)base, (unsigned long long)size); } }   // grill-risk M5
     else g_ipk[i].hot = 0;
     return 1;
 }
@@ -3819,7 +3836,8 @@ static int ipk_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDevic
         if (i < 0) { uint64_t old = UINT64_MAX; for (int k = 0; k < IPK_NP; k++) if (ipk_idle(k) && g_ipk[k].last < old) { old = g_ipk[k].last; i = k; }   // the least recently used idle pool
                      if (i < 0) { g_ipk_fb_flight++; return 0; } ipk_free_slot(i); }
         g_ipk[i].base = base; g_ipk[i].size = psize; g_ipk[i].regid = rid; }
-    if (g_ipk[i].refused) { g_ipk_fb_other++; return 0; }
+    if (g_ipk[i].refused == 1 && now_ns() - g_ipk[i].refused_ns > 120000000000ull && ipk_idle(i)) { ipk_free_copies(i); g_ipk[i].refused = 0; g_ipk[i].hot = 0; }   // a hot pool: tried again (fresh copies) after 2 minutes, the game's use may have changed
+    if (g_ipk[i].refused) { if (ipk_idle(i)) ipk_free_copies(i); g_ipk_fb_other++; return 0; }   // grill-risk re-check MED: a refused pool's copies are freed once the GPU is done with them
     g_ipk[i].span = span; g_ipk[i].last = g_fence + 1;
     ipk_copy *c;
     if (g_ipk[i].cur_fence == g_fence + 1) {   // this submission's copy: any page this draw can read written since its stamp makes the draw copy as before
@@ -3830,7 +3848,7 @@ static int ipk_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDevic
         if (best < 0) { g_ipk_fb_flight++; return 0; }
         c = &g_ipk[i].c[best];
         if (!c->b) { c->b = buf_new(psize, ALL_BUF_USAGE, &c->m, (void **)&c->p); if (!c->b || !c->p) { g_ipk_fb_other++; return 0; } g_ipk_bytes_live += psize; c->valid = 0; }
-        if (!ipk_sync(i, c)) { g_ipk[i].refused = 1; g_ipk_fb_other++; static int nl; if (nl++ < 4) LOG("vk: DM_VK_IDXPOOL_KEEP: pool %#llx +%llu cannot be protected: copied as before", (unsigned long long)base, (unsigned long long)psize); return 0; }
+        if (!ipk_sync(i, c)) { g_ipk[i].refused = 2; g_ipk_fb_other++; static int nl; if (nl++ < 4) LOG("vk: DM_VK_IDXPOOL_KEEP: pool %#llx +%llu cannot be protected: copied as before", (unsigned long long)base, (unsigned long long)psize); return 0; }
         c->fence = g_fence + 1; g_ipk[i].cur = best; g_ipk[i].cur_fence = g_fence + 1;
     }
     if (idxpool_keep_mode() == 2 && memcmp(c->p + (ibuf - base), (const void *)(uintptr_t)ibuf, n)) {
@@ -4691,7 +4709,7 @@ void mtl_exec_rest(const uint64_t *handles, int n) { g_rest = handles; g_nrest =
 // the entry and is bound in place. The entry has a snapshot (the guest's bytes), so it goes back by changed words (post kind 5) and the CPU's later rewrites of the padding are
 // patched into later reads (gw_cpu_dirty), as for any dispatch range. Counted in the per-600 line 'vk: DM_VK_GW_PAD'
 static int gw_pad_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_PAD"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_PAD=1: small copies of GPU-written bytes padded with the guest's bytes around them"); } return v; }
-static uint64_t g_pad_n, g_pad_into, g_pad_over, g_pad_why[5], g_pad_retired, g_pad_cur; static int g_pad_curi[16];   // g_pad_why: 1 no pool, 2 this submission's other GPU writes there, 3 no room, 4 too many GPU-written parts   // g_pad_sync: in-stream writes put into windows; g_pad_cur: this submission's GPU writes laid into new windows
+static uint64_t g_pad_n, g_pad_into, g_pad_over, g_pad_why[5], g_pad_retired, g_pad_cur, g_pad_parts; static int g_pad_curi[16];   // g_pad_why: 1 no pool, 2 this submission's other GPU writes there, 3 no room, 4 too many GPU-written parts   // g_pad_sync: in-stream writes put into windows; g_pad_cur: this submission's GPU writes laid into new windows
 // This submission's padded windows (recording thread only): each window's range and ring place, and the parts GPU copies wrote into it (the copy that made it, the copies that
 // went into it). An earlier submission's writes laid in and this submission's exact writes taken in are not listed: their own entries stay live and serve those bytes once the
 // window goes (grill-risk re-check: listing them made this submission's snapshot-less entries hide the earlier ones and their CPU-rewrite patching)
@@ -4708,13 +4726,29 @@ static padw_t *padw_new(void) {
 // recorded earlier read, and lose to GPU copies recorded earlier). The window is retired instead: its entry goes, and its GPU-written parts become exact entries over the same
 // ring bytes, as they would have been without the window. Later reads compose as before (the guest's bytes, the CPU's write included, under the GPU's parts); earlier draws keep
 // the window; its write-back (changed words, its snapshot) is unchanged
+static int padw_entry(const padw_t *w) {   // the window's own entry, -1 if gone (replaced by a write of the same range, or forgotten at NGW); caller holds g_gwmu
+    for (int i = 0; i < g_ngw; i++) { const gw_t *e = &g_gw[i]; if (e->pad && e->fence == g_fence + 1 && e->addr == w->lo && e->size == w->hi - w->lo && e->buf == w->buf) return i; }
+    return -1;
+}
 static void pad_retire(uint64_t a, uint64_t n) {
     for (int k = 0; k < g_padw_n; k++) { padw_t *w = &g_padw[k]; if (w->fence != g_fence + 1 || w->dead || a >= w->hi || a + n <= w->lo) continue;
         w->dead = 1; g_pad_retired++;
         lk_(&g_gwmu, LW_GWMU);
-        for (int i = 0; i < g_ngw; i++) { gw_t *e = &g_gw[i]; if (e->pad && e->fence == g_fence + 1 && e->addr == w->lo && e->size == w->hi - w->lo && e->buf == w->buf) { gw_del(i); break; } }
+        int wi = padw_entry(w); uint64_t wseq = wi >= 0 ? g_gw[wi].seq : 0; if (wi >= 0) gw_del(wi);
         pthread_mutex_unlock(&g_gwmu);
-        for (int j = 0; j < w->nsub && j < NPADSUB; j++) gw_add(w->sub[j].a, w->sub[j].b - w->sub[j].a, w->buf, w->off + (w->sub[j].a - w->lo), w->p + (w->sub[j].a - w->lo), g_fence + 1, g_ci, NULL, 1);
+        if (!wseq) continue;   // its entry was gone already: a later write of the whole range has every byte (or it was forgotten, logged), and its parts with it
+        // Its parts, as the window holds them now (later copies over earlier ones): their union, in at most NPADSUB ranges, each an exact entry over the window's bytes. They take
+        // the window's seq (just above it): what was newer than the window stays newer, as it was while the window lived; a copy into the window was refused when a write newer
+        // than the window was over its bytes (mtl_sub_copy), so none of the parts is older than a write it would now hide
+        uint64_t ra[NPADSUB], rb[NPADSUB]; int nr = 0;
+        for (int j = 0; j < w->nsub && j < NPADSUB; j++) {
+            uint64_t x0 = w->sub[j].a, x1 = w->sub[j].b; int m = 0;
+            while (m < nr) { if (x0 <= rb[m] && ra[m] <= x1) { if (ra[m] < x0) x0 = ra[m]; if (rb[m] > x1) x1 = rb[m]; ra[m] = ra[nr - 1]; rb[m] = rb[nr - 1]; nr--; m = 0; } else m++; }   // touching or overlapping: one range
+            ra[nr] = x0; rb[nr] = x1; nr++;
+        }
+        g_pad_parts += (uint64_t)nr;
+        for (int m = 0; m < nr; m++) { g_gw_add_seq = wseq + 1 + (uint64_t)m; gw_add(ra[m], rb[m] - ra[m], w->buf, w->off + (ra[m] - w->lo), w->p + (ra[m] - w->lo), g_fence + 1, g_ci, NULL, 1); }
+        g_gw_add_seq = 0;
     }
 }
 static uint64_t pool_range(uint64_t addr, uint64_t *size);
@@ -4734,14 +4768,18 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
         if (!why) {   // this submission's live window already holding dst: the copy goes into it (its GPU-written parts noted for a later retirement)
             padw_t *w = padw_find(dst, n);
             if (w) {
-                if (w->nsub < NPADSUB) {
-                    lk_(&g_gwmu, LW_GWMU); for (int i = 0; i < g_ngw; i++) { gw_t *e = &g_gw[i]; if (e->pad && e->fence == g_fence + 1 && e->addr == w->lo && e->size == w->hi - w->lo && e->snap) { memcpy((uint8_t *)(uintptr_t)e->snap + (dst - w->lo), (const void *)(uintptr_t)dst, n); break; } }   // the CPU-side copy above is not a CPU rewrite
+                lk_(&g_gwmu, LW_GWMU);
+                int wi = padw_entry(w), newer = wi < 0;   // its entry gone, or a write newer than the window over dst: a copy into it would be hidden (the old way below, newest)
+                for (int i = 0; i < g_ngw && !newer; i++) newer = !GW_MISS(i, dst, n) && g_gw[i].seq > g_gw[wi].seq;
+                if (w->nsub < NPADSUB && !newer) {
+                    { gw_t *e = &g_gw[wi]; if (e->snap) memcpy((uint8_t *)(uintptr_t)e->snap + (dst - w->lo), (const void *)(uintptr_t)dst, n); }   // the CPU-side copy above is not a CPU rewrite
                     pthread_mutex_unlock(&g_gwmu);
                     VkBufferCopy bc = {so, w->off + (dst - w->lo), n}; vkCmdCopyBuffer(C->cb, sb, w->buf, 1, &bc); barrier_xfer(C->cb);
                     w->sub[w->nsub].a = dst; w->sub[w->nsub].b = dst + n; w->nsub++;
                     atomic_fetch_add(&g_gw_b2b, 1); g_pad_into++; return;
                 }
-                why = 4;   // its list of GPU-written parts is full: the old way (an exact entry over the window, newer)
+                pthread_mutex_unlock(&g_gwmu);
+                why = newer ? 2 : 4;   // a newer write there, or its list of GPU-written parts is full: the old way (an exact entry over the window, newer)
             }
         }
         VkDeviceSize ro = !why ? ring_alloc(hi - lo, 256) : VK_WHOLE_SIZE; uint8_t *snap = ro != VK_WHOLE_SIZE ? snap_alloc(hi - lo) : NULL;
@@ -4756,7 +4794,8 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
             if (why) { pthread_mutex_unlock(&g_gwmu); snap_free(snap, hi - lo); w->fence = 0; g_pad_why[why]++; goto nopad; }
             memcpy(rp, (const void *)(uintptr_t)lo, hi - lo); memcpy(snap, (const void *)(uintptr_t)lo, hi - lo);
             w->lo = lo; w->hi = hi; w->buf = rb; w->off = ro; w->p = rp; w->nsub = 0; w->fence = g_fence + 1; w->dead = 0;
-            for (int i = 0; i < g_ngw; i++) { if (GW_MISS(i, lo, hi - lo)) continue; gw_t *e = &g_gw[i]; if (e->fence == g_fence + 1) continue;   // an earlier submission's GPU writes there (still running): laid in at this submission's start, as gw_compose does
+            int nord = gw_ordered(lo, hi - lo);
+            for (int x = 0; x < nord; x++) { gw_t *e = &g_gw[g_gw_ord[x]]; if (e->fence == g_fence + 1) continue;   // oldest first by seq   // an earlier submission's GPU writes there (still running): laid in at this submission's start, as gw_compose does
                 uint64_t a0 = e->addr > lo ? e->addr : lo, a1 = e->addr + e->size < hi ? e->addr + e->size : hi;
                 VkBufferCopy bc = {e->off + (a0 - e->addr), ro + (a0 - lo), a1 - a0}; vkCmdCopyBuffer(C->up, e->buf, rb, 1, &bc); C->up_used = 1;
                 if (gw_cpu_dirty(e, a0, a1)) gw_patch(e, a0, a1, rb, ro + (a0 - lo));
@@ -5695,8 +5734,8 @@ static void h0_lines(void) {
                                    g_ipk_hit / 600.0, g_ipk_syncs / 600.0, g_ipk_full / 600.0, g_ipk_pages / 600.0, g_ipk_pages * 4096.0 / 600.0 / 1048576.0, g_ipk_fb_flight / 600.0, g_ipk_fb_dirty / 600.0, g_ipk_fb_other / 600.0, g_ipk_bad / 600.0, g_ipk_bytes_live / 1048576.0);
                                g_ipk_hit = g_ipk_syncs = g_ipk_full = g_ipk_pages = g_ipk_fb_flight = g_ipk_fb_dirty = g_ipk_fb_other = g_ipk_bad = 0; }
     if (gw_shadow_on()) { LOG("vk: DM_VK_GW_SHADOW per frame over the last 600: aligned copies made after dispatches %.1f, reads remembered (new or changed) %.2f", g_shl_made / 600.0, g_shl_learn / 600.0); g_shl_made = g_shl_learn = 0; }
-    if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: windows made %.1f, small copies into a window %.1f, earlier submissions' parts put into new windows %.1f, this submission's %.1f; windows retired by an in-stream write %.1f; not padded: no pool %.1f, this submission's non-exact or overlapping GPU writes there %.1f, no room or too many parts %.1f",
-                           g_pad_n / 600.0, g_pad_into / 600.0, g_pad_over / 600.0, g_pad_cur / 600.0, g_pad_retired / 600.0, g_pad_why[1] / 600.0, g_pad_why[2] / 600.0, (g_pad_why[3] + g_pad_why[4]) / 600.0); g_pad_n = g_pad_into = g_pad_over = g_pad_cur = g_pad_retired = 0; memset(g_pad_why, 0, sizeof g_pad_why); }
+    if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: windows made %.1f, small copies into a window %.1f, earlier submissions' parts put into new windows %.1f, this submission's %.1f; windows retired by an in-stream write %.1f (exact entries left from their parts %.1f); not padded: no pool %.1f, this submission's non-exact or overlapping GPU writes there (or newer than the window) %.1f, no room or too many parts %.1f; GPU-written entries forgotten at the cap of %d %llu",
+                           g_pad_n / 600.0, g_pad_into / 600.0, g_pad_over / 600.0, g_pad_cur / 600.0, g_pad_retired / 600.0, g_pad_parts / 600.0, g_pad_why[1] / 600.0, g_pad_why[2] / 600.0, (g_pad_why[3] + g_pad_why[4]) / 600.0, (int)NGW, (unsigned long long)g_gw_dropped); g_pad_n = g_pad_into = g_pad_over = g_pad_cur = g_pad_retired = g_pad_parts = 0; memset(g_pad_why, 0, sizeof g_pad_why); }
     if (idxpool_once_mode()) { LOG("vk: DM_VK_IDXPOOL_ONCE per frame over the last 600: pool copies %.2f (%.2f MB), draws bound to one %.1f, left to the old copy %.2f, copied again after a write-back landed in it %.2f, verify differences %.2f",
                                    g_ipo_copy / 600.0, g_ipo_bytes / 600.0 / 1048576.0, g_ipo_hit / 600.0, g_ipo_fallback / 600.0, g_ipo_hwl / 600.0, g_ipo_bad / 600.0); g_ipo_copy = g_ipo_bytes = g_ipo_hit = g_ipo_fallback = g_ipo_bad = g_ipo_hwl = 0; }
     if (ring_reuse_on()) { LOG("vk: DM_VK_RING_REUSE over the last 600 frames: rings of idle contexts given back %llu, extra rings sized from the overflow %llu (recent overflow %.1f MB); %d extra rings kept (%.0f MB)",
