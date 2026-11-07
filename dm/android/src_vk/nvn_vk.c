@@ -99,7 +99,8 @@ static int g_h0_cpass;   // the open pass was begun by gw_compose (its draws are
 static uint64_t g_h0_cp_draws, g_h0_cp_prims, g_h0_cp_vbytes, g_h0_cmp_bytes, g_h0_cmp_cur_bytes;   // draws in composed passes (direct: count x instances), their bound vertex bytes; bytes composed (all, this submission's parts)
 static uint64_t g_h0_chain_n, g_h0_chain_b, g_h0_dsp_fresh;   // dispatch storage buffers bound from a running submission's GPU-written range (chained: no snapshot), their bytes; bound from guest memory
 static uint64_t g_h0_gw_n, g_h0_gw_b, g_h0_gw_nmax, g_h0_gw_bmax;   // GPU-written entries at submission starts (summed, max), their bytes
-static _Atomic uint64_t g_h0_ii_draws, g_h0_ii_inst, g_h0_ii_prims, g_h0_ii_max, g_h0_ii_cp_inst;   // indirect draws read back at completion: draws, instances, count x instances, most instances in one, instances in composed passes
+static _Atomic uint64_t g_h0_ii_draws, g_h0_ii_inst, g_h0_ii_prims, g_h0_ii_max, g_h0_ii_cp_inst, g_h0_ii_fi, g_h0_ii_bv;   // fi / bv: GPU-written indirect draws with a first instance / vertex offset not 0
+static uint64_t g_h0_dbi; static _Atomic uint64_t g_h0_past_i, g_h0_past_v;   // GPU-written indirect draws whose arguments read past the index window / the vertex copy   // direct (and CPU-read indirect) draws with a base instance not 0   // indirect draws read back at completion: draws, instances, count x instances, most instances in one, instances in composed passes
 static _Atomic uint64_t g_h0_lost_b, g_h0_lost_n, g_h0_snap_skip;   // chained write-backs: guest bytes the CPU wrote while the submission ran, overwritten by the whole-range write-back; ranges checked; not checked (too big)
 static uint8_t *g_h0_indp;   // ind_args: the ring bytes of GPU-written arguments
 #define H0_GWH_END(k) do { atomic_fetch_add_explicit(&g_h0_gwh_ns[k], stat_ns() - h0t_, memory_order_relaxed); atomic_fetch_add_explicit(&g_h0_gwh_n[k], 1, memory_order_relaxed); } while (0)
@@ -233,7 +234,8 @@ typedef struct {
     uint64_t hold;   // the last later submission that reads this one's ring (gw_find): the ring is not reused, nor its extra rings freed, before that one is done too
     // The work recorded into it (draws and dispatches), the last TRN kept and the heaviest noted: dumped when the GPU is lost (trace_dump), to name what hung it
     struct trace { char kind, gpu_ind; char a[17], b[17]; const char *pa, *pb; uint32_t n0, n1, n2, zero_tb; } tr[48]; uint32_t ntr, ndraw, ndisp, max_groups; struct trace heavy;
-    const uint8_t *h0ip[256]; uint8_t h0ix[256]; int nh0ip;   // H0: GPU-written indirect arguments of this submission's draws (read back at completion); bit 0 indexed, bit 1 in a pass a compose began   // pa / pb: the shader keys themselves (DM_VK_LEAN; shaders are never freed), else copied into a / b
+    const uint8_t *h0ip[256]; uint8_t h0ix[256]; int nh0ip;
+    const uint8_t *h0ipp[256]; uint32_t h0iw[256], h0vmax[256]; uint8_t h0isz[256];   // H0 (dark vegetation): the index copy (its bytes, window) and the vertices copied, to check the GPU's arguments against at completion   // H0: GPU-written indirect arguments of this submission's draws (read back at completion); bit 0 indexed, bit 1 in a pass a compose began   // pa / pb: the shader keys themselves (DM_VK_LEAN; shaders are never freed), else copied into a / b
 } ctx_t;
 enum { TRN = 48 };
 static _Atomic uint64_t g_gpu_ns, g_gpu_cum;   // g_gpu_cum: never reset (the long-frame lines)
@@ -798,8 +800,26 @@ static int gpu_ts_on(void) { static int v = -1; if (v < 0) { const char *e = get
 static void ctx_complete(ctx_t *c) {
     if (c->nh0ip) {   // H0: the GPU-written indirect arguments this submission drew with (vertex or index count, instances)
         static uint64_t prev; uint64_t tot = 0, mx = atomic_load(&g_h0_ii_max);
-        for (int i = 0; i < c->nh0ip; i++) { uint32_t a[2]; memcpy(a, c->h0ip[i], 8); tot += a[1]; atomic_fetch_add(&g_h0_ii_prims, (uint64_t)a[0] * a[1]); if (a[1] > mx) mx = a[1];
-                                             if (c->h0ix[i] & 2) atomic_fetch_add(&g_h0_ii_cp_inst, a[1]); }
+        static uint64_t nsub; int dump = (nsub++ % 300) == 0;   // every 300th submission with such draws: all of its arguments in full (H0, the dark vegetation)
+        for (int i = 0; i < c->nh0ip; i++) { uint32_t a[5] = {0}; int idx = c->h0ix[i] & 1; memcpy(a, c->h0ip[i], idx ? 20 : 16); tot += a[1]; atomic_fetch_add(&g_h0_ii_prims, (uint64_t)a[0] * a[1]); if (a[1] > mx) mx = a[1];
+                                             if (c->h0ix[i] & 2) atomic_fetch_add(&g_h0_ii_cp_inst, a[1]);
+                                             if (idx ? a[4] : a[3]) atomic_fetch_add(&g_h0_ii_fi, 1); if (idx && a[3]) atomic_fetch_add(&g_h0_ii_bv, 1);
+                                             if (dump && i < 24) LOG("vk: H0 indirect arguments of submission %llu, draw %d%s: %s %u, instances %u, first %s %u, %s %d, first instance %u", (unsigned long long)c->fence_val, i,
+                                                                     c->h0ix[i] & 2 ? " (in a composed pass)" : "", idx ? "indices" : "vertices", a[0], a[1], idx ? "index" : "vertex", a[2], idx ? "vertex offset" : "-", idx ? (int32_t)a[3] : 0, idx ? a[4] : a[3]); }
+        for (int i = 0; i < c->nh0ip; i++) {   // H0 (dark vegetation): did the GPU's arguments reach past what was copied (indices past the index window, vertices past the copied streams)?
+            uint32_t a[5] = {0}; int idx = c->h0ix[i] & 1; memcpy(a, c->h0ip[i], idx ? 20 : 16); if (!a[0] || !a[1]) continue;
+            int past_i = 0, past_v = 0; uint64_t maxv = 0;
+            if (idx && c->h0isz[i]) { uint32_t isz = c->h0isz[i]; uint64_t end = ((uint64_t)a[2] + a[0]) * isz; past_i = end > c->h0iw[i];
+                if (c->h0ipp[i]) { uint64_t lim = end < c->h0iw[i] ? end : c->h0iw[i], mi = 0; const uint8_t *ib = c->h0ipp[i];
+                    for (uint64_t q = (uint64_t)a[2] * isz; q + isz <= lim; q += isz) { uint32_t v = isz == 2 ? *(const uint16_t *)(ib + q) : isz == 4 ? *(const uint32_t *)(ib + q) : ib[q]; if ((isz == 2 && v == 0xffff) || (isz == 4 && v == 0xffffffffu)) continue; if (v > mi) mi = v; }
+                    maxv = mi + (uint64_t)(int64_t)(int32_t)a[3]; past_v = c->h0vmax[i] != UINT32_MAX && maxv >= c->h0vmax[i]; } }
+            else if (!idx) { maxv = (uint64_t)a[2] + a[0]; past_v = c->h0vmax[i] != UINT32_MAX && maxv > c->h0vmax[i]; }
+            if (past_i) atomic_fetch_add(&g_h0_past_i, 1); if (past_v) atomic_fetch_add(&g_h0_past_v, 1);
+            static int nlp; if ((past_i || past_v) && nlp++ < 32)
+                LOG("[RED] vk: H0 a GPU-written indirect draw reads past its copies (submission %llu, draw %d): %s %u from %u, vertex offset %d, instances %u; index window %u bytes (%u-byte indices)%s; the highest vertex read %llu, vertices copied %u%s",
+                    (unsigned long long)c->fence_val, i, idx ? "indices" : "vertices", a[0], a[2], idx ? (int32_t)a[3] : 0, a[1], c->h0iw[i], c->h0isz[i], past_i ? " PAST THE INDEX WINDOW" : "",
+                    (unsigned long long)maxv, c->h0vmax[i], past_v ? " PAST THE VERTEX COPY" : "");
+        }
         atomic_fetch_add(&g_h0_ii_draws, (uint64_t)c->nh0ip); atomic_fetch_add(&g_h0_ii_inst, tot); atomic_store(&g_h0_ii_max, mx);
         static int nl; if (prev >= 1000 && tot * 2 < prev && nl++ < 40) LOG("vk: H0 indirect instances fell: submission %llu drew %llu instances in %d GPU-written indirect draws, the one before %llu", (unsigned long long)c->fence_val, (unsigned long long)tot, c->nh0ip, (unsigned long long)prev);
         prev = tot; c->nh0ip = 0;
@@ -3858,7 +3878,9 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (C->ntq & 1) C->tdraws[C->ntq / 2]++;   // draws in the timed pass (its signature's line)
     if (ind_b && (dw ? dw->prim : di->prim) == NVN_DRAW_PRIMITIVE_QUADS) { RED_ONCE(30, "a GPU-written indirect draw of quads is not implemented"); SKIP(3); }
     if (ind_b && di && di->itype == 0 && !g_has_u8) { RED_ONCE(37, "a GPU-written indirect draw with 8-bit indices needs VK_EXT_index_type_uint8"); SKIP(3); }
-    if (ind_b && g_h0_indp && C->nh0ip < 256) { C->h0ip[C->nh0ip] = g_h0_indp; C->h0ix[C->nh0ip++] = (uint8_t)((di ? 1 : 0) | (g_h0_cpass ? 2 : 0)); }   // H0: read back at completion
+    int h0slot = -1;
+    if (ind_b && g_h0_indp && C->nh0ip < 256) { h0slot = C->nh0ip; C->h0ip[C->nh0ip] = g_h0_indp; C->h0ipp[h0slot] = NULL; C->h0iw[h0slot] = 0; C->h0vmax[h0slot] = UINT32_MAX; C->h0isz[h0slot] = 0;
+                                                 C->h0ix[C->nh0ip++] = (uint8_t)((di ? 1 : 0) | (g_h0_cpass ? 2 : 0)); }   // H0: read back at completion
     int prim = dw ? dw->prim : di->prim;
     if (prim == NVN_DRAW_PRIMITIVE_LINE_LOOP || prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP || prim == NVN_DRAW_PRIMITIVE_PATCHES) { RED_ONCE(31, "primitive %d not implemented yet", prim); SKIP(4); }
     pso_key k; memset(&k, 0, sizeof k);
@@ -3982,6 +4004,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (vhi < vlo) { g_stat_draws++; return; }
     if (vlo < 0) vlo = 0;
     if (vs->vid) { int32_t bias = (int32_t)vlo; vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 4, &bias); g_vid_push++; if (bias) g_vid_nz++; }   // the shader adds it back to VertexIndex (spv_vid_bias)
+    if ((dw ? dw->base_instance : di->base_instance) && !ind_b) g_h0_dbi++;   // H0
     if (g_h0_cpass) { g_h0_cp_draws++; if (!ind_b) g_h0_cp_prims += (uint64_t)(dw ? (dw->count > 0 ? dw->count : 0) : (di->count > 0 ? di->count : 0)) * inst;
                       for (int s2 = 0; s2 < 16; s2++) if (S.vbuf[s2].address) g_h0_cp_vbytes += S.vbuf[s2].size; }   // H0: the composed passes' draws
     uint32_t used = 0, ext[16] = {0};
@@ -4005,6 +4028,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         else if (S.vbuf[s].address && to > from && tog(TG_BSTORE) && ts_buf(S.vbuf[s].address + from, to - from, 16, TSK_VTX, &b, &o)) {}   // DM_VK_BUF_STORE (vk19.72): the store's block
         else if (S.vbuf[s].address && to > from) { VkDeviceSize ro = copy_in(S.vbuf[s].address + from, to - from, 16, CI_VTX); if (ro != VK_WHOLE_SIZE) { b = C->ring; o = ro; } }
         vbs[s] = b; vos[s] = o;
+        if (h0slot >= 0 && !per_inst && stride && to > from) { uint64_t vc = (to - from) / stride; if (vc < C->h0vmax[h0slot]) C->h0vmax[h0slot] = (uint32_t)(vc > UINT32_MAX ? UINT32_MAX : vc); }   // H0: vertices copied
     }
     // one call for each run of consecutive slots that changed (DM_VK_STATE_SKIP): was a call per stream for every draw
     for (int s = 0; s < 16;) {
@@ -4021,8 +4045,9 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             h0_ipd(di->ibuf, n);   // H0: index starts and pools of these draws
             if (n && tog(TG_BSTORE) && ts_buf(di->ibuf, n, 16, TSK_IDXPOOL, &ibs, &o)) {}   // DM_VK_BUF_STORE (vk19.72): the store's block
             else if (n && idxpool_once_mode() && ipo_get(di->ibuf, n, isz, &ibs, &o)) {}   // DM_VK_IDXPOOL_ONCE: the submission's one copy of the pool
-            else { o = n ? copy_in(di->ibuf, n, 16, CI_IDXPOOL) : VK_WHOLE_SIZE; ibs = C->ring; }
+            else { o = n ? copy_in(di->ibuf, n, 16, CI_IDXPOOL) : VK_WHOLE_SIZE; ibs = C->ring; if (h0slot >= 0 && o != VK_WHOLE_SIZE) C->h0ipp[h0slot] = C->ringp + o; }
             if (o == VK_WHOLE_SIZE) { RED_ONCE(38, "a GPU-written indirect indexed draw: its index buffer is not in a known pool"); return; }
+            if (h0slot >= 0) { C->h0iw[h0slot] = (uint32_t)n; C->h0isz[h0slot] = (uint8_t)isz; }
             g_ds_last.ib_ok = 0; vkCmdBindIndexBuffer(cb, ibs, o, isz == 1 ? VK_INDEX_TYPE_UINT8_EXT : isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
             DRAWQ(vkCmdDrawIndexedIndirect(cb, ind_b, ind_o, 1, 20));
         }
@@ -5449,6 +5474,10 @@ static void h0_tick(uint64_t n) {
     double k = (double)(n - f0); f0 = n;
     uint64_t id = atomic_exchange(&g_h0_ii_draws, 0), ii = atomic_exchange(&g_h0_ii_inst, 0), ip = atomic_exchange(&g_h0_ii_prims, 0), im = atomic_exchange(&g_h0_ii_max, 0), icp = atomic_exchange(&g_h0_ii_cp_inst, 0);
     uint64_t lb = atomic_exchange(&g_h0_lost_b, 0), ln = atomic_exchange(&g_h0_lost_n, 0), sk = atomic_exchange(&g_h0_snap_skip, 0);
+    uint64_t ifi = atomic_exchange(&g_h0_ii_fi, 0), ibv = atomic_exchange(&g_h0_ii_bv, 0), ppi = atomic_exchange(&g_h0_past_i, 0), ppv = atomic_exchange(&g_h0_past_v, 0);
+    if (nl < 2000) LOG("vk: H0 frame %llu, base instances per frame over the last %.0f: GPU-written indirect draws with a first instance not 0 %.1f, with a vertex offset not 0 %.1f; other draws with a base instance not 0 %.1f; GPU-written indirect draws reading past the index window %.2f, past the vertex copy %.2f",
+                       (unsigned long long)n, k, ifi / k, ibv / k, g_h0_dbi / k, ppi / k, ppv / k);
+    g_h0_dbi = 0;
     if (nl++ < 2000)
         LOG("vk: H0 frame %llu, per frame over the last %.0f: GPU-written entries at submission start %.1f (%.2f MB; most %llu, %.2f MB); dispatch storage buffers bound from a running submission's range %.1f (%.2f MB), from guest memory %.1f; their whole write-backs: CPU writes overwritten %.0f bytes in %.1f ranges (%llu too big to check); composes %.2f MB (this submission's parts %.2f MB); composed passes' draws %.1f (direct vertices x instances %.0f, bound vertex bytes %.1f MB); GPU-written indirect draws %.1f, instances %.0f (in composed passes %.0f), vertices x instances %.0f, most instances in one %llu",
             (unsigned long long)n, k, (g_h0_gw_n - b_gwn) / k, (g_h0_gw_b - b_gwb) / k / 1048576.0, (unsigned long long)g_h0_gw_nmax, g_h0_gw_bmax / 1048576.0,
