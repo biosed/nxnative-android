@@ -347,13 +347,20 @@ static int gw_pg_any(uint64_t addr, uint64_t size) {
     for (uint64_t m = a; m <= b; m++) if (__atomic_load_n(&g_gw_pg[m & (GWPG - 1)], __ATOMIC_RELAXED)) return 1;
     return 0;
 }
-static void gw_del(int i) { gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] = g_gw[--g_ngw]; }   // caller holds g_gwmu
+// DM_VK_GW_INDEX (Harvest Moon heavy scene; off by default): the walks over the GPU-written entries (gw_find, gw_any, gw_compose) test each entry's range in two compact arrays
+// beside g_gw (16 bytes an entry) instead of in the ~130-byte entries: hm9 walked 270 entries a lookup, 875 lookups a frame, with the lock held 10 ms a frame by the recording
+// thread. The arrays are kept in step with g_gw always (gw_add / gw_del / the oldest dropped); the switch only picks which the walks read. Same answers by construction
+static uint64_t g_gwa[NGW], g_gwe[NGW];   // [i]: g_gw[i].addr, g_gw[i].addr + g_gw[i].size
+static int gw_index_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_INDEX"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_INDEX=1: GPU-written entries walked by their compact ranges"); } return v; }
+#define GW_MISS(i, lo, n) (gw_index_on() ? ((lo) >= g_gwe[i] || (lo) + (n) <= g_gwa[i]) : ((lo) >= g_gw[i].addr + g_gw[i].size || (lo) + (n) <= g_gw[i].addr))   // entry i does not overlap [lo, lo + n)
+static void gw_del(int i) { gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] = g_gw[--g_ngw]; g_gwa[i] = g_gwa[g_ngw]; g_gwe[i] = g_gwe[g_ngw]; }   // caller holds g_gwmu
 static int g_gw_add_dfr;   // gw_add: the entry is a deferred dispatch's (see defer_on)
 static int g_defer_haz;   // a draw's resources include what a deferred dispatch writes: the pass ends and the dispatches are recorded before the draw (DRAWQ)
 static void gw_add(uint64_t addr, uint64_t size, VkBuffer buf, VkDeviceSize off, uint8_t *p, uint64_t fence, int ci, const uint8_t *snap, int exact) {
     lk_(&g_gwmu, LW_GWMU);
     for (int i = 0; i < g_ngw; i++) if (g_gw[i].addr == addr && g_gw[i].size == size) { gw_del(i); break; }   // the newer write of one range replaces the older
-    if (g_ngw == NGW) { RED_ONCE(62, "more than %d GPU-written buffer ranges in flight: the oldest is forgotten", NGW); gw_pg_mark(g_gw[0].addr, g_gw[0].size, -1); memmove(g_gw, g_gw + 1, (NGW - 1) * sizeof *g_gw); g_ngw--; }
+    if (g_ngw == NGW) { RED_ONCE(62, "more than %d GPU-written buffer ranges in flight: the oldest is forgotten", NGW); gw_pg_mark(g_gw[0].addr, g_gw[0].size, -1); memmove(g_gw, g_gw + 1, (NGW - 1) * sizeof *g_gw); memmove(g_gwa, g_gwa + 1, (NGW - 1) * 8); memmove(g_gwe, g_gwe + 1, (NGW - 1) * 8); g_ngw--; }
+    g_gwa[g_ngw] = addr; g_gwe[g_ngw] = addr + size;
     g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0, (uint8_t)g_gw_add_dfr}; gw_pg_mark(addr, size, 1);
     pthread_mutex_unlock(&g_gwmu);
 }
@@ -387,6 +394,17 @@ static int chain_snap_mode(void) { static int v = -1; if (v < 0) { const char *e
     if (v) LOG("vk: DM_VK_GW_CHAIN_SNAP=%d: a dispatch's range bound from a running submission's GPU-written range gets a snapshot and goes back by changed words%s", v, v == 2 ? " (with counts of the CPU's words kept)" : ""); } return v; }
 static uint64_t g_cs_n, g_cs_b;   // chained ranges given a snapshot (recording thread)
 static _Atomic uint64_t g_cs_prop_b, g_cs_prop_n, g_cs_kept_w, g_cs_both_w, g_cs_wb_n;   // completion: bytes put into later snapshots (writes), CPU words kept, words both wrote, chained write-backs
+// Host write-backs into guest memory (post kinds 3, 5, 6 at completion), logged with a sequence number: DM_VK_IDXPOOL_ONCE drops a pool copy one of them landed in since it was
+// made (hm9's verify differences: the completion thread writes back while the next submission is recorded)
+enum { NHWL = 1024 };
+static struct { uint64_t lo, hi; } g_hwl[NHWL]; static uint64_t g_hwl_seq; static pthread_mutex_t g_hwl_mu = PTHREAD_MUTEX_INITIALIZER;
+static void hwl_add(const void *dst, size_t n) { pthread_mutex_lock(&g_hwl_mu); g_hwl[g_hwl_seq % NHWL].lo = (uint64_t)(uintptr_t)dst; g_hwl[g_hwl_seq % NHWL].hi = (uint64_t)(uintptr_t)dst + n; g_hwl_seq++; pthread_mutex_unlock(&g_hwl_mu); }
+static int hwl_since(uint64_t seq, uint64_t lo, uint64_t hi) {   // 1: a write-back over [lo, hi) since seq (or the log went round)
+    int r = 0; pthread_mutex_lock(&g_hwl_mu);
+    if (g_hwl_seq - seq > NHWL) r = 1; else for (uint64_t k = seq; k < g_hwl_seq && !r; k++) r = g_hwl[k % NHWL].lo < hi && g_hwl[k % NHWL].hi > lo;
+    pthread_mutex_unlock(&g_hwl_mu); return r;
+}
+static uint64_t hwl_now(void) { pthread_mutex_lock(&g_hwl_mu); uint64_t v = g_hwl_seq; pthread_mutex_unlock(&g_hwl_mu); return v; }
 // A write-back of n bytes at dst (now: the GPU's final bytes; old: what it started from, NULL for a whole write-back) of submission fence: the bytes it changes in guest memory go into
 // the snapshots of the later live entries over them. Caller holds g_gwmu
 static void gw_snap_follow(const uint8_t *dst, size_t n, const uint8_t *now, const uint8_t *old, uint64_t fence) {
@@ -589,7 +607,8 @@ static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align)
     VkDeviceSize ro = ring_put((const void *)(uintptr_t)addr, size, align); if (ro == VK_WHOLE_SIZE) return ro;
     int cur = 0;
     for (int i = 0; i < g_ngw; i++) {   // earlier submissions' parts, oldest first: copied at the start of this one (they are complete by then)
-        gw_t *e = &g_gw[i]; if (addr >= e->addr + e->size || e->addr >= addr + size) continue;
+        if (GW_MISS(i, addr, size)) continue;
+        gw_t *e = &g_gw[i];
         if (e->fence == g_fence + 1) { cur = 1; continue; }
         uint64_t lo = e->addr > addr ? e->addr : addr, hi = e->addr + e->size < addr + size ? e->addr + e->size : addr + size;
         VkBuffer rb = C->ring; VkBufferCopy bc = {e->off + (lo - e->addr), ro + (lo - addr), hi - lo}; vkCmdCopyBuffer(C->up, e->buf, rb, 1, &bc); C->up_used = 1;
@@ -599,7 +618,8 @@ static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align)
     if (cur) {   // parts this submission's own dispatches wrote: copied here, in order, after them (outside a render pass: the open one is ended and begun again)
         int was_open = g_pass_open_(); if (was_open) { pass_end(); g_h0_cmp_pass++; }
         for (int i = 0; i < g_ngw; i++) {
-            const gw_t *e = &g_gw[i]; if (e->fence != g_fence + 1 || addr >= e->addr + e->size || e->addr >= addr + size) continue;
+            if (GW_MISS(i, addr, size)) continue;
+            const gw_t *e = &g_gw[i]; if (e->fence != g_fence + 1) continue;
             uint64_t lo = e->addr > addr ? e->addr : addr, hi = e->addr + e->size < addr + size ? e->addr + e->size : addr + size;
             VkBufferCopy bc = {e->off + (lo - e->addr), ro + (lo - addr), hi - lo}; vkCmdCopyBuffer(C->cb, e->buf, C->ring, 1, &bc); g_h0_cmp_cur_bytes += hi - lo;
         }
@@ -622,8 +642,8 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
     g_gw_calls++; if (!gw_pg_any(addr, size)) { g_gw_quick++; return 0; }
     lk_(&g_gwmu, LW_GWMU); H0_GWH_T0(); g_gw_walked += (uint64_t)g_ngw; g_h0_look++; g_h0_walk += (uint64_t)g_ngw;
     for (int i = g_ngw - 1; i >= 0 && !hit && !wait; i--) {
+        if (GW_MISS(i, addr, size)) continue;
         gw_t *e = &g_gw[i];
-        if (addr >= e->addr + e->size || addr + size <= e->addr) continue;
         if (e->dfr) g_defer_haz = 1;   // what a deferred dispatch writes: it is recorded first (DRAWQ / pass_end)
         int inside = addr >= e->addr && addr + size <= e->addr + e->size, fits = inside && (e->off + (addr - e->addr)) % align == 0;
         if (e->fence != g_fence + 1) {   // an earlier submission's, still running
@@ -821,15 +841,15 @@ static void ctx_complete(ctx_t *c) {
               for (int k = 0; k < g_ngw;) if (g_gw[k].snap >= snap && g_gw[k].snap < snap + p->n) { gw_del(k); ended++; } else k++;
               H0_GWH_END(1); pthread_mutex_unlock(&g_gwmu);
               if (ended) { atomic_fetch_add(&g_gw_wb_ended, ended); static int once; if (!once) { once = 1; LOG("vk: GPU-written ranges end at their write-back (vk19.58): %llu ended by the first one, submission %llu", (unsigned long long)ended, (unsigned long long)c->fence_val); } } }
-            snap_free((void *)snap, p->n); g_wb_words += nw; g_wb_bytes += p->n;
+            snap_free((void *)snap, p->n); g_wb_words += nw; g_wb_bytes += p->n; if (nw) hwl_add(dst, p->n);
         }
-        else if (p->kind == 6) { for (uint32_t r = 0; r < p->v; r++) memcpy((uint8_t *)p->dst + (size_t)r * p->mode, p->src + (size_t)r * p->mode, p->type); }   // rows: v rows of type bytes, mode apart
+        else if (p->kind == 6) { hwl_add(p->dst, (size_t)p->v * p->mode); for (uint32_t r = 0; r < p->v; r++) memcpy((uint8_t *)p->dst + (size_t)r * p->mode, p->src + (size_t)r * p->mode, p->type); }   // rows: v rows of type bytes, mode apart
         else if (p->kind == 3) {
             if (p->addr) { const uint8_t *h0s = (const uint8_t *)(uintptr_t)p->addr, *g = p->dst; uint64_t lost = 0;   // H0: CPU writes since the dispatch was recorded, about to be overwritten
                            for (size_t q = 0; q + 4 <= p->n; q += 4) if (memcmp(g + q, h0s + q, 4) && memcmp(g + q, p->src + q, 4)) lost += 4;
                            atomic_fetch_add(&g_h0_lost_b, lost); atomic_fetch_add(&g_h0_lost_n, 1); free((void *)h0s); }
             if (chain_snap_mode()) { lk_(&g_gwmu, LW_GWMU); gw_snap_follow(p->dst, p->n, p->src, NULL, c->fence_val); pthread_mutex_unlock(&g_gwmu); }   // DM_VK_GW_CHAIN_SNAP
-            memcpy(p->dst, p->src, p->n);
+            memcpy(p->dst, p->src, p->n); hwl_add(p->dst, p->n);
             if (c->plog && p->n <= 64) { float f[16]; memcpy(f, p->src, p->n); LOG("plog: written back %#llx +%zu: %g %g %g %g%s", (unsigned long long)(uintptr_t)p->dst, p->n, f[0], p->n > 4 ? f[1] : 0, p->n > 8 ? f[2] : 0, p->n > 12 ? f[3] : 0, p->n > 16 ? " ..." : ""); } }
     }
     c->npost = 0;
@@ -3668,24 +3688,33 @@ static uint64_t pool_range(uint64_t addr, uint64_t *size);
 // start on) into the ring once, and the submission's later draws in that pool bind that copy at their own start, while the write log shows no write into it and the copy
 // generation is the same. =2: each reuse also compares the copy with the guest's bytes the draw could read; differences are counted and logged, and the copy is made as before
 static int idxpool_once_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_IDXPOOL_ONCE"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 1; if (v) LOG("vk: DM_VK_IDXPOOL_ONCE=%d: the index pool of GPU-indirect indexed draws copied once a submission", v); } return v; }
-static struct { uint64_t base, lo, hi, gen, fence; VkBuffer b; VkDeviceSize o; uint8_t *p; uint32_t seq; } g_ipo[4]; static int g_ipo_next;
-static uint64_t g_ipo_hit, g_ipo_copy, g_ipo_bytes, g_ipo_bad, g_ipo_fallback;
+static struct { uint64_t base, lo, hi, gen, fence; VkBuffer b; VkDeviceSize o; uint8_t *p; uint32_t seq; uint64_t hseq; } g_ipo[4]; static int g_ipo_next;
+static uint64_t g_ipo_hit, g_ipo_copy, g_ipo_bytes, g_ipo_bad, g_ipo_fallback, g_ipo_hwl;
+static uint64_t hwl_now(void); static int hwl_since(uint64_t seq, uint64_t lo, uint64_t hi);
 static int ipo_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDeviceSize *o) {
     uint64_t psize = 0, base = pool_range(ibuf, &psize); if (!base || !n) return 0;
     for (int i = 0; i < 4; i++) { typeof(g_ipo[0]) *e = &g_ipo[i];
         if (e->base != base || e->fence != g_fence + 1 || e->gen != g_wgen || ibuf < e->lo || ibuf + n > e->hi || e->seq > g_nwlog) continue;
         uint32_t k = e->seq; for (; k < g_nwlog; k++) if (g_wlo[k] < e->hi && g_whi[k] > e->lo) break;
         if (k != g_nwlog) { e->fence = 0; break; }   // written since: copied again
+        if (hwl_since(e->hseq, ibuf, ibuf + n)) { e->fence = 0; g_ipo_hwl++; break; }   // a completed submission's write-back landed in it since: copied again
         if ((e->o + (ibuf - e->lo)) % isz) break;
-        if (idxpool_once_mode() == 2 && memcmp(e->p + (ibuf - e->lo), (const void *)(uintptr_t)ibuf, n)) { static int nl; g_ipo_bad++; if (nl++ < 8) LOG("[RED] vk: DM_VK_IDXPOOL_ONCE=2: the pool copy differs from the guest's indices at %#llx +%llu", (unsigned long long)ibuf, (unsigned long long)n); return 0; }
+        if (idxpool_once_mode() == 2 && memcmp(e->p + (ibuf - e->lo), (const void *)(uintptr_t)ibuf, n)) { static int nl; g_ipo_bad++;
+            if (nl++ < 16) { const uint8_t *a = e->p + (ibuf - e->lo), *g = (const uint8_t *)(uintptr_t)ibuf; uint64_t first = UINT64_MAX, last = 0, pages = 0, lastpg = UINT64_MAX;
+                for (uint64_t q = 0; q < n; q += 8) if (memcmp(a + q, g + q, n - q < 8 ? n - q : 8)) { if (first == UINT64_MAX) first = q; last = q; if (q >> 12 != lastpg) { lastpg = q >> 12; pages++; } }
+                LOG("[RED] vk: DM_VK_IDXPOOL_ONCE=2: the pool copy differs from the guest's indices at %#llx +%llu: from +%llu to +%llu, %llu pages (pool %#llx, copy made %llu bytes before)",
+                    (unsigned long long)ibuf, (unsigned long long)n, (unsigned long long)first, (unsigned long long)last, (unsigned long long)pages, (unsigned long long)e->base, (unsigned long long)(ibuf - e->lo)); }
+            return 0; }
         *b = e->b; *o = e->o + (ibuf - e->lo); g_ipo_hit++; return 1;
     }
     static uint64_t cap; if (!cap) { const char *e = getenv("DM_VK_IDXPOOL_ONCE_MB"); long mb = e && atol(e) > 0 ? atol(e) : 32; cap = (uint64_t)mb << 20; }
     uint64_t lo = psize <= cap ? base : ibuf, hi = psize <= cap ? base + psize : (ibuf + cap < base + psize ? ibuf + cap : base + psize);
     if (hi - lo < n) { g_ipo_fallback++; return 0; }
+    uint64_t hs = hwl_now();   // before the copy: a write-back during it counts as since
     VkDeviceSize ro = ring_put((const void *)(uintptr_t)lo, hi - lo, 16); if (ro == VK_WHOLE_SIZE) { g_ipo_fallback++; return 0; }
     if ((ro + (ibuf - lo)) % isz) { g_ipo_fallback++; return 0; }
-    typeof(g_ipo[0]) *e = &g_ipo[g_ipo_next++ & 3]; *e = (typeof(g_ipo[0])){base, lo, hi, g_wgen, g_fence + 1, C->ring, ro, C->ringp + ro, g_nwlog};
+    typeof(g_ipo[0]) *e = &g_ipo[g_ipo_next++ & 3]; *e = (typeof(g_ipo[0])){base, lo, hi, g_wgen, g_fence + 1, C->ring, ro, C->ringp + ro, g_nwlog, 0};
+    e->hseq = hs;
     g_ipo_copy++; g_ipo_bytes += hi - lo;
     *b = C->ring; *o = ro + (ibuf - lo); return 1;
 }
@@ -4377,8 +4406,8 @@ static void mem_watch(void) {
     last_trim = now; avail_at_trim = avail / 1024; atomic_fetch_add(&g_trim_gen, 1); if (g_mem_tight && (!ring_reuse_on() || g_mem_real_low)) atomic_fetch_add(&g_ring_trim_gen, 1);   // DM_VK_RING_REUSE: rings stay unless memory is really low
     if (dm_ueheap_release) { last_rel = now; heap_release_kick(); }
     pthread_mutex_lock(&g_snapmu); for (int k = 0; k < SNAP_NC; k++) { while (g_snap_n[k]) free(g_snap_free[k][--g_snap_n[k]]); } g_snap_kept = 0; pthread_mutex_unlock(&g_snapmu);
-    pthread_mutex_lock(&g_xcmu); while (g_nxc && (!ring_reuse_on() || g_mem_real_low)) { g_nxc--; vkDestroyBuffer(g_dev, g_xc[g_nxc].b, NULL); vkFreeMemory(g_dev, g_xc[g_nxc].m, NULL);
-        for (int k = 0; k < g_nxmap; k++) if (g_xmap[k].m == g_xc[g_nxc].m) { g_xmap[k] = g_xmap[--g_nxmap]; break; } } g_xc_bytes = 0; pthread_mutex_unlock(&g_xcmu);
+    pthread_mutex_lock(&g_xcmu); while (g_nxc && (!ring_reuse_on() || g_mem_real_low)) { g_nxc--; vkDestroyBuffer(g_dev, g_xc[g_nxc].b, NULL); vkFreeMemory(g_dev, g_xc[g_nxc].m, NULL); g_xc_bytes -= g_xc[g_nxc].size;
+        for (int k = 0; k < g_nxmap; k++) if (g_xmap[k].m == g_xc[g_nxc].m) { g_xmap[k] = g_xmap[--g_nxmap]; break; } } if (!g_nxc) g_xc_bytes = 0; pthread_mutex_unlock(&g_xcmu);   // only the rings let go (DM_VK_RING_REUSE keeps the others, and their bytes)
     if (g_mem_tight) mallopt(M_PURGE, 0);
     static int nl; if (nl++ < 60) LOG("vk: memory %s (%ld MB available, the process %ld MB resident + %llu MB device, the game heap %.0f MB): idle textures evicted, reuse pools emptied%s",
                                       jump ? "early trim: the game heap grew fast" : fall ? "early trim: MemAvailable fell, or GPU or resident memory grew, fast" : is_low ? "low" : over ? "over budget" : "near low (early trim)",
@@ -4490,12 +4519,36 @@ void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *handles, int n) { g_rest = handles; g_nrest = n; }   // the handles after the one replayed next (rt_hold_scan)
 // A buffer copy is made on the CPU as the command list is walked (the in-order writes, wlog). Where the source holds bytes the GPU wrote and has not put back in guest memory
 // yet (gw_find), the copy is made on the GPU from them into the ring instead, and the destination becomes a GPU-written range like the source (gw_add, back at completion)
-static int gw_any(uint64_t a, uint64_t n) { int r = 0; if (!gw_pg_any(a, n)) return 0; lk_(&g_gwmu, LW_GWMU); for (int i = 0; i < g_ngw && !r; i++) r = a < g_gw[i].addr + g_gw[i].size && g_gw[i].addr < a + n; pthread_mutex_unlock(&g_gwmu); return r; }
+// DM_VK_GW_PAD (Harvest Moon heavy scene; off by default): a buffer copy of GPU-written bytes (mtl_sub_copy) of at most 256 bytes registers its destination padded to the
+// 256-byte-aligned window 64 bytes around it (within its pool), the padding taken from the guest's bytes, when nothing else GPU-written lies in that window. hm9: 83 composes
+// a frame came from 20-byte indirect-argument reads around a 4-byte GPU-written instance count (an exact copy's entry), each ending the render pass. With the pad the read fits
+// the entry and is bound in place. The entry has a snapshot (the guest's bytes), so it goes back by changed words (post kind 5) and the CPU's later rewrites of the padding are
+// patched into later reads (gw_cpu_dirty), as for any dispatch range. Counted in the per-600 line 'vk: DM_VK_GW_PAD'
+static int gw_pad_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_PAD"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_PAD=1: small copies of GPU-written bytes padded with the guest's bytes around them"); } return v; }
+static uint64_t g_pad_n, g_pad_no;
+static uint64_t pool_range(uint64_t addr, uint64_t *size);
+static int gw_any(uint64_t a, uint64_t n) { int r = 0; if (!gw_pg_any(a, n)) return 0; lk_(&g_gwmu, LW_GWMU); for (int i = 0; i < g_ngw && !r; i++) r = !GW_MISS(i, a, n); pthread_mutex_unlock(&g_gwmu); return r; }
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     memmove((void *)dst, (const void *)src, n); wlog_add(dst, n);
     if (!n || !g_ngw || !gw_any(src, n)) return;
     pass_end();
     g_h0_caller = H0C_COPY; VkBuffer sb; VkDeviceSize so; if (!gw_find(src, n, 16, &sb, &so, NULL)) { memmove((void *)dst, (const void *)src, n); return; }   // complete now (gw_find waited for it): in guest memory
+    if (gw_pad_on() && n <= 256) {   // DM_VK_GW_PAD: a small copy's entry padded with the guest's bytes around it, so reads of the record it sits in fit (no compose, no pass break)
+        uint64_t psz = 0, base = pool_range(dst, &psz), lo = dst > 64 ? (dst - 64) & ~(uint64_t)255 : 0, hi = (dst + n + 64 + 255) & ~(uint64_t)255;
+        if (base && lo < base) lo = base; if (base && hi > base + psz) hi = base + psz;
+        if (base && lo <= dst && hi >= dst + n && !gw_any(lo, hi - lo)) {   // nothing else GPU-written there (the padding is the guest's bytes)
+            VkDeviceSize ro = ring_alloc(hi - lo, 256);
+            uint8_t *snap = ro != VK_WHOLE_SIZE ? snap_alloc(hi - lo) : NULL;
+            if (snap) {
+                memcpy(C->ringp + ro, (const void *)(uintptr_t)lo, hi - lo); memcpy(snap, (const void *)(uintptr_t)lo, hi - lo);
+                VkBufferCopy bc = {so, ro + (dst - lo), n}; vkCmdCopyBuffer(C->cb, sb, C->ring, 1, &bc); barrier_xfer(C->cb);
+                gw_add(lo, hi - lo, C->ring, ro, C->ringp + ro, g_fence + 1, g_ci, snap, 1);
+                post_add((post_t){5, (void *)(uintptr_t)lo, 0, 0, (uint64_t)(uintptr_t)snap, 0, C->ringp + ro, hi - lo});   // back by changed words: the padding's CPU writes stay
+                atomic_fetch_add(&g_gw_b2b, 1); g_pad_n++; return;
+            }
+        }
+        g_pad_no++;
+    }
     VkDeviceSize ro = ring_alloc(n, 16); if (ro == VK_WHOLE_SIZE) { RED_ONCE(93, "a buffer copy of GPU-written bytes found no room in the ring: copied from guest memory"); return; }
     VkBufferCopy bc = {so, ro, n}; vkCmdCopyBuffer(C->cb, sb, C->ring, 1, &bc); barrier_xfer(C->cb);
     gw_add(dst, n, C->ring, ro, C->ringp + ro, g_fence + 1, g_ci, NULL, 1); post_add((post_t){3, (void *)(uintptr_t)dst, 0, 0, 0, 0, C->ringp + ro, n});
@@ -5389,8 +5442,9 @@ static void h0_tick(uint64_t n) {
 }
 // H0 (Harvest Moon plan v2): the per-600 lines; counters zeroed after. Called on the presenting thread with the other per-600 lines
 static void h0_lines(void) {
-    if (idxpool_once_mode()) { LOG("vk: DM_VK_IDXPOOL_ONCE per frame over the last 600: pool copies %.2f (%.2f MB), draws bound to one %.1f, left to the old copy %.2f, verify differences %.2f",
-                                   g_ipo_copy / 600.0, g_ipo_bytes / 600.0 / 1048576.0, g_ipo_hit / 600.0, g_ipo_fallback / 600.0, g_ipo_bad / 600.0); g_ipo_copy = g_ipo_bytes = g_ipo_hit = g_ipo_fallback = g_ipo_bad = 0; }
+    if (gw_pad_on()) { LOG("vk: DM_VK_GW_PAD per frame over the last 600: small GPU-written copies padded %.1f, not padded (something GPU-written near, no pool or no room) %.1f", g_pad_n / 600.0, g_pad_no / 600.0); g_pad_n = g_pad_no = 0; }
+    if (idxpool_once_mode()) { LOG("vk: DM_VK_IDXPOOL_ONCE per frame over the last 600: pool copies %.2f (%.2f MB), draws bound to one %.1f, left to the old copy %.2f, copied again after a write-back landed in it %.2f, verify differences %.2f",
+                                   g_ipo_copy / 600.0, g_ipo_bytes / 600.0 / 1048576.0, g_ipo_hit / 600.0, g_ipo_fallback / 600.0, g_ipo_hwl / 600.0, g_ipo_bad / 600.0); g_ipo_copy = g_ipo_bytes = g_ipo_hit = g_ipo_fallback = g_ipo_bad = g_ipo_hwl = 0; }
     if (ring_reuse_on()) { LOG("vk: DM_VK_RING_REUSE over the last 600 frames: rings of idle contexts given back %llu, extra rings sized from the overflow %llu (recent overflow %.1f MB); %d extra rings kept (%.0f MB)",
                                (unsigned long long)g_h05_shrunk, (unsigned long long)g_h05_sized, g_h05_over / 1048576.0, g_nxc, g_xc_bytes / 1048576.0); g_h05_shrunk = g_h05_sized = 0; }
     if (chain_snap_mode()) { uint64_t pb = atomic_exchange(&g_cs_prop_b, 0), pn = atomic_exchange(&g_cs_prop_n, 0), kw = atomic_exchange(&g_cs_kept_w, 0), bw = atomic_exchange(&g_cs_both_w, 0), wn = atomic_exchange(&g_cs_wb_n, 0);
