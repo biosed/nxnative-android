@@ -162,7 +162,7 @@ APK `ffr_hib_vk19_64d.apk` (android-ffr 3839590b, hib 10f74320), Earth Shrine du
 | `DM_LATCH_BLOCK=1` | all threads +2.7 (noise) | no gain: off |
 | `DM_VK_POOL_RESET=1` | RHIThread +0.7, all threads +3.7 | loss: off |
 | `DM_G_SPIN=200` | RHIThread ≈, all threads +1.5 (a slightly different clock limit) | no gain: off |
-| `DM_VK_HTAB=1` | its run had the clock limits lifted (GPU 15.1 against 19.2 ms) | confounded: test again |
+| `DM_VK_HTAB=1` | its run had the clock limits lifted (GPU 15.1 against 19.2 ms) | confounded: tested again in session 2 (win) |
 
 Counters (baseline H, per frame):
 - copy_in: 3,102 copies (20.6 MB); miss reasons: slot held by another range 1,136, earlier submission 1,965; every pool "CPU uncached".
@@ -173,6 +173,15 @@ Counters (baseline H, per frame):
 - Page faults: 3.8.
 - The CPU line's RHIThread group read 0.00 (guest thread names carry the handle: "1018 RHIThread"); fixed in vk19.65d.
 
+## Session 2 (vk19.66n): HTAB again, guest synchronization, condition-wait sites, repeats by caller
+
+APK `ffr_hib_vk19_66n.apk` (android-ffr 06c84218, hib b494370c), network adb, plugged in. Logs: `s2/` (B1, HTAB, B2; marks.txt). HyperOS moved the cpu7 limit between 1228 and 2956 MHz within every run, and the GPU dropped to 14–16 ms whenever it was 2956: whole-run averages are confounded, only windows at the same cpu7 clock are compared.
+
+- `DM_VK_HTAB=1`: win. At cpu7 ≈1365 MHz (limit 1478): recording 14.94 / RHIThread 18.87 ms against B2's 7 windows at 1306–1384 MHz with 15.77–16.32 / 19.58–20.35 (−0.9…−1.0 ms). On by default from vk19.67a.
+- Guest synchronization, all threads, per frame: G waited for 28.2 times (4.05 ms); lock_handoff 3.50 ms, of which 65.8 wakes (pthread_cond_signal) take 3.24 ms.
+- Condition-wait timeouts: one GameThread site, `sdk+0xc833b8 < sdk+0x13c004 < main+0x17150`, waits 17.3 times a frame with timeouts under 1 ms and times out 16.2 (~1,000 wake-ups a second); Foreground Worker #1 waits with timeouts of 20 ms or more, 5.2 a frame.
+- Copies' repeated bytes by caller (another submission of the frame / an earlier frame, MB a frame): vertex 1.17 / 1.23, index 0.45 / 0.45, index pool 2.00 / 2.00, uniform 0.11 / 0.19, storage 0 / 0.61, texel 0.17 / 2.50; in all 3.88 MB from another submission, 6.96 MB from an earlier frame. The index-pool store (C4′a) is worth about 2 MB a frame (~−0.3 ms), not the 6.95 MB its copies move.
+
 ## Opt-in switches of vk19.47–19.56 and their verdicts
 
 | Switch | Build | Verdict | Dead weight to remove later? |
@@ -181,7 +190,7 @@ Counters (baseline H, per frame):
 | thread names (15 characters) and named backend threads | 19.47 | kept, on by default | no |
 | `DM_ADPF_ALL` | 19.50 | no effect on the clocks (N): off | yes: the extra hint calls and the name scan (the plain ADPF session stays) |
 | `DM_VK_STORE_NONE` | 19.51 | +0.8 ms CPU, +0.9 ms GPU (O): off | candidate: the secondary-per-pass path (sec_begin / sec_end) unless the parallel translation reuses it |
-| `DM_VK_HTAB` | 19.52 | dset −0.3 ms, noise (Q′): off | yes: the handle table (tex_slot / samp_cached wrappers) |
+| `DM_VK_HTAB` | 19.52 (default on from 19.67) | dset −0.3 ms, noise (Q′); session 2 at matched clocks: recording −0.9, RHIThread −1.0 ms: kept, on by default | no |
 | `DM_TOPO_AFFINITY` | 19.53–19.54 | masks not applied by the kernel (R): off | yes: topo_tick, topo_place, the guest-thread registry (dm_guest_thread_named) |
 | `DM_TOPO_SELF` | 19.55 | the thread's own mask not applied either (U1, U2): off | yes: the affinity part of topo_self_tick |
 | `DM_UCLAMP_MIN` | 19.56 | EPERM (V1, V2): off | yes: uclamp_apply (the recording-thread identification is shared with the above) |
