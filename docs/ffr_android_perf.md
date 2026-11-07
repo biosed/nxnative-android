@@ -216,9 +216,12 @@ APK `ffr_hib_vk19_68b.apk` (android-ffr 2b731986, hib e6d8e2e0). Logs: `s3/` (A,
 | `DM_WAKE_AFTER_G` | 19.68 (default on, Android, from 19.71) | all threads −2…−3 ms, G waits −85% (session 3): kept, on by default | no |
 | `DM_VK_DC_WAYS2` | 19.69 | neutral (session 3): off | yes: the two-way path in copy_in |
 | `DM_VK_TEXEL_STORE` | 19.70 | not measured yet (session 4: =2 verify, then =1) | — |
+| `DM_VK_BUF_STORE` | 19.72 | not measured yet (=2 verify, then =1) | — |
 | `DM_VK_ZEROCOPY` (Z0) | 19.46 | −0.6 ms rec, −230 MB MemAvailable (L): off | candidate: zc_back / zc_find / the AHB import (kept only if Z1/Z2 are ever tried) |
 
 ## Open
+
+- Later (deferred by the user, after the closing builds): coalescing GameThread's sub-millisecond condition-wait poll (`sdk+0xc833b8 < sdk+0x13c004 < main+0x17150`, ~1,000 wake-ups a second; needs a game-speed check); a thermal governor (frame cap and Unreal's dynamic resolution budget from the thermal headroom forecast, plan v4 T3); UBWC for render targets that are never copy or blit destinations (plan v4 T4, watched by MemAvailable).
 
 - CPU–GPU waiting (Path A S0): done. `DM_VK_CTX_PICK` is on by default from vk19.58 (Run X); vk19.58 also ends a GPU-written range at its dispatch write-back (the gap found in the Run W review). To check on the tablet: `DM_VK_CTX_PICK=0` against the default at 60% resolution, and the 'entries ended at their write-back' count.
 
