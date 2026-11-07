@@ -3084,14 +3084,21 @@ static fbsnap_t *fb_snap_for(vtex *v, int i) {   // the snapshot image for attac
 // last one below, which a downsample chain never does), registered like a snapshot (g_fb_src / g_fb_view). Drawing the view's base level itself, or a layer of a single-level
 // multi-layer view, has no such cut: snapshotted as before. Tomodachi Life: Living the Dream builds 64x64 → 1x1, 122x82 → 1x1 and a 66-layer cube chain every frame: a pass
 // split and a snapshot per level made 287 render passes a frame on the Adreno (182 on the Mac) and vkCmdBeginRendering ~28 ms a frame
-static uint64_t g_fb_chain;   // mip-chain draws given a view cut below the level they draw (counted beside the snapshots)
+static uint64_t g_fb_chain, g_fb_asis;   // mip-chain draws given a view cut below the level they draw; layered / base-level ones left as they are (counted beside the snapshots)
 static int fb_view_hits(const treg_t *tr, vtex *v, int a) {
     uint32_t bl = tr->has_v && tr->v.set_levels ? tr->v.base_level : 0, nl = tr->has_v && tr->v.set_levels ? tr->v.nlevels : (v->levels > bl ? v->levels - bl : 1);
     uint32_t b0 = tr->has_v && tr->v.set_layers ? tr->v.min_layer : 0, nly = tr->has_v && tr->v.set_layers ? tr->v.nlayers : (v->layers > b0 ? v->layers - b0 : 1);
     if (!nl) nl = 1; if (!nly) nly = 1;
     uint32_t L = P.clv[a];
     if (L < bl || L >= bl + nl || P.cly[a] < b0 || P.cly[a] >= b0 + nly) return 0;   // another level or layer of the same texture
-    if (nl == 1 || L == bl) return 1;   // the very level drawn (or a layer of it), or the chain's base level: a snapshot
+    int tgt = tr->has_v && tr->v.set_target ? tr->v.target : tr->t.d.target;
+    int layered = tgt == NVN_TEXTURE_TARGET_CUBEMAP || tgt == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY || tgt == NVN_TEXTURE_TARGET_2D_ARRAY || tgt == NVN_TEXTURE_TARGET_1D_ARRAY || tgt == NVN_TEXTURE_TARGET_2D_MULTISAMPLE_ARRAY;
+    if (nl == 1 && nly == 1 && !layered) return 1;   // the very level and layer drawn, through a plain 2D view: a snapshot (fb_snap_for's is a 2D image)
+    if (L == bl || nl == 1) {   // a cube / array view, or the chain's base level: no cut keeps the level drawn out, and a 2D snapshot in a layered binding is a type the shader
+        g_fb_asis++;            // does not declare (undefined; an Adreno may fault): left as it was before the cut (a8c227be), counted
+        static int once; if (!once++) LOG("vk: same-pass feedback: a view over levels %u+%u, layers %u+%u (target %d) sampled while level %u layer %u is drawn: left as is (no cut possible, no 2D snapshot in a layered binding)", bl, nl, b0, nly, tgt, L, P.cly[a]);
+        return 0;
+    }
     for (int q = 0; q < g_fb_n; q++) if (g_fb_src[q] == v) return 0;   // cut already (DM_VK_FB_FAST=2 asks twice)
     view_t vv = tr->has_v ? tr->v : (view_t){0}; vv.set_levels = 1; vv.base_level = (uint8_t)bl; vv.nlevels = (uint8_t)(L - bl);
     VkImageView cut = tex_view(v, &tr->t, &vv, 1, -1, 0);
@@ -5783,7 +5790,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     }
     if (n % 600 == 0) { uint64_t live = 0, held = 0; int nb = 0; lk_(&g_blkmu, LW_BLKMU); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) { nb++; held += g_blk[i].size; live += g_blk[i].live; } pthread_mutex_unlock(&g_blkmu);
                         LOG("vk: image memory: %d blocks of 64 MB (%.0f MB, %llu live images in them), big images %.0f MB now; rings %.0f MB extra", nb, held / 1048576.0, (unsigned long long)live, atomic_load(&g_big_bytes) / 1048576.0, atomic_load(&g_extra_ring_bytes) / 1048576.0); }
-    if (n % 600 == 0 && (g_fb_copies || g_fb_chain)) LOG("vk: same-pass feedback snapshots so far: %llu; mip-chain draws through a view cut below the level drawn: %llu", (unsigned long long)g_fb_copies, (unsigned long long)g_fb_chain);
+    if (n % 600 == 0 && (g_fb_copies || g_fb_chain || g_fb_asis)) LOG("vk: same-pass feedback snapshots so far: %llu; mip-chain draws through a view cut below the level drawn: %llu; layered or base-level ones left as they are: %llu", (unsigned long long)g_fb_copies, (unsigned long long)g_fb_chain, (unsigned long long)g_fb_asis);
     if (n % 600 == 0) LOG("vk: texture slots read as black so far: no handle %llu, handle not registered %llu, texture not created %llu, no view %llu; lookups of a dead texture object %llu (registrations of one %llu)", (unsigned long long)g_tex_miss[0],
                           (unsigned long long)g_tex_miss[1], (unsigned long long)g_tex_miss[2], (unsigned long long)g_tex_miss[3], (unsigned long long)g_tex_dead, (unsigned long long)g_treg_dead);
     if (n % 600 == 0) { extern uint64_t g_nsub_stat; static uint64_t ls;
