@@ -29,6 +29,14 @@ Nothing beyond the profile the NSP script's survey guessed and the depth mode: n
 
 - 2026-11-07, Mac, `--platform mac` from the export of `android-ffr` 06c84218: boot, title (frame ~600), New Game, character creation (models, skin / hair menus, name, profile), the intro (in-engine scenes and the H.264 movie), the tutorial pop-ups and walking in the first forest ("Venture deeper into the forest"). Driven through `DM_CTL`.
 
+## Mac pass (2026-11-08)
+
+Mac M1, `--platform mac` with `shader_half_clamp`, new save, driven with `DM_CTL`. Nothing black, missing, flickering or wrongly coloured found:
+- **Seen:** title, character creation (eyes correct), the intro and the first forest, the dream farm with its crops, butterflies and harvest prompts, the waking-up dialogue, and the real farm's prologue (Carol's close-ups, the Soilbot machine, tutorial pop-ups).
+- **Frame by frame (DM_CTL `shots`, a frame difference test plus contact sheets):** 150 consecutive frames still and 150 while panning in the first forest, 120 in the dream farm, 120 on the real farm. No object vanished and came back.
+- **Not reached:** menus (the in-game menu stays closed during the dream sequence) and an indoor scene.
+- **Only red line:** `nvnTextureViewCompare`.
+
 ## Open
 
 - **The characters' eyes render as white glowing blobs** (character creation and the forest): not investigated yet (an eye material's texture or shader).
