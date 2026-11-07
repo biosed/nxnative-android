@@ -140,8 +140,8 @@ static void pw_send(thr_t *me) {   // the queued signals (with or without G)
     // reentrant (vk19.68b): SetThreadActivity's pause signal can interrupt this loop and send again from its own g_cond_wait; the list is taken and emptied first, so each
     // entry is signalled and counted once
     int n = me->npw; if (!n) return;
-    thr_t *w[8]; memcpy(w, me->pw, (size_t)n * sizeof *w); me->npw = 0;
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);   // the empty list is visible to a signal handler on this thread before the first signal
+    me->npw = 0; __atomic_signal_fence(__ATOMIC_SEQ_CST);   // emptied before anything else (vk19.70a): a pause signal from here on finds nothing to send (on_pause_sig never wakes, so nothing is queued meanwhile)
+    thr_t *w[8]; memcpy(w, me->pw, (size_t)n * sizeof *w);
     uint64_t t0 = sy_ticks();
     for (int i = 0; i < n; i++) pthread_cond_signal(&w[i]->cv);
     atomic_fetch_sub(&g_pw_out, n);
@@ -1114,22 +1114,22 @@ static int cv_site_note(thr_t *t, int64_t ns, const uint64_t *lr) {   // holding
 }
 static size_t cv_report(char *out, size_t n, double fr) {   // holding G; resets the counts
     static const char *bn[CVB_N] = {"none", "0", "<0.1 ms", "<1 ms", "<5 ms", "<20 ms", ">=20 ms"};
-    size_t o = (size_t)snprintf(out, n, "; condition-wait timeouts asked: none %.1f, 0 %.1f, <0.1 ms %.1f, <1 ms %.1f, <5 ms %.1f, <20 ms %.1f, >=20 ms %.1f; the busiest timed sites (one wait in 8 per thread sampled, counts x8; period between samples /8):",
+    size_t o = (size_t)snprintf(out, n, "; condition-wait timeouts asked: none %.1f, 0 %.1f, <0.1 ms %.1f, <1 ms %.1f, <5 ms %.1f, <20 ms %.1f, >=20 ms %.1f; the busiest timed sites (one wait in 7 per thread sampled, counts x7; period between samples /7):",
                                 g_cvb[0] / fr, g_cvb[1] / fr, g_cvb[2] / fr, g_cvb[3] / fr, g_cvb[4] / fr, g_cvb[5] / fr, g_cvb[6] / fr);
     for (int r = 0; r < 6 && o < n; r++) {
         int best = -1; for (int k = 0; k < g_ncvs; k++) if (g_cvs[k].n && (best < 0 || g_cvs[k].n > g_cvs[best].n)) best = k;
-        if (best < 0 && g_cvs[64].n) { o += (size_t)snprintf(out + o, n - o, " other sites %.1f (timed out %.1f)", 8.0 * g_cvs[64].n / fr, 8.0 * g_cvs[64].tout / fr); g_cvs[64].n = 0; continue; }
+        if (best < 0 && g_cvs[64].n) { o += (size_t)snprintf(out + o, n - o, " other sites %.1f (timed out %.1f)", 7.0 * g_cvs[64].n / fr, 7.0 * g_cvs[64].tout / fr); g_cvs[64].n = 0; continue; }
         if (best < 0) break;
         int mb = 0; for (int i = 1; i < CVB_N; i++) if (g_cvs[best].b[i] > g_cvs[best].b[mb]) mb = i;
         o += (size_t)snprintf(out + o, n - o, " '%s'", g_cvs[best].who);
         for (int d = 0; d < 6 && o < n; d++) { uint64_t a = d < 3 ? g_cvs[best].lr[d] : g_cvs[best].up[d - 3]; if (!a) break; module_t *m = module_of((void *)a);
             o += (size_t)snprintf(out + o, n - o, "%s%s+%#llx", d ? " < " : " ", m ? m->name : "?", (unsigned long long)(m ? a - (uint64_t)m->base : a)); }
         double tms = sy_tick_hz() / 1000.0;
-        if (o < n) o += (size_t)snprintf(out + o, n - o, " %.1f (timed out %.1f, mostly %s; asked %.3f-%.3f ms; every ~%.3f ms)", 8.0 * g_cvs[best].n / fr, 8.0 * g_cvs[best].tout / fr, bn[mb],
-                                         g_cvs[best].ns_min / 1e6, g_cvs[best].ns_max / 1e6, g_cvs[best].ngap ? g_cvs[best].gap_tk / tms / g_cvs[best].ngap / 8.0 : 0.0);
+        if (o < n) o += (size_t)snprintf(out + o, n - o, " %.1f (timed out %.1f, mostly %s; asked %.3f-%.3f ms; every ~%.3f ms)", 7.0 * g_cvs[best].n / fr, 7.0 * g_cvs[best].tout / fr, bn[mb],
+                                         g_cvs[best].ns_min / 1e6, g_cvs[best].ns_max / 1e6, g_cvs[best].ngap ? g_cvs[best].gap_tk / tms / g_cvs[best].ngap / 7.0 : 0.0);
         g_cvs[best].n = 0;   // taken: the next round finds the next one
     }
-    if (g_cvs[64].n && o < n) o += (size_t)snprintf(out + o, n - o, "; other sites %.1f (timed out %.1f)", 8.0 * g_cvs[64].n / fr, 8.0 * g_cvs[64].tout / fr);
+    if (g_cvs[64].n && o < n) o += (size_t)snprintf(out + o, n - o, "; other sites %.1f (timed out %.1f)", 7.0 * g_cvs[64].n / fr, 7.0 * g_cvs[64].tout / fr);
     memset(g_cvb, 0, sizeof g_cvb); g_ncvs = 0; memset(&g_cvs[64], 0, sizeof g_cvs[64]); g_cv_gen++;
     return o;
 }
@@ -1247,7 +1247,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x1B: g_lock(); lock_handoff(regs[0]); g_unlock(); regs[0] = 0; return 1;
     case 0x1C: {  // WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
         thr_t *t = cur(); uint64_t addr = regs[0], key = regs[1];
-        static __thread uint32_t cvw; uint64_t cvlr[6] = {0}; int cvsamp = (int64_t)regs[3] > 0 && !(cvw++ & 7);
+        static __thread uint32_t cvw; uint64_t cvlr[6] = {0}; int cvsamp = (int64_t)regs[3] > 0 && cvw++ % 7 == 0;   // an odd period (vk19.70a): alternating sites do not alias
         if (cvsamp) cv_site_walk(regs, cvlr);   // before G (vk19.66n); one timed wait in 8 per thread (vk19.68b: the walk's system calls, ~5,000 a second on GameThread, sampled)
         g_lock();
         // The order matters: first set the condition key = 1, then release the mutex. The SDK's InternalConditionVariable::Signal first reads the condition key in user mode, and does not issue svc 0x1D if it is 0;
