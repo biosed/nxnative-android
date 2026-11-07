@@ -48,6 +48,15 @@ XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-textur
 # and its saturation gives 0, as Metal's precise:: functions (IEEE fmin / fmax) do on every GPU. The M4 Pro's fast ones happen to agree, an A20 Pro's do not: Super Mario Galaxy 2's
 # GX lighting takes max(0, NaN) from light directions left at zero, and the half of Mario its fill light faces came out white on the iPhone (GitHub issue 72; vk_shaders.py PRECISE)
 def precise(msl): return re.sub(r'\bfast::(min|max|clamp)\(', r'precise::\1(', msl)
+# Packed-half results (Maxwell HADD2 / HFMA2 / F2F.F16, packed by the translator as half2(float2(...))): a float past the half range becomes inf in Metal's conversion, where the
+# games' GPUs keep it finite. Harvest Moon: Echoes of Teradea's toon eye pass (937e832a1b3b3068) packs its main-light term this way: on the Mac every eye drew white with yellow rims
+# (inf in some channels), while Android's Adreno, running the same SPIR-V, drew brown eyes. Clamped to ±65504 first, the Mac draws them right. A profile key, shader_half_clamp,
+# turns it on for a game (it is part of every shader's key through the profile's shader_* rows); off by default, so other games' libraries are unchanged
+HALF_CLAMP_HELPER = 'static inline __attribute__((always_inline)) half2 dm_h2(float2 v) { return half2(precise::clamp(v, float2(-65504.0), float2(65504.0))); }\n'
+HALF_CLAMP = GAME.get('shader_half_clamp', 'off').split()[0] == 'on'
+def half_clamp(msl):
+    if 'half2(float2(' not in msl: return msl
+    return msl.replace('half2(float2(', 'dm_h2(float2(').replace('using namespace metal;\n', 'using namespace metal;\n' + HALF_CLAMP_HELPER, 1)
 # Border colours: Maxwell's sampler takes any RGBA border colour, Metal's only transparent black, opaque black or opaque white, and the host's sampler gets the nearest of them
 # (nvn_border.h). A filtered sample is linear in the border colour, r = Σ w·texel + w_border·B, so two samples through samplers that differ only in their border colour give the rest:
 # with Metal colours Bn (the sampler) and Bw (its twin), r = s_n + (s_w - s_n)·k, k = (B - Bn) / (Bw - Bn) per channel. Each sampler member a shader samples gets a twin member
@@ -1120,6 +1129,7 @@ def finish(key, w, j, c1):
     try: src = dmsh_atomic.check_msl(src)
     except ValueError as e: return 'image atomic MSL failed', str(e), None
     src = precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
+    if HALF_CLAMP: src = half_clamp(src)   # packed halves kept finite (see half_clamp; profile key shader_half_clamp)
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
     except ValueError as e: return 'pool rewrite failed', str(e)[:160], None
     src = border_emu(src); open(msl, 'w').write(src)   # border colours Metal lacks (see border_emu)
