@@ -53,6 +53,12 @@ MANIFEST = '''<?xml version="1.0" encoding="utf-8"?>
 </manifest>
 '''
 
+sys.path.insert(0, os.path.join(ANDROID, '..', 'games'))
+def profile_txt(gid):   # the game profile's keys the menu reads (dm/games/game.py; a provisional profile through DM_GAMES_DIR): one "key value" line each
+    import game
+    g = game.load(gid)
+    return f"hibernate {1 if g.get('hibernate', 'off') == 'on' else 0}\n"
+
 def build(a):
     lib = os.path.join(ANDROID, 'gen', a.id, 'libdmhost.so')
     boot = os.path.join(ANDROID, 'gen', a.id, 'libdmboot.so')   # the NativeActivity library: loads libdmhost.so at a fixed address (dm/android/boot/boot.c)
@@ -80,6 +86,7 @@ def build(a):
         z.write(lib, 'lib/arm64-v8a/libdmhost.so')
         z.write(boot, 'lib/arm64-v8a/libdmboot.so')
         if a.cheats: z.write(a.cheats, 'assets/cheats.txt')
+        z.writestr('assets/profile.txt', profile_txt(a.id))   # what the menu offers for this game (MenuActivity.profileFlag)
         for name, f in controls_atlas.build_all(os.path.join(w, 'gfx')).items():   # every graphic, rasterized from the SVG masters (app/res_svg); PNGs stored, compressed already
             z.write(f, name, zipfile.ZIP_STORED if name.endswith('.png') else zipfile.ZIP_DEFLATED)
         if a.save:
