@@ -198,7 +198,9 @@ static void md_defer_body(void *arg) {
 }
 // log the first 12 calls one by one, then every 2^k-th (DM_MOVIE_TRACE=1: every call, with the calling thread and the decoder: Unity drives a movie's audio and video decoders from one thread)
 static int md_trace_all(void) { static int on = -1; if (on < 0) on = getenv("DM_MOVIE_TRACE") != NULL; return on; }
-#define MD_TRACE(d, slot, fmt, ...) do { unsigned long n_ = ++(d)->ncall[slot]; if (md_trace_all()) LOG("[movie] [%p] [%p] " fmt, (void *)pthread_self(), (void *)(d), ##__VA_ARGS__); \
+// seconds since the first traced call: DM_MOVIE_TRACE lines carry it, to set the decoders' timestamps against wall time (a player that falls behind its audio clock)
+static double md_trace_s(void) { static struct timespec t0; struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); if (!t0.tv_sec) t0 = t; return (t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) / 1e9; }
+#define MD_TRACE(d, slot, fmt, ...) do { unsigned long n_ = ++(d)->ncall[slot]; if (md_trace_all()) LOG("[movie] %.3f [%p] [%p] " fmt, md_trace_s(), (void *)pthread_self(), (void *)(d), ##__VA_ARGS__); \
                                          else if (n_ <= 12 || !(n_ & (n_ - 1))) LOG("[movie] " fmt, ##__VA_ARGS__); } while (0)
 
 // VP9 key frame uncompressed header → width and height (VP9 spec 6.2: frame_marker, profile, show_existing_frame, frame_type, show_frame, error_resilient_mode, sync code, color config, frame_size)
