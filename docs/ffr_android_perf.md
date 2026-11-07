@@ -191,6 +191,14 @@ APK `ffr_hib_vk19_68b.apk` (android-ffr 2b731986, hib e6d8e2e0). Logs: `s3/` (A,
 | `DM_WAKE_AFTER_G=1` | G waited 22–31 times a frame (2.6–3.5 ms) → 7.8–9.9 (0.35–0.53 ms); all threads 49.1–49.9 → 46.4–48.5 ms (−2…−3), the game's threads 28.7–29.5 → 26.2–27.6; RHIThread ≈ (17.2–17.4 / 17.0–17.5); present p50 18.6–18.8 → 18.4–18.7, p99 25.4–27.5 / 22.9–30.8 (no pacing regression); 57–70 wakes a frame deferred | win: on by default on Android from vk19.71a |
 | `DM_VK_DC_WAYS2=1` | run-time A/B in A, 3 pairs: submit+present p50 ≈15.0–15.3 ms on and off | neutral: off, dead weight |
 
+## Session 4 (vk19.71): the texel store
+
+APK `ffr_hib_vk19_71.apk` (android-ffr 82c07833, hib e02144e8), dungeon spot, one run per arm, device-side script (18:12–18:25); windows at matched cpu7 clocks.
+
+- `DM_VK_TEXEL_STORE=2` (verify): every 600-frame window "verify ~1,528 checked, 0 differed"; ~1,528 served a frame (18.6 MB), ~217 missed; the store 4.5 of 32 MB in 409 blocks; mprotect failures 0; dropped once.
+- `DM_VK_TEXEL_STORE=1` against base: at ~1.17 GHz (T w16–19 against B w10–15) recording 15.40 against 16.03 ms (−0.6), RHIThread 19.6 against 20.25 (−0.6), all threads 55.7 against 57.1 (−1.4); at ~1.63 GHz (T w8–13 against B w6, w7, w18) recording 12.97 against 13.87 (−0.9), RHIThread 16.6 against 17.4 (−0.8). 17.6 MB a frame served from the store, 0 evicted, 0 mprotect failures, the game alive at the end of all three runs.
+- Verdict: win, on by default from vk19.73a.
+
 ## Opt-in switches of vk19.47–19.56 and their verdicts
 
 | Switch | Build | Verdict | Dead weight to remove later? |
@@ -215,7 +223,7 @@ APK `ffr_hib_vk19_68b.apk` (android-ffr 2b731986, hib e6d8e2e0). Logs: `s3/` (A,
 | `DM_VK_SHADOW` | 19.59 | diagnostic | no |
 | `DM_WAKE_AFTER_G` | 19.68 (default on, Android, from 19.71) | all threads −2…−3 ms, G waits −85% (session 3): kept, on by default | no |
 | `DM_VK_DC_WAYS2` | 19.69 | neutral (session 3): off | yes: the two-way path in copy_in |
-| `DM_VK_TEXEL_STORE` | 19.70 | not measured yet (session 4: =2 verify, then =1) | — |
+| `DM_VK_TEXEL_STORE` | 19.70 (default on from 19.73) | verify 0 differences; recording −0.6…−0.9, RHIThread −0.6…−0.8, all threads −1.4 ms (session 4): kept, on by default | no |
 | `DM_VK_BUF_STORE` | 19.72 | not measured yet (=2 verify, then =1) | — |
 | `DM_VK_ZEROCOPY` (Z0) | 19.46 | −0.6 ms rec, −230 MB MemAvailable (L): off | candidate: zc_back / zc_find / the AHB import (kept only if Z1/Z2 are ever tried) |
 
