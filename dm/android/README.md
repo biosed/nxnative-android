@@ -72,7 +72,7 @@ The log goes to stderr, as on the Mac. `tests/t_tls_slot.c` checks a device for 
 `app/front_android.c` is the NativeActivity (process `:game`): window → Vulkan swapchain (Android rotates it on phones whose
 screen is portrait by nature), controllers by position (the console's own and any other, e.g. an Xbox pad), on-screen
 controls drawn over the picture at the first touch (hidden again when a controller is used), − and + held two seconds →
-back to the menu. Without dynamic rendering (Vulkan 1.1 / 1.2 GPUs without `VK_KHR_dynamic_rendering`) the backend uses
+back to the menu. The game's touch screen: a finger that lands on no on-screen control touches it, mapped onto the picture as it is letterboxed (`app/touch_map.h`, checked by `tests/touch_map_test.c`; a finger on a black bar is ignored), up to 16 fingers, in handheld mode only as on the Switch; `DM_TOUCH_MODE` (the menu's "Touch screen", default the profile's `touch_mode`) chooses 0 = floating sticks take the fingers as before, 1 = buttons and fixed sticks stay and every other finger touches, 2 = no on-screen controls; one log line per finger down (the first 40, then every 100th). Without dynamic rendering (Vulkan 1.1 / 1.2 GPUs without `VK_KHR_dynamic_rendering`) the backend uses
 render passes made per pass; `DM_VK_NO_DYNREND=1` forces that path for testing. `app/java/com/nxnative/MenuActivity.java`
 is the Spanish start-up menu (mode, frame rate, screen fit, language, frame-rate counter, the build's cheats, "no volver a
 mostrar"); it writes `<files>/settings.env`, seeds `<files>/save` from `assets/save` on first start and copies `assets/cheats.txt`.
