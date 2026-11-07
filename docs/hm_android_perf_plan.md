@@ -1,10 +1,10 @@
-# Harvest Moon Android: heavy-scene plan v1 (shared Vulkan backend)
+# Harvest Moon Android: heavy-scene plan v2 (shared Vulkan backend)
 
-Status: **plan only, not coded.** It goes to two reviewers (risk, alternatives) and then to the user for approval.
+Status: **plan only, not coded.** v1 (27556b31, test protocol d502dd71) was reviewed by grill-risk ("go after plan fixes; the root-cause claims hold") and by grill-alt (alternatives). v2 takes in both reviews; what changed is listed at the end.
 
-Line numbers are for `dm/android/src_vk/nvn_vk.c` at merge-main 1e9660cf (`m:` = `dm/gfx/nvn/nvn_mtl.m`). Harvest Moon's branch (game-0100839022642000 054f3f17) changes nvn_vk.c only in `shot()`.
+Line numbers are for `dm/android/src_vk/nvn_vk.c` at merge-main 1e9660cf (`m:` = `dm/gfx/nvn/nvn_mtl.m`).
 
-The data is the hm5 log (`hm5/log2.txt`, frames 3000–3600; its per-600 block ends at frame 3600). It was recorded on the vk19.66n backend. Its pass-end lines 514 and 2382 are the same code at 3618f85b as at merge-main, so the analysis below holds for merge-main.
+The data is the hm5 log (`hm5/log2.txt`): the per-600 block for frames 3000–3600, and the long-frame lines of frames 3600–3612. It was recorded on the vk19.66n backend. Its pass-end lines 514 and 2382 are the same code at 3618f85b as at merge-main.
 
 ## Goal
 
@@ -12,263 +12,310 @@ Harvest Moon's heavy later scene (Unity 6, 0100839022642000) at its own 30 fps o
 - **Now:** present p50 90 ms, p95 147 ms.
 - **Target:** p50 ≤ 34 ms.
 
-Remove work before moving it. Every step lives in the shared backend, so FINAL FANTASY RESONANCE and FINAL FANTASY XII must stay as they are, or get better.
+Remove work before moving it. Every step is in the shared backend, so FINAL FANTASY RESONANCE and FINAL FANTASY XII must stay as they are, or get better.
 
-## Where a frame goes (hm5, frames 3000–3600, ms a frame)
+## Where a frame goes (hm5, ms a frame)
+
+**Present p50 90 ms.** The frame is bound by the recorder, so present tracks recording.
+
+**Recording thread (UnityGfxDeviceWorker): 67.1 ms recording, 67.6 ms on the CPU.** About 23 ms a frame of the 90 is off the CPU and not explained yet.
 
 **GPU 36.7 ms**
-- Render passes 35.5 ms. Of that, **33.3 ms is 96.5 passes on the same 1280x720 target (colour 122, depth 129), with 2 draws each**:
-  - Ended at nvn_vk.c:514 95.4 times a frame, which is gw_compose's `pass_end`.
-  - Ended at 2382 1.4 times, which is SetRenderTargets.
-  - About 0.345 ms a pass is the tiler loading and storing 1280x720 colour and depth.
-- Dispatches 0.31 ms: `cs cf3858b7` 46.5 a frame, 0.28 ms.
+- Render passes 35.5 ms. **33.3 ms of it is 96.5 passes on one 1280x720 target, 2 draws each**:
+  - 95.4 a frame end at :514, gw_compose's `pass_end`.
+  - 1.4 end at :2382, SetRenderTargets.
+- Dispatches 0.31 ms: `cs cf3858b7`, 46.5 a frame.
 
-**Recording 67.1 ms** (all in `draw`: 65.3 ms, of which descriptor sets 7.3 ms)
-- **Volume.** copy_in moves 93 MB a frame (981.7 copies):
-  - Index pool: 71.1 MB in 18.2 copies, about 3.9 MB each.
+**Recording 67 ms, all in `draw`** (65.3 ms; "descriptor sets" 7.3 ms of it)
+- **Page faults:** 18,189 minor a frame on this thread over the window. The long-frame lines of frames 3600–3612 show about 23,000.
+  - At about 2.6 µs a fault (grill-alt's estimate) that is **40–47 ms**: a hypothesis H0 tests.
+- **Fresh ring memory:** extra rings 5.51 a frame, 88 MB. Only 1,043 of about 3,300 in the window came from the kept ones.
+- **copy_in:** 93 MB a frame in 981.7 copies.
+  - Index pool: 71.1 MB in 18.2 copies, against 28.2 reuses.
   - Vertex: 19.7 MB in 231 copies.
-  - Copies from GPU-written data: 95 a frame (57,238 in 600 frames).
-- **copy_in miss reasons, a frame:**
-  - MR_GEN ("earlier submission") 417: Harvest Moon has 1 submission a frame, so these are generation changes inside a submission.
-  - MR_OTHER (slot held by another range) 410.
-  - MR_WLOG (written since) 134.
-- **Extra rings:** 5.51 a frame, 88 MB. Only 1,043 of about 3,300 came from the kept ones.
-- **Page faults:** 18,189 minor a frame on this thread, about one per 4 KB of the fresh ring memory.
-- **Lock waits:** gwmu 4.7 ms.
-- **GPU-written range lookups:** 2,437 a frame, 115,782 entries walked.
-- **Index scans:** 192 a frame over 554,649 indices, 166 of them the same range again.
-
-**Memory:** extra rings 176 MB live; RSS 1.7 GB.
-
-**CPU:** the recording thread (UnityGfxDeviceWorker) runs 67.6 ms a frame, mostly on cpu2–4. It is the critical path: GPU 36.7 ms < recording 67 ms < present 90 ms.
+  - Misses by reason, a frame: MR_GEN 417, MR_OTHER 410, MR_WLOG 134.
+- **GPU-written ranges:** 95 composes a frame; 2,437 lookups walking 115,782 entries; gwmu waits 4.7 ms (off the CPU).
+- **Index scans:** 192 a frame over 554,649 indices; 166 of them the same range again.
 
 ## Root causes, confirmed in code
 
-### R-A: the 95 pass breaks come from gw_compose, not from the dispatches
+### R1: fresh ring memory on every frame (the biggest CPU lever, found by grill-alt)
 
-**How a draw reads what a dispatch of the same submission wrote**
-- `dispatch()` ends any open pass (`if (!dfr) pass_end();` :3907), records the dispatch, and then `barrier_cs` (:3925).
-  - That barrier is `barrier_after` :1005: shader writes made available to every consumer stage, vertex input included.
-- It then registers each storage buffer the dispatch bound as GPU-written: `gw_add(..., g_fence + 1, ...)` :3941.
-- A later read that finds a current-submission entry and **fits** is bound to the entry's own ring range (:589). No copy, no pass break, and it is correct (the barrier above orders it).
-- A read that does **not fit** goes to `gw_compose` (:585 → :502).
-  - "Not fit" means not inside one entry, or at an offset the binding cannot take (`align`).
-  - gw_compose copies the guest's bytes into the ring (`ring_put` :503).
-  - Then it lays the current submission's GPU-written parts over them with `vkCmdCopyBuffer` on the main command buffer, in order after the dispatches. A transfer cannot be recorded inside a render pass, so the open pass is ended (:514) and begun again after a transfer barrier (:520–522).
+1. **ctx_pick takes the least recently used free context** (:4261: `best` = the lowest `fence_val`).
+   - At one submission a frame it rotates through all 20 contexts. Each has its own ring0 (4 MB at `RING_MIN` :177).
+2. **The rings cannot grow.**
+   - `ring_fit` (:4233) grows a context's ring only to the full power of two of its last use (`want` up to `RING_MAX` 64 MB :178).
+   - It gives up when that would pass `RING_CAP` (96 MB, :4238). With 20 contexts at 4 MB (80 MB), a context wanting 64 MB never grows.
+   - A context that is never picked is never shrunk either: `ring_fit` runs only at its own submission's start (:4295).
+3. **Extra rings fill the gap.** So the frame's ~93 MB goes into extra rings: 16 MB or more each (:260), 5.5 a frame.
+4. **Few of them are kept, so the rest is fresh memory.**
+   - The keep pool `g_xc[8]` (:229) holds at most 8 rings and `DM_VK_XRING_KEEP_MB` (64 MB) in all.
+   - Nothing is kept under `g_mem_low`, and Harvest Moon runs with `DM_VK_MEM_LOW_MB=600`.
+   - The rest is fresh `vkAllocateMemory` (:244): mapped, and every page faults at its first write. 88 MB is about 22,500 pages, the fault count above.
+   - Because the pool holds at most 8 rings, raising `DM_VK_XRING_KEEP_MB` alone cannot keep the ~11 live extra rings. v1's env test would have understated the effect.
 
-**Why the copy exists.** It is guest coherency for a read that spans GPU-written and CPU-written bytes.
-- On the Switch, one memory pool holds both: the draw sees the GPU's bytes where the dispatch wrote and the CPU's everywhere else.
-- Here the GPU's bytes live only in the ring until completion writes them back (post kind 3/5). A read wider than the entry, or misaligned for the binding, needs one contiguous range made from both.
-- It is not aliasing, and not the CPU reading the result. CPU reads go through completion and the write-back.
-- The Metal host never needs it. It binds guest memory itself (`newBufferWithBytesNoCopy`, m:526), so the GPU writes into the pool as on the Switch.
+### R2: each extra ring starts a new copy generation, and the index pool is copied per start address
 
-**The shape is not "dispatch, then 2 draws".** No pass in the log ends at the dispatch's `pass_end` (3669 at 3618f85b) or at `mtl_sub_copy` (4078). So when the 46.5 dispatches and the 46.7 GPU-written buffer copies a frame are recorded, no pass is open: they come before the draws that read them. Every break is a compose in the middle of a pass. The aim is therefore **zero** breaks, not one per dispatch.
+1. **Generation reset.**
+   - `ring_alloc` (:256) moving to an extra ring runs `C->used = 0; o = 0; g_wgen++; g_nwlog = 0;` (:265).
+   - So copy_in's cache (:2765) and the index-range cache (`ic[]`, :3792) miss everything recorded before in the same submission. That is the 417 MR_GEN misses and the 166 rescans.
+2. **Index pool.**
+   - Draws whose indirect arguments the GPU writes copy the rest of the index pool from the draw's start address, up to 8 MB (`pool_left(di->ibuf, 8 MB)` :3836, :5525), keyed by `di->ibuf`.
+   - If the 18.2 copies a frame are **distinct start addresses** in one pool (grill-risk), keeping the generation alive recovers little. The fix is then **one copy of the pool range per submission, bound at `ibuf − base`**.
+   - H0 counts distinct `ibuf` starts and pools a frame to decide.
+3. **The existing range store doesn't cover it.** `DM_VK_BUF_STORE` (vertex streams and the indirect index pool across frames, `nvn_dirty`, verify `=2`) is off for Harvest Moon. Even on, it refuses any vertex or index-pool range over 2 MB (:3137, vk19.74a), and the pool windows here average 3.9 MB.
 
-**Which reads don't fit is not known yet.** The counters do not split it:
-- `misfits in-submission 0` (:588) counts only composes that failed.
-- `g_gw_copied` (:547/:582/:587) mixes current-submission composes with earlier-submission ones (`held reads 107.4`).
+### R3: the 95 pass breaks are gw_compose, not the dispatches
 
-Candidates:
-- **(a) A vertex stream read past the entry's end.** A draw reads `[vlo·stride, vhi·stride + ext)`, with `ext = attribute offset + 16` (:3809): every attribute is taken as 16 bytes. A 24-byte stride (position and normal, no tangent) with the normal at offset 12 reads 4 bytes past the last vertex.
-  - If the game binds the stream with more than `n·stride` bytes, the clamp `to > size` (:3818) does not stop it, and the read leaves a skinning output written as exactly `n·stride` bytes.
-  - The Metal host already uses each attribute's real size (`vattr_bytes`, m:4702).
-- **(b) A storage or uniform read at an offset not aligned to minStorage/UniformBufferOffsetAlignment** (:3362, :3320, :3353).
-- **(c) A read that covers two entries**, or an entry and bytes the CPU wrote.
-- **(d) A chain: dispatch → `mtl_sub_copy` (:4318) → draw.** The copy's destination becomes an exact entry (`gw_add(dst, n, ..., 1)` :4325), and a draw reads around it.
+**How the in-place read works**
+- `dispatch()` ends any open pass (:3907), records the dispatch, then `barrier_cs` (:3925; `barrier_after` :1005, every consumer stage).
+- It registers its storage buffers as GPU-written: `gw_add(..., g_fence + 1, ...)` :3941.
+- A read inside one current-submission entry, at an offset the binding takes, is bound in place (:589). Correct, and no copy.
 
-Build H0 below names which of these it is before any fix is chosen.
+**Where the breaks come from**
+- Any other overlap of a current-submission entry goes to `gw_compose` (:585 → :502):
+  - the guest's bytes into the ring (`ring_put` :503);
+  - then the GPU-written parts over them with `vkCmdCopyBuffer` in record order;
+  - and a transfer cannot sit inside a render pass, so `pass_end` (:514), copies, barrier, `pass_begin` (:520–522).
+- **Why the copy exists:** guest coherency for a read that mixes the GPU's and the CPU's bytes. On the Switch both are in one pool. It is not aliasing, and not the CPU reading the result. Metal binds guest memory in place (m:526) and never needs it.
+- **No pass ends at a dispatch** (3669 at 3618f85b) **or at `mtl_sub_copy`.** The dispatches and the 46.7 GPU-written buffer copies a frame come before the draws, outside passes. So the aim is **zero** breaks.
 
-### R-C: the ring generation changes with every extra ring, throwing away copies of the same submission
+**Reasons a read can fail to fit:**
+- **(a) A vertex stream read past the entry.** The extent is `attribute offset + 16` (:3809) whatever the format. A 24-byte stride with an attribute at offset 12 reads 4 bytes past the last vertex, when the bound stream is bigger than the entry (the clamp at :3818 is the bound size).
+  - Vertex reads use `align 1` (`gw_find(..., 1, ...)` :3819), so misalignment never applies to them.
+- **(b) A uniform or storage read misaligned for the binding** (:3320, :3353, :3362).
+- **(c) A read over two entries**, or over an entry and CPU bytes.
+- **(d) The entry is a buffer copy's** (`mtl_sub_copy` :4318, an exact entry :4325).
 
-**What happens when the ring fills**
-- `ring_alloc` (:256) moves to an extra ring and starts a new generation: `C->used = 0; o = 0; g_wgen++; g_nwlog = 0;` (:265).
-- copy_in's cache (:2765) and the index-range cache (:3792) then miss everything recorded before:
-  - copy_in's entries keep only an offset, and its callers bind `C->ring`.
-  - The write log restarts.
+H0 names which.
 
-**Effect in Harvest Moon**
-- The ring is outgrown 5.5 times a frame, so a frame has about 6.5 generations.
-- The 3.9 MB index-pool copies (`pool_left(di->ibuf, 8 MB)` :3836, for draws whose indirect arguments the GPU writes) and the vertex copies are made again after every change. That is the 417 MR_GEN misses a frame.
-- That volume overflows the next ring sooner, so the cycle feeds itself. The fresh ring memory brings about 18,000 page faults a frame.
-- The 166 rescans of the same index range a frame are the same thing: `ic[]` is valid only for `e->gen == g_wgen` (:3792).
+### R4: the GPU-written-range table and its lock
 
-**Why the generation changes there**
-- The cached copies are in the old ring, and the callers bind `C->ring`.
-- The write-log restart is incidental: the old ring stays alive until the submission completes (extra rings are freed at completion, :734).
+- **Lookups.** gw_find walks every live entry under `g_gwmu`: 115,782 entry checks a frame, about 47 a lookup.
+  - `write_set` asks for every uniform and storage binding, so much of this is inside the 7.3 ms "descriptor sets".
+- **The lock.** The completion thread (dm-complete) takes the same lock in `gw_expire` (:606) and `ctx_complete`, and the write-backs and frees run while it is held: 4.7 ms a frame of waits on the critical thread.
+- **Coarse filter only.** The per-megabyte counts (:293) skip only reads that touch no entry's megabyte.
 
-### R-B: the index scan itself is cheap
+### R5: the index scan itself is cheap
 
-554,649 indices a frame through `idx_scan` (NEON by default, :3797) is about 0.3–0.6 ms on these cores. That is about 1 MB of 16-bit indices; session 1 measured FFR's 1.7 ms scalar scan at roughly 3× the NEON one.
+`idx_scan` (NEON by default, :3797) over 554,649 indices is about 0.3–0.6 ms. The rescans are R2's symptom.
 
-The rescans are a symptom of R-C. On its own, an index-scan cache is worth well under 1 ms here.
+## Steps (one change per build, every switch off by default, verify mode where possible)
 
-## Steps (one change per build; every new switch off by default)
+**Gate for every build that changes behaviour:**
+- Its verify mode shows **0 differences over ≥3,000 heavy-scene frames** (five 600-frame windows) in Harvest Moon.
+- And in FF12's verify run.
+- And FFR's.
 
-### Build H0: measurement only
+### H0: measurement only
 
-Counters, each with a per-600 line:
+**Counters, each with a per-600 line**
+- **Faults:**
+  - by source: first writes into a fresh ring (counted at `xring_get` / `buf_new` by bytes) vs everything else;
+  - the recording thread's user and system time from `/proc/self/task/<tid>/stat`;
+  - its run-delay from `/proc/self/task/<tid>/schedstat`, for the ~23 ms off the CPU.
+- **Rings:**
+  - fresh vs kept extra rings, and why one was not kept (pool full, byte cap, `g_mem_low`);
+  - contexts used a frame, and ring0 sizes.
+- **copy_in misses** by caller × reason. MR_GEN split into "new submission" vs "ring change in this submission".
+- **Write-log overflows** (NWLOG 8192 :2751), and the write-log entries scanned per hit.
+- **Index pool:**
+  - draws whose arguments the GPU writes;
+  - distinct `ibuf` starts a frame, and distinct pools;
+  - bytes per copy.
 - **Composes:**
-  - By the current submission vs earlier ones.
-  - By caller: vertex, index, uniform, storage, texel, indirect, buffer copy.
-  - By reason, with the overshoot measured:
-    - (a) past the entry's end, by how many bytes: ≤16, ≤256, more;
-    - before its start;
-    - (b) misaligned, with the alignment;
-    - (c) spans two or more entries;
-    - (d) the entry is a buffer copy's (exact).
-  - The first 16 composes logged in full: address, size, entry address/size/exact, stride, attribute offsets and formats, bound stream size, align.
-- **Generation changes** by cause: submission start, extra ring, write-log overflow.
-- **copy_in MR_GEN** split into "new submission" vs "ring change in this submission".
-- **Draws whose indirect arguments the GPU writes** (`ind_b`), and the bytes of their index-pool and vertex copies.
-- **Extra rings:** fresh vs kept, against `g_mem_low` (which turns keeping off).
+  - current submission vs earlier;
+  - by caller: vertex, index, uniform, storage, texel, indirect, buffer copy;
+  - by reason (a)–(d), with the overshoot in bytes (≤16, ≤256, more) and the alignment;
+  - the first 16 logged in full: addresses, sizes, entry, exact, stride, attribute offsets and Vulkan formats, bound size.
+- **GPU-written-range lookups:** entries walked, lock held time by holder (recorder vs dm-complete).
 
-In the same session, with no build: `DM_VK_DC_WAYS2=1` (410 MR_OTHER a frame), `DM_VK_RING_CAP_MB=192`, `DM_VK_XRING_KEEP_MB=192`.
-- Check `DM_VK_MEM_LOW_MB=600` first: the kept extra rings are let go under `g_mem_low`.
-- These only move memory and faults around. They show how much of the 67 ms is ring churn, at a memory cost the tablet may not afford (MemAvailable about 1.2–1.5 GB in this scene).
+**Env tests in the same session, no build**, each its own run per the device protocol:
+1. `DM_VK_DC_WAYS2=1`: 410 MR_OTHER misses a frame.
+2. `DM_VK_BUF_STORE=2`, then `=1`: vertex streams under 2 MB. It cannot take the index pool (:3137); the refusal counters show by how much.
+3. Ring memory, **not first in a session**, with the run aborted if MemAvailable drops below 600 MB: `DM_VK_RING_CAP_MB=192` with `DM_VK_XRING_KEEP_MB=128`. It understates H0.5, because the pool still holds at most 8 rings.
 
-**Predicted:** nothing; no behaviour change. Risk: none beyond log volume.
+**Predicted:** no behaviour change; the env tests −0…−8 ms. Risk: log volume only.
 
-### Build H1 — R-A: no compose, so no pass break (`DM_VK_GW_FIT`, chosen by H0)
+### H0.5: ring reuse (`DM_VK_RING_REUSE`; grill-alt's proposal; the first behaviour change)
 
-The fix follows H0's dominant reason.
+**Design, all four parts behind the one switch:**
+- **(a) ctx_pick prefers the most recently freed context** whose completion work is done (`reset_done`, :753). This keeps the recorder off the descriptor and command pool resets (:4300–4304). So a game with one submission a frame uses 2–3 contexts, not 20.
+- **(b) ring_fit:**
+  - A hot context's ring grows to the largest power of two that fits under `RING_CAP`, not "the whole want or nothing".
+  - Contexts not picked for 120 frames give their ring back to `RING_MIN`, done by the completion thread.
+- **(c) Keep pool** `g_xc` 8 → 32 entries, still under `DM_VK_XRING_KEEP_MB`.
+- **(d) Extra rings:** at most one per submission, sized from that context's last overflow (the bytes past ring0, rounded up to a power of two), instead of 16 MB rings one after another.
 
-**H1a: H0 shows (a), a vertex read past the entry by up to 16 bytes**
-- **Design:** the stream's extent from each attribute's real element size (`offset + bytes(format)`, the table of m:4702 moved to a shared header) instead of `offset + 16`.
-  - The vertex fetch reads exactly those bytes. Every vertex copy shrinks a little in every game, and a skinning output read by its own draws fits, so it is bound in place (:589).
-  - Formats the table does not know keep +16.
-- **Correctness:** Vulkan's vertex fetch reads `offset + size(format)` bytes per element, so the exact range is what the GPU reads.
-- **Verify mode (`=2`):** both extents computed and the old one used, counting:
-  - draws whose fit result differs;
-  - attributes with an unknown format;
-  - draws where the exact range is larger than the old one (it should never be; logged in red).
+**Correctness:**
+- Nothing changes about what is bound or copied; only which memory holds it.
+- Context choice keeps today's conditions: the fence is done, and no later reader holds it (`hold`).
 
-**H1b: (b) misalignment or (c) multi-entry dominates**
-- **Design:** the compose's GPU-part copies are recorded into the **primary** before the open pass begins, instead of ending the pass.
-  - This needs the pass recorded into a secondary command buffer, as `DM_VK_STORE_NONE` already does (:2180, `sec_begin`/`sec_end`). The primary begins rendering only at the pass's end.
-  - Allowed only when every overlapping current-submission entry was written before the pass began. In H0's shape that is always the case: no dispatch ends a pass.
-  - Otherwise, the compose works as today.
-- **Correctness:**
-  - The copy runs after the dispatch (recorded earlier in the primary) and before the pass (executed at `sec_end`), with a transfer barrier.
-  - The ring destination is fresh, so nothing earlier in the pass reads it.
-  - Secondary recording conflicts with `DM_VK_DISPATCH_DEFER` (:2180 turns STORE_NONE off with it).
-- **Verify mode (`=2`):**
-  - Hoisted composes counted.
-  - A read-back compare of a hoisted range against a compose made the old way, one in 64, at the end of the submission. This is a diagnostic only; it costs a drain.
-- **Cost:** vk19.51 measured about 20 µs CPU and 22 µs GPU per secondary in FFR. With about 3 passes a frame here instead of 96, that is under 0.2 ms.
-  - FFR's ~40 passes would pay about +0.8 ms. So H1b is for a game's profile (as `range_store`), not global, unless FFR's A/B is neutral.
+**Verify:** none needed for the output; the gate is the counters. Faults from fresh rings must be < 1,000 a frame, with no new waits for a context.
 
-**H1c, either way:** remember a compose's ring range for the rest of the submission, keyed by (address, size, the gw generation that `gw_add` bumps), so the second draw of a mesh binds the first compose. On its own it halves the breaks; with H1a or H1b it is a CPU saving only.
-
-**Predicted (Harvest Moon):**
-- GPU −28…−32 ms: 96.5 passes become ~2–4. Each pass's ~0.345 ms is tile load/store, and the 193 draws remain.
-- CPU −4…−10 ms: 95 composes (guest memcpy plus a GPU copy each), 95 × (pass end + barrier + begin) at about 30–50 µs, and fewer bytes in the ring.
+**Predicted:**
+- Harvest Moon: faults about 18,000 → < 1,000 a frame. Recording **−25…−45 ms** if H0 confirms the fault cost; GPU ~0.
+- Memory: ring0s up to the cap plus one extra ring, against today's 80 MB + 176 MB extra. Expected lower, watched.
+- FFR (8 submissions a frame, 2 extra rings): neutral or slightly better. **FFR's ABAB is required before any default flip.**
 
 **Risks**
-- H1a: a wrong element size in the table means a truncated vertex fetch (garbage vertices). The verify mode and the fallback to +16 for unknown formats cover it.
-- H1b: a hoisted copy for an entry written after the pass began would read data before it is written. The guard checks every overlapping entry's record order against the pass start.
-- Secondaries on the Adreno (driver cost) also apply to H1b.
+- A bigger ring0 is host-visible memory held longer. On a low-memory signal (`g_ring_trim_gen`, :4236) every ring goes back to `RING_MIN` as now.
+- Most recently freed may hit a context whose completion is just finishing. The `reset_done` check keeps that work off the recorder.
+- 20-minute soak (MemAvailable, kills).
 
-### Build H2 — R-C: keep the copy caches across a ring change in the same submission (`DM_VK_RING_GEN`)
+### H1: no compose pass breaks, vertex extents (`DM_VK_VTX_EXTENT`)
 
 **Design**
-- copy_in's entries (`dcopy`) and the index-range entries keep the ring they were copied into (VkBuffer and mapped pointer). Their validity becomes:
-  - the same **submission** generation (still bumped at :4297);
-  - no later write in the write log.
-- An extra ring no longer bumps the generation or restarts the write log (:265). Write-log overflow still does (:2751).
-- copy_in gets a form that returns the buffer as well (`copy_in_b`). The vertex, index and index-pool callers (:3822, :3838, :3864) bind the buffer it returns.
-  - Callers not converted keep the old form, which treats a hit in an older ring as a miss. So a missed caller cannot bind the wrong buffer.
+- A stream's extent comes from its attributes' Vulkan formats as actually bound (`vfmt` :1116; the pipeline's attribute formats :2436): `offset + format size`, capped at the stride when the attribute lies inside it.
+  - Where the format is unknown, or the attribute starts at or past the stride, the old `+16` stays.
+- The vertex fetch reads exactly those bytes, so a skinning output read by its own draws fits and is bound in place (:589).
+- Every game's vertex copies shrink slightly.
 
-**Correctness**
-- The old ring lives until the submission completes. Extra rings are freed at completion, or kept for reuse after it (:734, `xring_put`).
-- Within the submission its bytes are not overwritten: `ring_alloc` only moves forward in a new ring.
-- The write log keeps every in-order write of the submission, so a hit is exactly as valid as today's same-generation hit.
+**Verify (`=2`):** both extents are computed and the old one used. It asserts new ≥ the format's size and new ≤ old, counts draws whose fit result differs, and logs a red line on any violation.
 
-**Verify mode (`=2`):** every hit in an older ring is compared with the guest's bytes at the time (memcmp of the ring copy). Differences are counted and logged, and the miss path is taken.
+**Predicted (only if H0 shows reason (a) dominates):**
+- GPU −28…−32 ms: 96.5 passes → ~2–4.
+- CPU −4…−10 ms: the composes, the pass end/begin pairs, ring bytes.
+- **Present** improves mostly by the CPU part (present tracks recording until H0.5 lands). The GPU part is confirmed with the timed passes (`C->tq`, the "GPU per frame: render passes" line).
 
-**Predicted (Harvest Moon):**
-- CPU −10…−20 ms:
-  - Most of the 417 MR_GEN misses, and with them most of the 71 MB of index-pool copies and part of the 19.7 MB of vertex copies.
-  - The ring volume, so fewer extra rings and fewer of the ~18,000 faults a frame.
-- GPU ~0: fewer upload copies.
-- Memory: −50…−150 MB of live extra rings.
+**Risk:** a wrong format size truncates the fetch, so garbage vertices. The verify mode and the `+16` fallback cover it.
 
-**FFR and FF12:** FFR has 8 submissions a frame (each a new generation anyway) and about 2 extra rings a frame (vk19.40 notes), so the gain there is small and the risk is the same code. Measured in their regression runs.
+**If H0 shows (b), (c) or (d)** instead, H1 becomes the padded entry (H1-pad, per game, see "Held back").
 
-**Risks**
-- A caller converted but still binding `C->ring`: a wrong buffer, so garbage geometry. Mitigation: the verify mode, and converting only three call sites.
-- Old rings referenced across `xring_put`'s reuse: impossible within a submission. The fence ends every reference.
+### H2: the GPU-written-range index and its lock (`DM_VK_GW_INDEX`)
 
-### Build H3 — R-B: the index-range cache across ring changes (`DM_VK_IDX_GEN`)
+**Design**
+- Entries kept in an address-sorted array, or in per-megabyte buckets alongside the counts at :293. A lookup touches only the entries over its range.
+- The completion thread copies out under the lock what it has to write back and free, and does the write-backs and frees after unlocking. Entries are marked dead under the lock, so lookups skip them.
 
-- **Design:** with H2's write log kept across ring changes, `ic[]` checks the submission generation and the log instead of `g_wgen`. lo/hi come from guest bytes, not from the ring.
-  - This is H2's change applied to `ic[]`. It is a build of its own only so it can be measured on its own.
-- **Verify mode (`=2`):** every hit rescanned and compared.
-- **Predicted:** CPU −0.3…−0.6 ms (the 166 rescans).
-  - A further step (scan results kept across submissions while `nvn_dirty` says the index pages are unchanged) would save the per-frame first scans too (≤0.3 ms more). It write-protects index pages, the risk the range stores carry, so it would be per game (`range_store`-style key). **Not proposed** unless H0–H3 leave the index scan above 1 ms.
+**Verify (`=2`):** every lookup also runs the old walk; a different answer is counted and logged.
 
-### Later, decided by H0–H3's numbers
+**Predicted:** Harvest Moon CPU −4…−7 ms (4.7 ms of waits plus the walks). FFR small: it walks fewer entries.
 
-- **gwmu (4.7 ms of waits).** The completion thread's `gw_expire` (:606) and `ctx_complete` hold the lock while the recorder walks every entry, 115,782 entry checks a frame.
-  - Fix: entries in a per-megabyte bucket list (the counts at :293 already exist), and the completion thread's work outside the lock.
-  - About −2…−4 ms CPU. A change to code both FFR and FF12 lean on, so it comes after H1–H3.
-- **Index pool for draws with GPU-written arguments** (71 MB a frame before H2).
-  - If H2 leaves it high: copy the index range the arguments name, read after the dispatch on the GPU; or keep the pool in the range store with a cap above its ~4 MB, per game.
-- **Descriptor sets (7.3 ms, 23% reused).** Check again after H1/H2: ring offsets that change per compose and per generation break reuse.
-- **Not worth it now:**
-  - `DM_VK_DISPATCH_DEFER`: dispatches already come outside passes here.
-  - Moving work to more threads: the efficiency-first rule.
+**Risk:** an entry freed while a lookup still points into its ring. The ring stays held by `hold`/`xr_raise` exactly as now; only the table moves.
+
+### H3: the index pool (`DM_VK_IDXPOOL_ONCE`; design picked by H0's distinct-start count)
+
+**Distinct starts in one pool** (grill-risk's case)
+- **Design:** one copy per submission of the pool range the frame's indirect draws touch (from the lowest to the highest start + 8 MB, within the pool), bound at `ibuf − base`.
+- **Correctness:**
+  - The copy is taken at the first such draw. A later write into the range in the same submission (write log) or by the GPU (gw) makes the next draw copy again.
+  - The CPU between submissions does not matter: one copy per submission.
+- **Verify (`=2`):** the per-draw copy is made too, and compared over the range the draw could read.
+
+**Few starts**
+- Raise the range store's 2 MB cap for `TSK_IDXPOOL` in this game's profile (a `range_store idxpool` word) and turn `buf` on for Harvest Moon.
+- **Risk:** dynamic data in an 8 MB window means protection faults on game threads (the guest-memory protection counters).
+
+**Predicted:** index pool 71 MB → < 10 MB a frame; CPU −8…−15 ms (memcpy plus the ring volume left after H0.5).
+
+### H4 (only if generation churn still costs > 2 ms after H0.5–H3): copy caches across ring changes (`DM_VK_RING_GEN`, v1's H2 + H3 merged)
+
+**Design**
+- An extra ring no longer bumps `g_wgen`, and the write log goes on (:265). Write-log overflow still bumps it (:2751).
+- copy_in's entries store their ring's identity. A hit in an older ring is used only by callers converted to take the buffer back (`copy_in_b`: vertex, index, index pool).
+- Callers that use the returned CPU pointer or bind `C->ring` treat an older-ring hit as a miss: uniform and storage copies with `gp`, texel buffers, image copies.
+- The index-range cache follows the same generation (v1's H3).
+
+**Verify (`=2`):** every older-ring hit is compared with the guest's bytes (memcmp); a difference is a miss and is logged. The index-cache hits are rescanned.
+
+**Predicted:** small after H0.5 (few ring changes left), −1…−3 ms. **20-minute soak.**
+
+### Then: descriptor sets
+
+Re-measure only, after H1–H3: compose offsets and generation changes break reuse today.
+
+### Held back
+
+- **H1-pad**, for reasons (b)–(d), per game.
+  - **Design:** at the dispatch, the ring copy of its storage buffer is padded with the guest's bytes around it. The window is learned from the last frame's composes for that range. The dispatch is bound inside it (aligned), and the entry covers the window, so the reads fit.
+  - Write-back stays kind 5 (only changed words), so the padding is never written back.
+  - **Correctness:**
+    - The padding is the guest's bytes at the dispatch. A write to the padding later in the submission (write log) or by the CPU (`gw_cpu_dirty`) is patched before the read (`gw_patch`), as composes do for earlier submissions.
+    - If it cannot be patched, the read composes as today.
+- **v1's H1b (secondaries):** only if H1-pad cannot work, per game. It would need a per-entry pass-epoch stamp (the entry was written before the pass began) and an explicit dispatch → transfer barrier. `STORE_NONE` is a loss in FFR.
+- **v1's H1c (remembering a compose):** dropped. Its key missed the write log (OP_UPDATE_UB, CLEAR_BUF, buffer copies through `wlog_add`) and the CPU's rewrites (`gw_cpu_dirty` / `gw_patch`, :503–510). With H1 there is nothing left to remember. If composes remain, it would be validated like a copy_in hit (submission generation, no overlapping write since, `gw_cpu_dirty` again).
+- **Not worth it:**
+  - `DM_VK_DISPATCH_DEFER`: dispatches are already outside passes.
+  - More threads: efficiency first.
 
 ## Order and expected end state
 
-| Build | Change | GPU ms | Recording ms | Present p50 (expected) |
+| Step | Change | GPU ms | Recording ms | Present p50 (expected) |
 |---|---|---|---|---|
 | now | — | 36.7 | 67 | 90 |
-| H0 | counters (+ env test) | 36.7 | 67 (env: −0…−8) | 90 |
-| H1 | no compose pass breaks | ~5–9 | 57–63 | ~60 |
-| H2 | caches across ring changes | ~5–9 | 40–50 | ~45 |
-| H3 | index cache across ring changes | ~5–9 | 40–49 | ~45 |
-| later | gwmu, index pool, descriptor sets | ~5–9 | 30–40 | ~34 |
+| H0 | counters, env tests | 36.7 | 67 (env −0…−8) | 85–90 |
+| H0.5 | ring reuse | 36.7 | 25–42 | 37–50 (GPU-bound when recording < 37) |
+| H1 | vertex extents | 5–9 | 20–38 | 25–40 |
+| H2 | gw index + lock | 5–9 | 15–33 | 25–35 |
+| H3 | index pool once | 5–9 | 10–25 | ≤ 34 |
+| H4 | only if churn > 2 ms | — | −1…−3 | — |
 
-The frame stays bound by the recorder. 30 fps needs the "later" items too, unless H2's cut is at the top of its range.
+30 fps looks reachable after H0.5, H1 and H3 if the fault hypothesis holds (grill-alt's estimate: recording ~15–25 ms). If H0 shows the faults cost much less than 2.6 µs each, H0.5's share drops, and H2–H3 carry more.
 
 ## Test protocol
 
-- **Mac.**
-  - The Metal host binds guest memory in place (m:526) and has no compose, so the pass breaks cannot be reproduced there. nvn_vk.c builds only for Android.
-  - The Mac's use is to read the scene's NVN command pattern before H1 is chosen. With the same save at the same spot, an NVN trace of one heavy frame gives:
-    - the skinned draws' strides, attribute formats and bound stream sizes;
-    - the dispatch's storage bindings.
-  - That confirms or rules out H0's reason (a) independently. Optional, if the Harvest Moon agent can reach the scene on the Mac.
-- **Tablet, every build: Harvest Moon started by a device-side script.**
-  - The user allows the script to start Harvest Moon for fix tests. It is built on the Harvest Moon agent's `hm_run2.sh`, which has the input mapping (Switch A = `KEYCODE_BUTTON_B`, …) and the tap points of the notification dialog and the Play button.
-  - It runs as `setsid nohup sh` from `/data/local/tmp/hmperf/<session>/`, and the logs are pulled after. The game can drop the network adb.
-  - Installs and the session's start go through the lead.
-  - **Before the first run:**
-    - The tablet is free: no game of the user's in front. If FF12 is open, the FF12 hibernate procedure comes first.
-    - No leftovers from an aborted run: the game not running, the clean `env.txt` in place.
-    - The user's save folder is copied to `/data/local/tmp/hmperf/<session>/save_bak/`. It is never written back without the user.
-  - **One run** (one switch value, one fresh process, because most switches are read at start):
-    1. Write that run's `env.txt`: the clean one plus that run's line, mode 644.
-    2. `am start` the game.
-    3. Tap the notification dialog, then Settings "Play".
-    4. Wait for the title in the log.
-    5. Continue: inputs on the Continue path only, with the screen checked by a shot or a log line before the confirming press. **Never New Game; the script never presses through a menu it has not recognised. On anything unexpected it stops, force-stops the game and restores `env.txt`.**
-    6. Load the user's save, then reach and hold the heavy scene: no input while measuring, so the camera and the scene stay the same.
-    7. Settle 60 s.
-    8. Measure two full 600-frame windows: the backend's per-600 lines, and the clocks and heat lines alongside.
-    9. One shot at a fixed frame after the settle (`DM_VK_SHOTS`).
-    10. Force-stop, and restore the clean `env.txt`.
-  - **The spot.** The A/B needs Continue to land at the heavy scene, or a few fixed inputs from it.
-    - If the user's current save is elsewhere, the Harvest Moon agent and the lead ask the user to save at the spot in a spare slot. The script never saves over a slot.
-    - The first sessions check that two runs with the same switches give the same draws a frame, dispatches a frame and render passes a frame within 5%. Otherwise the spot is not repeatable enough for an A/B.
-  - **One switch a session:**
-    - First its verify mode (`=2`), once: it must show 0 differences.
-    - Then off / on / off / on (ABAB), each a fresh run as above, with a 120 s cool-down between runs (thermal status 0, headroom back near its start value).
-  - **Matched clocks.** A pair counts only if the recording thread's cluster (cpu2–4 in hm5) has its mean MHz within ±5% across the pair's windows. HyperOS caps clocks; perf mode stays off, the fixed protocol.
-  - **Measured:** GPU ms, recording ms, render passes a frame, compose and copy counts, extra rings (MB, fresh vs kept), page faults, gwmu wait, present p50/p95, total CPU and the recording thread's CPU.
-  - **Shots** are compared by eye between on and off; the scene animates, so not by pixels.
-  - After the last run: the game force-stopped, the clean `env.txt` back, and its sha1 checked.
-- **Regressions, every build that changes behaviour (H1, H2, H3).**
-  - **FFR:** the dungeon spot with env_runJ, the same ABAB. Recording and present must not get worse beyond noise; `=2` shows 0 differences; no visual change.
-  - **FF12:** the user's in-game save first, then boot, load and 5 minutes of play with the switch on: geometry, characters, menus, a battle; watch for stalls. Close it and reopen FF12 per the hibernate procedure.
-- **Defaults.** A switch that wins for Harvest Moon becomes default on only if FFR and FF12 are neutral or better. Otherwise it becomes a game-profile key (as `range_store`), and only Harvest Moon's profile sets it.
+**Mac**
+- The Metal host binds guest memory in place (m:526): no composes and no ring churn, and nvn_vk.c builds only for Android. So the Mac cannot reproduce the costs.
+- Its use: an NVN trace of one heavy frame from the same save (strides, attribute formats, bound sizes, the dispatch's bindings, the indirect draws' index starts). That checks H0's reasons independently. Optional.
+
+**Tablet, every build: Harvest Moon started by a device-side script**
+- The user allows the script to start Harvest Moon for fix tests. It is built on the Harvest Moon agent's `hm_run2.sh`, which has the input mapping (Switch A = `KEYCODE_BUTTON_B`, …) and the tap points of the notification dialog and the Play button.
+- It runs as `setsid nohup sh` from `/data/local/tmp/hmperf/<session>/`, and the logs are pulled after. The game can drop the network adb.
+- Installs and the session's start go through the lead.
+- **Before the first run:**
+  - The tablet is free: no game of the user's in front. If FF12 is open, the FF12 hibernate procedure comes first.
+  - No leftovers from an aborted run: the game not running, the clean `env.txt` in place.
+  - The user's save folder is copied to `/data/local/tmp/hmperf/<session>/save_bak/`. It is never written back without the user.
+- **One run** (one switch value, one fresh process, because most switches are read at start):
+  1. Write that run's `env.txt`: the clean one plus that run's line, mode 644.
+  2. `am start` the game.
+  3. Tap the notification dialog, then Settings "Play".
+  4. Wait for the title in the log.
+  5. Continue: inputs on the Continue path only, with the screen checked by a shot or a log line before the confirming press. **Never New Game; the script never presses through a menu it has not recognised. On anything unexpected it stops, force-stops the game and restores `env.txt`.**
+  6. Load the user's save, then reach and hold the heavy scene: no input while measuring, so the camera and the scene stay the same.
+  7. Settle 60 s.
+  8. Measure two full 600-frame windows: the backend's per-600 lines, and the clocks and heat lines alongside.
+  9. One shot at a fixed frame after the settle (`DM_VK_SHOTS`).
+  10. Force-stop, and restore the clean `env.txt`.
+- **Memory-raising runs** (ring env tests, H0.5) abort when MemAvailable drops below 600 MB, and never come first in a session.
+- **The spot.** The A/B needs Continue to land at the heavy scene, or a few fixed inputs from it.
+  - If the user's current save is elsewhere, the Harvest Moon agent and the lead ask the user to save at the spot in a spare slot. The script never saves over a slot.
+  - The first sessions check that two runs with the same switches give the same draws a frame, dispatches a frame and render passes a frame within 5%. Otherwise the spot is not repeatable enough for an A/B.
+- **One switch a session:**
+  - Its verify mode (`=2`) first: 0 differences over ≥3,000 frames.
+  - Then off / on / off / on (ABAB, **≥4 alternations**), each a fresh run as above, with a 120 s cool-down between runs (thermal status 0, headroom back near its start value).
+- **Matched clocks.** A pair counts only if the recording thread's cluster (cpu2–4 in hm5) has its mean MHz within ±5% across the pair's windows. HyperOS caps clocks; perf mode stays off, the fixed protocol.
+- **Measured:** GPU ms (the timed passes too), recording ms, render passes a frame, compose and copy counts, extra rings (MB, fresh vs kept), faults by source, run-delay, gwmu wait, present p50/p95, total CPU and the recording thread's CPU.
+- **Shots** are compared by eye between on and off; the scene animates, so not by pixels.
+- After the last run: the game force-stopped, the clean `env.txt` back, and its sha1 checked.
+- **20-minute soak** with the switch on, for H0.5 and H4 (memory, kills, pacing).
+
+**Regressions, every behaviour change (H0.5–H4)**
+- **FFR:** the dungeon spot with env_runJ.
+  - The `=2` verify run (0 differences).
+  - ABAB: recording and present must not get worse beyond noise. **H0.5 needs this before any default flip.**
+- **FF12:** the user's in-game save first.
+  - Then the `=2` verify run, and 5 minutes of play with the switch on: geometry, characters, menus, a battle; watch for stalls.
+  - Close it and reopen FF12 per the hibernate procedure.
+
+**Defaults.** A switch that wins for Harvest Moon becomes default on only if FFR and FF12 are neutral or better. Otherwise it becomes a game-profile key (as `range_store`), and only Harvest Moon's profile sets it.
+
+## Changes from v1
+
+| Review item | v2 |
+|---|---|
+| alt-1 fresh ring memory (top lever) | new R1 and H0.5, the first behaviour change; fault split and thread system time in H0 |
+| alt-2 BUF_STORE | env test in H0, with the reason it cannot take the index pool (2 MB cap :3137); per-game cap raise as an H3 option |
+| alt-3 simpler H1a / padded entry | H1 caps at the stride; H1-pad replaces secondaries for (b)–(d) |
+| alt-4 gwmu, run-delay | R4 and H2 right after the volume items; run-delay in H0 |
+| alt-5 30 fps reachable | end-state table |
+| risk HIGH1 H1c key | H1c dropped (the conditions for bringing it back are stated) |
+| risk HIGH2 index pool | H0 counts distinct ibuf starts and pools; H3's per-submission pool copy |
+| risk MED H1a sizes | Vulkan formats as bound (vfmt), verify asserts new ≥ format size and ≤ old |
+| risk MED NWLOG, CPU-pointer callers | H0 counts overflows and scan length; H4 lists the callers that treat an older-ring hit as a miss |
+| risk MED H1b secondaries | held back; per game, with an epoch stamp and an explicit barrier if ever |
+| risk MED ring env test | MemAvailable abort, never first in a session |
+| risk LOW items | timed passes for H1's GPU part; FF12 in `=2` runs; ≥3,000-frame gate, ≥4 alternations; 20-minute soak for H0.5 and H4 |
+
+**Order:** grill-alt's, with one change. The index pool (H3) comes before the generation work (H4) as a step of its own, because H0.5 does not touch the pool's per-start copies and BUF_STORE cannot take them.
