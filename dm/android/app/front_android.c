@@ -356,7 +356,7 @@ static void input_release_all(void) {
     pthread_mutex_unlock(&g_pmu);
 }
 // The shader pre-warm (src_vk/nvn_vk.c dm_vk_prewarm): the pipelines earlier runs made are made again before the game starts, behind a progress screen; a tap skips it
-int dm_vk_prewarm(void) __attribute__((weak)); void dm_vk_prewarm_cancel(void) __attribute__((weak));
+int dm_vk_prewarm(void) __attribute__((weak)); void dm_vk_prewarm_cancel(void) __attribute__((weak)); void dm_vk_message(const char *t1, const char *t2) __attribute__((weak));
 static _Atomic int g_prewarming;
 static int on_input(AInputEvent *e) {
     int32_t type = AInputEvent_getType(e), src = AInputEvent_getSource(e);
@@ -411,6 +411,7 @@ static void game_left(void) { char p[600]; marker_path(p, sizeof p, "game_runnin
 static void game_failed(void) { char a[600], b[600]; marker_path(a, sizeof a, "game_running"); marker_path(b, sizeof b, "game_failed"); if (rename(a, b)) { int fd = open(b, O_WRONLY | O_CREAT, 0600); if (fd >= 0) close(fd); } }
 static void back_to_menu(void) {
     static _Atomic int once; if (atomic_exchange(&once, 1)) return;
+    if (dm_hib_forget_hook) dm_hib_forget_hook();   // the game ends here: no hibernation snapshot to resume (dm/host/hle_hibsnap.c)
     char p[600]; snprintf(p, sizeof p, "%s/show_menu", g_files); FILE *f = fopen(p, "w"); if (f) fclose(f);
     game_left();
     LOG("front end: − and + held: back to the menu");
@@ -418,6 +419,14 @@ static void back_to_menu(void) {
     dm_host_shutdown("back to the menu");
 }
 
+// The hibernation snapshot the menu resumed the game for was refused (removed by the host): back to the menu, quietly (show_menu keeps it from starting the game again)
+static void hib_refused(void) {
+    char p[600]; snprintf(p, sizeof p, "%s/show_menu", g_files); FILE *f = fopen(p, "w"); if (f) fclose(f);
+    LOG("front end: the hibernation snapshot was refused: back to the menu");
+    game_left();   // not a failure: the menu shows, not the error
+    ANativeActivity_finish(g_act);
+    dm_host_shutdown("hibernation snapshot refused");
+}
 // ---------- Boot: environment from the menu's settings, log, then the host on its own thread ----------
 static char *g_argv[4];
 static void boot_env(const char *files, const char *ext) {
@@ -436,6 +445,19 @@ static void boot_env(const char *files, const char *ext) {
     snprintf(p, sizeof p, "%s/save", files); mkdir(p, 0755); setenv("DM_SAVE", p, 0);
     snprintf(p, sizeof p, "%s/temp", files); mkdir(p, 0755); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/cheats", files); if (!access(p, R_OK)) setenv("DM_CHEATS", p, 0);   // the cheats folder (<build>.txt files; hle_cheats.c)
+    // DM_HIBERNATE: a snapshot the last process wrote and did not come back from (dm/host/hle_hibsnap.c keeps it in <files>/hibernate) is where the game resumes
+    snprintf(p, sizeof p, "%s/hibernate/snap.bin", files);
+    int hib_on = getenv("DM_HIBERNATE") && atoi(getenv("DM_HIBERNATE")) > 0, snap = !access(p, R_OK);
+    if (hib_on && snap) {
+        setenv("DM_HIB_RESTORE", p, 0); dm_hib_refused_hook = hib_refused;   // a snapshot the host refuses (another build, damaged) is removed, and the menu shows
+        fprintf(stderr, "boot: hibernate: snapshot %s found, DM_HIBERNATE on: restoring it\n", p);
+    } else fprintf(stderr, "boot: hibernate: %s, %s: no restore\n", hib_on ? "DM_HIBERNATE on" : "DM_HIBERNATE off", snap ? "a snapshot exists (left as it is)" : "no snapshot");
+    // With hibernation, <external>/hib_ctl.txt takes DM_CTL's "hib" commands from adb (dm/android/tools/hib_install.sh writes "hib freeze" before an update installs over the
+    // game): made by the app, so that the shell's appends reach it (a file adb makes there is the shell's, and the app cannot read it). Other DM_CTL commands are not taken from it
+    if (hib_on && !getenv("DM_CTL")) {
+        snprintf(p, sizeof p, "%s/hib_ctl.txt", ext); FILE *c = fopen(p, "w");
+        if (c) { fclose(c); chmod(p, 0666); setenv("DM_CTL", p, 1); setenv("DM_CTL_HIB_ONLY", "1", 1); fprintf(stderr, "boot: hibernate: control file %s (hib commands only)\n", p); }
+    }
     chdir(files);
     g_argv[0] = strdup("dmhost"); snprintf(p, sizeof p, "%s/dm", ext); g_argv[1] = strdup(p);
 }
@@ -464,6 +486,7 @@ static void *boot_thread(void *a) {
     (void)a;
     static char alt[65536]; stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt}; sigaltstack(&ss, 0);
     if (dm_vk_prewarm) { atomic_store(&g_prewarming, 1); dm_vk_prewarm(); atomic_store(&g_prewarming, 0); }
+    if (getenv("DM_HIB_RESTORE") && dm_vk_message) dm_vk_message("MELANJUTKAN...", "DARI HIBERNASI");   // the snapshot takes seconds to read: the player sees why the screen waits
     int rc = dm_main(2, g_argv);
     fprintf(stderr, "boot: dm_main returned %d\n", rc);
     game_failed(); ANativeActivity_finish(g_act);   // the host is over: back to the menu, which shows the log's error
@@ -499,8 +522,8 @@ static void game_suspend(int on) {
     pthread_mutex_lock(&g_lmu);
     if (on != g_suspended) {
         g_suspended = on;
-        if (on) { input_release_all(); dm_focus_set(2); dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); LOG("front end: suspended (the activity stopped)"); }
-        else { dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(2); LOG("front end: resumed (the activity started)"); }
+        if (on) { input_release_all(); dm_focus_set(2); dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); dm_hib_suspend(1); LOG("front end: suspended (the activity stopped)"); }   // dm_hib_suspend: DM_HIBERNATE's snapshot, written on a thread of its own (dm/host/hle_hibsnap.c)
+        else { dm_hib_suspend(0); dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(2); LOG("front end: resumed (the activity started)"); }
     }
     pthread_mutex_unlock(&g_lmu);
 }
@@ -662,7 +685,8 @@ static void on_destroy(ANativeActivity *a) {
     JNIEnv *env = a->env;
     jboolean fin = (*env)->CallBooleanMethod(env, a->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "isFinishing", "()Z"));
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); fin = 1; }
-    if (fin) { game_left(); dm_host_shutdown("activity destroyed"); }
+    // finished without the − and + hold (a recents swipe, the task removed): the hibernation snapshot the stop began is written to the end and kept; only back_to_menu drops it
+    if (fin) { if (dm_hib_flush_hook) dm_hib_flush_hook(); game_left(); dm_host_shutdown("activity destroyed"); }
     else LOG("front end: the activity was destroyed by Android, not finished: the game stays suspended");
 }
 

@@ -143,6 +143,8 @@ def header(g):
     if pm not in ('follow', 'boost'): sys.exit(f'{g.id}: perf_mode must be follow or boost: {pm}')
     dmo = g.get('depth_mode', 'gl')   # the NVN depth mode the game sets, for the pipeline archive made offline (dm/gfx/tools/pso_offline.py; the host follows the game at run time): gl / zero
     if dmo not in ('gl', 'zero'): sys.exit(f'{g.id}: depth_mode must be gl or zero: {dmo}')
+    rs = g.words('range_store', 'off')   # Android: the range stores on by default for this game (nvn_vk.c DM_VK_TEXEL_STORE / DM_VK_BUF_STORE; the variables override): off, or texel and / or buf
+    if rs != ['off'] and (not rs or any(w not in ('texel', 'buf') for w in rs) or len(set(rs)) != len(rs)): sys.exit(f'{g.id}: range_store must be off, or texel and / or buf: {" ".join(rs)}')
     api = g.get('device_api', '55.15')   # the NVN API major.minor version nvnDeviceGetInteger reports (hle_nvn.c)
     if not re.fullmatch(r'\d+\.\d+', api): sys.exit(f'{g.id}: device_api must be major.minor: {api}')
     src = f'dm/games/{g.id}' if g.dir.parent == HERE else str(g.dir)
@@ -186,6 +188,8 @@ def header(g):
          f'#define DM_GAME_TEX_DYN_SLOTS {int(tds == "on")}',
          f'#define DM_GAME_GPU_TS_SEGMENT {int(gts == "segment")}',
          f'#define DM_GAME_VCONV_RANGE {int(vcr == "on")}',
+         f'#define DM_GAME_RANGE_STORE_TEXEL {int("texel" in rs)}',
+         f'#define DM_GAME_RANGE_STORE_BUF {int("buf" in rs)}',
          *([f'#define DM_GAME_NVN_API_MAJOR {api.split(".")[0]}', f'#define DM_GAME_NVN_API_MINOR {api.split(".")[1]}'] if g.get('device_api', '') else []),   # without the key: by the SDK version (hle_nvn.c nvn_api)
          '']
     return '\n'.join(L)

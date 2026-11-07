@@ -1,4 +1,6 @@
-# Parallel NVN→Vulkan translation (`DM_VK_PAR`): design
+# Parallel NVN→Vulkan translation (DM_VK_PAR): design
+
+Not built: DM_VK_PAR, DM_VK_PAR_CHUNK and DM_VK_PAR_STAT below are proposed switches that no code reads (FFR is frozen at vk19.75b without parallel translation).
 
 ## 1. What has to stay in order
 
@@ -17,7 +19,7 @@ Order-free once values are known: set hashing, `vkAllocateDescriptorSets`/`vkUpd
 | Per draw chunk | Balances; must not cross `pass_end_`. |
 
 **Recommended: pass-aligned jobs.**
-- Pass ≤ K draws (`DM_VK_PAR_CHUNK`, default 96): **PASS job**, a secondary that begins/ends rendering itself (legal in secondaries) plus its end barrier; adjacent small passes share one.
+- Pass ≤ K draws (DM_VK_PAR_CHUNK, default 96): **PASS job**, a secondary that begins/ends rendering itself (legal in secondaries) plus its end barrier; adjacent small passes share one.
 - Larger pass: **CHUNK jobs** of ≤ K draws (`RENDER_PASS_CONTINUE` + inheritance), executed in order inside the primary's `vkCmdBeginRendering(SECONDARY_COMMAND_BUFFERS_BIT)`.
 - Work outside passes (dispatches, copies, `fb_snap_for`, `lin_writeback`, barriers): **GAP** secondaries, recorded by the front.
 
@@ -80,10 +82,10 @@ Per draw it emits a packet (~100–300 B, per-submission arena): pipeline/layout
 
 | Stage | Switch | Effort | Expected rec / p50 |
 |---|---|---|---|
-| 0 | `DM_VK_PAR_STAT=1`: front-share vs. movable-share timers on today's path | 0.5 d | none; replaces the estimates above |
+| 0 | DM_VK_PAR_STAT=1: front-share vs. movable-share timers on today's path | 0.5 d | none; replaces the estimates above |
 | 0b | `DM_VK_HTAB=1`: handle table, single thread | 1–1.5 d | rec 24.5 → ~21–22; p50 −2…−3 |
-| 1 | `DM_VK_PAR=1`: packets and jobs run serially on the front | 2–3 d | rec +1…+2 (packets, ~20 µs/secondary); correctness gate |
-| 2 | `DM_VK_PAR=2`: two workers | 2–3 d | see below |
+| 1 | DM_VK_PAR=1: packets and jobs run serially on the front | 2–3 d | rec +1…+2 (packets, ~20 µs/secondary); correctness gate |
+| 2 | DM_VK_PAR=2: two workers | 2–3 d | see below |
 | 3 | `PAR=3/4`, `PAR_CHUNK` tuning | 1 d | ~0 while the front is ≥ 12 ms |
 | 4 | async commit (the last worker submits) | 2 d, optional | matters only if the frame turns CPU-bound again |
 

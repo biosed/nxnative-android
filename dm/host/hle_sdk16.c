@@ -47,6 +47,7 @@ HLE_FORCE("_ZN2nn4time26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTi
 HLE_FORCE("_ZN2nn4time8FinalizeEv", "pairs with Initialize; the host has no session", Result, h_time_Finalize, void) { return RES_OK; }
 // "Ensure network clock availability" async task: no request is sent; the finish event fires immediately and the result is failure. The object itself is untouched (constructor / destructor no-ops), the event lives in host static storage
 static _Alignas(16) uint8_t g_ev_netclock[0x100];
+HLE_HIB_STATIC(g_ev_netclock)
 HLE_FORCE("_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTaskC1Ev", "network clock task constructor; the host opens no session", void, h_time_NcCtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTaskD1Ev", "network clock task destructor; no session to close", void, h_time_NcDtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTask10InitializeENS_2os14EventClearModeE", "network clock task init (offline)", Result, h_time_NcInit, void *self, int mode) { (void)self; (void)mode; return RES_OK; }

@@ -104,7 +104,7 @@ A `crc MISMATCH` line means a secondary path changed draw order or state. That w
 
 | Result | Reading |
 |---|---|
-| `overhead sec1-prim1` | Per-secondary CPU cost and GPU cost. In game (vk19.51 STORE_NONE, 40.4 secondaries a frame, runO vs runJ2): +0.8 ms CPU (24.7 → 25.5) and +0.9 ms GPU (span 25.9 → 26.8), ~20 µs + ~22 µs each; run 1 (40 secondaries) should land near that, and the 4b sweep shows how both scale with the count. If the per-secondary GPU cost is much higher here, keep jobs larger: a bigger `DM_VK_PAR_CHUNK` and more passes merged per job. |
+| `overhead sec1-prim1` | Per-secondary CPU cost and GPU cost. In game (vk19.51 STORE_NONE, 40.4 secondaries a frame, runO vs runJ2): +0.8 ms CPU (24.7 → 25.5) and +0.9 ms GPU (span 25.9 → 26.8), ~20 µs + ~22 µs each; run 1 (40 secondaries) should land near that, and the 4b sweep shows how both scale with the count. If the per-secondary GPU cost is much higher here, keep jobs larger: a bigger DM_VK_PAR_CHUNK (proposed, never built) and more passes merged per job. |
 | `sec2` speedup at `--tex 64` | About 1.8x or better means the Adreno driver scales: workers take the ~9.7 ms movable share as planned. 1.3x or less means `vulkan.adreno.so` serializes internally (descriptor or command allocation), so parallel recording buys little and the design falls back to stage 0b (handle table) only. |
 | sec3/sec4 against sec2 | Whether more than 2 workers can help at all. The design expects 2 to be enough while the front is about 12 ms or more. |
 | run 3 against run 4 | How much the chunking fixes a skewed pass (one secondary of 500 draws pins one worker). |

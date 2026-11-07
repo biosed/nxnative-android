@@ -162,7 +162,7 @@ APK `ffr_hib_vk19_64d.apk` (android-ffr 3839590b, hib 10f74320), Earth Shrine du
 | `DM_LATCH_BLOCK=1` | all threads +2.7 (noise) | no gain: off |
 | `DM_VK_POOL_RESET=1` | RHIThread +0.7, all threads +3.7 | loss: off |
 | `DM_G_SPIN=200` | RHIThread ≈, all threads +1.5 (a slightly different clock limit) | no gain: off |
-| `DM_VK_HTAB=1` | its run had the clock limits lifted (GPU 15.1 against 19.2 ms) | confounded: test again |
+| `DM_VK_HTAB=1` | its run had the clock limits lifted (GPU 15.1 against 19.2 ms) | confounded: tested again in session 2 (win) |
 
 Counters (baseline H, per frame):
 - copy_in: 3,102 copies (20.6 MB); miss reasons: slot held by another range 1,136, earlier submission 1,965; every pool "CPU uncached".
@@ -173,6 +173,58 @@ Counters (baseline H, per frame):
 - Page faults: 3.8.
 - The CPU line's RHIThread group read 0.00 (guest thread names carry the handle: "1018 RHIThread"); fixed in vk19.65d.
 
+## Session 2 (vk19.66n): HTAB again, guest synchronization, condition-wait sites, repeats by caller
+
+APK `ffr_hib_vk19_66n.apk` (android-ffr 06c84218, hib b494370c), network adb, plugged in. Logs: `s2/` (B1, HTAB, B2; marks.txt). HyperOS moved the cpu7 limit between 1228 and 2956 MHz within every run, and the GPU dropped to 14–16 ms whenever it was 2956: whole-run averages are confounded, only windows at the same cpu7 clock are compared.
+
+- `DM_VK_HTAB=1`: win. At cpu7 ≈1365 MHz (limit 1478): recording 14.94 / RHIThread 18.87 ms against B2's 7 windows at 1306–1384 MHz with 15.77–16.32 / 19.58–20.35 (−0.9…−1.0 ms). On by default from vk19.67a.
+- Guest synchronization, all threads, per frame: G waited for 28.2 times (4.05 ms); lock_handoff 3.50 ms, of which 65.8 wakes (pthread_cond_signal) take 3.24 ms.
+- Condition-wait timeouts: one GameThread site, `sdk+0xc833b8 < sdk+0x13c004 < main+0x17150`, waits 17.3 times a frame with timeouts under 1 ms and times out 16.2 (~1,000 wake-ups a second); Foreground Worker #1 waits with timeouts of 20 ms or more, 5.2 a frame.
+- Copies' repeated bytes by caller (another submission of the frame / an earlier frame, MB a frame): vertex 1.17 / 1.23, index 0.45 / 0.45, index pool 2.00 / 2.00, uniform 0.11 / 0.19, storage 0 / 0.61, texel 0.17 / 2.50; in all 3.88 MB from another submission, 6.96 MB from an earlier frame. The index-pool store (C4′a) is worth about 2 MB a frame (~−0.3 ms), not the 6.95 MB its copies move.
+
+## Session 3 (vk19.68b): wakes after G, a two-way copy table
+
+APK `ffr_hib_vk19_68b.apk` (android-ffr 2b731986, hib e6d8e2e0). Logs: `s3/` (A, W, B; marks.txt). The clock limits swung again; windows at matched cpu7 ≈1600–1640 MHz are compared.
+
+| Switch | Result | Verdict |
+|---|---|---|
+| `DM_WAKE_AFTER_G=1` | G waited 22–31 times a frame (2.6–3.5 ms) → 7.8–9.9 (0.35–0.53 ms); all threads 49.1–49.9 → 46.4–48.5 ms (−2…−3), the game's threads 28.7–29.5 → 26.2–27.6; RHIThread ≈ (17.2–17.4 / 17.0–17.5); present p50 18.6–18.8 → 18.4–18.7, p99 25.4–27.5 / 22.9–30.8 (no pacing regression); 57–70 wakes a frame deferred | win: on by default on Android from vk19.71a |
+| `DM_VK_DC_WAYS2=1` | run-time A/B in A, 3 pairs: submit+present p50 ≈15.0–15.3 ms on and off | neutral: off, dead weight |
+
+## Session 4 (vk19.71): the texel store
+
+APK `ffr_hib_vk19_71.apk` (android-ffr 82c07833, hib e02144e8), dungeon spot, one run per arm, device-side script (18:12–18:25); windows at matched cpu7 clocks.
+
+- `DM_VK_TEXEL_STORE=2` (verify): every 600-frame window "verify ~1,528 checked, 0 differed"; ~1,528 served a frame (18.6 MB), ~217 missed; the store 4.5 of 32 MB in 409 blocks; mprotect failures 0; dropped once.
+- `DM_VK_TEXEL_STORE=1` against base: at ~1.17 GHz (T w16–19 against B w10–15) recording 15.40 against 16.03 ms (−0.6), RHIThread 19.6 against 20.25 (−0.6), all threads 55.7 against 57.1 (−1.4); at ~1.63 GHz (T w8–13 against B w6, w7, w18) recording 12.97 against 13.87 (−0.9), RHIThread 16.6 against 17.4 (−0.8). 17.6 MB a frame served from the store, 0 evicted, 0 mprotect failures, the game alive at the end of all three runs.
+- Verdict: win, on by default from vk19.73a.
+
+## Session 5 (vk19.74): vertex streams and the index pool in the store
+
+APK `ffr_hib_vk19_74.apk` (android-ffr 539a707d, hib 728f6d64), dungeon spot, device-side script (18:35–18:52); windows at matched cpu7 clocks.
+
+- `DM_VK_BUF_STORE=2` (verify): vertex uses checked 383–612 a frame, 0 differed in every window. Memory was low (about 750 MB available): the store was dropped under pressure several times and made again, without errors. The index pool was never served (every range over 2 MB, or refused): the switch stores vertex streams only in practice.
+- `DM_VK_BUF_STORE=1` per kind: texel 1,545 served a frame (17.7 MB, as session 4: the texel share of vk19.74b holds), vertex ~710 (4.1 MB); the store 6.4 of 32 MB in 607 blocks, 0 mprotect failures, the game alive.
+- Against base at ~1.65–1.7 GHz: recording 12.55 against 12.78 ms (−0.2), RHIThread 15.95 against 16.2 (−0.25); the switch on at 1.77–1.87 GHz (recording 12.2–12.5) is also faster than base at 2.0–2.2 GHz (12.6–12.7).
+- Verdict: a small win, on by default from vk19.75b (vertex only in practice).
+- The vk19.58 arm did not run: Android refused the install as a version downgrade (26110622 under 26110718; HyperOS refuses -d), so that run went on vk19.74 and is not counted. `ffr_hib_vk19_58_v26110719.apk` is the same source (hib fd79ad5d) with only the version code raised (its .text is byte-identical to the original), and the final `ffr_hib_vk19_75b.apk` carries 26110720 to install over it. The end-to-end numbers follow.
+
+## End to end: vk19.58 vs final vk19.75b
+
+Re-run 19:11–19:20, device-side script, dungeon spot: `ffr_hib_vk19_58_v26110719.apk` (vk19.58's source, only the version code raised) then `ffr_hib_vk19_75b.apk` installed over it (android-ffr 73ceb47b, hib 790a8083); both runs alive to the end. Compared on the lines both builds log: the per-frame GPU / recording line, the clocks line (an instantaneous sample) and the [nvn] present timing.
+
+| | vk19.58 | vk19.75b | Change |
+|---|---|---|---|
+| Recording, cpu7 at 1670 MHz (vk19.58 w9–15, final w16–19) | 17.0–18.0 ms (avg ~17.6) | 12.8–13.3 ms (avg ~13.0) | −4.6 ms (−26%) |
+| GPU per frame, same windows | 19.2 ms | 14.2 ms | −5.0 ms (vk19.58 does not log the GPU clock: with caution) |
+| Recording, cpu7 sampled at 633 MHz | 18.0–18.3 ms | 16.0–16.5 ms | −2 ms |
+| Present, last 8 × 300-frame windows (cpu7 ~1.5–1.67 GHz): p50 / p95 | 23.31 ms (42.9 fps) / 28.9 | 17.86 ms (56.0 fps) / 22.6 | +13 fps (+31%) |
+| Long-frame anchors | 42.2 fps | 49.1 fps | |
+
+RHIThread, all-thread CPU and energy are not comparable end to end: vk19.58 predates those lines. The matched-clock gains of each step are in sessions 1–5 above. On by default in vk19.75b against vk19.58: DM_VK_IDX_NEON, DM_VK_FB_FAST, DM_VK_LEAN, DM_VK_HTAB, DM_WAKE_AFTER_G (Android), DM_VK_TEXEL_STORE, DM_VK_BUF_STORE (DM_VK_CTX_PICK was already on in vk19.58).
+
+**FFR is frozen at vk19.75b** (android-ffr 73ceb47b, android-ffr-hib 790a8083): no further FFR code changes; the "later" items in Open stay deferred.
+
 ## Opt-in switches of vk19.47–19.56 and their verdicts
 
 | Switch | Build | Verdict | Dead weight to remove later? |
@@ -181,7 +233,7 @@ Counters (baseline H, per frame):
 | thread names (15 characters) and named backend threads | 19.47 | kept, on by default | no |
 | `DM_ADPF_ALL` | 19.50 | no effect on the clocks (N): off | yes: the extra hint calls and the name scan (the plain ADPF session stays) |
 | `DM_VK_STORE_NONE` | 19.51 | +0.8 ms CPU, +0.9 ms GPU (O): off | candidate: the secondary-per-pass path (sec_begin / sec_end) unless the parallel translation reuses it |
-| `DM_VK_HTAB` | 19.52 | dset −0.3 ms, noise (Q′): off | yes: the handle table (tex_slot / samp_cached wrappers) |
+| `DM_VK_HTAB` | 19.52 (default on from 19.67) | dset −0.3 ms, noise (Q′); session 2 at matched clocks: recording −0.9, RHIThread −1.0 ms: kept, on by default | no |
 | `DM_TOPO_AFFINITY` | 19.53–19.54 | masks not applied by the kernel (R): off | yes: topo_tick, topo_place, the guest-thread registry (dm_guest_thread_named) |
 | `DM_TOPO_SELF` | 19.55 | the thread's own mask not applied either (U1, U2): off | yes: the affinity part of topo_self_tick |
 | `DM_UCLAMP_MIN` | 19.56 | EPERM (V1, V2): off | yes: uclamp_apply (the recording-thread identification is shared with the above) |
@@ -195,9 +247,15 @@ Counters (baseline H, per frame):
 | `DM_VK_POOL_RESET` | 19.64 | RHIThread +0.7, all threads +3.7 (session 1): off | yes |
 | `DM_G_SPIN` | 19.64 | no gain at 200 (session 1): off | candidate |
 | `DM_VK_SHADOW` | 19.59 | diagnostic | no |
+| `DM_WAKE_AFTER_G` | 19.68 (default on, Android, from 19.71) | all threads −2…−3 ms, G waits −85% (session 3): kept, on by default | no |
+| `DM_VK_DC_WAYS2` | 19.69 | neutral (session 3): off | yes: the two-way path in copy_in |
+| `DM_VK_TEXEL_STORE` | 19.70 (default on from 19.73) | verify 0 differences; recording −0.6…−0.9, RHIThread −0.6…−0.8, all threads −1.4 ms (session 4): kept, on by default | no |
+| `DM_VK_BUF_STORE` | 19.72 (default on from 19.75b) | verify 0 differences; recording −0.2, RHIThread −0.25 ms (session 5): kept, on by default (vertex only in practice) | no |
 | `DM_VK_ZEROCOPY` (Z0) | 19.46 | −0.6 ms rec, −230 MB MemAvailable (L): off | candidate: zc_back / zc_find / the AHB import (kept only if Z1/Z2 are ever tried) |
 
 ## Open
+
+- Later (deferred by the user, after the closing builds): coalescing GameThread's sub-millisecond condition-wait poll (`sdk+0xc833b8 < sdk+0x13c004 < main+0x17150`, ~1,000 wake-ups a second; needs a game-speed check); a thermal governor (frame cap and Unreal's dynamic resolution budget from the thermal headroom forecast, plan v4 T3); UBWC for render targets that are never copy or blit destinations (plan v4 T4, watched by MemAvailable).
 
 - CPU–GPU waiting (Path A S0): done. `DM_VK_CTX_PICK` is on by default from vk19.58 (Run X); vk19.58 also ends a GPU-written range at its dispatch write-back (the gap found in the Run W review). To check on the tablet: `DM_VK_CTX_PICK=0` against the default at 60% resolution, and the 'entries ended at their write-back' count.
 
