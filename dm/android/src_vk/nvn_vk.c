@@ -2606,19 +2606,27 @@ static void *pso_precreate(void *a) { pthread_setname_np("dm-psopre");
 // recording thread takes a copy of every value once per submission (tog_latch at mtl_sub_begin) and reads only that copy (tog), so a switch never changes in the middle
 // of a submission. A name not on the run-time list is refused when the file sets it (it is read at start only)
 enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_PACE, TG_DC2, TG_TSTORE, TG_BSTORE, TG_N };
+// The range stores (TG_TSTORE, TG_BSTORE) are per game (merge-main): on by default only where the game profile's range_store key names them (game.py: FINAL FANTASY RESONANCE
+// sets "texel buf"), because they write-protect guest pages (nvn_dirty), measured on that game only; FINAL FANTASY XII's profile records a hang from write-protected textures
+// (tex_dirty_upload). The variables still override both ways (0 / 1 / 2). tog_init_ logs which decided: the profile, the environment, or the default (off)
+#if !defined(DM_GAME_RANGE_STORE_TEXEL) || !defined(DM_GAME_RANGE_STORE_BUF)
+#error "game_profile.h has no range_store macros: regenerate it with dm/games/game.py"
+#endif
 static struct { const char *name; int runtime; _Atomic int val; int def; } g_tog[TG_N] = {   // def: the value without the variable (on by default after its A/B; =0 turns it off)
     [TG_SHADOW] = {"DM_VK_SHADOW", 1},   // diagnostic: what a persistent cache could save (copy_in / index-scan misses whose bytes an earlier copy already had)
     [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1, 0, 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2); on by default from vk19.65 (session 1: -1.0 ms)
     [TG_PACE] = {"DM_VK_PRESENT_PACE", 0},   // vk19.63: one setFrameRate request for the cap at the first swapchain, FIFO when the cap is at most the panel's rate; start only
-    [TG_TSTORE] = {"DM_VK_TEXEL_STORE", 0, 0, 1},   // vk19.70: uniform texel buffers kept across frames in a store, validated by nvn_dirty (1), checked against a host copy (2); start only; on by default from vk19.73 (session 4: recording -0.6...-0.9, RHIThread -0.6...-0.8 ms)
-    [TG_BSTORE] = {"DM_VK_BUF_STORE", 0, 0, 1},   // vk19.72: vertex streams and the indirect draws' index pool in the same store (1), checked against a host copy (2); start only; on by default from vk19.75b (session 5: recording -0.2, RHIThread -0.25 ms; vertex only in practice)
+    [TG_TSTORE] = {"DM_VK_TEXEL_STORE", 0, 0, DM_GAME_RANGE_STORE_TEXEL},   // vk19.70: uniform texel buffers kept across frames in a store, validated by nvn_dirty (1), checked against a host copy (2); start only; on by default from vk19.73 (session 4: recording -0.6...-0.9, RHIThread -0.6...-0.8 ms)
+    [TG_BSTORE] = {"DM_VK_BUF_STORE", 0, 0, DM_GAME_RANGE_STORE_BUF},   // vk19.72: vertex streams and the indirect draws' index pool in the same store (1), checked against a host copy (2); start only; on by default from vk19.75b (session 5: recording -0.2, RHIThread -0.25 ms; vertex only in practice)
     [TG_DC2] = {"DM_VK_DC_WAYS2", 1},   // vk19.69: copy_in's table two-way set-associative (C5); on the run-time list (a mode change only costs misses)
     [TG_LEAN] = {"DM_VK_LEAN", 0, 0, 1},   // vk19.62: small hot-path items (trace pointers, the memo hash, the timer conversion, sampled descriptor-set timing); start only; on by default from vk19.65 (session 1: RHIThread -1.0 ms)
     [TG_FB_FAST] = {"DM_VK_FB_FAST", 1, 0, 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2); on by default from vk19.65 (session 1: -0.4 ms)
 };
 static int g_tog_lat[TG_N];
 static void tog_init_(void) {
-    for (int i = 0; i < TG_N; i++) { const char *e = getenv(g_tog[i].name); int v = e ? atoi(e) : g_tog[i].def; atomic_store(&g_tog[i].val, v); if (v) LOG("vk: %s=%d (%s%s)", g_tog[i].name, v, e ? "from the environment" : "the default", g_tog[i].runtime ? "; may be changed at run time" : ""); else if (g_tog[i].def) LOG("vk: %s=0: off (on by default)", g_tog[i].name); }
+    for (int i = 0; i < TG_N; i++) { const char *e = getenv(g_tog[i].name); int v = e ? atoi(e) : g_tog[i].def; atomic_store(&g_tog[i].val, v);
+        if (i == TG_TSTORE || i == TG_BSTORE) { LOG("vk: %s=%d (%s)", g_tog[i].name, v, e ? "env" : g_tog[i].def ? "profile: range_store" : "default off: not in the profile's range_store"); continue; }   // the range stores: always logged, with the source
+        if (v) LOG("vk: %s=%d (%s%s)", g_tog[i].name, v, e ? "from the environment" : "the default", g_tog[i].runtime ? "; may be changed at run time" : ""); else if (g_tog[i].def) LOG("vk: %s=0: off (on by default)", g_tog[i].name); }
 }
 static pthread_once_t g_tog_once = PTHREAD_ONCE_INIT;
 static void tog_init(void) { pthread_once(&g_tog_once, tog_init_); }   // vk_init, and the control file's first set (vk19.59c: once, whichever thread)
