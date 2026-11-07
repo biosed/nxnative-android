@@ -4454,7 +4454,9 @@ void mtl_finish(void) { if (g_rec_drain) g_rec_drain(); mtl_wait(g_fence, UINT64
 void mtl_drain(void) { mtl_finish(); pcache_save(); }   // going to the background: the pipelines made so far are kept for the next run
 
 // ---------- Presentation: counted; DM_VK_SHOTS writes chosen frames as BMP files ----------
-static void shot(const tex_t *t, uint64_t n) {
+// Only the window crop is written, the part of the texture the screen shows (win_present's source rectangle): a game in handheld mode renders 1280x720 into the top left of
+// a 1920x1080 swapchain texture (Harvest Moon: Echoes of Teradea, WindowCrop 0,0 1280x720), and the whole texture made a shot with the picture in one corner
+static void shot(const tex_t *t, uint64_t n, const int crop[4]) {
     static char *list; static const char *dir; static int init;
     if (!init) { init = 1; const char *e = getenv("DM_VK_SHOTS"); list = e ? strdup(e) : NULL; dir = getenv("DM_VK_SHOT_DIR"); if (!dir) dir = "."; else mkdir(dir, 0775); }   // the folder may not exist yet (a fresh install's files/shots)
     if (!list) return;
@@ -4463,10 +4465,12 @@ static void shot(const tex_t *t, uint64_t n) {
     mtl_finish();
     lk_(&g_rmu, LW_RMU); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
     if (!v || (v->f.f != VK_FORMAT_R8G8B8A8_UNORM && v->f.f != VK_FORMAT_R8G8B8A8_SRGB && v->f.f != VK_FORMAT_B8G8R8A8_UNORM)) { LOG("[RED] vk: frame %llu: the presented texture is not an 8-bit RGBA image (%s)", (unsigned long long)n, v ? "format" : "never drawn"); return; }
-    uint32_t w = v->w, h = v->h; VkDeviceMemory m; void *px;
+    int32_t sx = crop ? crop[0] : 0, sy = crop ? crop[1] : 0, cw = crop && crop[2] ? crop[2] : (int32_t)v->w, ch = crop && crop[3] ? crop[3] : (int32_t)v->h;
+    if (sx < 0 || sy < 0 || cw <= 0 || ch <= 0 || sx + cw > (int32_t)v->w || sy + ch > (int32_t)v->h) { sx = sy = 0; cw = (int32_t)v->w; ch = (int32_t)v->h; }   // a crop outside the texture: all of it
+    uint32_t w = (uint32_t)cw, h = (uint32_t)ch; VkDeviceMemory m; void *px;
     VkBuffer b = buf_new((VkDeviceSize)w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &m, &px);
     VkCommandBuffer cb = once_begin(); barrier_all(cb);
-    VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {sx, sy, 0}, {w, h, 1}};
     vkCmdCopyImageToBuffer(cb, v->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &c); once_end(cb);
     char path[1024]; snprintf(path, sizeof path, "%s/frame%05llu.bmp", dir, (unsigned long long)n);
     FILE *f = fopen(path, "wb");
@@ -5376,7 +5380,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0) { LOG("vk: per frame over the last 600: GPU %.2f ms, recording %.2f ms, waiting for the GPU %.2f ms, present waiting %.2f ms", atomic_exchange(&g_gpu_ns, 0) / 600e6,
                             atomic_exchange(&g_rec_ns, 0) / 600e6, atomic_exchange(&g_wait_ns, 0) / 600e6, atomic_exchange(&g_pwait_ns, 0) / 600e6); }
     if (n % 600 == 0) meas_lines();
-    if (t) shot(t, n);
+    if (t) shot(t, n, crop);
     // On demand: DM_VK_DUMP_FILE=<path>; when that file appears (checked every 30 frames) the next frame is pass-logged and its render targets written, and the file is removed
     // (a capture where the frame number cannot be known in advance: wherever the player happens to be)
     static uint64_t trig; static const char *tf = (const char *)1; if (tf == (const char *)1) tf = getenv("DM_VK_DUMP_FILE");

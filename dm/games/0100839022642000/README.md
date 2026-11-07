@@ -1,7 +1,7 @@
 # Harvest Moon: Echoes of Teradea (`0100839022642000`)
 
 Update 1.2.0 (v131072, over the base v0). Unity 6000.3.7f1 IL2CPP, FMOD, SDK 20.5.24, NVN. Modules `main`, `subsdk0` (NintendoSDK_movie) and `sdk`.
-Plays on the Mac from the title through character creation and the intro into the first forest. Android: first APK built (untested on a device). iOS: untested.
+Plays on the Mac from the title through character creation and the intro into the first forest. Android: plays on the Xiaomi tablet (the user played it; title, character creation, the intro) at the game's 30 fps. iOS: untested.
 
 ## What it needs
 
@@ -33,4 +33,4 @@ Nothing beyond the profile the NSP script's survey guessed and the depth mode: n
 
 - **The characters' eyes render as white glowing blobs** (character creation and the forest): not investigated yet (an eye material's texture or shader).
 - `nvnTextureViewCompare` is unimplemented (`[RED]`, about 100 calls in a 10-minute run), as in Silver Pines; no visible effect found.
-- Android: the first APK (`make_apk.py`, game files outside the APK) is built but not yet run on a device. Shaders: 26,763 SPIR-V modules from `spv_android.py` (`DMSH_SKIP_METAL=1`; 1.27 GB of `.spv` + `.vk.txt`). iOS: untested.
+- Android (2026-11-07, Xiaomi tablet, Adreno): boot to the title in about 25 s, character creation and the intro; frame time p50 34 ms, p95 47 ms (the game's own 30 fps); 1.0 GB resident at the title; FMOD without underruns. Draws are left out only while their pipeline is first made (865 in the first 1,800 frames of a first run, `pipelines: ... draws left out while theirs was made`): a new shader can be missing for a few frames the first time it is seen; the pipeline cache keeps them for later runs. No prewarm list yet. Game files outside the APK (`make_apk.py`, then the files copied into `Android/data/<package>/files`). Shaders: 26,763 SPIR-V modules from `spv_android.py` (`DMSH_SKIP_METAL=1`; 1.27 GB of `.spv` + `.vk.txt`). iOS: untested.
