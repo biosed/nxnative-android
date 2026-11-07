@@ -3146,13 +3146,15 @@ static ts_ent *ts_get(uint64_t addr, uint64_t n, VkDeviceSize al, int kind) {
     if (c->bl_until && c->bl_until > ts_now_s()) return NULL;
     uint64_t fr = g_ts_frame;
     if (c->hframe == fr) return NULL;   // hashed in this frame already
+    // the cheap refusals before any hash (vk19.75c): larger than half the store (an allocation that would fail), an untracked span, a GPU-only pool, GPU-written bytes
+    if (n > (uint64_t)g_ts_ngran * TS_GRAN / 2) { ts_blacklist(addr, n, kind); return NULL; }
+    const void *span = nvn_dirty_span((const void *)(uintptr_t)addr, (size_t)n); uint64_t rid = nvn_dirty_span_regid(span);
+    if (!span || !rid || gw_any(addr, n) || pool_class(addr) == PC_GPU) { g_ts_refused++; ts_blacklist(addr, n, kind); return NULL; }
     uint64_t h = ts_span_hash(addr, n);
     if (!(c->hframe && c->hframe + 1 == fr && c->h == h)) {
         if (c->hframe && c->h != h && ++c->nmis >= 3) { ts_blacklist(addr, n, kind); return NULL; }   // never stable: not hashed again for a while (a hash costs about a copy)
         c->h = h; c->hframe = fr; return NULL; }
-    // the same bytes in two consecutive frames: admitted, if it qualifies
-    const void *span = nvn_dirty_span((const void *)(uintptr_t)addr, (size_t)n); uint64_t rid = nvn_dirty_span_regid(span);
-    if (!span || !rid || gw_any(addr, n) || pool_class(addr) == PC_GPU) { g_ts_refused++; ts_blacklist(addr, n, kind); return NULL; }
+    // the same bytes in two consecutive frames: admitted (span, registration and exclusions checked above, before the hash)
     if (e->used) { if (e->fence > __atomic_load_n(&g_done, __ATOMIC_ACQUIRE) || (kind != TSK_TEXEL && e->kind == TSK_TEXEL)) { g_ts_refused++; return NULL; } ts_retire(e); g_ts_evict++; }   // a vertex / index-pool range never takes a texel block's slot (vk19.74b)
     if (!ts_fill(e, addr, n, span, rid, 1, kind)) { g_ts_refused++; ts_blacklist(addr, n, kind); return NULL; }
     g_ts_adm++; g_ts_kadm[kind]++; c->addr = 0;
