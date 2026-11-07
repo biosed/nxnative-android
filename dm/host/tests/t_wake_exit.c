@@ -19,7 +19,7 @@ void dm_thread_enter(uint64_t entry, uint64_t arg, uint64_t sp) {
 int main(int argc, char **argv) {
     (void)argv;
     signal(SIGALRM, timeout); alarm(60);
-    if (argc > 1) unsetenv("DM_WAKE_AFTER_G"); else setenv("DM_WAKE_AFTER_G", "1", 1);
+    setenv("DM_WAKE_AFTER_G", argc > 1 ? "0" : "1", 1);   // on by default from vk19.71: --off sets 0
     svc_thread_main_init();
     int fails = 0;
     for (int i = 0; i < 50; i++) {
