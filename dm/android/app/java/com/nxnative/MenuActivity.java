@@ -264,6 +264,13 @@ public class MenuActivity extends Activity {
         return null;
     }
     // DM_HIBERNATE=<n> with n > 0 in the settings (the menu's "Resume after the app is closed") or in the diagnostics file <external>/env.txt (which wins), as the game reads them (app/front_android.c boot_env)
+    // A key of the game profile as the APK carries it (assets/profile.txt, "key value" lines); false when the file or the key is missing (an APK made before it)
+    private boolean profileFlag(String key) {
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open("profile.txt"), StandardCharsets.UTF_8))) {
+            String l; while ((l = r.readLine()) != null) { String[] kv = l.trim().split("\\s+"); if (kv.length == 2 && kv[0].equals(key)) return kv[1].equals("1"); }
+        } catch (Exception e) { /* no profile file: off */ }
+        return false;
+    }
     private boolean hibernationOn() {
         String v = null;
         for (File f : new File[] { new File(getFilesDir(), "settings.env"), new File(getExternalFilesDir(null), "env.txt") }) {
@@ -350,8 +357,12 @@ public class MenuActivity extends Activity {
             }
         }
         // Hibernation (DM_HIBERNATE, dm/host/hle_hibsnap.c): leaving the game writes it to storage, and opening the app after Android closed it goes back there. Off by default while it is tested
-        hibernate = new CheckBox(this); hibernate.setText("Resume after the app is closed (beta): leaving the game saves where you are, opening the app goes back there");
-        hibernate.setTextColor(Color.WHITE); hibernate.setChecked(prefs.getBoolean("hibernate", false)); col.addView(hibernate);
+        // Offered only for a game whose profile says hibernate on (assets/profile.txt, written by make_apk.py from game.tsv), checked by default there; other games never hibernate
+        // (an untested game's memory layout changes under it: Tomodachi Life ran with it by mistake)
+        if (profileFlag("hibernate")) {
+            hibernate = new CheckBox(this); hibernate.setText("Resume after the app is closed (beta): leaving the game saves where you are, opening the app goes back there");
+            hibernate.setTextColor(Color.WHITE); hibernate.setChecked(prefs.getBoolean("hibernate", true)); col.addView(hibernate);
+        }
         skip = new CheckBox(this); skip.setText("Do not show this menu again (− and + during the game open it again)"); skip.setTextColor(Color.WHITE);
         skip.setChecked(prefs.getBoolean("skip", false)); col.addView(skip);
         Button controls = new Button(this); controls.setText("Atur tombol (on-screen controls)"); controls.setTextSize(16); controls.setAllCaps(false);   // ControlsActivity: the layout editor
@@ -380,11 +391,11 @@ public class MenuActivity extends Activity {
         String[] langs = {"es-419", "en-US", "system"};
         prefs.edit().putInt("opmode", mode.getSelectedItemPosition() == 1 ? 1 : 0).putInt("fps", fps.getSelectedItemPosition() == 1 ? 30 : 60)
              .putBoolean("stretch", fit.getSelectedItemPosition() == 1).putString("lang", langs[lang.getSelectedItemPosition()])
-             .putBoolean("showfps", showFps.isChecked()).putStringSet("cheats", on).putBoolean("skip", skip.isChecked()).putBoolean("hibernate", hibernate.isChecked()).apply();
+             .putBoolean("showfps", showFps.isChecked()).putStringSet("cheats", on).putBoolean("skip", skip.isChecked()).putBoolean("hibernate", hibernate != null && hibernate.isChecked()).apply();
         String l = langs[lang.getSelectedItemPosition()]; if (l.equals("system")) l = systemLang();
         String env = "DM_OPMODE=" + (mode.getSelectedItemPosition() == 1 ? 1 : 0) + "\nDM_FPS=" + (fps.getSelectedItemPosition() == 1 ? 30 : 60)
                    + "\nDM_SCREEN_FIT=" + (fit.getSelectedItemPosition() == 1 ? "stretch" : "keep") + "\nDM_LANG=" + l + "\nDM_SHOW_FPS=" + (showFps.isChecked() ? 1 : 0)
-                   + "\nDM_CHEATS_ON=" + list + "\nDM_HIBERNATE=" + (hibernate.isChecked() ? 1 : 0) + "\n";
+                   + "\nDM_CHEATS_ON=" + list + "\nDM_HIBERNATE=" + (hibernate != null && hibernate.isChecked() ? 1 : 0) + "\n";
         try (OutputStream o = new FileOutputStream(new File(getFilesDir(), "settings.env"))) { o.write(env.getBytes(StandardCharsets.UTF_8)); } catch (Exception e) { /* the defaults apply */ }
     }
     // SaveBackup on its own thread: the backup of the save, then the import if one waits; a play asked meanwhile starts when it is done
