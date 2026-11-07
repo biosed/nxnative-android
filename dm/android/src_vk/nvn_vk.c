@@ -4456,7 +4456,7 @@ void mtl_drain(void) { mtl_finish(); pcache_save(); }   // going to the backgrou
 // ---------- Presentation: counted; DM_VK_SHOTS writes chosen frames as BMP files ----------
 static void shot(const tex_t *t, uint64_t n) {
     static char *list; static const char *dir; static int init;
-    if (!init) { init = 1; const char *e = getenv("DM_VK_SHOTS"); list = e ? strdup(e) : NULL; dir = getenv("DM_VK_SHOT_DIR"); if (!dir) dir = "."; }
+    if (!init) { init = 1; const char *e = getenv("DM_VK_SHOTS"); list = e ? strdup(e) : NULL; dir = getenv("DM_VK_SHOT_DIR"); if (!dir) dir = "."; else mkdir(dir, 0775); }   // the folder may not exist yet (a fresh install's files/shots)
     if (!list) return;
     char key[24]; snprintf(key, sizeof key, ",%llu,", (unsigned long long)n); char hay[1024]; snprintf(hay, sizeof hay, ",%s,", list);
     if (!strstr(hay, key)) return;
@@ -4481,7 +4481,7 @@ static void shot(const tex_t *t, uint64_t n) {
             fwrite(row, 1, (size_t)w * 4, f);
         }
         free(row); fclose(f); LOG("vk: frame %llu written to %s (%ux%u; %llu draws so far, %llu dropped)", (unsigned long long)n, path, w, h, (unsigned long long)g_stat_draws, (unsigned long long)g_stat_skip);
-    }
+    } else LOG("[RED] vk: frame %llu: cannot write %s: %s", (unsigned long long)n, path, strerror(errno));
     vkDestroyBuffer(g_dev, b, NULL); vkFreeMemory(g_dev, m, NULL);
 }
 // Diagnostics: DM_VK_RTDUMP=<frame> writes every color image the GPU rendered into, as it stands at that frame's present, to DM_VK_SHOT_DIR as
