@@ -239,14 +239,35 @@ The frame stays bound by the recorder. 30 fps needs the "later" items too, unles
     - the skinned draws' strides, attribute formats and bound stream sizes;
     - the dispatch's storage bindings.
   - That confirms or rules out H0's reason (a) independently. Optional, if the Harvest Moon agent can reach the scene on the Mac.
-- **Tablet, every build.**
-  - The tablet goes through the lead.
-  - Device-side script (`setsid nohup sh`, logs pulled after), perf mode off, the fixed protocol.
-  - Same save, same spot. Harvest Moon's heavy scene: the HM agent names the spot and the save.
-  - 60 s settle, then the A/B on one install: the switch off/on, ABAB, 300-frame windows, compared at matched cpu2/cpu7 MHz (HyperOS caps).
-  - The verify mode (`=2`) is run first, and must show 0 differences.
-  - Then measured: GPU ms, recording ms, render passes a frame, extra rings MB and fresh, page faults, gwmu wait, present p50/p95, total CPU.
-  - A screenshot at a fixed frame on and off (`DM_VK_SHOTS`), compared by eye. The scene animates, so it is not compared by pixels.
+- **Tablet, every build: Harvest Moon started by a device-side script.**
+  - The user allows the script to start Harvest Moon for fix tests. It is built on the Harvest Moon agent's `hm_run2.sh`, which has the input mapping (Switch A = `KEYCODE_BUTTON_B`, …) and the tap points of the notification dialog and the Play button.
+  - It runs as `setsid nohup sh` from `/data/local/tmp/hmperf/<session>/`, and the logs are pulled after. The game can drop the network adb.
+  - Installs and the session's start go through the lead.
+  - **Before the first run:**
+    - The tablet is free: no game of the user's in front. If FF12 is open, the FF12 hibernate procedure comes first.
+    - No leftovers from an aborted run: the game not running, the clean `env.txt` in place.
+    - The user's save folder is copied to `/data/local/tmp/hmperf/<session>/save_bak/`. It is never written back without the user.
+  - **One run** (one switch value, one fresh process, because most switches are read at start):
+    1. Write that run's `env.txt`: the clean one plus that run's line, mode 644.
+    2. `am start` the game.
+    3. Tap the notification dialog, then Settings "Play".
+    4. Wait for the title in the log.
+    5. Continue: inputs on the Continue path only, with the screen checked by a shot or a log line before the confirming press. **Never New Game; the script never presses through a menu it has not recognised. On anything unexpected it stops, force-stops the game and restores `env.txt`.**
+    6. Load the user's save, then reach and hold the heavy scene: no input while measuring, so the camera and the scene stay the same.
+    7. Settle 60 s.
+    8. Measure two full 600-frame windows: the backend's per-600 lines, and the clocks and heat lines alongside.
+    9. One shot at a fixed frame after the settle (`DM_VK_SHOTS`).
+    10. Force-stop, and restore the clean `env.txt`.
+  - **The spot.** The A/B needs Continue to land at the heavy scene, or a few fixed inputs from it.
+    - If the user's current save is elsewhere, the Harvest Moon agent and the lead ask the user to save at the spot in a spare slot. The script never saves over a slot.
+    - The first sessions check that two runs with the same switches give the same draws a frame, dispatches a frame and render passes a frame within 5%. Otherwise the spot is not repeatable enough for an A/B.
+  - **One switch a session:**
+    - First its verify mode (`=2`), once: it must show 0 differences.
+    - Then off / on / off / on (ABAB), each a fresh run as above, with a 120 s cool-down between runs (thermal status 0, headroom back near its start value).
+  - **Matched clocks.** A pair counts only if the recording thread's cluster (cpu2–4 in hm5) has its mean MHz within ±5% across the pair's windows. HyperOS caps clocks; perf mode stays off, the fixed protocol.
+  - **Measured:** GPU ms, recording ms, render passes a frame, compose and copy counts, extra rings (MB, fresh vs kept), page faults, gwmu wait, present p50/p95, total CPU and the recording thread's CPU.
+  - **Shots** are compared by eye between on and off; the scene animates, so not by pixels.
+  - After the last run: the game force-stopped, the clean `env.txt` back, and its sha1 checked.
 - **Regressions, every build that changes behaviour (H1, H2, H3).**
   - **FFR:** the dungeon spot with env_runJ, the same ABAB. Recording and present must not get worse beyond noise; `=2` shows 0 differences; no visual change.
   - **FF12:** the user's in-game save first, then boot, load and 5 minutes of play with the switch on: geometry, characters, menus, a battle; watch for stalls. Close it and reopen FF12 per the hibernate procedure.
