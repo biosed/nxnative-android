@@ -2985,7 +2985,7 @@ typedef struct { VkFormat f; VkDeviceSize n; VkBufferView v; } ts_view_t;
 typedef struct { uint64_t addr, len, regid, stamp, fence, tick, serial; const void *span; uint32_t off_g, ng; uint8_t used, dirty, nv, kind; ts_view_t v[4]; uint8_t *shadow; } ts_ent;   // kind: TSK_* (vk19.72)
 enum { TSK_TEXEL, TSK_VTX, TSK_IDXPOOL };
 static ts_ent g_ts[TS_NENT];
-static struct { uint64_t addr, len, h, hframe, bl_until; uint32_t nmis; uint8_t kind, nbl; } g_tc[TS_NCAND];   // nbl: times refused (vk19.74a: 10 s, then 60 s, then for the session)   // nmis: hashes that differed from the last (vk19.70b: 3 and it is refused for 10 s)
+static struct { uint64_t addr, len, h, hframe, bl_until; uint32_t nmis; uint8_t kind, nbl; } g_tc[TS_NCAND];   // nbl: times refused (vk19.74a: 10 s, then 60 s, then for the session: vk19.75a, in g_tsbl)   // nmis: hashes that differed from the last (vk19.70b: 3 and it is refused for 10 s)
 typedef struct { VkBufferView v[4]; int nv; uint32_t off_g, ng; uint64_t fence; uint8_t kind; } ts_ret_t;
 static uint32_t g_ts_bgran;   // granules held by vertex and index-pool blocks: at most half the store (vk19.74b: they never push texel blocks out)
 static ts_ret_t *g_ts_ret; static int g_ts_nret, g_ts_cret;   // blocks and views waiting for their readers: grows as needed (vk19.70b: a block is never forgotten)
@@ -3049,7 +3049,7 @@ static VkBufferView ts_view(ts_ent *e, VkFormat f, VkDeviceSize n) {
     VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, NULL, 0, g_ts_buf, f, (VkDeviceSize)e->off_g * TS_GRAN, n};
     VkBufferView v; if (vkCreateBufferView(g_dev, &ci, NULL, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
     g_ts_vmade++;
-    if (e->nv == 4) { ts_ret_t *r = ts_ret_push(); r->nv = 1; r->v[0] = e->v[0].v; r->off_g = 0; r->ng = 0; r->fence = e->fence; memmove(e->v, e->v + 1, 3 * sizeof *e->v); e->nv = 3; }
+    if (e->nv == 4) { ts_ret_t *r = ts_ret_push(); r->nv = 1; r->v[0] = e->v[0].v; r->off_g = 0; r->ng = 0; r->fence = e->fence; r->kind = e->kind; memmove(e->v, e->v + 1, 3 * sizeof *e->v); e->nv = 3; }
     e->v[e->nv++] = (ts_view_t){f, n, v};
     return v;
 }
@@ -3084,10 +3084,24 @@ static int ts_fill(ts_ent *e, uint64_t addr, uint64_t len, const void *span, uin
 static uint32_t ts_cand(uint64_t addr, uint64_t len, int kind) {   // vertex and index-pool candidates use the upper half of the table only (vk19.74b)
     uint64_t h = addr >> 6 ^ addr >> 19 ^ len * 0x9e3779b1u ^ (uint64_t)kind * 0x5bd1e995u;
     return kind == TSK_TEXEL ? (uint32_t)(h % TS_NCAND) : (uint32_t)(TS_NCAND / 2 + h % (TS_NCAND / 2)); }
+// Ranges refused for the session (vk19.75a): their own small set (128 sets of 4, the oldest of a set replaced), not the candidate table, whose slot a session-long refusal
+// used to hold for good (every other range landing there was refused too: over hours of play the table died slot by slot)
+static struct { uint64_t addr, len; uint8_t kind, used; } g_tsbl[128][4]; static uint8_t g_tsbl_next[128]; static uint64_t g_tsbl_n;
+static uint32_t ts_bl_set(uint64_t addr, uint64_t len, int kind) { return (uint32_t)((addr >> 6 ^ addr >> 21 ^ len * 0x9e3779b1u ^ (uint64_t)kind * 0x5bd1e995u) % 128); }
+static int ts_bl_session(uint64_t addr, uint64_t len, int kind) {
+    uint32_t st = ts_bl_set(addr, len, kind);
+    for (int w = 0; w < 4; w++) if (g_tsbl[st][w].used && g_tsbl[st][w].addr == addr && g_tsbl[st][w].len == len && g_tsbl[st][w].kind == kind) return 1;
+    return 0;
+}
 static void ts_blacklist(uint64_t addr, uint64_t len, int kind) {   // refused for 10 s, again 60 s, a third time for the session (vk19.74a: a range that keeps failing stops costing hashes and copies)
     typeof(g_tc[0]) *c = &g_tc[ts_cand(addr, len, kind)];
     uint8_t nbl = c->addr == addr && c->len == len && c->kind == kind && c->nbl < 255 ? c->nbl + 1 : 1;
-    c->addr = addr; c->len = len; c->kind = (uint8_t)kind; c->h = 0; c->hframe = 0; c->nmis = 0; c->nbl = nbl; c->bl_until = nbl >= 3 ? UINT64_MAX : ts_now_s() + (nbl == 1 ? 10 : 60); g_ts_bl++;
+    g_ts_bl++;
+    if (nbl >= 3) {   // for the session: into the set, and the candidate slot is free for any other range
+        uint32_t st = ts_bl_set(addr, len, kind); int w = g_tsbl_next[st]; g_tsbl_next[st] = (uint8_t)((w + 1) & 3);
+        g_tsbl[st][w].addr = addr; g_tsbl[st][w].len = len; g_tsbl[st][w].kind = (uint8_t)kind; g_tsbl[st][w].used = 1; g_tsbl_n++;
+        memset(c, 0, sizeof *c); return; }
+    c->addr = addr; c->len = len; c->kind = (uint8_t)kind; c->h = 0; c->hframe = 0; c->nmis = 0; c->nbl = nbl; c->bl_until = ts_now_s() + (nbl == 1 ? 10 : 60);
 }
 void ts_pool_deleted(const void *mem, uint64_t size) {   // mtl_pool_del (any thread), holding g_pool_mu: the recording thread drops its blocks at its next lookup
     int n = atomic_load(&g_ts_npdel); if (n < 64) { g_ts_pdel[n].mem = (uint64_t)(uintptr_t)mem; g_ts_pdel[n].size = size; atomic_store(&g_ts_npdel, n + 1); }
@@ -3129,7 +3143,7 @@ static ts_ent *ts_get(uint64_t addr, uint64_t n, VkDeviceSize al, int kind) {
     }
     g_ts_miss++;
     typeof(g_tc[0]) *c = &g_tc[ts_cand(addr, n, kind)];
-    if (c->addr != addr || c->len != n || c->kind != kind) { if (c->bl_until > ts_now_s()) return NULL; c->addr = addr; c->len = n; c->kind = (uint8_t)kind; c->h = 0; c->hframe = 0; c->bl_until = 0; c->nmis = 0; c->nbl = 0; return NULL; }   // its first miss: noted, not hashed
+    if (c->addr != addr || c->len != n || c->kind != kind) { if (ts_bl_session(addr, n, kind) || c->bl_until > ts_now_s()) return NULL; /* refused for the session (its own set), or the slot's range refused for a while */ c->addr = addr; c->len = n; c->kind = (uint8_t)kind; c->h = 0; c->hframe = 0; c->bl_until = 0; c->nmis = 0; c->nbl = 0; return NULL; }   // its first miss: noted, not hashed
     if (c->bl_until && c->bl_until > ts_now_s()) return NULL;
     uint64_t fr = g_ts_frame;
     if (c->hframe == fr) return NULL;   // hashed in this frame already
@@ -5212,9 +5226,9 @@ static void meas_lines(void) {
             g_ts_khit[0] / 600.0, g_ts_khit_b[0] / 600.0 / 1048576.0, g_ts_kadm[0] / 600.0, g_ts_khit[1] / 600.0, g_ts_khit_b[1] / 600.0 / 1048576.0, g_ts_kadm[1] / 600.0,
             g_ts_khit[2] / 600.0, g_ts_khit_b[2] / 600.0 / 1048576.0, g_ts_kadm[2] / 600.0);
         memset(g_ts_khit, 0, sizeof g_ts_khit); memset(g_ts_khit_b, 0, sizeof g_ts_khit_b); memset(g_ts_kadm, 0, sizeof g_ts_kadm);
-        LOG("vk: range store (DM_VK_TEXEL_STORE=%d) per frame over the last 600, all kinds: %.1f served (%.2f MB), %.1f missed, %.2f admitted, %.2f copied again, %.2f evicted, %.2f refused for a while (%.2f could not be admitted); views reused %.1f, made %.2f; verify %.1f checked, %llu differed; store %.1f of %.0f MB in %d blocks, %d waiting for readers, dropped %llu times; mprotect failures %llu; memory map %d lines",
+        LOG("vk: range store (DM_VK_TEXEL_STORE=%d) per frame over the last 600, all kinds: %.1f served (%.2f MB), %.1f missed, %.2f admitted, %.2f copied again, %.2f evicted, %.2f refused for a while (%.2f could not be admitted); views reused %.1f, made %.2f; verify %.1f checked, %llu differed; store %.1f of %.0f MB in %d blocks, %d waiting for readers, dropped %llu times; refused for the session %llu so far; mprotect failures %llu; memory map %d lines",
             ts_mode(), g_ts_hit / 600.0, g_ts_hit_b / 600.0 / 1048576.0, g_ts_miss / 600.0, g_ts_adm / 600.0, g_ts_recopy / 600.0, g_ts_evict / 600.0, g_ts_bl / 600.0, g_ts_refused / 600.0, g_ts_vreuse / 600.0, g_ts_vmade / 600.0,
-            g_ts_vchk / 600.0, (unsigned long long)g_ts_vbad, g_ts_inuse * (double)TS_GRAN / 1048576.0, g_ts_ngran * (double)TS_GRAN / 1048576.0, ne, g_ts_nret, (unsigned long long)g_ts_drops,
+            g_ts_vchk / 600.0, (unsigned long long)g_ts_vbad, g_ts_inuse * (double)TS_GRAN / 1048576.0, g_ts_ngran * (double)TS_GRAN / 1048576.0, ne, g_ts_nret, (unsigned long long)g_ts_drops, (unsigned long long)g_tsbl_n,
             (unsigned long long)nvn_dirty_mp_failures(), vk_stats_maps_last());
         g_ts_hit = g_ts_hit_b = g_ts_miss = g_ts_adm = g_ts_recopy = g_ts_evict = g_ts_bl = g_ts_vmade = g_ts_vreuse = g_ts_vchk = g_ts_refused = 0; }
     { void dm_guest_sync_report(char *out, size_t n, uint64_t frames); static char gs[8192]; dm_guest_sync_report(gs, sizeof gs, 600);   // hle_thread.c (vk19.59b)
