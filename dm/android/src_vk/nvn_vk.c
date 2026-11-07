@@ -273,6 +273,7 @@ static uint64_t g_xr_fresh, g_xr_fresh_bytes, g_ring_new, g_ring_new_bytes;
 static VkDeviceSize xring_keep(void) { static VkDeviceSize v; if (!v) { const char *e = getenv("DM_VK_XRING_KEEP_MB"); long mb = e && atol(e) >= 0 ? atol(e) : ring_reuse_on() ? 256 : 64; v = ((VkDeviceSize)mb << 20) | 1; } return v & ~(VkDeviceSize)1; }
 static int g_mem_low;   // the system is short of memory (mem_watch): nothing is kept for reuse
 static int g_mem_tight;   // real pressure (a burst, or under half the low mark): extra rings are not kept, rings go back to their minimum (vk19.38)
+static int g_mem_real_low;   // MemAvailable under DM_VK_MEM_LOW_MB (or the budget passed): with DM_VK_RING_REUSE, the only state that lets kept rings go (an early trim's burst does not)
 static _Atomic uint64_t g_ring_trim_gen;
 static struct { VkDeviceMemory m; void *p; } g_xmap[256]; static int g_nxmap; static pthread_mutex_t g_xcmu = PTHREAD_MUTEX_INITIALIZER; static uint64_t g_xc_reused;
 static VkBuffer xring_get(VkDeviceSize want, VkDeviceSize *size, VkDeviceMemory *m, uint8_t **p) {
@@ -287,7 +288,7 @@ static VkBuffer xring_get(VkDeviceSize want, VkDeviceSize *size, VkDeviceMemory 
 static void xring_put(VkBuffer b, VkDeviceMemory m, VkDeviceSize size) {   // a freed extra ring: kept for reuse, or destroyed
     pthread_mutex_lock(&g_xcmu); void *p = NULL; int k = 0;
     for (; k < g_nxmap; k++) if (g_xmap[k].m == m) { p = g_xmap[k].p; break; }
-    if (p && g_nxc < (ring_reuse_on() ? NXC : 8) && g_xc_bytes + size <= xring_keep() && !g_mem_tight) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); return; }
+    if (p && g_nxc < (ring_reuse_on() ? NXC : 8) && g_xc_bytes + size <= xring_keep() && !(ring_reuse_on() ? g_mem_real_low : g_mem_tight)) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); return; }
     atomic_fetch_add(&g_h0_xr_nokeep[!p ? 0 : g_nxc >= (ring_reuse_on() ? NXC : 8) ? 1 : g_xc_bytes + size > xring_keep() ? 2 : 3], 1);   // H0: why it was not kept
     if (k < g_nxmap) g_xmap[k] = g_xmap[--g_nxmap];
     pthread_mutex_unlock(&g_xcmu);
@@ -3660,6 +3661,34 @@ static int ind_args(uint64_t addr, uint32_t n, void *out, VkBuffer *b, VkDeviceS
 // The bytes of a pool from addr on (at most cap): the extent of an index buffer an indirect draw reads, whose count only the GPU will know
 static uint64_t pool_left(uint64_t addr, uint64_t cap);
 static uint64_t pool_base(uint64_t addr);
+static uint64_t pool_range(uint64_t addr, uint64_t *size);
+// DM_VK_IDXPOOL_ONCE (Harvest Moon heavy scene, H3 of docs/hm_android_perf_plan.md; off by default). An indexed draw whose indirect arguments the GPU writes copied the rest of
+// its index pool from its own start (pool_left, at most 8 MB), keyed by that start: hm2 had 35 such draws a frame at 12 distinct starts in one pool, 76 MB of copies a frame
+// (83% of copy_in's bytes). With it on, the first such draw of a submission copies the whole pool (at most DM_VK_IDXPOOL_ONCE_MB, default 32; a bigger pool: from the draw's
+// start on) into the ring once, and the submission's later draws in that pool bind that copy at their own start, while the write log shows no write into it and the copy
+// generation is the same. =2: each reuse also compares the copy with the guest's bytes the draw could read; differences are counted and logged, and the copy is made as before
+static int idxpool_once_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_IDXPOOL_ONCE"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 1; if (v) LOG("vk: DM_VK_IDXPOOL_ONCE=%d: the index pool of GPU-indirect indexed draws copied once a submission", v); } return v; }
+static struct { uint64_t base, lo, hi, gen, fence; VkBuffer b; VkDeviceSize o; uint8_t *p; uint32_t seq; } g_ipo[4]; static int g_ipo_next;
+static uint64_t g_ipo_hit, g_ipo_copy, g_ipo_bytes, g_ipo_bad, g_ipo_fallback;
+static int ipo_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDeviceSize *o) {
+    uint64_t psize = 0, base = pool_range(ibuf, &psize); if (!base || !n) return 0;
+    for (int i = 0; i < 4; i++) { typeof(g_ipo[0]) *e = &g_ipo[i];
+        if (e->base != base || e->fence != g_fence + 1 || e->gen != g_wgen || ibuf < e->lo || ibuf + n > e->hi || e->seq > g_nwlog) continue;
+        uint32_t k = e->seq; for (; k < g_nwlog; k++) if (g_wlo[k] < e->hi && g_whi[k] > e->lo) break;
+        if (k != g_nwlog) { e->fence = 0; break; }   // written since: copied again
+        if ((e->o + (ibuf - e->lo)) % isz) break;
+        if (idxpool_once_mode() == 2 && memcmp(e->p + (ibuf - e->lo), (const void *)(uintptr_t)ibuf, n)) { static int nl; g_ipo_bad++; if (nl++ < 8) LOG("[RED] vk: DM_VK_IDXPOOL_ONCE=2: the pool copy differs from the guest's indices at %#llx +%llu", (unsigned long long)ibuf, (unsigned long long)n); return 0; }
+        *b = e->b; *o = e->o + (ibuf - e->lo); g_ipo_hit++; return 1;
+    }
+    static uint64_t cap; if (!cap) { const char *e = getenv("DM_VK_IDXPOOL_ONCE_MB"); long mb = e && atol(e) > 0 ? atol(e) : 32; cap = (uint64_t)mb << 20; }
+    uint64_t lo = psize <= cap ? base : ibuf, hi = psize <= cap ? base + psize : (ibuf + cap < base + psize ? ibuf + cap : base + psize);
+    if (hi - lo < n) { g_ipo_fallback++; return 0; }
+    VkDeviceSize ro = ring_put((const void *)(uintptr_t)lo, hi - lo, 16); if (ro == VK_WHOLE_SIZE) { g_ipo_fallback++; return 0; }
+    if ((ro + (ibuf - lo)) % isz) { g_ipo_fallback++; return 0; }
+    typeof(g_ipo[0]) *e = &g_ipo[g_ipo_next++ & 3]; *e = (typeof(g_ipo[0])){base, lo, hi, g_wgen, g_fence + 1, C->ring, ro, C->ringp + ro, g_nwlog};
+    g_ipo_copy++; g_ipo_bytes += hi - lo;
+    *b = C->ring; *o = ro + (ibuf - lo); return 1;
+}
 // H0: an indexed draw whose indirect arguments the GPU writes (its index-pool window copied from di->ibuf): distinct starts and pools a frame, summed over the window
 static void h0_ipd(uint64_t ibuf, uint64_t n) {
     static uint64_t fr = UINT64_MAX, st[256], pl[32]; static int nst, npl;
@@ -3961,6 +3990,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
             uint64_t n = pool_left(di->ibuf, 8u << 20); VkBuffer ibs = C->ring; VkDeviceSize o = VK_WHOLE_SIZE;
             h0_ipd(di->ibuf, n);   // H0: index starts and pools of these draws
             if (n && tog(TG_BSTORE) && ts_buf(di->ibuf, n, 16, TSK_IDXPOOL, &ibs, &o)) {}   // DM_VK_BUF_STORE (vk19.72): the store's block
+            else if (n && idxpool_once_mode() && ipo_get(di->ibuf, n, isz, &ibs, &o)) {}   // DM_VK_IDXPOOL_ONCE: the submission's one copy of the pool
             else { o = n ? copy_in(di->ibuf, n, 16, CI_IDXPOOL) : VK_WHOLE_SIZE; ibs = C->ring; }
             if (o == VK_WHOLE_SIZE) { RED_ONCE(38, "a GPU-written indirect indexed draw: its index buffer is not in a known pool"); return; }
             g_ds_last.ib_ok = 0; vkCmdBindIndexBuffer(cb, ibs, o, isz == 1 ? VK_INDEX_TYPE_UINT8_EXT : isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
@@ -4331,6 +4361,7 @@ static void mem_watch(void) {
     if (tick || early) pbase = hu;
     g_mem_low = is_low || over || near || now < pre_until;
     g_mem_tight = early || now < pre_until || (low > 0 && avail > 0 && avail / 1024 < low / 2);   // real pressure: a burst, or under half the low mark
+    g_mem_real_low = is_low || over;   // DM_VK_RING_REUSE: kept rings go only when memory is really low (the bursts came from freeing and making the rings themselves)
     // A steady low (vk19.38): the dungeon sat at ~1 GB available, under the low mark and the budget, and the backend trimmed every 5 s, the most it may: every ring back to
     // its minimum (fresh mappings again, each page faulted on its first write: ~4,000 faults a frame on the render thread), textures re-made, malloc purged. Now a low that
     // holds without falling trims again only after DM_VK_TRIM_STEADY_S (default 60) seconds, or at once when MemAvailable fell 100 MB since the last trim; rings go back to their
@@ -4343,10 +4374,10 @@ static void mem_watch(void) {
     }
     static int fast_age = -1; if (fast_age < 0) { const char *e = getenv("DM_VK_EVICT_FAST"); fast_age = e && atoi(e) > 0 ? atoi(e) : 30; }
     atomic_store(&g_trim_age, early ? fast_age : 60);
-    last_trim = now; avail_at_trim = avail / 1024; atomic_fetch_add(&g_trim_gen, 1); if (g_mem_tight) atomic_fetch_add(&g_ring_trim_gen, 1);
+    last_trim = now; avail_at_trim = avail / 1024; atomic_fetch_add(&g_trim_gen, 1); if (g_mem_tight && (!ring_reuse_on() || g_mem_real_low)) atomic_fetch_add(&g_ring_trim_gen, 1);   // DM_VK_RING_REUSE: rings stay unless memory is really low
     if (dm_ueheap_release) { last_rel = now; heap_release_kick(); }
     pthread_mutex_lock(&g_snapmu); for (int k = 0; k < SNAP_NC; k++) { while (g_snap_n[k]) free(g_snap_free[k][--g_snap_n[k]]); } g_snap_kept = 0; pthread_mutex_unlock(&g_snapmu);
-    pthread_mutex_lock(&g_xcmu); while (g_nxc) { g_nxc--; vkDestroyBuffer(g_dev, g_xc[g_nxc].b, NULL); vkFreeMemory(g_dev, g_xc[g_nxc].m, NULL);
+    pthread_mutex_lock(&g_xcmu); while (g_nxc && (!ring_reuse_on() || g_mem_real_low)) { g_nxc--; vkDestroyBuffer(g_dev, g_xc[g_nxc].b, NULL); vkFreeMemory(g_dev, g_xc[g_nxc].m, NULL);
         for (int k = 0; k < g_nxmap; k++) if (g_xmap[k].m == g_xc[g_nxc].m) { g_xmap[k] = g_xmap[--g_nxmap]; break; } } g_xc_bytes = 0; pthread_mutex_unlock(&g_xcmu);
     if (g_mem_tight) mallopt(M_PURGE, 0);
     static int nl; if (nl++ < 60) LOG("vk: memory %s (%ld MB available, the process %ld MB resident + %llu MB device, the game heap %.0f MB): idle textures evicted, reuse pools emptied%s",
@@ -5354,6 +5385,8 @@ static void h0_tick(uint64_t n) {
 }
 // H0 (Harvest Moon plan v2): the per-600 lines; counters zeroed after. Called on the presenting thread with the other per-600 lines
 static void h0_lines(void) {
+    if (idxpool_once_mode()) { LOG("vk: DM_VK_IDXPOOL_ONCE per frame over the last 600: pool copies %.2f (%.2f MB), draws bound to one %.1f, left to the old copy %.2f, verify differences %.2f",
+                                   g_ipo_copy / 600.0, g_ipo_bytes / 600.0 / 1048576.0, g_ipo_hit / 600.0, g_ipo_fallback / 600.0, g_ipo_bad / 600.0); g_ipo_copy = g_ipo_bytes = g_ipo_hit = g_ipo_fallback = g_ipo_bad = 0; }
     if (ring_reuse_on()) { LOG("vk: DM_VK_RING_REUSE over the last 600 frames: rings of idle contexts given back %llu, extra rings sized from the overflow %llu (recent overflow %.1f MB); %d extra rings kept (%.0f MB)",
                                (unsigned long long)g_h05_shrunk, (unsigned long long)g_h05_sized, g_h05_over / 1048576.0, g_nxc, g_xc_bytes / 1048576.0); g_h05_shrunk = g_h05_sized = 0; }
     if (chain_snap_mode()) { uint64_t pb = atomic_exchange(&g_cs_prop_b, 0), pn = atomic_exchange(&g_cs_prop_n, 0), kw = atomic_exchange(&g_cs_kept_w, 0), bw = atomic_exchange(&g_cs_both_w, 0), wn = atomic_exchange(&g_cs_wb_n, 0);
@@ -5742,6 +5775,11 @@ static int pool_class(uint64_t addr) {   // copy_in misses (the submit thread): 
     int c = PC_NONE; pthread_mutex_lock(&g_pool_mu);
     for (int i = 0; i < g_npool; i++) { uint64_t b = (uint64_t)(uintptr_t)g_pool[i].mem; if (addr >= b && addr < b + g_pool[i].size) { c = g_pool[i].cls; lb = b; le = b + g_pool[i].size; lc = c; break; } }
     pthread_mutex_unlock(&g_pool_mu); return c;
+}
+static uint64_t pool_range(uint64_t addr, uint64_t *size) {   // the guest address of the memory pool holding addr and its size; 0 when none
+    uint64_t r = 0; *size = 0; pthread_mutex_lock(&g_pool_mu);
+    for (int i = 0; i < g_npool; i++) { uint64_t b = (uint64_t)(uintptr_t)g_pool[i].mem; if (addr >= b && addr < b + g_pool[i].size) { r = b; *size = g_pool[i].size; break; } }
+    pthread_mutex_unlock(&g_pool_mu); return r;
 }
 static uint64_t pool_base(uint64_t addr) {   // the guest address of the memory pool holding addr, 0 when none (H0)
     uint64_t r = 0; pthread_mutex_lock(&g_pool_mu);
