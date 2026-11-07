@@ -1864,6 +1864,9 @@ typedef struct {
     uint8_t md[8];   // the key as bytes (shader_get's lookup)
     int dyn;   // dynamic slot arrays (profile key tex_dyn_slots): 32-entry texture / texel buffer / sampler arrays indexed at run time by the IDs the shader reads from c2 (see write_set)
     int ssbo_wr;   // the module stores to or atomically updates a storage buffer (spv_ssbo_writes): only then is a draw's storage buffer a write that gets lost
+    uint32_t io_mask;   // user interface locations: a vertex shader's outputs, a pixel shader's inputs (spv_io): an input no output feeds is an interface mismatch (vs_pad_mod)
+    uint16_t in_type[32];   // a pixel shader's input type per location (spv_io: 1-4 components | 0x100 int | 0x200 uint; 0 = not a plain 32-bit scalar or vector)
+    struct { uint32_t mask; VkShaderModule m; } pad[4]; int npad;   // a vertex shader's padded variants, by the locations added (vs_pad_mod)
 } shader_t;
 static shader_t **g_sh; static int g_nsh;
 static int g_depth_zero;   // NVN depth mode (mtl_set_depth_zero, defined with the replay state)
@@ -1919,6 +1922,110 @@ static uint32_t *spv_dual(const uint32_t *w, size_t nw, size_t *out_n) {
     o[at + 4] = 4u << 16 | OpDecorate; o[at + 5] = w[at + 1]; o[at + 6] = Index; o[at + 7] = 1;
     memcpy(o + at + 8, w + at + 4, (nw - at - 4) * 4);
     *out_n = nw + 4; return o;
+}
+// The user locations of a module's interface: Output variables of a vertex shader or Input variables of a pixel shader (built-ins left out), and for a pixel shader each input's
+// type when it is a 32-bit float / int / uint scalar or vector with no Component decoration (in_type; 0 otherwise)
+static uint32_t spv_io(const uint32_t *w, size_t nw, int sc, uint16_t *types) {
+    enum { OpTypeInt = 21, OpTypeFloat = 22, OpTypeVector = 23, OpTypePointer = 32, OpVariable = 59, OpDecorate = 71, OpMemberDecorate = 72, Location = 30, Component = 31, BuiltIn = 11 };
+    uint32_t bound = nw > 3 ? w[3] : 0, mask = 0; if (!bound || bound > (1u << 22)) return 0;
+    int32_t *loc = malloc(bound * 4); uint8_t *bi = calloc(bound, 1), *comp = calloc(bound, 1); uint32_t *tdef = calloc(bound, 4);
+    if (!loc || !bi || !comp || !tdef) { free(loc); free(bi); free(comp); free(tdef); return 0; }
+    for (uint32_t i = 0; i < bound; i++) loc[i] = -1;
+    for (size_t i = 5; i < nw;) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len || i + len > nw) break;
+        if (op == OpDecorate && len >= 4 && w[i + 1] < bound) { if (w[i + 2] == Location) loc[w[i + 1]] = (int32_t)w[i + 3]; else if (w[i + 2] == BuiltIn) bi[w[i + 1]] = 1; else if (w[i + 2] == Component) comp[w[i + 1]] = 1; }
+        if (op == OpMemberDecorate && len >= 4 && w[i + 1] < bound && w[i + 3] == BuiltIn) bi[w[i + 1]] = 1;
+        if (op == OpTypeFloat && len >= 3 && w[i + 1] < bound && w[i + 2] == 32) tdef[w[i + 1]] = 1;
+        if (op == OpTypeInt && len >= 4 && w[i + 1] < bound && w[i + 2] == 32) tdef[w[i + 1]] = w[i + 3] ? 0x101 : 0x201;
+        if (op == OpTypeVector && len >= 4 && w[i + 1] < bound && w[i + 2] < bound && tdef[w[i + 2]] && w[i + 3] >= 2 && w[i + 3] <= 4) tdef[w[i + 1]] = (tdef[w[i + 2]] & 0xf00) | w[i + 3];
+        if (op == OpTypePointer && len >= 4 && w[i + 1] < bound && w[i + 2] == (uint32_t)sc && w[i + 3] < bound) tdef[w[i + 1]] = 0x10000 | w[i + 3];   // a pointer: its pointee
+        if (op == OpVariable && len >= 4 && w[i + 3] == (uint32_t)sc && w[i + 2] < bound && w[i + 1] < bound && !bi[w[i + 2]] && loc[w[i + 2]] >= 0 && loc[w[i + 2]] < 32) {
+            mask |= 1u << loc[w[i + 2]];
+            if (types) { uint32_t pt = tdef[w[i + 1]], ty = pt >> 16 ? tdef[pt & 0xffff] : 0; types[loc[w[i + 2]]] = comp[w[i + 2]] || ty > 0x2ff ? 0 : (uint16_t)ty; }
+        }
+        i += len; }
+    free(loc); free(bi); free(comp); free(tdef);
+    return mask;
+}
+// A vertex shader with an Output at every location in add, of the pixel shader's input type there (types), written with zeros at the entry function's start: a pixel shader
+// reading an input the vertex shader lacks is an interface mismatch Vulkan leaves undefined (VUID-RuntimeSpirv-OpEntryPoint-08743), which the Adreno 825 refuses (-13).
+// Tomodachi Life: Living the Dream's c0b81b887fb0137d is the vertex stage of a tessellation program, drawn without tessellation as on Metal; its pixel shader d317a98e994ca9dd
+// reads location 2, which the evaluation stage would write. Metal's paired-vertex-shader padding gives zeros there too. Existing types are used; a missing vector or pointer type
+// and the null constants are added before the first function. NULL when a location's type is not a plain 32-bit scalar or vector, or the module's layout is not as expected
+static uint32_t *spv_pad_outputs(const uint32_t *w, size_t nw, uint32_t add, const uint16_t *types, size_t *out_n) {
+    enum { OpEntryPoint = 15, OpTypeInt = 21, OpTypeFloat = 22, OpTypeVector = 23, OpTypePointer = 32, OpConstantNull = 46, OpFunction = 54, OpLabel = 248, OpVariable = 59,
+           OpStore = 62, OpDecorate = 71, Output = 3, Location = 30, Function = 7 };
+    for (int l = 0; l < 32; l++) if (add >> l & 1 && !types[l]) return NULL;
+    uint32_t bound = w[3], tf = 0, ti = 0, tu = 0, tv[3][5] = {{0}}, tp[3][5] = {{0}}, tn[3][5] = {{0}}, entry = 0;
+    size_t first_type = 0, first_fn = 0, ep = 0, body = 0;
+    for (size_t i = 5; i < nw;) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len || i + len > nw) return NULL;
+        if (op == OpEntryPoint && len >= 3 && w[i + 1] == 0 && !ep) { ep = i; entry = w[i + 2]; }
+        if (!first_type && ((op >= 19 && op <= 39) || (op >= 41 && op <= 52) || op == OpVariable)) first_type = i;
+        if (op == OpTypeFloat && len >= 3 && w[i + 2] == 32) tf = w[i + 1];
+        if (op == OpTypeInt && len >= 4 && w[i + 2] == 32) { if (w[i + 3]) ti = w[i + 1]; else tu = w[i + 1]; }
+        for (int k = 0; k < 3; k++) { uint32_t base = k == 0 ? tf : k == 1 ? ti : tu; if (!base) continue;
+            if (op == OpTypeVector && len >= 4 && w[i + 2] == base && w[i + 3] >= 2 && w[i + 3] <= 4) tv[k][w[i + 3]] = w[i + 1];
+            for (int c = 1; c <= 4; c++) { uint32_t t = c == 1 ? base : tv[k][c]; if (!t) continue;
+                if (op == OpTypePointer && len >= 4 && w[i + 2] == Output && w[i + 3] == t) tp[k][c] = w[i + 1];
+                if (op == OpConstantNull && len >= 3 && w[i + 1] == t) tn[k][c] = w[i + 2]; } }
+        if (op == OpFunction && !first_fn) first_fn = i;
+        if (op == OpFunction && len >= 5 && w[i + 2] == entry && !body) {   // the entry function: after its first label and the OpVariable block
+            size_t j = i + len; if (j < nw && (w[j] & 0xffff) == OpLabel) { j += w[j] >> 16; while (j < nw && (w[j] & 0xffff) == OpVariable && (w[j] >> 16) >= 4 && w[j + 3] == Function) j += w[j] >> 16; body = j; } }
+        i += len; }
+    if (!ep || !first_type || !first_fn || !body) return NULL;
+    uint32_t *add_dec = malloc(32 * 4 * 4), *add_ty = malloc(32 * 4 * 16), *add_st = malloc(32 * 3 * 4), *add_ep = malloc(32 * 4);
+    size_t nd = 0, nt = 0, ns = 0, ne = 0;
+    if (!add_dec || !add_ty || !add_st || !add_ep) { free(add_dec); free(add_ty); free(add_st); free(add_ep); return NULL; }
+    for (int l = 0; l < 32; l++) { if (!(add >> l & 1)) continue;
+        int k = types[l] & 0x100 ? 1 : types[l] & 0x200 ? 2 : 0, c = types[l] & 0xff; uint32_t *base = k == 0 ? &tf : k == 1 ? &ti : &tu;
+        if (!*base) { *base = bound++; if (k == 0) { add_ty[nt++] = 3u << 16 | OpTypeFloat; add_ty[nt++] = *base; add_ty[nt++] = 32; }
+                                     else { add_ty[nt++] = 4u << 16 | OpTypeInt; add_ty[nt++] = *base; add_ty[nt++] = 32; add_ty[nt++] = k == 1; } }
+        uint32_t t = *base;
+        if (c > 1) { if (!tv[k][c]) { tv[k][c] = bound++; add_ty[nt++] = 4u << 16 | OpTypeVector; add_ty[nt++] = tv[k][c]; add_ty[nt++] = *base; add_ty[nt++] = (uint32_t)c; } t = tv[k][c]; }
+        if (!tp[k][c]) { tp[k][c] = bound++; add_ty[nt++] = 4u << 16 | OpTypePointer; add_ty[nt++] = tp[k][c]; add_ty[nt++] = Output; add_ty[nt++] = t; }
+        if (!tn[k][c]) { tn[k][c] = bound++; add_ty[nt++] = 3u << 16 | OpConstantNull; add_ty[nt++] = t; add_ty[nt++] = tn[k][c]; }
+        uint32_t v = bound++;
+        add_ty[nt++] = 4u << 16 | OpVariable; add_ty[nt++] = tp[k][c]; add_ty[nt++] = v; add_ty[nt++] = Output;
+        add_dec[nd++] = 4u << 16 | OpDecorate; add_dec[nd++] = v; add_dec[nd++] = Location; add_dec[nd++] = (uint32_t)l;
+        add_st[ns++] = 3u << 16 | OpStore; add_st[ns++] = v; add_st[ns++] = tn[k][c];
+        add_ep[ne++] = v; }
+    uint32_t *o = malloc((nw + nd + nt + ns + ne) * 4); size_t n = 0;
+    if (o) {
+        uint32_t eplen = w[ep] >> 16;
+        for (size_t i = 0; i < nw;) {
+            if (i == first_type) { memcpy(o + n, add_dec, nd * 4); n += nd; }
+            if (i == first_fn) { memcpy(o + n, add_ty, nt * 4); n += nt; }
+            if (i == body) { memcpy(o + n, add_st, ns * 4); n += ns; }
+            if (i < 5) { o[n++] = w[i++]; continue; }
+            uint32_t len = w[i] >> 16;
+            if (i == ep) { o[n] = (uint32_t)(eplen + ne) << 16 | OpEntryPoint; memcpy(o + n + 1, w + i + 1, (eplen - 1) * 4); memcpy(o + n + eplen, add_ep, ne * 4); n += eplen + ne; }
+            else { memcpy(o + n, w + i, len * 4); n += len; }
+            i += len;
+        }
+        o[3] = bound; *out_n = n;
+    }
+    free(add_dec); free(add_ty); free(add_st); free(add_ep);
+    return o;
+}
+static uint32_t *vs_transform(shader_t *s, uint32_t *spv, size_t *ns, int at_load);
+static pthread_mutex_t g_padmu = PTHREAD_MUTEX_INITIALIZER;
+// The vertex shader to draw with a pixel shader: itself when it writes every location the pixel shader reads (every pair in FINAL FANTASY RESONANCE, FINAL FANTASY XII and Harvest
+// Moon), else a variant padded with zero outputs at the missing ones (spv_pad_outputs), made from the shader file with the same transforms as the plain one, cached by the mask
+static VkShaderModule vs_pad_mod(shader_t *vs, const shader_t *fs) {
+    uint32_t miss = fs ? fs->io_mask & ~vs->io_mask : 0; if (!miss) return vs->mod;
+    pthread_mutex_lock(&g_padmu);
+    VkShaderModule m = VK_NULL_HANDLE; int found = 0;
+    for (int i = 0; i < vs->npad; i++) if (vs->pad[i].mask == miss) { m = vs->pad[i].m; found = 1; break; }
+    if (!found) {
+        char path[1024]; size_t ns = 0, n = 0; snprintf(path, sizeof path, "%s/%s.spv", g_vkdir, vs->key);
+        uint32_t *spv = read_file(path, &ns), *w = spv ? spv_pad_outputs(spv, ns / 4, miss, fs->in_type, &n) : NULL; free(spv);
+        if (w) { size_t nb = n * 4; w = vs_transform(vs, w, &nb, 0);
+                 VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, nb, w};
+                 if (vkCreateShaderModule(g_dev, &mi, NULL, &m) != VK_SUCCESS) m = VK_NULL_HANDLE; free(w); }
+        LOG("vk: vertex shader %s padded with zero outputs at locations %#x for pixel shader %s (it reads inputs the vertex shader does not write): %s", vs->key, miss, fs->key, m ? "made" : "not possible, drawn unpadded");
+        if (vs->npad < 4) { vs->pad[vs->npad].mask = miss; vs->pad[vs->npad].m = m; vs->npad++; }
+    }
+    pthread_mutex_unlock(&g_padmu);
+    return m ? m : vs->mod;
 }
 static void spv_set(uint32_t *spv, size_t nw, uint32_t set) {   // every resource into descriptor set `set` (DescriptorSet decorations, operand 34): the fragment stage's go to set 1
     for (size_t i = 5; i < nw;) { uint32_t w = spv[i], op = w & 0xffff, len = w >> 16; if (!len) break; if (op == 71 && len >= 4 && spv[i + 2] == 34) spv[i + 3] = set; i += len; }
@@ -2123,6 +2230,19 @@ static int spv_ssbo_writes(const uint32_t *w, size_t nw) {
 // Shaders are loaded on the replay thread and on the pipeline pre-creation thread (pso_precreate): one lock for the table and the loads. Their time is the long-frame lines'
 // "shader libraries" (mtl_create_ns): a first-time load reads <key>.spv and <key>.vk.txt from the shader folder (150,000 files in one directory on Android's shared storage)
 static pthread_mutex_t g_shmu = PTHREAD_MUTEX_INITIALIZER; static _Atomic uint64_t g_sh_ns;
+// A module's load-time rewrites, the same for a vertex shader's padded variant (vs_pad_mod) as for the plain one, so their layouts and behaviour match
+static uint32_t *vs_transform(shader_t *s, uint32_t *spv, size_t *nsp, int at_load) {
+    size_t ns = *nsp;
+    if (s->stage == 0 && vid_fix_on() && (at_load || s->vid)) { size_t nn; uint32_t *w2 = spv_vid_bias(spv, ns / 4, &nn); if (w2) { free(spv); spv = w2; ns = nn * 4; if (at_load) s->vid = 1; } }   // VertexIndex as the game gave it (see spv_vid_bias)
+    if (s->stage == 0) { size_t nn; uint32_t *w2 = spv_invariant(spv, ns / 4, &nn); if (w2) { free(spv); spv = w2; ns = nn * 4; } }
+    if (s->stage == 0) { size_t nn; uint32_t *w2 = spv_point_size(spv, ns / 4, &nn); if (w2) { free(spv); spv = w2; ns = nn * 4; } }
+    if (s->stage == 0 && !g_depth_zero) {   // NVN's GL depth convention (see spv_gl_depth)
+        size_t nn; uint32_t *w2 = spv_gl_depth(spv, ns / 4, &nn);
+        if (w2) { free(spv); spv = w2; ns = nn * 4; } else if (at_load) LOG("[RED] vk: vertex shader %s: no position written, left as it is for the GL depth convention", s->key);
+    }
+    spv_set(spv, ns / 4, s->stage == 1 ? 1 : s->stage == 2 ? 2 : 0);   // fragment resources in set 1, geometry in set 2
+    *nsp = ns; return spv;
+}
 static shader_t *shader_get_(const uint8_t md[8]);
 static shader_t *shader_get(const uint8_t md[8]) {
     pthread_mutex_lock(&g_shmu);
@@ -2167,14 +2287,8 @@ static shader_t *shader_get_(const uint8_t md[8]) {
     for (size_t i = 5; i + 4 < ns / 4;) { uint32_t op = spv[i] & 0xffff, n = spv[i] >> 16; if (!n) break;   // BuiltIn Layer (9): OpDecorate / OpMemberDecorate
         if ((op == 71 && n >= 4 && spv[i + 2] == 11 && spv[i + 3] == 9) || (op == 72 && n >= 5 && spv[i + 3] == 11 && spv[i + 4] == 9)) s->layer_out = 1;
         i += n; }
-    if (s->stage == 0 && vid_fix_on()) { size_t nn; uint32_t *w2 = spv_vid_bias(spv, ns / 4, &nn); if (w2) { free(spv); spv = w2; ns = nn * 4; s->vid = 1; } }   // VertexIndex as the game gave it (see spv_vid_bias)
-    if (s->stage == 0) { size_t nn; uint32_t *w2 = spv_invariant(spv, ns / 4, &nn); if (w2) { free(spv); spv = w2; ns = nn * 4; } }
-    if (s->stage == 0) { size_t nn; uint32_t *w2 = spv_point_size(spv, ns / 4, &nn); if (w2) { free(spv); spv = w2; ns = nn * 4; } }
-    if (s->stage == 0 && !g_depth_zero) {   // NVN's GL depth convention (see spv_gl_depth)
-        size_t nn; uint32_t *w2 = spv_gl_depth(spv, ns / 4, &nn);
-        if (w2) { free(spv); spv = w2; ns = nn * 4; } else LOG("[RED] vk: vertex shader %s: no position written, left as it is for the GL depth convention", key);
-    }
-    spv_set(spv, ns / 4, s->stage == 1 ? 1 : s->stage == 2 ? 2 : 0);   // fragment resources in set 1, geometry in set 2
+    s->io_mask = s->stage == 0 ? spv_io(spv, ns / 4, 3, NULL) : s->stage == 1 ? spv_io(spv, ns / 4, 1, s->in_type) : 0;   // outputs / inputs (vs_pad_mod)
+    spv = vs_transform(s, spv, &ns, 1);
     VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, ns, spv};
     VkResult r = vkCreateShaderModule(g_dev, &mi, NULL, &s->mod); free(spv);
     if (r != VK_SUCCESS) { LOG("[RED] vk: shader %s rejected (%d)", key, (int)r); s->mod = VK_NULL_HANDLE; }
@@ -2593,7 +2707,8 @@ static int bf_src1(int f) { return f >= 0x10 && f <= 0x13; }   // NVN_BLEND_FUNC
 // The second source without the GPU feature (Mali), or without the pixel shader's output 1: read as one (ONE_MINUS_*: zero), as before
 static int bf_no_src1(int f) { if (!bf_src1(f)) return f; RED_ONCE(10, "dual-source blending: not available here, the second source reads as one"); return f == 0x11 || f == 0x13 ? 1 : 2; }
 static VkPipeline pso_create(const pso_key *k, VkPipelineLayout pl) {
-    VkPipelineShaderStageCreateInfo st[3] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, k->vs->mod, "main", NULL}}; uint32_t nst = 1;
+    VkShaderModule vsm = k->gs ? k->vs->mod : vs_pad_mod(k->vs, k->fs);   // padded where the pixel shader reads what the vertex shader does not write (with a geometry stage between, as it was)
+    VkPipelineShaderStageCreateInfo st[3] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vsm, "main", NULL}}; uint32_t nst = 1;
     if (k->gs) st[nst++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_GEOMETRY_BIT, k->gs->mod, "main", NULL};
     if (k->fs) st[nst++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, k->dual ? k->fs->mod_dual : k->fs->mod, "main", NULL};
     VkVertexInputBindingDescription vb[16]; VkVertexInputAttributeDescription va[16]; uint32_t nvb = 0, nva = 0; uint32_t used = 0;
