@@ -320,3 +320,26 @@ Re-measure only, after H1–H3: compose offsets and generation changes break reu
 | risk LOW items | timed passes for H1's GPU part; FF12 in `=2` runs; ≥3,000-frame gate, ≥4 alternations; 20-minute soak for H0.5 and H4 |
 
 **Order:** grill-alt's, with one change. The index pool (H3) comes before the generation work (H4) as a step of its own, because H0.5 does not touch the pool's per-start copies and BUF_STORE cannot take them.
+
+## Android-only switches and flicker (for the tablet phase)
+
+The user reports objects appearing and disappearing at the forest spot after character creation. Before that is bisected on the tablet (after the Mac verdict), this is what the Android-only switches can and cannot do to the picture, from the code (hm-next).
+
+- **DM_VK_GW_SHADOW: no wrong bytes.**
+  - The remembered pair is keyed by the dispatch range's address *and* size, and gives the read's offset and size inside it. The copy is a byte copy of that dispatch's output, made right after it in the same command buffer.
+  - Batch reordering:
+    - A batch that lands at another address, or with another size, gets no shadow: its reads compose as before.
+    - A batch at the same address and size but read at another offset finds the shadow does not hold its read. That read composes, laying the dispatch's part and the shadow (the same bytes) in order.
+  - A later GPU write over the range in the same submission is a newer entry, and is found first.
+  - So a stale pair costs a compose; it cannot feed another batch's instance list. Its risk is cost only.
+- **DM_VK_GW_PAD (v2, h10): a real flicker candidate, fixed in hm-next (v3).**
+  - A padded window takes the guest's bytes when it is made, and is then read in place by later draws of the submission. Before hm-next, an in-stream write after that into any of the window's 4 KB was not seen by the window. Such writes are mtl_sub_copy's CPU side, OP_UPDATE_UB and OP_CLEAR_BUF: the bytes went to guest memory and the write log, but not into the window.
+  - A compose, as without the switch, reads the guest's bytes at each draw. HM's cull pattern writes exactly there: a constant copied into the next batch's counter, and argument records next to the GPU-written instance counts.
+  - A stale counter or argument word for one submission draws a batch with the wrong instance count or index range for a frame: popping.
+  - hm-next: wlog_add puts such writes into the window's ring bytes and snapshot (pad_sync).
+  - Windows refused mid-frame are not a hazard. A refused copy takes the old path: an exact 4-byte entry, composed at the read.
+- **DM_VK_GW_CHAIN_SNAP:** changes which bytes the GPU starts from (the CPU's rewrites are now patched in). That is a correctness fix; the stale CPU-side bytes of a GPU buffer copy are kept out of the CPU's rewrites since h6.
+- **DM_VK_IDXPOOL_ONCE / _KEEP:** wrong index bytes would show as broken geometry, not as popping. KEEP refuses any draw whose readable window was written since the copy's stamp. Its =2 mode compares every use.
+- **DM_VK_RING_REUSE, DM_VK_GW_INDEX:** neither changes what is bound or copied.
+
+**Tablet bisect, when allowed:** the hm-next APK at the spot, with GW_PAD=0 against GW_PAD=1. Only if the Mac shows no popping there.
