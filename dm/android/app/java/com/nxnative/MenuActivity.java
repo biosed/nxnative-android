@@ -41,7 +41,7 @@ import java.util.Set;
 
 public class MenuActivity extends Activity {
     private SharedPreferences prefs;
-    private Spinner mode, fps, fit, lang;
+    private Spinner mode, fps, fit, lang, touch;
     private CheckBox showFps, skip, hibernate;
     private final List<CheckBox> cheatBoxes = new ArrayList<>();
     private boolean launched;
@@ -333,6 +333,10 @@ public class MenuActivity extends Activity {
         mode = spinner(col, "Console mode", new String[]{"Handheld (smoother)", "Docked (TV, higher resolution)"}, prefs.getInt("opmode", 0) == 1 ? 1 : 0);
         fps = spinner(col, "Frame rate", new String[]{"60 (default)", "30 (saves battery)"}, prefs.getInt("fps", 60) == 30 ? 1 : 0);
         fit = spinner(col, "Screen", new String[]{"Keep aspect ratio (black bars)", "Fill the screen (stretch)"}, prefs.getBoolean("stretch", false) ? 1 : 0);
+        // DM_TOUCH_MODE (front_android.c): where a finger that lands on no on-screen button goes. "Game default" writes nothing (the profile's touch_mode decides); the touch screen reaches the
+        // game in handheld mode only, as on the Switch
+        touch = spinner(col, "Touch screen", new String[]{"Game default", "Off: fingers move the sticks", "On: buttons + touch the game", "Touch only (no on-screen controls)"},
+                        Math.max(0, Math.min(3, prefs.getInt("touchmode", -1) + 1)));
         String sys = systemLang();
         String[] langs = {"es-419", "en-US", "system"};
         int ls = 0; for (int i = 0; i < langs.length; i++) if (langs[i].equals(prefs.getString("lang", "en-US"))) ls = i;
@@ -380,11 +384,13 @@ public class MenuActivity extends Activity {
         String[] langs = {"es-419", "en-US", "system"};
         prefs.edit().putInt("opmode", mode.getSelectedItemPosition() == 1 ? 1 : 0).putInt("fps", fps.getSelectedItemPosition() == 1 ? 30 : 60)
              .putBoolean("stretch", fit.getSelectedItemPosition() == 1).putString("lang", langs[lang.getSelectedItemPosition()])
-             .putBoolean("showfps", showFps.isChecked()).putStringSet("cheats", on).putBoolean("skip", skip.isChecked()).putBoolean("hibernate", hibernate.isChecked()).apply();
+             .putBoolean("showfps", showFps.isChecked()).putStringSet("cheats", on).putBoolean("skip", skip.isChecked()).putBoolean("hibernate", hibernate.isChecked())
+             .putInt("touchmode", touch.getSelectedItemPosition() - 1).apply();
         String l = langs[lang.getSelectedItemPosition()]; if (l.equals("system")) l = systemLang();
         String env = "DM_OPMODE=" + (mode.getSelectedItemPosition() == 1 ? 1 : 0) + "\nDM_FPS=" + (fps.getSelectedItemPosition() == 1 ? 30 : 60)
                    + "\nDM_SCREEN_FIT=" + (fit.getSelectedItemPosition() == 1 ? "stretch" : "keep") + "\nDM_LANG=" + l + "\nDM_SHOW_FPS=" + (showFps.isChecked() ? 1 : 0)
-                   + "\nDM_CHEATS_ON=" + list + "\nDM_HIBERNATE=" + (hibernate.isChecked() ? 1 : 0) + "\n";
+                   + "\nDM_CHEATS_ON=" + list + "\nDM_HIBERNATE=" + (hibernate.isChecked() ? 1 : 0) + "\n"
+                   + (touch.getSelectedItemPosition() > 0 ? "DM_TOUCH_MODE=" + (touch.getSelectedItemPosition() - 1) + "\n" : "");
         try (OutputStream o = new FileOutputStream(new File(getFilesDir(), "settings.env"))) { o.write(env.getBytes(StandardCharsets.UTF_8)); } catch (Exception e) { /* the defaults apply */ }
     }
     // SaveBackup on its own thread: the backup of the save, then the import if one waits; a play asked meanwhile starts when it is done
