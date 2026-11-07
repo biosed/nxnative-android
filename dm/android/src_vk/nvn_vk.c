@@ -2605,11 +2605,12 @@ static void *pso_precreate(void *a) { pthread_setname_np("dm-psopre");
 // from DM_VK_CTL_FILE ("set <name> <value>", vk_ctl: the file is read again only when its modification time changes, at most once a frame). The value is an atomic; the
 // recording thread takes a copy of every value once per submission (tog_latch at mtl_sub_begin) and reads only that copy (tog), so a switch never changes in the middle
 // of a submission. A name not on the run-time list is refused when the file sets it (it is read at start only)
-enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_PACE, TG_N };
+enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_PACE, TG_DC2, TG_N };
 static struct { const char *name; int runtime; _Atomic int val; int def; } g_tog[TG_N] = {   // def: the value without the variable (on by default after its A/B; =0 turns it off)
     [TG_SHADOW] = {"DM_VK_SHADOW", 1},   // diagnostic: what a persistent cache could save (copy_in / index-scan misses whose bytes an earlier copy already had)
     [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1, 0, 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2); on by default from vk19.65 (session 1: -1.0 ms)
     [TG_PACE] = {"DM_VK_PRESENT_PACE", 0},   // vk19.63: one setFrameRate request for the cap at the first swapchain, FIFO when the cap is at most the panel's rate; start only
+    [TG_DC2] = {"DM_VK_DC_WAYS2", 1},   // vk19.69: copy_in's table two-way set-associative (C5); on the run-time list (a mode change only costs misses)
     [TG_LEAN] = {"DM_VK_LEAN", 0, 0, 1},   // vk19.62: small hot-path items (trace pointers, the memo hash, the timer conversion, sampled descriptor-set timing); start only; on by default from vk19.65 (session 1: RHIThread -1.0 ms)
     [TG_FB_FAST] = {"DM_VK_FB_FAST", 1, 0, 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2); on by default from vk19.65 (session 1: -0.4 ms)
 };
@@ -2741,7 +2742,16 @@ static void wlog_add(uint64_t a, uint64_t n) {
     g_wlo[g_nwlog] = a; g_whi[g_nwlog] = a + n; g_nwlog++;
 }
 static VkDeviceSize copy_in(uint64_t addr, uint64_t size, VkDeviceSize align, int caller) {   // guest memory → ring, reused when the same range is asked for again unchanged (hashed by address)
-    dcopy *e = &g_dc[(addr >> 4 ^ addr >> 13) % NDC]; int why;
+    dcopy *e; int why;
+    // DM_VK_DC_WAYS2 (vk19.69, plan C5, off by default): two ways a set (NDC / 2 sets): the way holding this address, else a free or older-submission one, else the one
+    // used less recently. Session 1: 37% of copies found the slot held by another range; the same-submission repeats (275 copies, 2.0 MB a frame) are what it can catch
+    static uint8_t lru[NDC / 2];   // the way to replace next in each set
+    if (tog(TG_DC2)) {
+        uint32_t st = (uint32_t)((addr >> 4 ^ addr >> 13) % (NDC / 2)); dcopy *w = &g_dc[2 * st];
+        int k = w[0].addr == addr ? 0 : w[1].addr == addr ? 1 : -1;
+        if (k < 0) k = w[0].gen != g_wgen ? 0 : w[1].gen != g_wgen ? 1 : lru[st];   // a miss of another range: a free or stale way first
+        e = &w[k]; lru[st] = (uint8_t)!k;   // the other way is now the less recently used
+    } else e = &g_dc[(addr >> 4 ^ addr >> 13) % NDC];
     if (e->addr == addr && e->size >= size && e->gen == g_wgen && e->gen && e->off % align == 0 && e->seq <= g_nwlog) {
         uint64_t hi = addr + size; uint32_t k = e->seq;
         for (; k < g_nwlog; k++) if (g_wlo[k] < hi && g_whi[k] > addr) break;
