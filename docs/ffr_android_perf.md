@@ -253,6 +253,13 @@ RHIThread, all-thread CPU and energy are not comparable end to end: vk19.58 pred
 | `DM_VK_BUF_STORE` | 19.72 (default on from 19.75b) | verify 0 differences; recording −0.2, RHIThread −0.25 ms (session 5): kept, on by default (vertex only in practice) | no |
 | `DM_VK_ZEROCOPY` (Z0) | 19.46 | −0.6 ms rec, −230 MB MemAvailable (L): off | candidate: zc_back / zc_find / the AHB import (kept only if Z1/Z2 are ever tried) |
 
+## Regression: ctx_pick's else-chain (ed58b06b, fixed 1950433c)
+
+- HM perf H0.5 (`ed58b06b`, `DM_VK_RING_REUSE`) put the ring-shrink block between `if (best >= 0)` and `else if (grow) / else wait` in `ctx_pick`. With RING_REUSE off (the default) every free pick then also ran the wait branch: the context became the busy one that frees first, the previous submission, so the recorder waited for the GPU at every submission. With RING_REUSE on, no context was ever made or waited for at the cap.
+- Every build from main `53acb437` (and hm-next before `cbda207c`) had it; the "~0 context wait" numbers above (Runs X/Y through vk19.75b) predate it and stand.
+- Found on FINAL FANTASY XII from main (log2): the CTX_PICK line counted 4.0 picks for 2.0 real submissions (2.0 free, 2.00 waited at the cap), waiting for the GPU 22–24 ms a frame (equal to its GPU time), present p50 40–55 ms against 33 ms in vk19.6.
+- Fixed in `1950433c` (main): one chain again, the ring upkeep after it. Verified on the tablet (FF12, log3): 2.0–2.1 submissions, 100% took a free context, 0.00 waited; waiting for the GPU 0.01 ms; frame p50 33.2–33.5 ms.
+
 ## Open
 
 - Later (deferred by the user, after the closing builds): coalescing GameThread's sub-millisecond condition-wait poll (`sdk+0xc833b8 < sdk+0x13c004 < main+0x17150`, ~1,000 wake-ups a second; needs a game-speed check); a thermal governor (frame cap and Unreal's dynamic resolution budget from the thermal headroom forecast, plan v4 T3); UBWC for render targets that are never copy or blit destinations (plan v4 T4, watched by MemAvailable).
