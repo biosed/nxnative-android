@@ -2605,11 +2605,12 @@ static void *pso_precreate(void *a) { pthread_setname_np("dm-psopre");
 // from DM_VK_CTL_FILE ("set <name> <value>", vk_ctl: the file is read again only when its modification time changes, at most once a frame). The value is an atomic; the
 // recording thread takes a copy of every value once per submission (tog_latch at mtl_sub_begin) and reads only that copy (tog), so a switch never changes in the middle
 // of a submission. A name not on the run-time list is refused when the file sets it (it is read at start only)
-enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_PACE, TG_DC2, TG_N };
+enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_PACE, TG_DC2, TG_TSTORE, TG_N };
 static struct { const char *name; int runtime; _Atomic int val; int def; } g_tog[TG_N] = {   // def: the value without the variable (on by default after its A/B; =0 turns it off)
     [TG_SHADOW] = {"DM_VK_SHADOW", 1},   // diagnostic: what a persistent cache could save (copy_in / index-scan misses whose bytes an earlier copy already had)
     [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1, 0, 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2); on by default from vk19.65 (session 1: -1.0 ms)
     [TG_PACE] = {"DM_VK_PRESENT_PACE", 0},   // vk19.63: one setFrameRate request for the cap at the first swapchain, FIFO when the cap is at most the panel's rate; start only
+    [TG_TSTORE] = {"DM_VK_TEXEL_STORE", 0},   // vk19.70: uniform texel buffers kept across frames in a store, validated by nvn_dirty (1), checked against a host copy (2); start only
     [TG_DC2] = {"DM_VK_DC_WAYS2", 1},   // vk19.69: copy_in's table two-way set-associative (C5); on the run-time list (a mode change only costs misses)
     [TG_LEAN] = {"DM_VK_LEAN", 0, 0, 1},   // vk19.62: small hot-path items (trace pointers, the memo hash, the timer conversion, sampled descriptor-set timing); start only; on by default from vk19.65 (session 1: RHIThread -1.0 ms)
     [TG_FB_FAST] = {"DM_VK_FB_FAST", 1, 0, 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2); on by default from vk19.65 (session 1: -0.4 ms)
@@ -2757,7 +2758,7 @@ static VkDeviceSize copy_in(uint64_t addr, uint64_t size, VkDeviceSize align, in
         for (; k < g_nwlog; k++) if (g_wlo[k] < hi && g_whi[k] > addr) break;
         if (k == g_nwlog) { if (size >= e->size) e->seq = g_nwlog; g_ci_hit[caller]++; return e->off; }   // good up to now: the next lookup scans only later writes
         why = MR_WLOG;
-    } else why = !e->gen ? MR_EMPTY : e->addr != addr ? MR_OTHER : e->gen != g_wgen || e->seq > g_nwlog ? MR_GEN : e->size < size ? MR_SIZE : MR_ALIGN;
+    } else why = !e->gen || (e->addr != addr && e->gen != g_wgen && tog(TG_DC2)) ? MR_EMPTY : e->addr != addr ? MR_OTHER : e->gen != g_wgen || e->seq > g_nwlog ? MR_GEN : e->size < size ? MR_SIZE : MR_ALIGN;
     g_ci_miss[caller]++; g_ci_mbytes[caller] += size; g_ci_why[why]++;
     // the pool class (vk19.59c): the entry's when it held this address, else looked up for one miss in 8 and counted for 8 (no lock and pool scan on every miss)
     static uint32_t pc_tick; int cls = e->addr == addr && e->cls < PC_N ? e->cls : PC_N;
@@ -2959,6 +2960,165 @@ static VkFormatProperties fmt_props(VkFormat f) {   // vkGetPhysicalDeviceFormat
     VkFormatProperties p; vkGetPhysicalDeviceFormatProperties(g_pd, f, &p); return p;
 }
 static uint64_t g_tbuf_miss[3]; static uint32_t g_ws_zero_tb;   // g_ws_zero_tb: texel buffer elements the last write_sets bound to the zero stand-in (the trace)   // texel buffer slots read as zeros: 0 nothing bound, 1 not a buffer texture / no format, 2 format not usable as a texel buffer here
+// ---------- Texel store (DM_VK_TEXEL_STORE, vk19.70, plan v4 C4'b stage 1; off by default, read at start) ----------
+// Uniform texel buffers are copied into the ring at every first use in a submission, with a new VkBufferView each (session 1: 745 texel copies, 5.8 MB and 784 views a frame;
+// session 2: 2.50 MB of those bytes repeat from an earlier frame). With the store on, a range whose bytes stayed the same over two consecutive frames is admitted into a
+// persistent host-visible buffer and served from there, with views that live as long as its block, while nvn_dirty says no page of it was written since.
+// - Admission: a range's first miss records it; its second (in another frame) hashes its page-aligned span (pages it shares with per-frame data change too, and protecting them
+//   would fault every frame); the same hash in the next frame admits it. Only uniform texel buffers (no storage texel buffer, nothing gw_find / gw_any knows as GPU-written),
+//   tracked pools that are not GPU-only, not with DM_VK_ZEROCOPY.
+// - Validity, in this order: stamp (nvn_dirty_now), protect (nvn_dirty_protect, which reports an mprotect failure: never admitted then), read into the block. A use needs the
+//   span's registration id unchanged (a pool slot reused by another pool has a new one; checked before since()) and no page written since the stamp. A range found written is
+//   copied again (in place, or into a new block while a submission in flight still reads the old one); written three times it is dropped and refused for 10 s.
+// - Blocks: 4 KB granules (offsets meet minTexelBufferOffsetAlignment), a direct-mapped table of 4,096 entries, least recently used evicted when full. A block and its views
+//   are freed only when every submission that read it is done (its fence, set at each use). The views are the store's own: not in C->bv nor in bview's cache.
+// - Pool deletion (mtl_pool_del, any thread) queues the pool's range under g_pool_mu; the recording thread drops its blocks at its next lookup. Memory pressure (g_mem_low /
+//   g_mem_tight) drops the whole store: its pages are unprotected (dm_guest_write_prepare), its blocks freed after their fences, the buffer last.
+// - =2 (verify): a host-side copy per block; every use compares guest memory with it, counts and logs a difference and takes the copy path for that use.
+// Everything runs on the recording thread (tbuf_view); faults only touch nvn_dirty's atomics. Kernel writes into guest memory (EFAULT on a protected page instead of a fault):
+// hle_fs ReadFile / ReadFileExact / ReadFileOpt (pread) and hle_cheats' vm_write prepare first; no host code recv()s or ioctl()s into guest memory; arc4random_buf copies in user space
+static int gw_any(uint64_t a, uint64_t n);
+static VkBuffer g_ts_buf; static VkDeviceMemory g_ts_mem; static uint8_t *g_ts_p; static uint32_t g_ts_ngran, g_ts_next; static uint8_t *g_ts_used; static int g_ts_dropping;
+enum { TS_GRAN = 4096, TS_NENT = 4096, TS_NCAND = 8192, TS_NRET = 2048 };
+typedef struct { VkFormat f; VkDeviceSize n; VkBufferView v; } ts_view_t;
+typedef struct { uint64_t addr, len, regid, stamp, fence, tick, serial; const void *span; uint32_t off_g, ng; uint8_t used, dirty, nv; ts_view_t v[4]; uint8_t *shadow; } ts_ent;
+static ts_ent g_ts[TS_NENT];
+static struct { uint64_t addr, len, h, hframe, bl_until; } g_tc[TS_NCAND];
+static struct { VkBufferView v[4]; int nv; uint32_t off_g, ng; uint64_t fence; } g_ts_ret[TS_NRET]; static int g_ts_nret;
+static uint64_t g_ts_tick, g_ts_serial, g_ts_hit, g_ts_hit_b, g_ts_miss, g_ts_adm, g_ts_recopy, g_ts_evict, g_ts_bl, g_ts_vmade, g_ts_vreuse, g_ts_vchk, g_ts_vbad, g_ts_refused, g_ts_drops;
+static uint32_t g_ts_inuse;   // granules in use
+static struct { uint64_t mem, size; } g_ts_pdel[64]; static _Atomic int g_ts_npdel;   // deleted pools to drop (under g_pool_mu)
+static int ts_mode(void) { return tog(TG_TSTORE); }
+static uint64_t ts_now_s(void) { return now_ns() / 1000000000ull; }
+static int ts_init(void) {
+    if (g_ts_buf) return 1;
+    if (zc_mode()) { RED_ONCE(110, "DM_VK_TEXEL_STORE is refused together with DM_VK_ZEROCOPY"); return 0; }
+    const char *e = getenv("DM_VK_TEXEL_STORE_MB"); int mb = e && atoi(e) > 0 ? atoi(e) : 32; if (mb > 256) mb = 256;
+    g_ts_ngran = (uint32_t)((uint64_t)mb << 20) / TS_GRAN; g_ts_used = calloc(g_ts_ngran, 1); if (!g_ts_used) return 0;
+    g_ts_buf = buf_new((VkDeviceSize)g_ts_ngran * TS_GRAN, ALL_BUF_USAGE, &g_ts_mem, (void **)&g_ts_p); g_ts_next = 0; g_ts_inuse = 0; g_ts_dropping = 0;
+    LOG("vk: DM_VK_TEXEL_STORE=%d: a %d MB store for texel buffers that stay the same across frames%s", ts_mode(), mb, ts_mode() == 2 ? " (verify: each use compared with a host copy)" : "");
+    return 1;
+}
+static void ts_gran_set(uint32_t o, uint32_t n, uint8_t v) { memset(g_ts_used + o, v, n); if (v) g_ts_inuse += n; else g_ts_inuse -= n; }
+static int ts_gran_alloc(uint32_t n) {   // next fit over the granule map: -1 when no run of n is free
+    if (!n || n > g_ts_ngran) return -1;
+    for (uint32_t pass = 0, o = g_ts_next; pass < 2; pass++, o = 0) {
+        uint32_t run = 0;
+        for (uint32_t i = o; i < g_ts_ngran; i++) { if (g_ts_used[i]) { run = 0; continue; } if (++run == n) { uint32_t s0 = i + 1 - n; ts_gran_set(s0, n, 1); g_ts_next = i + 1 < g_ts_ngran ? i + 1 : 0; return (int)s0; } }
+    }
+    return -1;
+}
+static void ts_retire(ts_ent *e) {   // the block and its views go when its readers are done
+    if (!e->used) return;
+    if (g_ts_nret == TS_NRET) { RED_ONCE(111, "texel store: more than %d blocks waiting for their readers: the store is dropped", TS_NRET); }
+    else { typeof(g_ts_ret[0]) *r = &g_ts_ret[g_ts_nret++]; r->nv = e->nv; for (int i = 0; i < e->nv; i++) r->v[i] = e->v[i].v; r->off_g = e->off_g; r->ng = e->ng; r->fence = e->fence; }
+    free(e->shadow); memset(e, 0, sizeof *e);
+}
+static void ts_reap(void) {   // blocks whose readers are done: views destroyed, granules freed; a dropped store's buffer last
+    uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < g_ts_nret;) { typeof(g_ts_ret[0]) *r = &g_ts_ret[i];
+        if (r->fence > done) { i++; continue; }
+        for (int k = 0; k < r->nv; k++) vkDestroyBufferView(g_dev, r->v[k], NULL);
+        ts_gran_set(r->off_g, r->ng, 0); g_ts_ret[i] = g_ts_ret[--g_ts_nret]; }
+    if (g_ts_dropping && !g_ts_nret && g_ts_buf) { vkDestroyBuffer(g_dev, g_ts_buf, NULL); vkFreeMemory(g_dev, g_ts_mem, NULL); g_ts_buf = VK_NULL_HANDLE; g_ts_p = NULL; free(g_ts_used); g_ts_used = NULL; g_ts_dropping = 0;
+                                                    LOG("vk: DM_VK_TEXEL_STORE: the store was dropped (memory pressure); made again when it has gone"); }
+}
+static void ts_drop_all(void) {
+    for (int i = 0; i < TS_NENT; i++) if (g_ts[i].used) { dm_guest_write_prepare((void *)(uintptr_t)g_ts[i].addr, (size_t)g_ts[i].len); ts_retire(&g_ts[i]); }   // its pages writable again
+    g_ts_dropping = 1; g_ts_drops++;
+}
+static uint64_t ts_span_hash(uint64_t addr, uint64_t len) {   // the page-aligned span's bytes
+    static uint64_t pg; if (!pg) { long v = sysconf(_SC_PAGESIZE); pg = v > 0 ? (uint64_t)v : 4096; }   // the protection's page
+    uint64_t a = addr & ~(pg - 1), b = (addr + len + pg - 1) & ~(pg - 1);
+    return shadow_hash((const uint8_t *)(uintptr_t)a, b - a);
+}
+static ts_ent *ts_slot(uint64_t addr, uint64_t len) { return &g_ts[(addr >> 6 ^ addr >> 19 ^ len * 0x9e3779b1u) % TS_NENT]; }
+static VkBufferView ts_view(ts_ent *e, VkFormat f, VkDeviceSize n) {
+    for (int i = 0; i < e->nv; i++) if (e->v[i].f == f && e->v[i].n == n) { g_ts_vreuse++; return e->v[i].v; }
+    VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, NULL, 0, g_ts_buf, f, (VkDeviceSize)e->off_g * TS_GRAN, n};
+    VkBufferView v; if (vkCreateBufferView(g_dev, &ci, NULL, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
+    g_ts_vmade++;
+    if (e->nv == 4) { if (g_ts_nret < TS_NRET) { typeof(g_ts_ret[0]) *r = &g_ts_ret[g_ts_nret++]; r->nv = 1; r->v[0] = e->v[0].v; r->off_g = 0; r->ng = 0; r->fence = e->fence; } memmove(e->v, e->v + 1, 3 * sizeof *e->v); e->nv = 3; }
+    e->v[e->nv++] = (ts_view_t){f, n, v};
+    return v;
+}
+static int ts_fill(ts_ent *e, uint64_t addr, uint64_t len, const void *span, uint64_t regid, int fresh) {   // stamp -> protect -> read, into e's block (or a new one)
+    uint32_t ng = (uint32_t)((len + TS_GRAN - 1) / TS_GRAN);
+    int newblock = fresh || e->fence > __atomic_load_n(&g_done, __ATOMIC_ACQUIRE) || e->ng < ng;
+    uint32_t off_g = e->off_g;
+    if (newblock) {
+        int o = ts_gran_alloc(ng);
+        for (int tries = 0; o < 0 && tries < 64; tries++) {   // full: the least recently used block whose readers are done
+            ts_ent *v = NULL; uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
+            for (int i = 0; i < TS_NENT; i++) if (g_ts[i].used && &g_ts[i] != e && g_ts[i].fence <= done && (!v || g_ts[i].tick < v->tick)) v = &g_ts[i];
+            if (!v) break;
+            ts_retire(v); g_ts_evict++; ts_reap(); o = ts_gran_alloc(ng);
+        }
+        if (o < 0) return 0;
+        if (!fresh) ts_retire(e);   // the old block stays for its readers
+        off_g = (uint32_t)o;
+    }
+    uint64_t stamp = nvn_dirty_now();
+    if (!nvn_dirty_protect((const void *)(uintptr_t)addr, (size_t)len)) { if (newblock) ts_gran_set(off_g, ng, 0); if (!newblock || !fresh) ts_retire(e); return 0; }
+    memcpy(g_ts_p + (size_t)off_g * TS_GRAN, (const void *)(uintptr_t)addr, (size_t)len);
+    if (newblock) { memset(e, 0, sizeof *e); e->off_g = off_g; e->ng = ng; e->serial = ++g_ts_serial; }
+    e->addr = addr; e->len = len; e->regid = regid; e->span = span; e->stamp = stamp; e->used = 1; e->tick = ++g_ts_tick; e->fence = g_fence + 1;
+    if (ts_mode() == 2) { if (!e->shadow) e->shadow = malloc((size_t)len); if (e->shadow) memcpy(e->shadow, (const void *)(uintptr_t)addr, (size_t)len); }
+    return 1;
+}
+static void ts_blacklist(uint64_t addr, uint64_t len) {
+    typeof(g_tc[0]) *c = &g_tc[(addr >> 6 ^ addr >> 19 ^ len * 0x9e3779b1u) % TS_NCAND];
+    c->addr = addr; c->len = len; c->h = 0; c->hframe = 0; c->bl_until = ts_now_s() + 10; g_ts_bl++;
+}
+void ts_pool_deleted(const void *mem, uint64_t size) {   // mtl_pool_del (any thread), holding g_pool_mu: the recording thread drops its blocks at its next lookup
+    int n = atomic_load(&g_ts_npdel); if (n < 64) { g_ts_pdel[n].mem = (uint64_t)(uintptr_t)mem; g_ts_pdel[n].size = size; atomic_store(&g_ts_npdel, n + 1); }
+    else { g_ts_pdel[63].mem = 0; g_ts_pdel[63].size = UINT64_MAX; }   // too many at once: every block goes
+}
+static pthread_mutex_t g_pool_mu;
+// Served from the store: a view over the range's block; 0: the caller copies as before
+static int ts_lookup(uint64_t addr, uint64_t n, VkFormat f, VkDeviceSize al, VkBufferView *out) {
+    if (!ts_mode() || zc_mode()) return 0;
+    if (g_mem_low || g_mem_tight) { if (g_ts_buf && !g_ts_dropping) ts_drop_all(); if (g_ts_buf) ts_reap(); return 0; }
+    if (g_ts_dropping) { ts_reap(); return 0; }
+    if (!g_ts_buf && !ts_init()) return 0;
+    if (atomic_load(&g_ts_npdel)) {   // pools deleted since: their blocks go
+        pthread_mutex_lock(&g_pool_mu); int k = atomic_load(&g_ts_npdel);
+        for (int j = 0; j < k; j++) for (int i = 0; i < TS_NENT; i++) if (g_ts[i].used && g_ts[i].addr + g_ts[i].len > g_ts_pdel[j].mem && g_ts[i].addr < g_ts_pdel[j].mem + g_ts_pdel[j].size) ts_retire(&g_ts[i]);
+        atomic_store(&g_ts_npdel, 0); pthread_mutex_unlock(&g_pool_mu); }
+    ts_reap();
+    if (al > TS_GRAN || !n || n > (64u << 20)) return 0;
+    ts_ent *e = ts_slot(addr, n);
+    if (e->used && e->addr == addr && e->len == n) {
+        uint64_t rid = nvn_dirty_span_regid(e->span);
+        if (!rid || rid != e->regid) { ts_retire(e); g_ts_miss++; return 0; }   // the pool's registration changed (checked before since: a reused slot starts with zeroed generations)
+        int clean = !nvn_dirty_since_span(e->span, (const void *)(uintptr_t)addr, (size_t)n, e->stamp) && !gw_any(addr, n);
+        if (clean && ts_mode() == 2 && e->shadow) { g_ts_vchk++;
+            if (memcmp(e->shadow, (const void *)(uintptr_t)addr, (size_t)n)) { g_ts_vbad++; clean = 0; static int nl; if (nl++ < 8) LOG("[RED] vk: DM_VK_TEXEL_STORE=2: %#llx (%llu bytes) differs from its stored copy while nvn_dirty says unwritten", (unsigned long long)addr, (unsigned long long)n); } }
+        if (clean) { VkBufferView v = ts_view(e, f, n); if (!v) return 0;
+                     e->fence = g_fence + 1; e->tick = ++g_ts_tick; g_ts_hit++; g_ts_hit_b += n; *out = v; return 1; }
+        if (++e->dirty >= 3 || gw_any(addr, n)) { ts_retire(e); ts_blacklist(addr, n); g_ts_miss++; return 0; }   // written again and again: refused for a while
+        uint8_t d = e->dirty;
+        if (!ts_fill(e, addr, n, e->span, rid, 0)) { g_ts_miss++; return 0; }
+        e->dirty = d; g_ts_recopy++;
+        VkBufferView v = ts_view(e, f, n); if (!v) return 0; *out = v; return 1;
+    }
+    g_ts_miss++;
+    typeof(g_tc[0]) *c = &g_tc[(addr >> 6 ^ addr >> 19 ^ n * 0x9e3779b1u) % TS_NCAND];
+    if (c->addr != addr || c->len != n) { if (c->bl_until > ts_now_s()) return 0; c->addr = addr; c->len = n; c->h = 0; c->hframe = 0; c->bl_until = 0; return 0; }   // its first miss: noted, not hashed
+    if (c->bl_until && c->bl_until > ts_now_s()) return 0;
+    uint64_t fr = atomic_load_explicit(&g_presents, memory_order_relaxed);
+    if (c->hframe == fr) return 0;   // hashed in this frame already
+    uint64_t h = ts_span_hash(addr, n);
+    if (!(c->hframe && c->hframe + 1 == fr && c->h == h)) { c->h = h; c->hframe = fr; return 0; }
+    // the same bytes in two consecutive frames: admitted, if it qualifies
+    const void *span = nvn_dirty_span((const void *)(uintptr_t)addr, (size_t)n); uint64_t rid = nvn_dirty_span_regid(span);
+    if (!span || !rid || gw_any(addr, n) || pool_class(addr) == PC_GPU) { g_ts_refused++; ts_blacklist(addr, n); return 0; }
+    if (e->used) { if (e->fence > __atomic_load_n(&g_done, __ATOMIC_ACQUIRE)) { g_ts_refused++; return 0; } ts_retire(e); g_ts_evict++; }
+    if (!ts_fill(e, addr, n, span, rid, 1)) { g_ts_refused++; ts_blacklist(addr, n); return 0; }
+    g_ts_adm++; c->addr = 0;
+    VkBufferView v = ts_view(e, f, n); if (!v) return 0;
+    *out = v; return 1;
+}
 static VkBufferView tbuf_view(int stage, uint64_t h, int storage) {
     int tid = (int)(h & 0xfffff); if (!tid) { g_tbuf_miss[0]++; return VK_NULL_HANDLE; }
     lk_(&g_rmu, LW_RMU); treg_t tr = tid < g_ntreg ? g_treg[tid] : (treg_t){0}; pthread_mutex_unlock(&g_rmu);
@@ -2975,7 +3135,8 @@ static VkBufferView tbuf_view(int stage, uint64_t h, int storage) {
     VkBuffer b = VK_NULL_HANDLE; VkDeviceSize off = 0; uint8_t *p = NULL;
     int ci = g_ci, from_gw = 0;
     if (gw_find(addr, n, al, &b, &off, &p)) { ci = g_gw_ci; from_gw = 1; }   // what a dispatch wrote (this submission's, or an earlier one's still running)
-    else { off = copy_in(addr, n, al, CI_TEXEL); if (off != VK_WHOLE_SIZE && off % al) off = ring_put((const void *)(uintptr_t)addr, n, al);   // a cached copy at a smaller alignment
+    else { if (!storage && ts_mode()) { VkBufferView sv; if (ts_lookup(addr, n, f.f, al, &sv)) return sv; }   // DM_VK_TEXEL_STORE (vk19.70): the store's block and its own view
+           off = copy_in(addr, n, al, CI_TEXEL); if (off != VK_WHOLE_SIZE && off % al) off = ring_put((const void *)(uintptr_t)addr, n, al);   // a cached copy at a smaller alignment
            if (off == VK_WHOLE_SIZE) return VK_NULL_HANDLE; b = C->ring; p = C->ringp + off; }
     if (storage && stage == 5 && g_nwb < 16) g_wb[g_nwb++] = (gw_t){addr, n, b, off, p, (uint64_t)from_gw, ci};   // fence field: 1 = GPU-written source (see dispatch)
     return bview(b, off, n, f.f);
@@ -5004,6 +5165,13 @@ static void meas_lines(void) {
       memcpy(ptid, tid, sizeof tid); memcpy(pnf, nf, sizeof nf); pk = k;
       LOG("vk: guest-memory protection per frame over the last 600: page faults %.2f (%s); mprotect %.1f calls, %.3f ms", all / 600.0, q ? fb : "none", (mc - pmc) / 600.0, (mns - pmns) / 600e6);
       pmc = mc; pmns = mns; }
+    if (ts_mode()) { int vk_stats_maps_last(void);   // DM_VK_TEXEL_STORE (vk19.70)
+        int ne = 0; for (int i = 0; i < TS_NENT; i++) ne += g_ts[i].used;
+        LOG("vk: DM_VK_TEXEL_STORE=%d per frame over the last 600: %.1f served (%.2f MB), %.1f missed, %.2f admitted, %.2f copied again, %.2f evicted, %.2f refused for a while (%.2f could not be admitted); views reused %.1f, made %.2f; verify %.1f checked, %llu differed; store %.1f of %.0f MB in %d blocks, %d waiting for readers, dropped %llu times; mprotect failures %llu; memory map %d lines",
+            ts_mode(), g_ts_hit / 600.0, g_ts_hit_b / 600.0 / 1048576.0, g_ts_miss / 600.0, g_ts_adm / 600.0, g_ts_recopy / 600.0, g_ts_evict / 600.0, g_ts_bl / 600.0, g_ts_refused / 600.0, g_ts_vreuse / 600.0, g_ts_vmade / 600.0,
+            g_ts_vchk / 600.0, (unsigned long long)g_ts_vbad, g_ts_inuse * (double)TS_GRAN / 1048576.0, g_ts_ngran * (double)TS_GRAN / 1048576.0, ne, g_ts_nret, (unsigned long long)g_ts_drops,
+            (unsigned long long)nvn_dirty_mp_failures(), vk_stats_maps_last());
+        g_ts_hit = g_ts_hit_b = g_ts_miss = g_ts_adm = g_ts_recopy = g_ts_evict = g_ts_bl = g_ts_vmade = g_ts_vreuse = g_ts_vchk = g_ts_refused = 0; }
     { void dm_guest_sync_report(char *out, size_t n, uint64_t frames); static char gs[8192]; dm_guest_sync_report(gs, sizeof gs, 600);   // hle_thread.c (vk19.59b)
       LOG("vk: guest sync per frame over the last 600, the 8 busiest threads: %s", gs); }
     memset(g_ci_hit, 0, sizeof g_ci_hit); memset(g_ci_miss, 0, sizeof g_ci_miss); memset(g_ci_mbytes, 0, sizeof g_ci_mbytes); memset(g_ci_why, 0, sizeof g_ci_why); memset(g_ci_pool, 0, sizeof g_ci_pool);
@@ -5290,7 +5458,7 @@ static uint64_t pool_left(uint64_t addr, uint64_t cap) {
     for (int i = 0; i < g_npool; i++) { uint64_t b = (uint64_t)(uintptr_t)g_pool[i].mem; if (addr >= b && addr < b + g_pool[i].size) { n = b + g_pool[i].size - addr; break; } }
     pthread_mutex_unlock(&g_pool_mu); return n < cap ? n : cap;
 }
-void mtl_pool_del(const void *mem) { if (zc_mode()) zc_unback(mem); pthread_mutex_lock(&g_pool_mu); for (int i = 0; i < g_npool; i++) if (g_pool[i].mem == mem) { g_pool[i] = g_pool[--g_npool]; break; } pthread_mutex_unlock(&g_pool_mu); }
+void mtl_pool_del(const void *mem) { if (zc_mode()) zc_unback(mem); pthread_mutex_lock(&g_pool_mu); for (int i = 0; i < g_npool; i++) if (g_pool[i].mem == mem) { if (g_ts_buf) ts_pool_deleted(mem, g_pool[i].size); g_pool[i] = g_pool[--g_npool]; break; } pthread_mutex_unlock(&g_pool_mu); }
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     int hit = 0; pthread_mutex_lock(&g_pool_mu);
     for (int i = 0; i < g_npool && !hit; i++) { uint64_t b = (uint64_t)(uintptr_t)g_pool[i].mem; if (addr >= b && addr + len <= b + g_pool[i].size) { if (buf) *buf = (void *)g_pool[i].mem; if (off) *off = addr - b; hit = 1; } }
