@@ -714,6 +714,11 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     game_service(a, "start", 0);   // in the foreground now, as starting a foreground service requires
     boot_env(a->internalDataPath, a->externalDataPath);
     boot_files_check(a->externalDataPath);
+    {   // the menu's save backup for this start (MenuActivity.play writes <files>/play_token after SaveBackup): said in the log, consumed
+        char tp[600], ln[512] = ""; marker_path(tp, sizeof tp, "play_token"); FILE *t = fopen(tp, "r");
+        if (t) { if (!fgets(ln, sizeof ln, t)) ln[0] = 0; fclose(t); unlink(tp); ln[strcspn(ln, "\r\n")] = 0; fprintf(stderr, "boot: save backup before this start: %s\n", ln); }
+        else fprintf(stderr, "boot: [RED] started without the menu's Play (no play_token): no save backup made for this start\n");
+    }
     pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 16 << 20);
     pthread_t th; if (pthread_create(&th, &at, boot_thread, NULL)) die("front end: cannot start the host");
     pthread_detach(th);
