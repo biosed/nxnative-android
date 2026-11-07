@@ -137,11 +137,18 @@ static void g_lock_note(thr_t *me, uint64_t tk) { me->sy[SY_G_CONT]++; me->sy[SY
 static int g_wag = -1; static _Atomic int g_pw_out; static thr_t *g_grave; static uint64_t g_grave_n;
 static int wake_after_g(void) { if (g_wag < 0) { const char *e = getenv("DM_WAKE_AFTER_G"); g_wag = e && atoi(e) != 0; if (g_wag) LOG("DM_WAKE_AFTER_G=1: wakes are signalled after G is released"); } return g_wag; }
 static void pw_send(thr_t *me) {   // the queued signals (with or without G)
+    // reentrant (vk19.68b): SetThreadActivity's pause signal can interrupt this loop and send again from its own g_cond_wait; the list is taken and emptied first, so each
+    // entry is signalled and counted once
     int n = me->npw; if (!n) return;
+    thr_t *w[8]; memcpy(w, me->pw, (size_t)n * sizeof *w); me->npw = 0;
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);   // the empty list is visible to a signal handler on this thread before the first signal
     uint64_t t0 = sy_ticks();
-    for (int i = 0; i < n; i++) pthread_cond_signal(&me->pw[i]->cv);
-    me->npw = 0; atomic_fetch_sub(&g_pw_out, n);
+    for (int i = 0; i < n; i++) pthread_cond_signal(&w[i]->cv);
+    atomic_fetch_sub(&g_pw_out, n);
     me->sy[SY_WAKE_N] += (uint64_t)n; me->sy[SY_WAKE_TK] += sy_ticks() - t0;
+}
+static void grave_drain(void) {   // holding G: the freed threads kept for queued wakes, once none is outstanding
+    if (atomic_load(&g_pw_out) == 0) while (g_grave) { thr_t *u = g_grave; g_grave = u->next; pthread_cond_destroy(&u->cv); pthread_cond_destroy(&u->pcv); free(u); }
 }
 static inline void g_unlock(void) {
     thr_t *me = g_wag > 0 ? pthread_getspecific(g_keythr) : NULL;
@@ -511,7 +518,7 @@ static void thr_free(thr_t *t) {   // Holding G; unlink from the all-threads cha
         for (int i = 0; i < u->nhand; ) if (u->hand[i].by == t) u->hand[i] = u->hand[--u->nhand]; else i++;
     if (g_wag > 0 || g_grave) {   // DM_WAKE_AFTER_G: a queued signal may still point at it; freed once none is outstanding (holding G, so none is queued meanwhile)
         t->next = g_grave; g_grave = t; g_grave_n++;
-        if (atomic_load(&g_pw_out) == 0) while (g_grave) { thr_t *u = g_grave; g_grave = u->next; pthread_cond_destroy(&u->cv); pthread_cond_destroy(&u->pcv); free(u); }
+        grave_drain();
         return;
     }
     pthread_cond_destroy(&t->cv); pthread_cond_destroy(&t->pcv); free(t);
@@ -524,6 +531,7 @@ static void thread_exit(thr_t *t) {
     t->exited = 1;
     core_release(t);
     wake_sync_waiters(t);   // Synchronization waiters on this thread re-check
+    if (t->npw) pw_send(t);   // DM_WAKE_AFTER_G (vk19.68b): its queued wakes now, under G, before it stops being a guest thread (g_unlock below no longer finds it: joiners would sleep for good)
     pthread_setspecific(g_keythr, NULL);
     if (t->closed) thr_free(t);
     g_unlock();
@@ -1093,10 +1101,10 @@ static void cv_site_walk(const uint64_t *regs, uint64_t lr[6]) {   // six return
         if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof w, (vm_address_t)w, &got) != KERN_SUCCESS || got != sizeof w) break;
         lr[d] = w[1]; if (w[0] <= fp) break; fp = w[0]; }
 }
-static int cv_site_note(thr_t *t, int64_t ns, const uint64_t lr[6]) {   // holding G: the size bucket, and the site's slot (no system call)
+static int cv_site_note(thr_t *t, int64_t ns, const uint64_t *lr) {   // holding G: the size bucket, and the site's slot (no system call)
     int b = ns < 0 ? CVB_INF : ns == 0 ? CVB_0 : ns < 100000 ? CVB_100US : ns < 1000000 ? CVB_1MS : ns < 5000000 ? CVB_5MS : ns < 20000000 ? CVB_20MS : CVB_MORE;
     g_cvb[b]++;
-    if (ns <= 0) return -1;
+    if (ns <= 0 || !lr) return -1;   // lr NULL: a timed wait not sampled (only its size counts)
     int k = 0; for (; k < g_ncvs; k++) if (!memcmp(g_cvs[k].lr, lr, 3 * sizeof *lr)) break;
     if (k == g_ncvs) { if (g_ncvs == 64) k = 64; else { k = g_ncvs++; memset(&g_cvs[k], 0, sizeof g_cvs[k]); memcpy(g_cvs[k].lr, lr, 3 * sizeof *lr); memcpy(g_cvs[k].up, lr + 3, 3 * sizeof *lr); char nb[48]; snprintf(g_cvs[k].who, sizeof g_cvs[k].who, "%s", thr_name(t, nb, sizeof nb)); } }
     g_cvs[k].n++; g_cvs[k].b[b]++;
@@ -1106,22 +1114,22 @@ static int cv_site_note(thr_t *t, int64_t ns, const uint64_t lr[6]) {   // holdi
 }
 static size_t cv_report(char *out, size_t n, double fr) {   // holding G; resets the counts
     static const char *bn[CVB_N] = {"none", "0", "<0.1 ms", "<1 ms", "<5 ms", "<20 ms", ">=20 ms"};
-    size_t o = (size_t)snprintf(out, n, "; condition-wait timeouts asked: none %.1f, 0 %.1f, <0.1 ms %.1f, <1 ms %.1f, <5 ms %.1f, <20 ms %.1f, >=20 ms %.1f; the busiest timed sites:",
+    size_t o = (size_t)snprintf(out, n, "; condition-wait timeouts asked: none %.1f, 0 %.1f, <0.1 ms %.1f, <1 ms %.1f, <5 ms %.1f, <20 ms %.1f, >=20 ms %.1f; the busiest timed sites (one wait in 8 per thread sampled, counts x8; period between samples /8):",
                                 g_cvb[0] / fr, g_cvb[1] / fr, g_cvb[2] / fr, g_cvb[3] / fr, g_cvb[4] / fr, g_cvb[5] / fr, g_cvb[6] / fr);
     for (int r = 0; r < 6 && o < n; r++) {
         int best = -1; for (int k = 0; k < g_ncvs; k++) if (g_cvs[k].n && (best < 0 || g_cvs[k].n > g_cvs[best].n)) best = k;
-        if (best < 0 && g_cvs[64].n) { o += (size_t)snprintf(out + o, n - o, " other sites %.1f (timed out %.1f)", g_cvs[64].n / fr, g_cvs[64].tout / fr); g_cvs[64].n = 0; continue; }
+        if (best < 0 && g_cvs[64].n) { o += (size_t)snprintf(out + o, n - o, " other sites %.1f (timed out %.1f)", 8.0 * g_cvs[64].n / fr, 8.0 * g_cvs[64].tout / fr); g_cvs[64].n = 0; continue; }
         if (best < 0) break;
         int mb = 0; for (int i = 1; i < CVB_N; i++) if (g_cvs[best].b[i] > g_cvs[best].b[mb]) mb = i;
         o += (size_t)snprintf(out + o, n - o, " '%s'", g_cvs[best].who);
         for (int d = 0; d < 6 && o < n; d++) { uint64_t a = d < 3 ? g_cvs[best].lr[d] : g_cvs[best].up[d - 3]; if (!a) break; module_t *m = module_of((void *)a);
             o += (size_t)snprintf(out + o, n - o, "%s%s+%#llx", d ? " < " : " ", m ? m->name : "?", (unsigned long long)(m ? a - (uint64_t)m->base : a)); }
         double tms = sy_tick_hz() / 1000.0;
-        if (o < n) o += (size_t)snprintf(out + o, n - o, " %.1f (timed out %.1f, mostly %s; asked %.3f-%.3f ms; every %.3f ms)", g_cvs[best].n / fr, g_cvs[best].tout / fr, bn[mb],
-                                         g_cvs[best].ns_min / 1e6, g_cvs[best].ns_max / 1e6, g_cvs[best].ngap ? g_cvs[best].gap_tk / tms / g_cvs[best].ngap : 0.0);
+        if (o < n) o += (size_t)snprintf(out + o, n - o, " %.1f (timed out %.1f, mostly %s; asked %.3f-%.3f ms; every ~%.3f ms)", 8.0 * g_cvs[best].n / fr, 8.0 * g_cvs[best].tout / fr, bn[mb],
+                                         g_cvs[best].ns_min / 1e6, g_cvs[best].ns_max / 1e6, g_cvs[best].ngap ? g_cvs[best].gap_tk / tms / g_cvs[best].ngap / 8.0 : 0.0);
         g_cvs[best].n = 0;   // taken: the next round finds the next one
     }
-    if (g_cvs[64].n && o < n) o += (size_t)snprintf(out + o, n - o, "; other sites %.1f (timed out %.1f)", g_cvs[64].n / fr, g_cvs[64].tout / fr);
+    if (g_cvs[64].n && o < n) o += (size_t)snprintf(out + o, n - o, "; other sites %.1f (timed out %.1f)", 8.0 * g_cvs[64].n / fr, 8.0 * g_cvs[64].tout / fr);
     memset(g_cvb, 0, sizeof g_cvb); g_ncvs = 0; memset(&g_cvs[64], 0, sizeof g_cvs[64]); g_cv_gen++;
     return o;
 }
@@ -1239,7 +1247,8 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x1B: g_lock(); lock_handoff(regs[0]); g_unlock(); regs[0] = 0; return 1;
     case 0x1C: {  // WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
         thr_t *t = cur(); uint64_t addr = regs[0], key = regs[1];
-        uint64_t cvlr[6] = {0}; if ((int64_t)regs[3] > 0) cv_site_walk(regs, cvlr);   // before G (vk19.66n)
+        static __thread uint32_t cvw; uint64_t cvlr[6] = {0}; int cvsamp = (int64_t)regs[3] > 0 && !(cvw++ & 7);
+        if (cvsamp) cv_site_walk(regs, cvlr);   // before G (vk19.66n); one timed wait in 8 per thread (vk19.68b: the walk's system calls, ~5,000 a second on GameThread, sampled)
         g_lock();
         // The order matters: first set the condition key = 1, then release the mutex. The SDK's InternalConditionVariable::Signal first reads the condition key in user mode, and does not issue svc 0x1D if it is 0;
         // grabbing the mutex in user mode does not go through G either. It used to do lock_handoff first and set the key after: after the release and before the key was set, another thread could grab the lock in user mode, change the condition, read key 0 and not wake anyone,
@@ -1259,7 +1268,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         st32(key, 1);
         t->wkey = key; t->waddr = addr; t->wtag = (uint32_t)regs[2];
 #endif
-        int cvs = cv_site_note(t, (int64_t)regs[3], cvlr); uint64_t cvg = g_cv_gen;   // the timeout asked, and where from (vk19.66m)
+        int cvs = cv_site_note(t, (int64_t)regs[3], cvsamp ? cvlr : NULL); uint64_t cvg = g_cv_gen;   // the timeout asked, and where from (vk19.66m)
         int64_t r = block(t, 2, poll_wait_begin((int64_t)regs[3]));   // Timeout: the lock is not re-acquired (user mode takes it itself)
         if (cvs >= 0 && r == R_TIMEOUT && g_cv_gen == cvg && (cvs == 64 || !memcmp(g_cvs[cvs].lr, cvlr, 3 * sizeof *cvlr))) g_cvs[cvs].tout++;   // G is held again; not after a report reset the slot
         g_unlock();
@@ -1480,6 +1489,7 @@ void dm_guest_sync_report(char *out, size_t n, uint64_t frames) {
     }
     for (thr_t *t = g_all; t; t = t->all) memcpy(t->sy_seen, t->sy, sizeof t->sy);
     static char cvr[1600]; cv_report(cvr, sizeof cvr, fr);
+    grave_drain();   // vk19.68b
     g_unlock();
     if (o < n) snprintf(out + o, n - o, "%sall threads: releases no waiter %.1f / hand-off %.1f, signals no waiter %.1f / woke %.1f, waits %.1f (pre %.1f, <1 ms %.1f, >=1 ms %.1f, timeout %.1f; %.2f ms), naps peer %.1f back-off %.1f precise %.1f det %.1f; G waited %.1f (%.3f ms), in lock_handoff %.3f ms, wakes %.1f (%.3f ms; deferred %.1f, of them sent under G %.1f); freed threads kept for queued wakes %llu",
                          o ? " || " : "", all[SY_REL_NONE] / fr, all[SY_HANDOFF] / fr, all[SY_SIG_NONE] / fr, all[SY_SIG] / fr, (all[SY_W_LOCK] + all[SY_W_COND] + all[SY_W_ADDR] + all[SY_W_SYNC]) / fr,
