@@ -20,6 +20,7 @@
 #include <dlfcn.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <math.h>
 #include <sched.h>
 #include <sys/resource.h>
 
@@ -4527,7 +4528,12 @@ __attribute__((weak)) void front_window_lock(int on) { (void)on; }
 // pre: the transform the swapchain was made with (a 180-degree one when the tablet is held upside down: the picture is turned in the final blit and the overlay's rectangles, so
 // the compositor need not turn it); tf/cext: the surface's current transform and extent then, to tell a real change from a driver that keeps saying SUBOPTIMAL
 static struct { VkSurfaceKHR surf; VkSwapchainKHR sc; VkImage img[8]; VkImageView view[8]; uint32_t n; VkFormat fmt; VkExtent2D ext, cext; int gen;
-                VkSurfaceTransformFlagBitsKHR pre, tf; uint64_t made_ns, chk_ns, nsub; const char *why; } W;
+                VkSurfaceTransformFlagBitsKHR pre, tf; uint64_t made_ns, chk_ns, nsub; const char *why; int srgb; } W;
+// The swapchain's colour encoding follows the image the game presents. A blit decodes an sRGB source to linear values and stores them as they are in a UNORM destination,
+// so a game whose last target is sRGB (Harvest Moon: Echoes of Teradea, Unity URP: RGBA8_SRGB) came out dark on a UNORM swapchain: every value v as (v/255)^2.4, the dim
+// grass and ground near black (measured: Mac 47,65,28 → tablet 9,14,4; the decode predicts 7,13,3), bright sky and UI hardly changed. FINAL FANTASY RESONANCE presents UNORM
+static int g_want_srgb;   // the presented image's encoding: the next swapchain is made with it
+static int fmt_srgb(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32; }
 #define NPRES 3
 static struct { VkCommandPool pool; VkCommandBuffer cb; VkFence fence; VkSemaphore acq, done; VkFramebuffer fb; } g_pres[NPRES]; static int g_pi;
 static const char *tf_name(VkSurfaceTransformFlagBitsKHR t) {
@@ -4584,6 +4590,9 @@ static int win_make(ANativeWindow *aw) {
     VkSurfaceCapabilitiesKHR cap; vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_pd, W.surf, &cap);
     uint32_t nf = 0; vkGetPhysicalDeviceSurfaceFormatsKHR(g_pd, W.surf, &nf, NULL); VkSurfaceFormatKHR sf[32]; if (nf > 32) nf = 32; vkGetPhysicalDeviceSurfaceFormatsKHR(g_pd, W.surf, &nf, sf);
     VkSurfaceFormatKHR pick = sf[0]; for (uint32_t i = 0; i < nf; i++) if (sf[i].format == VK_FORMAT_R8G8B8A8_UNORM || sf[i].format == VK_FORMAT_B8G8R8A8_UNORM) { pick = sf[i]; break; }
+    if (g_want_srgb) { for (uint32_t i = 0; i < nf; i++) if (sf[i].format == VK_FORMAT_R8G8B8A8_SRGB || sf[i].format == VK_FORMAT_B8G8R8A8_SRGB) { pick = sf[i]; break; }   // an sRGB image presented: see g_want_srgb
+                       if (!fmt_srgb(pick.format)) RED_ONCE(111, "the game presents an sRGB image and the window offers no sRGB swapchain format: the picture is too dark"); }
+    W.srgb = fmt_srgb(pick.format);
     uint32_t npm = 0; vkGetPhysicalDeviceSurfacePresentModesKHR(g_pd, W.surf, &npm, NULL); VkPresentModeKHR pm[8]; if (npm > 8) npm = 8; vkGetPhysicalDeviceSurfacePresentModesKHR(g_pd, W.surf, &npm, pm);
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR; for (uint32_t i = 0; i < npm; i++) if (pm[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = pm[i];   // the host paces presents itself; mailbox never blocks it
     present_pace(aw, &mode);   // DM_VK_PRESENT_PACE (vk19.63): the panel's rate requested for the cap, FIFO when the cap fits it
@@ -4703,6 +4712,8 @@ static int ovl_pipe(VkFormat fmt) {   // the sprites' pipeline for the swapchain
     VKCHECK(vkCreateShaderModule(g_dev, &mi[0], NULL, &m[0])); VKCHECK(vkCreateShaderModule(g_dev, &mi[1], NULL, &m[1]));
     VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, m[0], "main", NULL},
                                              {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, m[1], "main", NULL}};
+    int32_t srgb_out = fmt_srgb(fmt); VkSpecializationMapEntry sme = {0, 0, sizeof srgb_out}; VkSpecializationInfo spi = {1, &sme, sizeof srgb_out, &srgb_out};
+    st[1].pSpecializationInfo = &spi;   // ovl.frag SRGB_OUT: the sprites keep their look on an sRGB swapchain
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_FALSE};
     VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
@@ -4779,6 +4790,9 @@ static VkFramebuffer overlay_draw(VkCommandBuffer cb, uint32_t img, int show_fps
     #undef CLIP
     VkClearAttachment black = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0, 0, 0, 1}}}}, white = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.85f, 0.85f, 0.9f, 1}}}},
                       grey = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.35f, 0.35f, 0.45f, 1}}}}, green = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.3f, 1, 0.3f, 1}}}};
+    if (W.srgb) {   // an sRGB swapchain encodes clear values: the display values decoded first, so the counter keeps its colours
+        VkClearAttachment *ca[] = {&white, &grey, &green};
+        for (int i = 0; i < 3; i++) for (int k = 0; k < 3; k++) ca[i]->clearValue.color.float32[k] = powf(ca[i]->clearValue.color.float32[k], 2.2f); }
     if (nb) ovl_clear(cb, &black, nb, bg);
     if (nf) ovl_clear(cb, &grey, nf, fills);
     if (nl) ovl_clear(cb, &white, nl, lines);
@@ -4800,6 +4814,10 @@ static void win_present(const tex_t *t, const int crop[4]) {
     front_window_lock(1);
     aw = front_native_window(&gen);
     if (aw && W.sc && atomic_load(&g_pace_fifo) && atomic_load(&g_pace_low)) { W.gen = -1; W.why = "panel rate below the cap (DM_VK_PRESENT_PACE)"; }   // back to mailbox
+    {   // the swapchain's encoding follows the presented image's (g_want_srgb); a change makes a new swapchain
+        lk_(&g_rmu, LW_RMU); vtex *pv = tex_find(t->serial); int s_ = pv ? fmt_srgb(pv->f.f) : g_want_srgb; pthread_mutex_unlock(&g_rmu);
+        if (s_ != g_want_srgb) { g_want_srgb = s_; if (W.sc) { W.gen = -1; W.why = s_ ? "the game presents an sRGB image" : "the game presents a UNORM image"; } }
+    }
     if (!aw || gen != W.gen) { win_drop(); W.gen = gen; if (aw) win_make(aw); }
     if (!aw || !W.sc) { front_window_lock(0); return; }
     lk_(&g_rmu, LW_RMU); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
