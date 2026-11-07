@@ -1486,7 +1486,9 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
     // An unknown format used to stop them by chance; a plausible one would have made an image of garbage size from a garbage storage pointer
     if (!t || t->magic != MAGIC('T', 'E', 'X', 0)) { if (t) g_tex_dead++; return NULL; }
     lk_(&g_rmu, LW_RMU); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
-    if (v && v->lcpu && !v->gpu && !for_rt && v->lhash_gen != g_bvgen) {   // a CPU-written linear texture (Unreal's Slate font atlas, a glyph cache): the GPU reads it in place on the Switch
+    // Not while evicted (tex_evict, the low-memory trim): its image is gone, and the remake below uploads it from its storage anyway. Tomodachi Life crashed in the driver's
+    // vkCmdCopyBufferToImage2 two frames after a trim evicted 58 textures: this upload went into VK_NULL_HANDLE (FINAL FANTASY RESONANCE's CPU-written atlases are used every frame)
+    if (v && v->lcpu && !v->gpu && !v->evicted && !for_rt && v->lhash_gen != g_bvgen) {   // a CPU-written linear texture (Unreal's Slate font atlas, a glyph cache): the GPU reads it in place on the Switch
         v->lhash_gen = g_bvgen; uint64_t h = mem_hash(t->mem, t->L.size);
         if (h != v->lhash) { v->lhash = h; tex_upload(v, t); }
     }
