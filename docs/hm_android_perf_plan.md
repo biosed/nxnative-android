@@ -261,26 +261,27 @@ Re-measure only, after H1–H3: compose offsets and generation changes break reu
 
 **Tablet, every build: Harvest Moon started by a device-side script**
 - The user allows the script to start Harvest Moon for fix tests. It is built on the Harvest Moon agent's `hm_run2.sh`, which has the input mapping (Switch A = `KEYCODE_BUTTON_B`, …) and the tap points of the notification dialog and the Play button.
+- The Harvest Moon agent writes this script: it loads slot 2 and holds the heavy scene.
 - It runs as `setsid nohup sh` from `/data/local/tmp/hmperf/<session>/`, and the logs are pulled after. The game can drop the network adb.
 - Installs and the session's start go through the lead.
 - **Before the first run:**
   - The tablet is free: no game of the user's in front. If FF12 is open, the FF12 hibernate procedure comes first.
   - No leftovers from an aborted run: the game not running, the clean `env.txt` in place.
-  - The user's save folder is copied to `/data/local/tmp/hmperf/<session>/save_bak/`. It is never written back without the user.
+  - **The script never saves; it only loads slot 2.** The user's save is in slot 2, next to the heavy scene. Saves live in the app's internal storage (`getFilesDir()/save`, `MenuActivity` :96), which adb cannot read in a build that is not debuggable, so there is no backup.
 - **One run** (one switch value, one fresh process, because most switches are read at start):
   1. Write that run's `env.txt`: the clean one plus that run's line, mode 644.
   2. `am start` the game.
   3. Tap the notification dialog, then Settings "Play".
   4. Wait for the title in the log.
   5. Continue: inputs on the Continue path only, with the screen checked by a shot or a log line before the confirming press. **Never New Game; the script never presses through a menu it has not recognised. On anything unexpected it stops, force-stops the game and restores `env.txt`.**
-  6. Load the user's save, then reach and hold the heavy scene: no input while measuring, so the camera and the scene stay the same.
+  6. Load slot 2, then reach and hold the heavy scene: no input while measuring, so the camera and the scene stay the same.
   7. Settle 60 s.
   8. Measure two full 600-frame windows: the backend's per-600 lines, and the clocks and heat lines alongside.
   9. One shot at a fixed frame after the settle (`DM_VK_SHOTS`).
   10. Force-stop, and restore the clean `env.txt`.
 - **Memory-raising runs** (ring env tests, H0.5) abort when MemAvailable drops below 600 MB, and never come first in a session.
 - **The spot.** The A/B needs Continue to land at the heavy scene, or a few fixed inputs from it.
-  - If the user's current save is elsewhere, the Harvest Moon agent and the lead ask the user to save at the spot in a spare slot. The script never saves over a slot.
+  - The user's save in slot 2 is next to the heavy scene. The script never saves.
   - The first sessions check that two runs with the same switches give the same draws a frame, dispatches a frame and render passes a frame within 5%. Otherwise the spot is not repeatable enough for an A/B.
 - **One switch a session:**
   - Its verify mode (`=2`) first: 0 differences over ≥3,000 frames.
