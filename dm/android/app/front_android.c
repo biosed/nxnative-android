@@ -9,6 +9,7 @@
 #include "dm_input.h"
 #include "front.h"
 #include "stick_tap.h"
+#include "touch_map.h"
 #include <android/input.h>
 #include <android/log.h>
 #include <android/keycodes.h>
@@ -159,8 +160,10 @@ static const struct { const char *name, *sprite, *label; uint64_t bit; int group
 static struct { float x[NG], y[NG], s[NG]; int hidden[NG], fixed[2]; float zone[2][4]; float opacity; uint64_t hide; int stick_click; } g_ctl;   // the layout, normalised (ctl_layout); stick_click: double tap on a stick = L3 / R3
 static struct { float cx, cy, r; int vis; } g_vb[NVB];   // the buttons in window pixels
 static _Atomic int g_ovl_show; static _Atomic uint64_t g_ovl_on; static float g_vw, g_vh;
-// Fingers down (by pointer ID): kind 1 buttons, 2 left stick, 3 right stick; x0 / y0 the stick's centre (where it came down, or the fixed place), x / y where it is
-static struct { int32_t id; int kind; float x0, y0, x, y; float fx, fy, maxd; int click; } g_ptr[NPTR]; static int g_nptr;   // fx / fy where it came down, maxd how far it went; click: a stick's double tap (L3 / R3)
+// Fingers down (by pointer ID): kind 1 buttons, 2 left stick, 3 right stick, 4 the game's touch screen (gid its finger there, 0-15), 5 nothing (came down on a black bar beside
+// the picture, or on a stick another finger holds); x0 / y0 the stick's centre (where it came down, or the fixed place), x / y where it is
+enum { PK_NONE = 0, PK_BTN = 1, PK_LS = 2, PK_RS = 3, PK_TOUCH = 4, PK_DEAD = 5 };
+static struct { int32_t id; int kind; float x0, y0, x, y; float fx, fy, maxd; int click, gid; } g_ptr[NPTR]; static int g_nptr;   // fx / fy where it came down, maxd how far it went; click: a stick's double tap (L3 / R3)
 static stick_tap g_tap[2];   // each stick's last touch (stick_tap.h)
 static struct { int on; float x0, y0, x, y; } g_stick[2];   // what front_overlay draws (copied under g_smu)
 static pthread_mutex_t g_smu = PTHREAD_MUTEX_INITIALIZER;
@@ -200,9 +203,9 @@ static uint64_t vb_hit(float x, float y) {   // the buttons a finger at (x, y) i
     return b;
 }
 static float stick_r(int k) { return STICK_R * g_vh * g_ctl.s[G_LS + k]; }
-static int stick_at(float x, float y, float *x0, float *y0) {   // the stick a finger coming down at (x, y) takes (2 left, 3 right), else 0
+static int stick_at(float x, float y, float *x0, float *y0, int floating) {   // the stick a finger coming down at (x, y) takes (2 left, 3 right), else 0; floating 0: fixed sticks only
     for (int k = 0; k < 2; k++) {
-        if (g_ctl.hidden[G_LS + k]) continue;
+        if (g_ctl.hidden[G_LS + k] || (!floating && !g_ctl.fixed[k])) continue;
         if (g_ctl.fixed[k]) { float cx = g_ctl.x[G_LS + k] * g_vw, cy = g_ctl.y[G_LS + k] * g_vh;
                               if (hypotf(x - cx, y - cy) < 1.35f * stick_r(k)) { *x0 = cx; *y0 = cy; return 2 + k; } continue; }
         const float *z = g_ctl.zone[k];
@@ -248,8 +251,9 @@ int front_overlay_atlas(const void **rgba, int *w, int *h, int *cell, int *cols)
 void front_overlay_atlas_release(void) { free(g_atlas); g_atlas = NULL; }
 // What the backend draws over the picture, in window pixels (0 = hidden): a sprite per button; per stick its base and its knob (a fixed one always, a floating one while held).
 // Without the atlas's names (an APK without it) the outlines and labels of before, and a ring of dots per stick
+static int touch_mode(void);
 int front_overlay(dm_ovl *out, int max) {
-    if (!atomic_load(&g_ovl_show)) return 0;
+    if (!atomic_load(&g_ovl_show) || touch_mode() == 2) return 0;
     vb_layout(); uint64_t on = atomic_load(&g_ovl_on); int n = 0; float al = g_ctl.opacity;
     for (int i = 0; i < NVB && n < max; i++) {
         if (!g_vb[i].vis) continue;
@@ -259,7 +263,7 @@ int front_overlay(dm_ovl *out, int max) {
     }
     typeof(g_stick[0]) st[2]; pthread_mutex_lock(&g_smu); memcpy(st, g_stick, sizeof st); pthread_mutex_unlock(&g_smu);
     for (int k = 0; k < 2; k++) {
-        if (g_ctl.hidden[G_LS + k]) continue;
+        if (g_ctl.hidden[G_LS + k] || (touch_mode() && !g_ctl.fixed[k])) continue;   // touch mode: no floating sticks
         float R = stick_r(k), kr = KNOB_R * g_vh * g_ctl.s[G_LS + k], x0 = st[k].x0, y0 = st[k].y0, ddx = 0, ddy = 0;
         if (g_ctl.fixed[k]) { x0 = g_ctl.x[G_LS + k] * g_vw; y0 = g_ctl.y[G_LS + k] * g_vh; } else if (!st[k].on) continue;
         if (st[k].on) { ddx = st[k].x - x0; ddy = st[k].y - y0; float m = hypotf(ddx, ddy); if (m > R) { ddx *= R / m; ddy *= R / m; } }
@@ -274,29 +278,70 @@ int front_overlay(dm_ovl *out, int max) {
     }
     return n;
 }
+// ---------- The game's touch screen ----------
+// DM_TOUCH_MODE (the menu's "Touch screen"; default the profile's touch_mode, game.py): 0 = a finger on no button moves the floating stick of its half, as before (a finger outside
+// every stick zone touches the game); 1 = the buttons and fixed sticks stay, every other finger touches the game; 2 = no on-screen controls, every finger touches the game.
+// A finger keeps to what it came down on: one that started on a control never becomes a touch, and a touch never takes over a control. The window's pixels are mapped onto
+// the picture as the backend letterboxes it (touch_map.h, dm_vk_picture); a finger that comes down on a black bar is ignored, one that slides onto it stays at the edge.
+// The touch screen reaches the game in handheld mode only, as on the Switch (hle_hid.c touch_read)
+int dm_vk_picture(int *w, int *h) __attribute__((weak));
+#ifndef DM_GAME_TOUCH_MODE
+#define DM_GAME_TOUCH_MODE 0
+#endif
+static int touch_mode(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = getenv("DM_TOUCH_MODE"); int v = e && *e ? atoi(e) : DM_GAME_TOUCH_MODE; m = v < 0 || v > 2 ? 0 : v;
+                 LOG("front end: touch mode %d (%s; %s)", m, m == 2 ? "every finger touches the game" : m ? "buttons, fixed sticks, the rest touches the game" : "floating sticks, as before",
+                     e && *e ? "DM_TOUCH_MODE" : "the profile's touch_mode"); }
+    return m;
+}
+static int g_ntouch_prev;
+static int touch_map_win(float x, float y, int clamp, float *u, float *v) {
+    int pw = 0, ph = 0, st = dm_vk_picture ? dm_vk_picture(&pw, &ph) : 0;
+    return touch_map(x, y, g_vw, g_vh, pw, ph, st, clamp, u, v);
+}
+static void touch_log(const char *what, int32_t id, float x, float y, float u, float v, int gid) {   // one line a finger down: the first 40, then every 100th
+    static int n; n++; if (n > 40 && n % 100) return;
+    if (gid >= 0) LOG("touch #%d: finger %d down at %.0f,%.0f → the game's screen %.3f,%.3f (touch id %d)", n, (int)id, x, y, u, v, gid);
+    else LOG("touch #%d: finger %d down at %.0f,%.0f: %s", n, (int)id, x, y, what);
+}
+static void touch_push(void) {   // every game finger to the host (dm_touch_set takes the whole set each time); nothing sent while none is down or lifted
+    dm_touch t[NPTR]; int n = 0;
+    for (int i = 0; i < g_nptr; i++) if (g_ptr[i].kind == PK_TOUCH) { float u, v; touch_map_win(g_ptr[i].x, g_ptr[i].y, 1, &u, &v); t[n++] = (dm_touch){(uint32_t)g_ptr[i].gid, u, v}; }
+    if (n || g_ntouch_prev) dm_touch_set(n ? t : NULL, n);
+    g_ntouch_prev = n;
+}
 static void touch_event(AInputEvent *e) {
     vb_layout();
+    int tm = touch_mode();
     int32_t act = AMotionEvent_getAction(e), kind = act & AMOTION_EVENT_ACTION_MASK;
     size_t ai = (size_t)((act & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
     uint64_t tnow = now_ns();
     if (kind == AMOTION_EVENT_ACTION_UP || kind == AMOTION_EVENT_ACTION_CANCEL) {   // the last finger up: nothing is held; a stick's touch may have been the first of a double tap
-        for (int i = 0; i < g_nptr; i++) if (g_ptr[i].kind >= 2) { int k = g_ptr[i].kind - 2;
+        for (int i = 0; i < g_nptr; i++) if (g_ptr[i].kind == PK_LS || g_ptr[i].kind == PK_RS) { int k = g_ptr[i].kind - 2;
             stick_tap_up(&g_tap[k], tnow, kind == AMOTION_EVENT_ACTION_CANCEL ? 1.f : g_ptr[i].maxd / stick_r(k), g_ptr[i].click); }
         g_nptr = 0;
     }
     else {
         if (kind == AMOTION_EVENT_ACTION_DOWN || kind == AMOTION_EVENT_ACTION_POINTER_DOWN) {   // a new finger: a button, else the stick whose zone or place it is in (one finger per stick)
             int32_t id = AMotionEvent_getPointerId(e, ai); float x = AMotionEvent_getX(e, ai), y = AMotionEvent_getY(e, ai), x0 = x, y0 = y;
-            int k = vb_hit(x, y) ? 1 : stick_at(x, y, &x0, &y0);
-            for (int i = 0; i < g_nptr && k > 1; i++) if (g_ptr[i].kind == k) k = 0;   // that stick is held already: this finger does nothing
             if (kind == AMOTION_EVENT_ACTION_DOWN) g_nptr = 0;
-            int click = k >= 2 && stick_tap_down(&g_tap[k - 2], tnow) && g_ctl.stick_click;   // the second touch of a double tap on that stick: its click while held
-            if (g_nptr < NPTR) g_ptr[g_nptr++] = (typeof(g_ptr[0])){id, k, x0, y0, x, y, x, y, 0, click};
+            int k = tm == 2 ? PK_NONE : vb_hit(x, y) ? PK_BTN : stick_at(x, y, &x0, &y0, tm == 0);
+            for (int i = 0; i < g_nptr && (k == PK_LS || k == PK_RS); i++) if (g_ptr[i].kind == k) k = PK_DEAD;   // that stick is held already: this finger does nothing
+            int gid = -1; float u = 0, v = 0;
+            if (k == PK_NONE) {   // on no control: the game's touch screen, when it is on the picture
+                if (!touch_map_win(x, y, 0, &u, &v)) { k = PK_DEAD; touch_log("on a black bar beside the picture: ignored", id, x, y, 0, 0, -1); }
+                else { int used = 0; for (int i = 0; i < g_nptr; i++) if (g_ptr[i].kind == PK_TOUCH) used |= 1 << g_ptr[i].gid;
+                       for (gid = 0; gid < 16 && (used >> gid & 1); gid++) {}
+                       if (gid < 16) { k = PK_TOUCH; touch_log(NULL, id, x, y, u, v, gid); } else { k = PK_DEAD; gid = -1; } }
+            } else touch_log(k == PK_BTN ? "on a button" : k == PK_DEAD ? "on a stick another finger holds" : "on a stick", id, x, y, 0, 0, -1);
+            int click = (k == PK_LS || k == PK_RS) && stick_tap_down(&g_tap[k - 2], tnow) && g_ctl.stick_click;   // the second touch of a double tap on that stick: its click while held
+            if (g_nptr < NPTR) g_ptr[g_nptr++] = (typeof(g_ptr[0])){id, k, x0, y0, x, y, x, y, 0, click, gid};
         }
         if (kind == AMOTION_EVENT_ACTION_POINTER_UP) {
             int32_t id = AMotionEvent_getPointerId(e, ai);
             for (int i = 0; i < g_nptr; i++) if (g_ptr[i].id == id) {
-                if (g_ptr[i].kind >= 2) { int k = g_ptr[i].kind - 2; stick_tap_up(&g_tap[k], tnow, g_ptr[i].maxd / stick_r(k), g_ptr[i].click); }
+                if (g_ptr[i].kind == PK_LS || g_ptr[i].kind == PK_RS) { int k = g_ptr[i].kind - 2; stick_tap_up(&g_tap[k], tnow, g_ptr[i].maxd / stick_r(k), g_ptr[i].click); }
                 g_ptr[i] = g_ptr[--g_nptr]; break; }
         }
         for (size_t p = 0; p < AMotionEvent_getPointerCount(e); p++) {   // where every finger is now
@@ -307,8 +352,8 @@ static void touch_event(AInputEvent *e) {
     }
     uint64_t btn = 0; float ax[4] = {0}; typeof(g_stick[0]) st[2] = {{0}};
     for (int i = 0; i < g_nptr; i++) {
-        if (g_ptr[i].kind == 1) { btn |= vb_hit(g_ptr[i].x, g_ptr[i].y); continue; }
-        if (g_ptr[i].kind < 2) continue;
+        if (g_ptr[i].kind == PK_BTN) { btn |= vb_hit(g_ptr[i].x, g_ptr[i].y); continue; }
+        if (g_ptr[i].kind != PK_LS && g_ptr[i].kind != PK_RS) continue;
         int k = g_ptr[i].kind - 2; float ddx = g_ptr[i].x - g_ptr[i].x0, ddy = g_ptr[i].y - g_ptr[i].y0, m = hypotf(ddx, ddy), R = stick_r(k);
         st[k] = (typeof(st[0])){1, g_ptr[i].x0, g_ptr[i].y0, g_ptr[i].x, g_ptr[i].y};
         if (g_ptr[i].click) btn |= k ? DM_BTN_RS : DM_BTN_LS;   // a double tap held: the stick's click (it still moves the stick)
@@ -318,7 +363,8 @@ static void touch_event(AInputEvent *e) {
     if (g_touch_slot < 0) g_touch_slot = dev_slot(-1000000);
     g_dev[g_touch_slot].btn = btn;
     g_dev[g_touch_slot].ax[AX_LX] = ax[0]; g_dev[g_touch_slot].ax[AX_LY] = ax[1]; g_dev[g_touch_slot].ax[AX_RX] = ax[2]; g_dev[g_touch_slot].ax[AX_RY] = ax[3];
-    atomic_store(&g_ovl_on, btn); atomic_store(&g_ovl_show, 1);
+    atomic_store(&g_ovl_on, btn); if (tm != 2) atomic_store(&g_ovl_show, 1);
+    touch_push();
     pads_push();
 }
 static void kbd_apply(void) {   // the keyboard's slot from its keys
@@ -351,6 +397,7 @@ static void input_release_all(void) {
     pthread_mutex_lock(&g_pmu);
     for (int i = 0; i < NDEV; i++) { g_dev[i].btn = 0; memset(g_dev[i].ax, 0, sizeof g_dev[i].ax); }
     memset(&g_kbd, 0, sizeof g_kbd); g_latch = 0; g_combo_since = 0; g_nptr = 0;
+    if (g_ntouch_prev) { g_ntouch_prev = 0; dm_touch_set(NULL, 0); }   // the game's touches lifted too
     pthread_mutex_lock(&g_smu); memset(g_stick, 0, sizeof g_stick); pthread_mutex_unlock(&g_smu);
     pads_push_();
     pthread_mutex_unlock(&g_pmu);

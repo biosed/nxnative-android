@@ -4941,6 +4941,10 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
 void mtl_finish(void) { if (g_rec_drain) g_rec_drain(); mtl_wait(g_fence, UINT64_MAX); }
 void mtl_drain(void) { mtl_finish(); pcache_save(); }   // going to the background: the pipelines made so far are kept for the next run
 
+// The picture as last presented (its crop's size, and whether it is stretched over the window): app/front_android.c maps a finger on the window onto the game's touch screen
+// with it (touch_map.h), the same letterbox the blit below draws. 0 until the first present
+static _Atomic uint64_t g_pic_wh;
+int dm_vk_picture(int *w, int *h) { uint64_t v = atomic_load(&g_pic_wh); *w = (int)(v >> 32 & 0x7fffffff); *h = (int)(uint32_t)v; return (int)(v >> 63); }
 // ---------- Presentation: counted; DM_VK_SHOTS writes chosen frames as BMP files ----------
 // Only the window crop is written, the part of the texture the screen shows (win_present's source rectangle): a game in handheld mode renders 1280x720 into the top left of
 // a 1920x1080 swapchain texture (Harvest Moon: Echoes of Teradea, WindowCrop 0,0 1280x720), and the whole texture made a shot with the picture in one corner
@@ -5326,6 +5330,7 @@ static void win_present(const tex_t *t, const int crop[4]) {
     vkCmdClearColorImage(cb, W.img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rr);
     int32_t sx = crop ? crop[0] : 0, sy = crop ? crop[1] : 0, sw = crop && crop[2] ? crop[2] : (int32_t)v->w, sh = crop && crop[3] ? crop[3] : (int32_t)v->h;
     static int stretch = -1; if (stretch < 0) { const char *e = getenv("DM_SCREEN_FIT"); stretch = e && !strcmp(e, "stretch"); }
+    atomic_store(&g_pic_wh, (uint64_t)(uint32_t)sw << 32 | (uint32_t)sh | (stretch ? 1ull << 63 : 0));   // what the front end maps fingers onto (dm_vk_picture)
     int32_t dw = (int32_t)W.ext.width, dh = (int32_t)W.ext.height, dx = 0, dy = 0;
     if (!stretch) { if ((int64_t)dw * sh > (int64_t)dh * sw) { dw = (int32_t)((int64_t)dh * sw / sh); dx = ((int32_t)W.ext.width - dw) / 2; } else { dh = (int32_t)((int64_t)dw * sh / sw); dy = ((int32_t)W.ext.height - dh) / 2; } }
     VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{sx, sy, 0}, {sx + sw, sy + sh, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
