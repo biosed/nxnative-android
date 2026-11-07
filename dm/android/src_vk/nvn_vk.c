@@ -94,6 +94,14 @@ static _Atomic uint64_t g_h0_xr_fresh, g_h0_xr_fresh_b, g_h0_xr_kept, g_h0_xr_no
 static _Atomic uint64_t g_h0_gwh_ns[2], g_h0_gwh_n[2];   // g_gwmu held: [0] by the recording thread's sites, [1] by the completion thread's
 static uint32_t g_h0_ctx_used; static uint64_t g_h0_look, g_h0_walk;   // lookups that walked the entries, and the entries walked   // contexts used in the window (bit per context)
 #define H0_GWH_T0() uint64_t h0t_ = stat_ns()
+// H0 sawtooth (hm6: GPU time per frame growing ~0.28 ms a frame, reset at the early trims): per 100 frames a line ('vk: H0 frame'), and a line when a quantity falls or a chain breaks
+static int g_h0_cpass;   // the open pass was begun by gw_compose (its draws are the composed passes' draws)
+static uint64_t g_h0_cp_draws, g_h0_cp_prims, g_h0_cp_vbytes, g_h0_cmp_bytes, g_h0_cmp_cur_bytes;   // draws in composed passes (direct: count x instances), their bound vertex bytes; bytes composed (all, this submission's parts)
+static uint64_t g_h0_chain_n, g_h0_chain_b, g_h0_dsp_fresh;   // dispatch storage buffers bound from a running submission's GPU-written range (chained: no snapshot), their bytes; bound from guest memory
+static uint64_t g_h0_gw_n, g_h0_gw_b, g_h0_gw_nmax, g_h0_gw_bmax;   // GPU-written entries at submission starts (summed, max), their bytes
+static _Atomic uint64_t g_h0_ii_draws, g_h0_ii_inst, g_h0_ii_prims, g_h0_ii_max, g_h0_ii_cp_inst;   // indirect draws read back at completion: draws, instances, count x instances, most instances in one, instances in composed passes
+static _Atomic uint64_t g_h0_lost_b, g_h0_lost_n, g_h0_snap_skip;   // chained write-backs: guest bytes the CPU wrote while the submission ran, overwritten by the whole-range write-back; ranges checked; not checked (too big)
+static uint8_t *g_h0_indp;   // ind_args: the ring bytes of GPU-written arguments
 #define H0_GWH_END(k) do { atomic_fetch_add_explicit(&g_h0_gwh_ns[k], stat_ns() - h0t_, memory_order_relaxed); atomic_fetch_add_explicit(&g_h0_gwh_n[k], 1, memory_order_relaxed); } while (0)
 static VkInstance g_inst; static VkPhysicalDevice g_pd; static VkDevice g_dev; static VkQueue g_q; static uint32_t g_qf;
 static VkPhysicalDeviceMemoryProperties g_memp; static VkPhysicalDeviceProperties g_props;
@@ -224,7 +232,8 @@ typedef struct {
     int reset_done;   // its command and descriptor pools were reset by the completion thread (ctx_complete), off the submit thread (each reset took ~9% of it)
     uint64_t hold;   // the last later submission that reads this one's ring (gw_find): the ring is not reused, nor its extra rings freed, before that one is done too
     // The work recorded into it (draws and dispatches), the last TRN kept and the heaviest noted: dumped when the GPU is lost (trace_dump), to name what hung it
-    struct trace { char kind, gpu_ind; char a[17], b[17]; const char *pa, *pb; uint32_t n0, n1, n2, zero_tb; } tr[48]; uint32_t ntr, ndraw, ndisp, max_groups; struct trace heavy;   // pa / pb: the shader keys themselves (DM_VK_LEAN; shaders are never freed), else copied into a / b
+    struct trace { char kind, gpu_ind; char a[17], b[17]; const char *pa, *pb; uint32_t n0, n1, n2, zero_tb; } tr[48]; uint32_t ntr, ndraw, ndisp, max_groups; struct trace heavy;
+    const uint8_t *h0ip[256]; uint8_t h0ix[256]; int nh0ip;   // H0: GPU-written indirect arguments of this submission's draws (read back at completion); bit 0 indexed, bit 1 in a pass a compose began   // pa / pb: the shader keys themselves (DM_VK_LEAN; shaders are never freed), else copied into a / b
 } ctx_t;
 enum { TRN = 48 };
 static _Atomic uint64_t g_gpu_ns, g_gpu_cum;   // g_gpu_cum: never reset (the long-frame lines)
@@ -524,7 +533,7 @@ static void pass_end_(int line); static int pass_begin(void); static int g_pass_
 static void h0_compose(uint64_t addr, uint64_t size, VkDeviceSize align, const gw_t *e) {
     int nov = 0, cur = 0;
     for (int i = 0; i < g_ngw; i++) { const gw_t *x = &g_gw[i]; if (addr >= x->addr + x->size || x->addr >= addr + size) continue; nov++; if (x->fence == g_fence + 1) cur = 1; }
-    g_h0_cmp[cur][g_h0_caller < H0C_N ? g_h0_caller : H0C_OTHER]++;
+    g_h0_cmp[cur][g_h0_caller < H0C_N ? g_h0_caller : H0C_OTHER]++; g_h0_cmp_bytes += size;
     uint64_t end = addr + size, eend = e->addr + e->size; int inside = addr >= e->addr && end <= eend;
     if (nov > 1) g_h0_cmp_why[H0R_MULTI]++;
     if (e->exact) g_h0_cmp_why[H0R_EXACT]++;
@@ -554,11 +563,11 @@ static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align)
         for (int i = 0; i < g_ngw; i++) {
             const gw_t *e = &g_gw[i]; if (e->fence != g_fence + 1 || addr >= e->addr + e->size || e->addr >= addr + size) continue;
             uint64_t lo = e->addr > addr ? e->addr : addr, hi = e->addr + e->size < addr + size ? e->addr + e->size : addr + size;
-            VkBufferCopy bc = {e->off + (lo - e->addr), ro + (lo - addr), hi - lo}; vkCmdCopyBuffer(C->cb, e->buf, C->ring, 1, &bc);
+            VkBufferCopy bc = {e->off + (lo - e->addr), ro + (lo - addr), hi - lo}; vkCmdCopyBuffer(C->cb, e->buf, C->ring, 1, &bc); g_h0_cmp_cur_bytes += hi - lo;
         }
         { VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
           vkCmdPipelineBarrier(C->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL); }   // the copies, for what reads the result
-        if (was_open) pass_begin();
+        if (was_open) { pass_begin(); g_h0_cpass = 1; }
     }
     return ro;
 }
@@ -728,6 +737,14 @@ static void snap_free(void *p, size_t n) {
 // guest clock when the completion thread saw the fence), the start that minus the submission's GPU span. DM_VK_GPU_TS=0: one time for all, as before
 static int gpu_ts_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GPU_TS"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_GPU_TS=0: counter timestamps all take the completion time"); } return v; }
 static void ctx_complete(ctx_t *c) {
+    if (c->nh0ip) {   // H0: the GPU-written indirect arguments this submission drew with (vertex or index count, instances)
+        static uint64_t prev; uint64_t tot = 0, mx = atomic_load(&g_h0_ii_max);
+        for (int i = 0; i < c->nh0ip; i++) { uint32_t a[2]; memcpy(a, c->h0ip[i], 8); tot += a[1]; atomic_fetch_add(&g_h0_ii_prims, (uint64_t)a[0] * a[1]); if (a[1] > mx) mx = a[1];
+                                             if (c->h0ix[i] & 2) atomic_fetch_add(&g_h0_ii_cp_inst, a[1]); }
+        atomic_fetch_add(&g_h0_ii_draws, (uint64_t)c->nh0ip); atomic_fetch_add(&g_h0_ii_inst, tot); atomic_store(&g_h0_ii_max, mx);
+        static int nl; if (prev >= 1000 && tot * 2 < prev && nl++ < 40) LOG("vk: H0 indirect instances fell: submission %llu drew %llu instances in %d GPU-written indirect draws, the one before %llu", (unsigned long long)c->fence_val, (unsigned long long)tot, c->nh0ip, (unsigned long long)prev);
+        prev = tot; c->nh0ip = 0;
+    }
     if (patch_verify()) { int ci = (int)(c - g_ctx); if (ci >= 0 && ci < 32 && g_npv[ci]) patch_verify_ctx(ci); }
     uint64_t ts[3], t_end = gpu_ticks(), t_top = t_end;
     if (vkGetQueryPoolResults(g_dev, c->qp, 0, 3, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[2] >= ts[0]) atomic_fetch_add(&g_up_gpu_ns, (uint64_t)((double)(ts[2] - ts[0]) * g_props.limits.timestampPeriod));
@@ -764,7 +781,11 @@ static void ctx_complete(ctx_t *c) {
             snap_free((void *)snap, p->n); g_wb_words += nw; g_wb_bytes += p->n;
         }
         else if (p->kind == 6) { for (uint32_t r = 0; r < p->v; r++) memcpy((uint8_t *)p->dst + (size_t)r * p->mode, p->src + (size_t)r * p->mode, p->type); }   // rows: v rows of type bytes, mode apart
-        else if (p->kind == 3) { memcpy(p->dst, p->src, p->n);
+        else if (p->kind == 3) {
+            if (p->addr) { const uint8_t *h0s = (const uint8_t *)(uintptr_t)p->addr, *g = p->dst; uint64_t lost = 0;   // H0: CPU writes since the dispatch was recorded, about to be overwritten
+                           for (size_t q = 0; q + 4 <= p->n; q += 4) if (memcmp(g + q, h0s + q, 4) && memcmp(g + q, p->src + q, 4)) lost += 4;
+                           atomic_fetch_add(&g_h0_lost_b, lost); atomic_fetch_add(&g_h0_lost_n, 1); free((void *)h0s); }
+            memcpy(p->dst, p->src, p->n);
             if (c->plog && p->n <= 64) { float f[16]; memcpy(f, p->src, p->n); LOG("plog: written back %#llx +%zu: %g %g %g %g%s", (unsigned long long)(uintptr_t)p->dst, p->n, f[0], p->n > 4 ? f[1] : 0, p->n > 8 ? f[2] : 0, p->n > 12 ? f[3] : 0, p->n > 16 ? " ..." : ""); } }
     }
     c->npost = 0;
@@ -2250,7 +2271,7 @@ static void sec_end(void) {   // the open pass's secondary ends; the primary ren
     g_sn_passes++; ds_last_newcb();
 }
 static void pass_end_(int line) {
-    g_rt_hold = NULL;
+    g_rt_hold = NULL; g_h0_cpass = 0;
     if (P.open) gsig_end(g_cur_sig, line);
     if (!P.open) { int pend = P.clr_d || P.clr_s; for (int i = 0; i < 8; i++) pend |= P.clr_c[i]; if (pend) pass_begin(); }   // clears with no draw after them still happen
     if (P.open) {
@@ -3590,7 +3611,7 @@ static void occ_end(VkCommandBuffer cb, int q) { if (q >= 0) vkCmdEndQuery(cb, C
 // Indirect arguments, n bytes at addr: 1 when guest memory holds them and they were read into out (written by the CPU, or by a submission that has completed: gw_find waits for
 // one still in flight), 2 when a dispatch of this submission writes them -- not run yet, so the GPU must read them: *b / *off is where
 static int ind_args(uint64_t addr, uint32_t n, void *out, VkBuffer *b, VkDeviceSize *off, int gpu_ok) {
-    g_h0_caller = H0C_IND; if (gw_find_(addr, n, 4, b, off, NULL, gpu_ok)) return 2;   // gpu_ok (dispatches): an earlier submission's arguments are read by the GPU too; draws wait for them and read them here (no whole-stream copies)   // this submission's own: drawn by the GPU; an earlier one's is waited for and read here (no whole-stream copies)
+    g_h0_caller = H0C_IND; g_h0_indp = NULL; if (gw_find_(addr, n, 4, b, off, &g_h0_indp, gpu_ok)) return 2;   // gpu_ok (dispatches): an earlier submission's arguments are read by the GPU too; draws wait for them and read them here (no whole-stream copies)   // this submission's own: drawn by the GPU; an earlier one's is waited for and read here (no whole-stream copies)
     memcpy(out, (const void *)(uintptr_t)addr, n); return 1;
 }
 // The bytes of a pool from addr on (at most cap): the extent of an index buffer an indirect draw reads, whose count only the GPU will know
@@ -3735,6 +3756,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (C->ntq & 1) C->tdraws[C->ntq / 2]++;   // draws in the timed pass (its signature's line)
     if (ind_b && (dw ? dw->prim : di->prim) == NVN_DRAW_PRIMITIVE_QUADS) { RED_ONCE(30, "a GPU-written indirect draw of quads is not implemented"); SKIP(3); }
     if (ind_b && di && di->itype == 0 && !g_has_u8) { RED_ONCE(37, "a GPU-written indirect draw with 8-bit indices needs VK_EXT_index_type_uint8"); SKIP(3); }
+    if (ind_b && g_h0_indp && C->nh0ip < 256) { C->h0ip[C->nh0ip] = g_h0_indp; C->h0ix[C->nh0ip++] = (uint8_t)((di ? 1 : 0) | (g_h0_cpass ? 2 : 0)); }   // H0: read back at completion
     int prim = dw ? dw->prim : di->prim;
     if (prim == NVN_DRAW_PRIMITIVE_LINE_LOOP || prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP || prim == NVN_DRAW_PRIMITIVE_PATCHES) { RED_ONCE(31, "primitive %d not implemented yet", prim); SKIP(4); }
     pso_key k; memset(&k, 0, sizeof k);
@@ -3858,6 +3880,8 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (vhi < vlo) { g_stat_draws++; return; }
     if (vlo < 0) vlo = 0;
     if (vs->vid) { int32_t bias = (int32_t)vlo; vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 4, &bias); g_vid_push++; if (bias) g_vid_nz++; }   // the shader adds it back to VertexIndex (spv_vid_bias)
+    if (g_h0_cpass) { g_h0_cp_draws++; if (!ind_b) g_h0_cp_prims += (uint64_t)(dw ? (dw->count > 0 ? dw->count : 0) : (di->count > 0 ? di->count : 0)) * inst;
+                      for (int s2 = 0; s2 < 16; s2++) if (S.vbuf[s2].address) g_h0_cp_vbytes += S.vbuf[s2].size; }   // H0: the composed passes' draws
     uint32_t used = 0, ext[16] = {0};
     for (int i = 0; i < S.nattr; i++) if (vs->vin_mask >> i & 1) { uint32_t st = S.attr[i].stream, e = S.attr[i].offset + 16; used |= 1u << st; if (e > ext[st]) ext[st] = e; }
     VkBuffer vbs[16]; VkDeviceSize vos[16];
@@ -3995,12 +4019,15 @@ static void dispatch(const p_dispatch *d) {
             if (q->kind == 3 && qa == w->addr && q->src == w->p && q->n == w->size) dup = 1;   // the same range again
             else if (q->kind == 5 && w->addr >= qa && w->addr + w->size <= qa + q->n && q->src + (w->addr - qa) == w->p) { dup = 1; dsnap = (const uint8_t *)(uintptr_t)q->addr + (w->addr - qa); } }   // inside one that goes back by its changed words
         uint8_t *snap = !dup && !from_gw && w->ci == g_ci && w->p ? snap_alloc(w->size) : NULL;
+        if (from_gw) { g_h0_chain_n++; g_h0_chain_b += w->size; } else g_h0_dsp_fresh++;   // H0
         if (snap) memcpy(snap, w->p, w->size);
         // The range is the GPU's until the submission completes (gw_find), with the bytes it started from to tell the CPU's later rewrites (gw_cpu_dirty)
         gw_add(w->addr, w->size, w->buf, w->off, w->p, g_fence + 1, w->ci, snap ? snap : dsnap, 0);   // this submission's fence value (mtl_sub_commit assigns g_fence + 1)
         if (dup) continue;
         if (snap) post_add((post_t){5, (void *)(uintptr_t)w->addr, 0, 0, (uint64_t)(uintptr_t)snap, 0, w->p, w->size});
-        else post_add((post_t){3, (void *)(uintptr_t)w->addr, 0, 0, 0, 0, w->p, w->size});
+        else {   // H0: a chained range (no snapshot) goes back whole; the guest's bytes now are kept aside (measurement only) to count what the CPU writes meanwhile that the write-back overwrites
+            uint8_t *h0s = NULL; if (from_gw) { if (w->size <= (1u << 20)) { h0s = malloc(w->size); if (h0s) memcpy(h0s, (const void *)(uintptr_t)w->addr, w->size); } else atomic_fetch_add(&g_h0_snap_skip, 1); }
+            post_add((post_t){3, (void *)(uintptr_t)w->addr, 0, 0, (uint64_t)(uintptr_t)h0s, 0, w->p, w->size}); }
     }
     g_gw_add_dfr = 0;
     g_stat_draws++;
@@ -4353,7 +4380,9 @@ void mtl_sub_begin(void) {
     atomic_fetch_add(&g_wait_ns, now_ns() - w0); atomic_fetch_add(&g_wait_cum, now_ns() - w0);
     ring_fit(c);
     C = c;
-    { void tex_evict_hook(void); tex_evict_hook(); } C->used = 0; C->up_used = 0; g_ndc = 0; g_wgen++; g_nwlog = 0; g_h0_gen[0]++; g_h0_sub_gen0 = g_wgen; g_h0_ctx_used |= 1u << (g_ci & 31); C->ring = C->ring0; C->ringp = C->ringp0; C->ring_size = C->ring0_size; C->total = 0;
+    { void tex_evict_hook(void); tex_evict_hook(); } C->used = 0; C->up_used = 0; g_ndc = 0; g_wgen++; g_nwlog = 0; g_h0_gen[0]++; g_h0_sub_gen0 = g_wgen; g_h0_ctx_used |= 1u << (g_ci & 31); C->nh0ip = 0;
+    { uint64_t gb = 0; int gn; lk_(&g_gwmu, LW_GWMU); gn = g_ngw; for (int i = 0; i < g_ngw; i++) gb += g_gw[i].size; pthread_mutex_unlock(&g_gwmu);   // H0: GPU-written entries live now
+      g_h0_gw_n += (uint64_t)gn; g_h0_gw_b += gb; if ((uint64_t)gn > g_h0_gw_nmax) g_h0_gw_nmax = (uint64_t)gn; if (gb > g_h0_gw_bmax) g_h0_gw_bmax = gb; } C->ring = C->ring0; C->ringp = C->ringp0; C->ring_size = C->ring0_size; C->total = 0;
     g_bvgen++;   // texel buffer views are this submission's (bview)
     C->ntr = C->ndraw = C->ndisp = C->max_groups = 0; memset(&C->heavy, 0, sizeof C->heavy); C->plog = 0;
     if (!C->reset_done) for (int i = 0; i < C->ndp; i++) VKCHECK(vkResetDescriptorPool(g_dev, C->dps[i], 0));   // normally done by the completion thread (ctx_complete)
@@ -5245,6 +5274,31 @@ static void adpf_frame(uint64_t cpu_ns, uint64_t gpu_ns) {
 // recording thread's cores, page faults by thread and the guest-memory protection's mprotect time
 static uint32_t g_pp[600]; static uint64_t g_npp, g_pp_last;
 static int u32cmp(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
+// H0 sawtooth: once a frame (the presenting thread). Every 100 frames a line with the frame's averages over those 100 (at most 2,000 lines); a line when the chained dispatch
+// bindings stop or start, or the live GPU-written bytes fall by half (at most 40 each)
+static void h0_tick(uint64_t n) {
+    static uint64_t f0, chain_prev = UINT64_MAX, gwb_prev, pf_ch, pf_gwb;   // per frame: the previous frame's values, the counters at the previous frame
+    static uint64_t b_ch, b_chb, b_gwn, b_gwb, b_cpd, b_cpp, b_cpv, b_cmb; static int nl, nlc, nlg;   // per 100 frames: the counters at the last line
+    uint64_t dch = g_h0_chain_n - pf_ch, dgwb = g_h0_gw_b - pf_gwb; pf_ch = g_h0_chain_n; pf_gwb = g_h0_gw_b;
+    if (chain_prev != UINT64_MAX && ((chain_prev && !dch) || (!chain_prev && dch)) && nlc++ < 40)
+        LOG("vk: H0 frame %llu: dispatches bound from a running submission's GPU-written ranges %s (%llu this frame, %llu the frame before)", (unsigned long long)n, dch ? "again" : "no longer", (unsigned long long)dch, (unsigned long long)chain_prev);
+    if (chain_prev != UINT64_MAX && gwb_prev > (1u << 20) && dgwb * 2 < gwb_prev && nlg++ < 40)
+        LOG("vk: H0 frame %llu: live GPU-written bytes at submission start fell to %.2f MB (%.2f MB the frame before)", (unsigned long long)n, dgwb / 1048576.0, gwb_prev / 1048576.0);
+    chain_prev = dch; gwb_prev = dgwb;
+    if (!f0) { f0 = n; b_ch = g_h0_chain_n; b_chb = g_h0_chain_b; b_gwn = g_h0_gw_n; b_gwb = g_h0_gw_b; b_cpd = g_h0_cp_draws; b_cpp = g_h0_cp_prims; b_cpv = g_h0_cp_vbytes; b_cmb = g_h0_cmp_bytes; return; }
+    if (n - f0 < 100) return;
+    double k = (double)(n - f0); f0 = n;
+    uint64_t id = atomic_exchange(&g_h0_ii_draws, 0), ii = atomic_exchange(&g_h0_ii_inst, 0), ip = atomic_exchange(&g_h0_ii_prims, 0), im = atomic_exchange(&g_h0_ii_max, 0), icp = atomic_exchange(&g_h0_ii_cp_inst, 0);
+    uint64_t lb = atomic_exchange(&g_h0_lost_b, 0), ln = atomic_exchange(&g_h0_lost_n, 0), sk = atomic_exchange(&g_h0_snap_skip, 0);
+    if (nl++ < 2000)
+        LOG("vk: H0 frame %llu, per frame over the last %.0f: GPU-written entries at submission start %.1f (%.2f MB; most %llu, %.2f MB); dispatch storage buffers bound from a running submission's range %.1f (%.2f MB), from guest memory %.1f; their whole write-backs: CPU writes overwritten %.0f bytes in %.1f ranges (%llu too big to check); composes %.2f MB (this submission's parts %.2f MB); composed passes' draws %.1f (direct vertices x instances %.0f, bound vertex bytes %.1f MB); GPU-written indirect draws %.1f, instances %.0f (in composed passes %.0f), vertices x instances %.0f, most instances in one %llu",
+            (unsigned long long)n, k, (g_h0_gw_n - b_gwn) / k, (g_h0_gw_b - b_gwb) / k / 1048576.0, (unsigned long long)g_h0_gw_nmax, g_h0_gw_bmax / 1048576.0,
+            (g_h0_chain_n - b_ch) / k, (g_h0_chain_b - b_chb) / k / 1048576.0, g_h0_dsp_fresh / k, lb / k, ln / k, (unsigned long long)sk,
+            (g_h0_cmp_bytes - b_cmb) / k / 1048576.0, g_h0_cmp_cur_bytes / k / 1048576.0, (g_h0_cp_draws - b_cpd) / k, (g_h0_cp_prims - b_cpp) / k, (g_h0_cp_vbytes - b_cpv) / k / 1048576.0,
+            id / k, ii / k, icp / k, ip / k, (unsigned long long)im);
+    b_ch = g_h0_chain_n; b_chb = g_h0_chain_b; b_gwn = g_h0_gw_n; b_gwb = g_h0_gw_b; b_cpd = g_h0_cp_draws; b_cpp = g_h0_cp_prims; b_cpv = g_h0_cp_vbytes; b_cmb = g_h0_cmp_bytes;
+    g_h0_dsp_fresh = 0; g_h0_cmp_cur_bytes = 0; g_h0_gw_nmax = g_h0_gw_bmax = 0;
+}
 // H0 (Harvest Moon plan v2): the per-600 lines; counters zeroed after. Called on the presenting thread with the other per-600 lines
 static void h0_lines(void) {
     static const char *cn[H0C_N] = {"vertex", "uniform", "storage", "texel", "indirect", "buffer copy", "image copy", "other"};
@@ -5481,6 +5535,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
                             g_pick_free = g_pick_grow = g_pick_wait = g_pick_wait_fence = g_pick_wait_hold = 0; } }
     if (n % 600 == 0) { LOG("vk: per frame over the last 600: GPU %.2f ms, recording %.2f ms, waiting for the GPU %.2f ms, present waiting %.2f ms", atomic_exchange(&g_gpu_ns, 0) / 600e6,
                             atomic_exchange(&g_rec_ns, 0) / 600e6, atomic_exchange(&g_wait_ns, 0) / 600e6, atomic_exchange(&g_pwait_ns, 0) / 600e6); }
+    h0_tick(n);
     if (n % 600 == 0) { h0_lines(); meas_lines(); }
     if (t) shot(t, n, crop);
     // On demand: DM_VK_DUMP_FILE=<path>; when that file appears (checked every 30 frames) the next frame is pass-logged and its render targets written, and the file is removed
