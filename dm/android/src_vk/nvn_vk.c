@@ -387,10 +387,10 @@ static int gw_pg_any(uint64_t addr, uint64_t size) {
 // DM_VK_GW_INDEX (Harvest Moon heavy scene; off by default): the walks over the GPU-written entries (gw_find, gw_any, gw_compose) test each entry's range in two compact arrays
 // beside g_gw (16 bytes an entry) instead of in the ~130-byte entries: hm9 walked 270 entries a lookup, 875 lookups a frame, with the lock held 10 ms a frame by the recording
 // thread. The arrays are kept in step with g_gw always (gw_add / gw_del / the oldest dropped); the switch only picks which the walks read. Same answers by construction
-static uint64_t g_gwa[NGW], g_gwe[NGW];   // [i]: g_gw[i].addr, g_gw[i].addr + g_gw[i].size
+static uint64_t g_gwa[NGW], g_gwe[NGW], g_gws[NGW];   // [i]: g_gw[i].addr, g_gw[i].addr + g_gw[i].size, g_gw[i].seq
 static int gw_index_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_INDEX"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_INDEX=1: GPU-written entries walked by their compact ranges"); } return v; }
 #define GW_MISS(i, lo, n) (gw_index_on() ? ((lo) >= g_gwe[i] || (lo) + (n) <= g_gwa[i]) : ((lo) >= g_gw[i].addr + g_gw[i].size || (lo) + (n) <= g_gw[i].addr))   // entry i does not overlap [lo, lo + n)
-static void gw_del(int i) { gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] = g_gw[--g_ngw]; g_gwa[i] = g_gwa[g_ngw]; g_gwe[i] = g_gwe[g_ngw]; }   // caller holds g_gwmu
+static void gw_del(int i) { gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] = g_gw[--g_ngw]; g_gwa[i] = g_gwa[g_ngw]; g_gwe[i] = g_gwe[g_ngw]; g_gws[i] = g_gws[g_ngw]; }   // caller holds g_gwmu
 static int g_gw_add_dfr;   // gw_add: the entry is a deferred dispatch's (see defer_on)
 static int g_gw_add_pad;   // gw_add: the entry is a padded window (DM_VK_GW_PAD)
 static int g_defer_haz;   // a draw's resources include what a deferred dispatch writes: the pass ends and the dispatches are recorded before the draw (DRAWQ)
@@ -403,10 +403,10 @@ static void gw_add(uint64_t addr, uint64_t size, VkBuffer buf, VkDeviceSize off,
     for (int i = 0; i < g_ngw; i++) if (g_gw[i].addr == addr && g_gw[i].size == size) {   // the newer write of one range replaces the older
         if (g_gw[i].seq > seq) { pthread_mutex_unlock(&g_gwmu); return; }   // a retired window's part under a later write of the same range: that write has every byte
         gw_del(i); break; }
-    if (g_ngw == NGW) { int o = 0; for (int i = 1; i < g_ngw; i++) if (g_gw[i].seq < g_gw[o].seq) o = i;
+    if (g_ngw == NGW) { int o = 0; for (int i = 1; i < g_ngw; i++) if (g_gws[i] < g_gws[o]) o = i;
         RED_ONCE(62, "more than %d GPU-written buffer ranges in flight: the oldest is forgotten", NGW); g_gw_dropped++; gw_del(o); }
     g_gwa[g_ngw] = addr; g_gwe[g_ngw] = addr + size;
-    g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0, (uint8_t)g_gw_add_dfr}; g_gw[g_ngw - 1].pad = (uint8_t)g_gw_add_pad; g_gw[g_ngw - 1].seq = seq; gw_pg_mark(addr, size, 1);
+    g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0, (uint8_t)g_gw_add_dfr}; g_gw[g_ngw - 1].pad = (uint8_t)g_gw_add_pad; g_gw[g_ngw - 1].seq = seq; g_gws[g_ngw - 1] = seq; gw_pg_mark(addr, size, 1);
     pthread_mutex_unlock(&g_gwmu);
 }
 // The ring range holding what the GPU wrote at [addr, addr + size), when an entry covers it and the offset in it keeps `align`. An entry of the submission being recorded is
@@ -663,7 +663,7 @@ static void h0_compose(uint64_t addr, uint64_t size, VkDeviceSize align, const g
 static int g_gw_ord[NGW];   // gw_ordered's answer (under g_gwmu)
 static int gw_ordered(uint64_t addr, uint64_t size) {   // the entries over [addr, addr + size), oldest first by seq, into g_gw_ord; caller holds g_gwmu
     int n = 0;
-    for (int i = 0; i < g_ngw; i++) { if (GW_MISS(i, addr, size)) continue; int k = n++; while (k > 0 && g_gw[g_gw_ord[k - 1]].seq > g_gw[i].seq) { g_gw_ord[k] = g_gw_ord[k - 1]; k--; } g_gw_ord[k] = i; }
+    for (int i = 0; i < g_ngw; i++) { if (GW_MISS(i, addr, size)) continue; int k = n++; while (k > 0 && g_gws[g_gw_ord[k - 1]] > g_gws[i]) { g_gw_ord[k] = g_gw_ord[k - 1]; k--; } g_gw_ord[k] = i; }
     return n;
 }
 static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align) {
@@ -702,7 +702,7 @@ static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *
     if (!__atomic_load_n(&g_ngw, __ATOMIC_RELAXED)) return 0;
     g_gw_calls++; if (!gw_pg_any(addr, size)) { g_gw_quick++; return 0; }
     lk_(&g_gwmu, LW_GWMU); H0_GWH_T0(); g_gw_walked += (uint64_t)g_ngw; g_h0_look++; g_h0_walk += (uint64_t)g_ngw;
-    int bi = -1; for (int i = 0; i < g_ngw; i++) if (!GW_MISS(i, addr, size) && (bi < 0 || g_gw[i].seq > g_gw[bi].seq)) bi = i;   // the newest write over the range decides
+    int bi = -1; for (int i = 0; i < g_ngw; i++) if (!GW_MISS(i, addr, size) && (bi < 0 || g_gws[i] > g_gws[bi])) bi = i;   // the newest write over the range decides
     for (int i = bi; i >= 0; i = -1) {   // once (a loop for the breaks below)
         gw_t *e = &g_gw[i];
         if (e->dfr) g_defer_haz = 1;   // what a deferred dispatch writes: it is recorded first (DRAWQ / pass_end)
@@ -3836,6 +3836,7 @@ static int ipk_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDevic
         if (i < 0) { uint64_t old = UINT64_MAX; for (int k = 0; k < IPK_NP; k++) if (ipk_idle(k) && g_ipk[k].last < old) { old = g_ipk[k].last; i = k; }   // the least recently used idle pool
                      if (i < 0) { g_ipk_fb_flight++; return 0; } ipk_free_slot(i); }
         g_ipk[i].base = base; g_ipk[i].size = psize; g_ipk[i].regid = rid; }
+    g_ipk[i].last = g_fence + 1;   // a refused pool in use keeps its slot (and its refusal) against eviction (re-check LOW)
     if (g_ipk[i].refused == 1 && now_ns() - g_ipk[i].refused_ns > 120000000000ull && ipk_idle(i)) { ipk_free_copies(i); g_ipk[i].refused = 0; g_ipk[i].hot = 0; }   // a hot pool: tried again (fresh copies) after 2 minutes, the game's use may have changed
     if (g_ipk[i].refused) { if (ipk_idle(i)) ipk_free_copies(i); g_ipk_fb_other++; return 0; }   // grill-risk re-check MED: a refused pool's copies are freed once the GPU is done with them
     g_ipk[i].span = span; g_ipk[i].last = g_fence + 1;
@@ -4770,7 +4771,7 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
             if (w) {
                 lk_(&g_gwmu, LW_GWMU);
                 int wi = padw_entry(w), newer = wi < 0;   // its entry gone, or a write newer than the window over dst: a copy into it would be hidden (the old way below, newest)
-                for (int i = 0; i < g_ngw && !newer; i++) newer = !GW_MISS(i, dst, n) && g_gw[i].seq > g_gw[wi].seq;
+                for (int i = 0; i < g_ngw && !newer; i++) newer = !GW_MISS(i, dst, n) && g_gws[i] > g_gws[wi];
                 if (w->nsub < NPADSUB && !newer) {
                     { gw_t *e = &g_gw[wi]; if (e->snap) memcpy((uint8_t *)(uintptr_t)e->snap + (dst - w->lo), (const void *)(uintptr_t)dst, n); }   // the CPU-side copy above is not a CPU rewrite
                     pthread_mutex_unlock(&g_gwmu);
