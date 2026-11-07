@@ -1,5 +1,7 @@
 # Path A: the Vulkan backend working like the Metal one
 
+The switches this design proposes (DM_VK_DIRTY_STATE, DM_VK_DBUF, DM_VK_ZC_VERIFY, DM_VK_MDRAW, DM_VK_HEAP) were never built: plan v4 took other steps, and FFR is frozen at vk19.75b. They are written without code quotes so docs/env_switches.tsv's check does not take them for removed switches.
+
 Target: the dungeon spot (~1,000 draws, ~40 passes, 8.8 submissions a frame). Today rec is 24.5–24.9 ms, the frame p50 is ~35 ms, and the GPU span is ~26 ms (runJ2, vk19.46–19.56 defaults).
 Backends: `dm/android/src_vk/nvn_vk.c` (Vulkan) and `dm/gfx/nvn/nvn_mtl.m` (Metal). Functions are cited by name.
 
@@ -89,7 +91,7 @@ Each stage stands alone and is measured on its own: same spot, env E, ≥4 in-st
 ### S1: Persistent pipeline state (pillar 4a)
 
 - **Change:** dirty bits from `OP_BIND_PROGRAM/STATE/VATTR/VSTREAM`, `OP_LINE_WIDTH`, `OP_PRIM_RESTART` and target changes; `draw` builds `pso_key` and calls `pso_get` only when dirty (today a ~600-byte compare every draw); dynamic state by dirty bit; debug checks (`g_plog`, `ctl_skip`) folded into one flag.
-- **Switch:** `DM_VK_DIRTY_STATE=1`. **Expected:** rec −1…−1.5 ms. Frame unchanged once GPU-bound.
+- **Switch:** DM_VK_DIRTY_STATE=1. **Expected:** rec −1…−1.5 ms. Frame unchanged once GPU-bound.
 - **Risk:** a missed dirty source gives a stale pipeline. Mitigation: a verify mode compares against the full key every Nth draw. **Effort:** 1–2 d.
 
 ### S2: Descriptor-buffer argument blocks (pillar 1, no shader change)
@@ -99,7 +101,7 @@ The Vulkan form of Mac's argument blocks.
 - **Descriptor bytes cached** (`vkGetDescriptorEXT` once): views in `tex_view`, samplers in `samp_get`, uniform/texel buffers per (address, range) from the ring or pool device address (BDA needed here, not in shaders).
 - **Per stage per draw:** if dirty (`g_bgen`, `g_reg_gen`, a serial gen as Mac's `g_ser_gen`, a guest-write gen for `K_TEXU`), resolve and memcpy bytes into a new block, else reuse; `vkCmdSetDescriptorBufferOffsetsEXT` only on change. No dynamic offsets exist here: a moved uniform buffer is a one-slot copy-on-write of the block (Mac re-encodes too).
 - **Replaces** allocation/update, `g_dsc`, `wsc_try`/`wsc_keep`, descriptor pools; **keeps** `tex_get`, `tbuf_view`, driver segments.
-- **Switch:** `DM_VK_DBUF=1`.
+- **Switch:** DM_VK_DBUF=1.
 - **Expected:** bindings 11 → ~2–3 ms, rec 24.5 → **~14–15** (with S1: ~13). Frame: GPU-bound, ~27.
 - **Risk:** descriptor buffers may cost GPU time or bind as slowly as sets on the Adreno (P1 tells). Fallback, same block logic: push descriptors with templates.
 - **Effort:** 4–6 d.
@@ -111,7 +113,7 @@ The Vulkan form of Mac's argument blocks.
 - **Ordering (Mac port):** `OP_UPDATE_UB` into a backed range no longer writes guest memory on the CPU: arena + pend list (`pend_add`); outside a pass `vkCmdCopyBuffer` in stream order; inside a pass deferred, draws bind the arena copy (`ubd_shadow`) or a memory+updates shadow (`ubp_get`, copies on a `ubc_push`-style thread), landing at pass end; unknowable shadow ends the pass. B2B copies and fills become `vkCmdCopyBuffer`/`vkCmdFillBuffer` (`mtl_sub_copy`, `mtl_sub_fill`). In-submission CPU readers (`ubo_word`, `ind_args`, `fb_prepare`) go through `pend_read`/`ubp_get` (Mac `ubo_read`).
 - **Switch:** `DM_VK_ZEROCOPY=2` (needs S2's descriptor buffer for the address-based descriptors).
 - **Expected:** rec −3…−4 ms (copies, write log, memo hashes, index scans, ring fit), to **~9–10**. GPU ±0.3 ms (memory placement). Frame ~27.
-- **Risks:** unswappable dmabuf (Run L: −230 MB for 384 MB; P4 sets the cap, the rest copies); ordering bugs (flicker, stale constants) caught by `DM_VK_ZC_VERIFY=1` (bound range vs copy-path bytes); hibernate needs the backed-range section.
+- **Risks:** unswappable dmabuf (Run L: −230 MB for 384 MB; P4 sets the cap, the rest copies); ordering bugs (flicker, stale constants) caught by DM_VK_ZC_VERIFY=1 (bound range vs copy-path bytes); hibernate needs the backed-range section.
 - **Effort:** 6–10 d, the largest stage (the pend/ubd/ubp port).
 - **Probe P2 (zcprobe, extends ahbprobe):** GPU time of uniform-heavy shading and vertex fetch from AHB vs device-local; device address of the AHB import and a descriptor-buffer UBO into it; CPU cost of 1,000 GPU-ordered 64-byte updates. Go if GPU ≤ +3%. **P4 (ahbcap):** 64 MB AHBs up to 1.5 GB, game closed, MemAvailable/LMK logged.
 
@@ -125,7 +127,7 @@ The Vulkan form of Mac's argument blocks.
 ### S5: Command thinning and multi-draw (pillar 4b)
 
 - **Change:** record only what changed per draw; runs with identical pipeline and bindings (only index/vertex ranges differ) become one `vkCmdDrawMultiIndexedEXT` or indirect `drawCount > 1`. Unreal moves per-object uniforms every draw, so runs are likely short: S0 adds a counter first. Per-draw constants via `gl_DrawID` would need a shader change: not planned.
-- **Switch:** `DM_VK_MDRAW=1`. **Expected:** rec −0.3…−1 ms (driver share), to **~7**. Frame unchanged.
+- **Switch:** DM_VK_MDRAW=1. **Expected:** rec −0.3…−1 ms (driver share), to **~7**. Frame unchanged.
 - **Risk:** low. **Effort:** 2–3 d.
 - **Probe P3 (mdprobe):** µs/draw single vs multi vs indirect at runs of 2–16.
 
@@ -135,7 +137,7 @@ Only if S2 leaves more than ~1 ms in descriptor-byte copies. The 32/128-entry `d
 - **Heap:** `UPDATE_AFTER_BIND | PARTIALLY_BOUND` arrays of images, samplers, texel views; a view's slot written once in `tex_view`, freed after `tex_evict`'s fence; samplers in `samp_get`.
 - **Shaders:** a SPIR-V pass in `dm/android/tools/spv_android.py` after `dmsh_xlate` (Ryujinx translator) and `strip_caps`: each image/sampler variable becomes a heap access at an index from a per-stage index block (uint32 per binding / `dyn` element), combined samplers split (`OpSampledImage` at use), `vk_reflect` emits the layout. The CPU writes 4 bytes per dirty slot.
 - **Unchanged:** `K_TEXU` handles stay CPU-read (Mac `ubo_handle`) because `tex_get` must still see uses; the `K_DRVCB` c0/c2 segment stays.
-- **Switch:** `DM_VK_HEAP=1`. **Expected:** bindings ~1.5 → ~0.5 ms.
+- **Switch:** DM_VK_HEAP=1. **Expected:** bindings ~1.5 → ~0.5 ms.
 - **Risk:** translator corner cases (CIS arrays, texel buffers, storage images); the runtime SPIR-V patches (`spv_dual`, `spv_vid_bias`, `spv_gl_depth`) must compose with it. **Effort:** 5–8 d. **Probe:** P1 model (e).
 
 ### S7: Frames in flight and the remaining waits (pillar 5, final)
