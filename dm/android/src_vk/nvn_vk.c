@@ -361,6 +361,30 @@ static uint64_t g_t_stale, g_stale_bytes, g_t_patch, g_patch_regions, g_npatch; 
 static int stale_patch_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_STALE_PATCH"); v = e ? atoi(e) : 2; if (v < 0 || v > 2) v = 2;   // 2 by default from vk19.44: checked exact on the GPU (Run I, DM_VK_PATCH_VERIFY)
     if (!v) LOG("DM_VK_STALE_PATCH=0: reads of an earlier submission's GPU-written range take its bytes as they are"); if (v == 2) LOG("DM_VK_STALE_PATCH=2: the CPU's rewrites over GPU-written ranges are put in place by a compute dispatch"); } return v; }
 static int stale_patch_on(void) { return stale_patch_mode() != 0; }
+// DM_VK_GW_CHAIN_SNAP (Harvest Moon's heavy scene, H0b; off by default): a dispatch whose storage buffer was bound from a running submission's GPU-written range (chained: the
+// GPU starts from that range's bytes, in its ring) had no snapshot. Its entry then could not tell the CPU's rewrites (gw_cpu_dirty answers 0 with no snapshot), and its completion
+// wrote the whole range back, over what the CPU had written meanwhile. With one submission a frame and the GPU behind, every frame's dispatch chains on the last one, and the
+// CPU's per-frame writes to such a buffer never reached the GPU nor stayed in guest memory (hm7: 96-206 KB a frame overwritten; the work the game asked the GPU for grew every
+// frame). =1: a chained range gets a snapshot as well, of the guest's bytes when the dispatch is recorded; it goes back by changed words (post kind 5), and later reads patch in
+// the CPU's rewrites (gw_cpu_dirty / gw_patch). Each write-back also puts the words it wrote into the snapshots of the later live entries over the same bytes, so a snapshot keeps
+// meaning "guest memory without the CPU's writes since": an earlier submission's write-back is not taken for a CPU rewrite. =2: as 1, plus counts at each chained write-back of
+// the CPU's words kept (which the whole write-back overwrote before) and of words both the CPU and the GPU wrote (the GPU's kept, as before). Per-600 line 'vk: chained GPU-written ranges'
+static int chain_snap_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_CHAIN_SNAP"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 1;
+    if (v) LOG("vk: DM_VK_GW_CHAIN_SNAP=%d: a dispatch's range bound from a running submission's GPU-written range gets a snapshot and goes back by changed words%s", v, v == 2 ? " (with counts of the CPU's words kept)" : ""); } return v; }
+static uint64_t g_cs_n, g_cs_b;   // chained ranges given a snapshot (recording thread)
+static _Atomic uint64_t g_cs_prop_b, g_cs_prop_n, g_cs_kept_w, g_cs_both_w, g_cs_wb_n;   // completion: bytes put into later snapshots (writes), CPU words kept, words both wrote, chained write-backs
+// A write-back of n bytes at dst (now: the GPU's final bytes; old: what it started from, NULL for a whole write-back) of submission fence: the bytes it changes in guest memory go into
+// the snapshots of the later live entries over them. Caller holds g_gwmu
+static void gw_snap_follow(const uint8_t *dst, size_t n, const uint8_t *now, const uint8_t *old, uint64_t fence) {
+    uint64_t a = (uint64_t)(uintptr_t)dst, b = a + n;
+    for (int k = 0; k < g_ngw; k++) { gw_t *e = &g_gw[k];
+        if (!e->snap || e->fence <= fence || e->addr >= b || e->addr + e->size <= a) continue;
+        uint64_t lo = e->addr > a ? e->addr : a, hi = e->addr + e->size < b ? e->addr + e->size : b, cnt = 0;
+        uint8_t *es = (uint8_t *)(uintptr_t)e->snap;   // the snapshot buffers are the backend's own (snap_alloc)
+        for (uint64_t x = lo; x < hi; x++) { uint8_t v = now[x - a]; if ((!old || v != old[x - a]) && es[x - e->addr] != v) { es[x - e->addr] = v; cnt++; } }
+        if (cnt) { e->chk = 0; atomic_fetch_add(&g_cs_prop_b, cnt); atomic_fetch_add(&g_cs_prop_n, 1); }
+    }
+}
 static int gw_whole_dirty(gw_t *e) {
     if (e->chk != g_fence + 1) { e->chk = g_fence + 1; e->dirty = memcmp((const void *)(uintptr_t)e->addr, e->snap, e->size) != 0; g_stale_bytes += e->size; }
     return e->dirty;
@@ -769,12 +793,17 @@ static void ctx_complete(ctx_t *c) {
         }
         else if (p->kind == 5) {   // a dispatch's storage buffer: the words the GPU changed (see dispatch)
             const uint8_t *snap = (const uint8_t *)(uintptr_t)p->addr, *now = p->src; uint8_t *dst = p->dst; size_t i = 0, nw = 0;
+            if (p->mode == 1) { atomic_fetch_add(&g_cs_wb_n, 1);   // a chained range (DM_VK_GW_CHAIN_SNAP)
+                if (chain_snap_mode() == 2) { uint64_t kept = 0, both = 0;
+                    for (size_t q = 0; q + 4 <= p->n; q += 4) if (memcmp(dst + q, snap + q, 4)) { if (!memcmp(now + q, snap + q, 4)) kept++; else both++; }
+                    atomic_fetch_add(&g_cs_kept_w, kept); atomic_fetch_add(&g_cs_both_w, both); } }
             for (; i + 4 <= p->n; i += 4) if (memcmp(now + i, snap + i, 4)) { memcpy(dst + i, now + i, 4); nw++; }
             for (; i < p->n; i++) if (now[i] != snap[i]) dst[i] = now[i];
             // Its entries end here, not at gw_expire below (vk19.58): guest memory holds the GPU's words and the CPU's rewrites now, so a later read copies it from there.
             // Only the snapshot used to be cleared, and the entry lived on until the rest of the submission was written back: a read in between bound the ring's bytes
             // without the CPU's rewrites (gw_cpu_dirty answers 0 with no snapshot), stale for a frame. gw_del moves the last entry into slot k: k is looked at again
             { uint64_t ended = 0; lk_(&g_gwmu, LW_GWMU); H0_GWH_T0();
+              if (chain_snap_mode()) gw_snap_follow(dst, p->n, now, snap, c->fence_val);   // the words written: into later entries' snapshots
               for (int k = 0; k < g_ngw;) if (g_gw[k].snap >= snap && g_gw[k].snap < snap + p->n) { gw_del(k); ended++; } else k++;
               H0_GWH_END(1); pthread_mutex_unlock(&g_gwmu);
               if (ended) { atomic_fetch_add(&g_gw_wb_ended, ended); static int once; if (!once) { once = 1; LOG("vk: GPU-written ranges end at their write-back (vk19.58): %llu ended by the first one, submission %llu", (unsigned long long)ended, (unsigned long long)c->fence_val); } } }
@@ -785,6 +814,7 @@ static void ctx_complete(ctx_t *c) {
             if (p->addr) { const uint8_t *h0s = (const uint8_t *)(uintptr_t)p->addr, *g = p->dst; uint64_t lost = 0;   // H0: CPU writes since the dispatch was recorded, about to be overwritten
                            for (size_t q = 0; q + 4 <= p->n; q += 4) if (memcmp(g + q, h0s + q, 4) && memcmp(g + q, p->src + q, 4)) lost += 4;
                            atomic_fetch_add(&g_h0_lost_b, lost); atomic_fetch_add(&g_h0_lost_n, 1); free((void *)h0s); }
+            if (chain_snap_mode()) { lk_(&g_gwmu, LW_GWMU); gw_snap_follow(p->dst, p->n, p->src, NULL, c->fence_val); pthread_mutex_unlock(&g_gwmu); }   // DM_VK_GW_CHAIN_SNAP
             memcpy(p->dst, p->src, p->n);
             if (c->plog && p->n <= 64) { float f[16]; memcpy(f, p->src, p->n); LOG("plog: written back %#llx +%zu: %g %g %g %g%s", (unsigned long long)(uintptr_t)p->dst, p->n, f[0], p->n > 4 ? f[1] : 0, p->n > 8 ? f[2] : 0, p->n > 12 ? f[3] : 0, p->n > 16 ? " ..." : ""); } }
     }
@@ -4021,10 +4051,13 @@ static void dispatch(const p_dispatch *d) {
         uint8_t *snap = !dup && !from_gw && w->ci == g_ci && w->p ? snap_alloc(w->size) : NULL;
         if (from_gw) { g_h0_chain_n++; g_h0_chain_b += w->size; } else g_h0_dsp_fresh++;   // H0
         if (snap) memcpy(snap, w->p, w->size);
+        int chained = 0;
+        if (!snap && !dup && from_gw && w->p && chain_snap_mode() && (snap = snap_alloc(w->size))) {   // DM_VK_GW_CHAIN_SNAP: the guest's bytes now (the GPU starts from the running range's)
+            memcpy(snap, (const void *)(uintptr_t)w->addr, w->size); chained = 1; g_cs_n++; g_cs_b += w->size; }
         // The range is the GPU's until the submission completes (gw_find), with the bytes it started from to tell the CPU's later rewrites (gw_cpu_dirty)
         gw_add(w->addr, w->size, w->buf, w->off, w->p, g_fence + 1, w->ci, snap ? snap : dsnap, 0);   // this submission's fence value (mtl_sub_commit assigns g_fence + 1)
         if (dup) continue;
-        if (snap) post_add((post_t){5, (void *)(uintptr_t)w->addr, 0, 0, (uint64_t)(uintptr_t)snap, 0, w->p, w->size});
+        if (snap) post_add((post_t){5, (void *)(uintptr_t)w->addr, (uint32_t)chained, 0, (uint64_t)(uintptr_t)snap, 0, w->p, w->size});   // mode 1: a chained range
         else {   // H0: a chained range (no snapshot) goes back whole; the guest's bytes now are kept aside (measurement only) to count what the CPU writes meanwhile that the write-back overwrites
             uint8_t *h0s = NULL; if (from_gw) { if (w->size <= (1u << 20)) { h0s = malloc(w->size); if (h0s) memcpy(h0s, (const void *)(uintptr_t)w->addr, w->size); } else atomic_fetch_add(&g_h0_snap_skip, 1); }
             post_add((post_t){3, (void *)(uintptr_t)w->addr, 0, 0, (uint64_t)(uintptr_t)h0s, 0, w->p, w->size}); }
@@ -5297,6 +5330,11 @@ static void h0_tick(uint64_t n) {
 }
 // H0 (Harvest Moon plan v2): the per-600 lines; counters zeroed after. Called on the presenting thread with the other per-600 lines
 static void h0_lines(void) {
+    if (chain_snap_mode()) { uint64_t pb = atomic_exchange(&g_cs_prop_b, 0), pn = atomic_exchange(&g_cs_prop_n, 0), kw = atomic_exchange(&g_cs_kept_w, 0), bw = atomic_exchange(&g_cs_both_w, 0), wn = atomic_exchange(&g_cs_wb_n, 0);
+        LOG("vk: chained GPU-written ranges per frame over the last 600 (DM_VK_GW_CHAIN_SNAP %d): given a snapshot %.1f (%.2f MB), written back by changed words %.1f; earlier write-backs put into later snapshots %.0f bytes (%.1f snapshots)%s",
+            chain_snap_mode(), g_cs_n / 600.0, g_cs_b / 600.0 / 1048576.0, wn / 600.0, pb / 600.0, pn / 600.0, "");
+        if (chain_snap_mode() == 2) LOG("vk: chained GPU-written ranges (verify): the CPU's words kept that the whole write-back overwrote before %.0f bytes a frame; words both the CPU and the GPU wrote (the GPU's kept) %.0f bytes a frame", kw * 4 / 600.0, bw * 4 / 600.0);
+        g_cs_n = g_cs_b = 0; }
     static const char *cn[H0C_N] = {"vertex", "uniform", "storage", "texel", "indirect", "buffer copy", "image copy", "other"};
     char b0[512], b1[512]; int o0 = 0, o1 = 0;
     for (int i = 0; i < H0C_N; i++) { o0 += snprintf(b0 + o0, sizeof b0 - o0, " %s %.1f", cn[i], g_h0_cmp[0][i] / 600.0); o1 += snprintf(b1 + o1, sizeof b1 - o1, " %s %.1f", cn[i], g_h0_cmp[1][i] / 600.0); }
