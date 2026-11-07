@@ -52,9 +52,8 @@ DM_GAMES_DIR=<NSP folder>/<id>_build/profile make -C dm/android GAME=<id> dmhost
 ```
 
 `NDK=` overrides the NDK (default: Homebrew's `android-ndk` cask). `dmhost` is the host as a command-line program
-(`cli/front_cli.c`, no window); the default target builds `libdmhost.so`, the library for the Android app, and
-`libdmboot.so`, the app's NativeActivity library (`boot/boot.c`), which loads `libdmhost.so` at a fixed address for
-hibernation (`DM_HIBERNATE`, [docs/development.md](../../docs/development.md#hibernation-save-state-to-disk)) and hands the activity to it.
+(`cli/front_cli.c`, no window); the default target `libdmhost.so` is the library for the Android app (its front end
+is still to be written).
 
 ## Run over adb
 
@@ -91,18 +90,6 @@ the menu asks for it once through the system file picker and checks it belongs t
 `<package>.prueba` copy that installs beside the real app.
 
 The log is `/sdcard/Android/data/<package>/files/log.txt`; an `env.txt` beside it (KEY=VALUE lines) sets diagnostic switches.
-
-The save is in the app's internal folder (`<files>/save`), which adb cannot read on a release build, so the menu copies it
-out (`app/java/com/nxnative/SaveBackup.java`) at each start and when the player comes back from the game, before the game
-starts: `<external>/save_backup/latest/` (replaced) and `save_backup/<yyyyMMdd-HHmmss>/` (the last 5); `save_backup/log.txt`
-and logcat tag `nxsave` say what was done. A save from elsewhere (the same files: `GameSaveData0`, `OptionSaveData`, ...)
-comes in through `<external>/save_import/` at the next start; the save it replaces is kept in `save_backup/pre-import-<time>/`:
-
-```bash
-E=/sdcard/Android/data/<package>/files
-adb pull $E/save_backup/latest ./save_from_android
-adb push ./my_save $E/save_import && adb shell chmod -R o+rX $E/save_import   # adb's files are the shell's: the app reads them only after the chmod
-```
 
 ## Next
 

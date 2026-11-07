@@ -14,10 +14,9 @@
 #ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>   // AAC
 #else
-// Android: AAC through the NDK's MediaCodec, the counterpart of AudioToolbox's converter; the decoder sits in the same field (md_aac below)
-#include <media/NdkMediaCodec.h>
+// Android: no AAC decoder yet (MediaCodec is the counterpart of AudioToolbox's converter here); AAC tracks play as silence
 typedef void *AudioConverterRef; typedef uint32_t UInt32; typedef struct { int64_t mStartOffset; uint32_t mVariableFramesInPacket, mDataByteSize; } AudioStreamPacketDescription;
-static void AudioConverterDispose(AudioConverterRef c) { if (c) { AMediaCodec_stop(c); AMediaCodec_delete(c); } }
+static void AudioConverterDispose(AudioConverterRef c) { (void)c; }
 #endif
 // Vorbis (movie audio tracks, Link's Awakening): stb_vorbis, built into this file (dm/third_party/stb_vorbis); only its push-data API, floats out
 #define STB_VORBIS_NO_STDIO
@@ -161,9 +160,6 @@ static void md_event(mdec_t *d, int i) {   // 0 input 1 output 2 format 3 error
 // g_dfmu and each decoder's dmu are held while guest code signals events, so guest threads take them with dm_host_lock: a thread waiting for one counts as blocked, and the
 // signaller's handoff does not wait for it (Kirby and the Forgotten Land froze at its first guide movie: the handoff waited for the input thread, which waited for dmu)
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size);
-// Live decoders: hibernation writes no snapshot while one exists (a decoder's state lives in libvpx / VideoToolbox, which cannot be saved)
-static _Atomic int g_md_live;
-int dm_movie_live(void) { return atomic_load(&g_md_live); }
 void dm_host_lock(pthread_mutex_t *m);   // hle_thread.c
 static pthread_mutex_t g_dfmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_dfcv = PTHREAD_COND_INITIALIZER;
 static struct { void *d; int ev; uint64_t due; } g_dfq[64]; static int g_ndfq, g_dfthr;
@@ -183,8 +179,6 @@ static void md_defer_drop(void *d) {
     g_ndfq = n; pthread_mutex_unlock(&g_dfmu);
 }
 // signal under the lock: the destructor first drops pending entries under it, so a signal never interleaves with destruction
-// Hibernation: whether the deferred-event thread exists (its queue is empty: a snapshot is written only with no decoder alive). Restored with the threads, it is not spawned again
-int dm_hib_movie_defer_thread(int set) { if (set >= 0) g_dfthr = set; return g_dfthr; }
 static void md_defer_body(void *arg) {
     (void)arg;
     dm_host_lock(&g_dfmu);
@@ -197,12 +191,8 @@ static void md_defer_body(void *arg) {
             if (d->started) md_event(d, e);   // not after Stop: the game takes its events apart right after Stop (a Stop within 2 ms of a Flush let the deferred signal hit events being torn down)
             continue;
         }
-        void dm_thread_native_wait(int entering);
-        dm_thread_native_wait(1);   // blocked in host code: with hibernation a restartable call (hle_guestthread.c spawn_tramp), parked here
         if (!next) pthread_cond_wait(&g_dfcv, &g_dfmu);
         else { uint64_t w = next - now; struct timespec ts = { (time_t)(w / 1000000000u), (long)(w % 1000000000u) }; pthread_cond_timedwait_relative_np(&g_dfcv, &g_dfmu, &ts); }
-        dm_thread_native_wait(0);
-        dm_hib_hold_here(&g_dfmu);
     }
 }
 // log the first 12 calls one by one, then every 2^k-th (DM_MOVIE_TRACE=1: every call, with the calling thread and the decoder: Unity drives a movie's audio and video decoders from one thread)
@@ -353,20 +343,6 @@ static int md_vorbis(mdec_t *d, const uint8_t *p, int n, int slot) {
     return 1;
 }
 // ---------- AAC ----------
-// The AudioSpecificConfig: Configure's csd-0 when the game gives one, else AAC-LC from the sample rate and channel count (FINAL FANTASY XII THE ZODIAC AGE's movies give none:
-// 6 channels at 48 kHz, which is the 0x11 0xb0 its Matroska files carry); the rate and channel count are taken from the configuration when Configure gave none. → its length
-static int md_aac_asc(mdec_t *d, uint8_t asc[64]) {
-    static const int rates[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
-    int an = d->vhdr_n[0] > 0 && d->vhdr_n[0] <= 64 ? d->vhdr_n[0] : 0;
-    if (an) memcpy(asc, d->vhdr[0], (size_t)an);
-    if (an >= 2) {   // sampling frequency index and channel configuration from the configuration itself
-        int fi = (asc[0] & 7) << 1 | asc[1] >> 7, cc = asc[1] >> 3 & 15;
-        if (fi < 13 && d->rate <= 0) d->rate = rates[fi]; if (cc && cc < 8 && d->ch <= 0) d->ch = cc == 7 ? 8 : cc;
-    }
-    if (d->rate <= 0) d->rate = 48000; if (d->ch <= 0) d->ch = 2;
-    if (!an) { int fi = 3; for (int i = 0; i < 13; i++) if (rates[i] == d->rate) fi = i; asc[0] = (uint8_t)(2 << 3 | fi >> 1); asc[1] = (uint8_t)((fi & 1) << 7 | (d->ch & 15) << 3); an = 2; }
-    return an;
-}
 #ifdef __APPLE__
 // The demuxer hands over raw AAC frames (1024 samples each) and the AudioSpecificConfig in csd-0. AudioToolbox takes the configuration as an MPEG-4 ES descriptor (the magic cookie built
 // here as FFmpeg's AudioToolbox decoder builds it); without csd-0 an AAC-LC configuration is made from the sample rate and channel count
@@ -379,7 +355,15 @@ static OSStatus aac_feed(AudioConverterRef c, UInt32 *np, AudioBufferList *bl, A
     *np = 1; d->aac_pkt = NULL; return 0;
 }
 static int md_aac_open(mdec_t *d) {
-    uint8_t asc[64]; int an = md_aac_asc(d, asc);
+    static const int rates[] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
+    uint8_t asc[64]; int an = d->vhdr_n[0] > 0 && d->vhdr_n[0] <= (int)sizeof asc ? d->vhdr_n[0] : 0;
+    if (an) memcpy(asc, d->vhdr[0], (size_t)an);
+    if (an >= 2) {   // sampling frequency index and channel configuration from the configuration itself
+        int fi = (asc[0] & 7) << 1 | asc[1] >> 7, cc = asc[1] >> 3 & 15;
+        if (fi < 13 && d->rate <= 0) d->rate = rates[fi]; if (cc && cc < 8 && d->ch <= 0) d->ch = cc == 7 ? 8 : cc;
+    }
+    if (d->rate <= 0) d->rate = 48000; if (d->ch <= 0) d->ch = 2;
+    if (!an) { int fi = 3; for (int i = 0; i < 13; i++) if (rates[i] == d->rate) fi = i; asc[0] = (uint8_t)(2 << 3 | fi >> 1); asc[1] = (uint8_t)((fi & 1) << 7 | (d->ch & 15) << 3); an = 2; }
     AudioStreamBasicDescription in = {.mSampleRate = d->rate, .mFormatID = kAudioFormatMPEG4AAC, .mFramesPerPacket = 1024, .mChannelsPerFrame = (UInt32)d->ch};
     AudioStreamBasicDescription out = {.mSampleRate = d->rate, .mFormatID = kAudioFormatLinearPCM, .mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
                                        .mBytesPerPacket = 2u * d->ch, .mFramesPerPacket = 1, .mBytesPerFrame = 2u * d->ch, .mChannelsPerFrame = (UInt32)d->ch, .mBitsPerChannel = 16};
@@ -409,77 +393,10 @@ static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
     return frames > 0;
 }
 #else
-// Android: MediaCodec's AAC decoder ("audio/mp4a-latm") on the raw frames, configured by the AudioSpecificConfig, PCM16 out. Its channel order is Android's (front left, front
-// right, centre, LFE, back left, back right), the order the Switch's audio takes; it is asked for every channel (it may downmix to stereo otherwise). Its start-up delay means
-// a packet's samples may come out with a later packet: each call hands out what the decoder has finished, which keeps the stream continuous
-static int md_aac_open(mdec_t *d) {
-    uint8_t asc[64]; int an = md_aac_asc(d, asc);
-    AMediaCodec *mc = AMediaCodec_createDecoderByType("audio/mp4a-latm");
-    if (!mc) { if (!d->red_vb++) LOG("[RED] movie: MediaCodec has no AAC decoder, outputting silence"); return 0; }
-    AMediaFormat *f = AMediaFormat_new();
-    AMediaFormat_setString(f, AMEDIAFORMAT_KEY_MIME, "audio/mp4a-latm");
-    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_SAMPLE_RATE, d->rate); AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_CHANNEL_COUNT, d->ch);
-    AMediaFormat_setInt32(f, "max-output-channel_count", d->ch);   // KEY_MAX_OUTPUT_CHANNEL_COUNT: no downmix
-    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_IS_ADTS, 0);
-    AMediaFormat_setBuffer(f, "csd-0", asc, (size_t)an);
-    media_status_t st = AMediaCodec_configure(mc, f, NULL, NULL, 0); AMediaFormat_delete(f);
-    if (st == AMEDIA_OK) st = AMediaCodec_start(mc);
-    if (st != AMEDIA_OK) { AMediaCodec_delete(mc); if (!d->red_vb++) LOG("[RED] movie: MediaCodec cannot start an AAC decoder (%d; %d channels %d Hz), outputting silence", (int)st, d->ch, d->rate); return 0; }
-    d->aac = mc; d->aac_pkt_n = (UInt32)d->ch;   // aac_pkt_n: the decoder's output channel count (its output format)
-    LOG("[movie] AAC: MediaCodec, %d channels %d Hz, AudioSpecificConfig %d bytes (object type %d)", d->ch, d->rate, an, asc[0] >> 3);
-    return 1;
-}
-// the decoder's finished output appended to the slot as PCM16 with d->ch channels interleaved; → bytes now in the slot
-static size_t md_aac_drain(mdec_t *d, int slot, size_t have, int64_t wait_us) {
-    AMediaCodec *mc = d->aac;
-    for (;;) {
-        AMediaCodecBufferInfo bi; ssize_t i = AMediaCodec_dequeueOutputBuffer(mc, &bi, wait_us);
-        if (i == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-            AMediaFormat *f = AMediaCodec_getOutputFormat(mc); int32_t v;
-            if (AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_CHANNEL_COUNT, &v) && v > 0) d->aac_pkt_n = (UInt32)v;
-            if ((int)d->aac_pkt_n != d->ch && !d->red_img++) LOG("[RED] movie: MediaCodec decodes AAC to %u channels, the game expects %d (extra channels dropped, missing ones silent)", d->aac_pkt_n, d->ch);
-            AMediaFormat_delete(f); continue;
-        }
-        if (i == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
-        if (i < 0) return have;
-        size_t sz; const uint8_t *b = AMediaCodec_getOutputBuffer(mc, (size_t)i, &sz);
-        int oc = d->aac_pkt_n ? (int)d->aac_pkt_n : d->ch;
-        size_t frames = b && bi.size > 0 ? (size_t)bi.size / (2 * (size_t)oc) : 0, room = (MD_PCM_CAP - have) / (2 * (size_t)d->ch);
-        if (frames > room) { if (!d->red_dec++) LOG("[RED] movie: AAC output beyond the slot's %d bytes dropped", MD_PCM_CAP); frames = room; }
-        const int16_t *s = (const int16_t *)(b + bi.offset); int16_t *o = (int16_t *)(d->out[slot].frm + have);
-        if (oc == d->ch) memcpy(o, s, frames * 2 * (size_t)oc);
-        else for (size_t k = 0; k < frames; k++) for (int c = 0; c < d->ch; c++) o[k * d->ch + c] = c < oc ? s[k * oc + c] : 0;
-        have += frames * 2 * (size_t)d->ch;
-        AMediaCodec_releaseOutputBuffer(mc, (size_t)i, false);
-        wait_us = 0;
-    }
-}
-// A packet's output is never empty: with no decoder, or nothing finished yet (the decoder's start-up delay), it is one frame's worth of silence (1024 samples per
-// channel). FINAL FANTASY XII THE ZODIAC AGE's movie-audio thread reads a ring of the decoded PCM, and once that ring is empty after the track ended it hands its writer
-// the ring's null buffer + 0x10 for 0x3000 bytes (1024 frames, 6 channels) and faults there (sig 11 at 0x10, lr main+0x7d62ec): with no samples out, every AAC movie
-// ended that way
-static int md_aac_silence(mdec_t *d, int slot) {
-    size_t n = (size_t)1024 * 2 * (size_t)(d->ch > 0 ? d->ch : 2);
-    if (n > MD_PCM_CAP) n = MD_PCM_CAP;
-    memset(d->out[slot].frm, 0, n); d->out[slot].bytes = n; return 1;
-}
 static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
-    if (n <= 0) return 0;
-    if (d->out[slot].cap < MD_PCM_CAP) { free(d->out[slot].frm); d->out[slot].frm = malloc(MD_PCM_CAP); d->out[slot].cap = MD_PCM_CAP; }
-    if (!d->aac && (d->red_vb || !md_aac_open(d))) return md_aac_silence(d, slot);   // red_vb: the decoder failed to open (said once): not tried again for every packet
-    size_t have = 0; int fed = 0;
-    for (int tries = 0; tries < 50 && !fed; tries++) {   // up to half a second for a free input buffer, taking finished output meanwhile
-        ssize_t i = AMediaCodec_dequeueInputBuffer(d->aac, 10000);
-        if (i < 0) { have = md_aac_drain(d, slot, have, 0); continue; }
-        size_t cap; uint8_t *b = AMediaCodec_getInputBuffer(d->aac, (size_t)i, &cap);
-        if (!b || cap < (size_t)n) { if (!d->red_dec++) LOG("[RED] movie: AAC packet of %d bytes does not fit MediaCodec's %zu-byte buffer", n, cap); AMediaCodec_queueInputBuffer(d->aac, (size_t)i, 0, 0, 0, 0); break; }
-        memcpy(b, p, (size_t)n); fed = AMediaCodec_queueInputBuffer(d->aac, (size_t)i, 0, (size_t)n, 0, 0) == AMEDIA_OK;
-    }
-    if (!fed && !d->red_dec++) LOG("[RED] movie: MediaCodec took no AAC input for half a second");
-    have = md_aac_drain(d, slot, have, 2000);   // what this packet finished (2 ms: the software decoder runs on its own thread)
-    if (!have) return md_aac_silence(d, slot);
-    d->out[slot].bytes = have;
-    return 1;
+    (void)p; (void)n; (void)slot;
+    if (!d->red_vb++) LOG("[RED] movie: AAC is not decoded on Android yet, outputting silence");
+    return 0;
 }
 #endif
 // The H.264 decoder, made by Configure (when the stream's parameter sets come with it) or by the first packet; RGBA pictures in the native texture mode either way.
@@ -583,7 +500,7 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
     // Audio: Vorbis to PCM16 (Link's Awakening's movies carry a Vorbis track; without a decoder the SDK's player plays them silent), AAC to PCM16 with AudioToolbox (Monster Hunter Rise)
     int audio = (type == MD_TYPE_VORBIS || type == MD_TYPE_AAC) && fmt == MD_FMT_PCM16;
     if (!audio && (type < 1 || type > 3 || (fmt != MD_FMT_NV12 && !(fmt == MD_FMT_ABGR && mode == MD_MODE_TEX)))) { LOG("[RED] movie: decoder type %d output %d mode %d not supported by the host, every method returns failure", type, fmt, mode); return; }
-    mdec_t *d = calloc(1, sizeof *d); atomic_fetch_add(&g_md_live, 1);
+    mdec_t *d = calloc(1, sizeof *d);
     pthread_mutex_init(&d->mu, NULL); pthread_mutex_init(&d->dmu, NULL); pthread_mutex_init(&d->wmu, NULL); pthread_cond_init(&d->wcv, NULL);
     d->type = type; d->fmt = fmt; d->mode = mode;
     // A Vorbis decoder keeps 64 outputs, an AAC decoder 32 (about 0.7 s), a video decoder 16. The host decodes far faster than the Switch, and a player that feeds its decoders in file order
@@ -623,7 +540,6 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatE", "mov
 }
 static void md_free(void **self) {
     mdec_t *d = md_of(self); if (!d) return;
-    atomic_fetch_sub(&g_md_live, 1);
     md_defer_drop(d);
     if (!MD_AUDIO(d)) atomic_store_explicit(&g_movie_pic_ns, 0, memory_order_relaxed);
     self[1] = NULL;

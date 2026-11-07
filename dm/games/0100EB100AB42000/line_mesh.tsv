@@ -1,4 +1,0 @@
-# kind: evidence  vertex key: vertex shaders drawn with line lists wider than one pixel (SetLineWidth 3), each built as one wide-line mesh library (dm/gfx/tools/dmsh_mesh.py compose_lines).
-# FINAL FANTASY XII THE ZODIAC AGE: its target lines (88-index line list in the scene pass) and the 2D line draws, both Phyre built-ins in main
-59241958cbf8ccf2
-16246f6e2c51b7b2

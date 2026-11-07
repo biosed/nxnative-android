@@ -223,9 +223,6 @@ void CFDictionarySetValue(CFMutableDictionaryRef d, const void *k, const void *v
 }
 void CFDictionaryRemoveValue(CFMutableDictionaryRef d, const void *k) { size_t i = cf_find(d, k); if (d->k[i] == k) { d->k[i] = CF_TOMB; d->v[i] = NULL; d->n--; } }
 CFIndex CFDictionaryGetCount(CFMutableDictionaryRef d) { return (CFIndex)d->n; }
-void CFDictionaryGetKeysAndValues(CFMutableDictionaryRef d, const void **keys, const void **values) {   // in table order, as CoreFoundation gives no order either
-    size_t n = 0; for (size_t i = 0; i < d->cap; i++) if (d->k[i] && d->k[i] != CF_TOMB) { if (keys) keys[n] = d->k[i]; if (values) values[n] = d->v[i]; n++; }
-}
 // The mapping that holds *addr, else the first one after it, from /proc/self/maps: its start, length and protection (VM_REGION_BASIC_INFO_64 only). Neighbouring mappings
 // with the same protection count as one region, as one malloc'd block may span two (hle_uemalloc.c dm_ue_heap_owns asks whether a thread stack lies inside one region).
 // The pointer's top byte is a tag on Android (heap pointer tagging), not part of the address

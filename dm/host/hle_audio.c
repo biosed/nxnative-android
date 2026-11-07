@@ -23,7 +23,6 @@ typedef struct { void *ptr; uint64_t cap, size; } gbuf;     // The first 24 byte
 #define RELMAX QMAX                    // Released max = number of in-flight buffers (the game must take a buffer back before it can append again), same limit as pending
 typedef struct {
     pthread_mutex_t m;
-    void *g;                           // the guest AudioOut (its objmap key; a host output's key is host memory)
     void *event;                       // Guest SystemEvent: signaled whenever a buffer is released
     int ch;
     _Atomic int state;
@@ -402,7 +401,7 @@ static Result au_open_at(void *g, void *ev, const char *name, const uint8_t *par
     if (!ch) ch = 2;
     if (rate && rate != RATE) die("AudioOut sample rate %d not supported (48 kHz only)", rate);
     aout *a = calloc(1, sizeof *a);
-    pthread_mutex_init(&a->m, NULL); a->event = ev; a->ch = ch; a->g = g;
+    pthread_mutex_init(&a->m, NULL); a->event = ev; a->ch = ch;
     atomic_init(&a->state, STATE_STOPPED); atomic_init(&a->vol, 0x3f800000u);
     atomic_init(&a->q_head, 0); atomic_init(&a->q_tail, 0);
     atomic_init(&a->rel_head, 0); atomic_init(&a->rel_tail, 0);
@@ -615,53 +614,4 @@ void dm_audio_reset(void) {
     }
     LOG("audio outputs set up again after the media services reset");
     pthread_mutex_unlock(&g_aos_lock);
-}
-
-// Hibernation (hle_hibsnap.c): the game's open outputs in a snapshot: their state, volume and queues (guest AudioOutBuffer addresses), with the release event (its kernel binding is
-// in the kernel's section). Restored before any guest thread runs: each output opens again as it was, and one that was playing starts again (the app comes back to the foreground).
-// Host outputs (the in-process audio renderer's) are not kept: hle_hibsnap.c refuses a snapshot while one is open
-typedef struct { uint64_t g, event, rel[RELMAX], q[QMAX], pos; int32_t ch, state, id, nq, nrel; uint32_t vol; } hib_ao;
-int dm_hib_audio_host_outputs(void) { int n = 0; pthread_mutex_lock(&g_aos_lock); for (int i = 0; i < AOMAX; i++) if (g_aos[i] && g_aos[i]->rel_sem) n++; pthread_mutex_unlock(&g_aos_lock); return n; }
-size_t dm_hib_audio_save(uint8_t **out) {
-    hib_ao *v = calloc(AOMAX, sizeof *v); int n = 0;
-    pthread_mutex_lock(&g_aos_lock);
-    for (int i = 0; i < AOMAX; i++) {
-        aout *a = g_aos[i]; if (!a || a->rel_sem) continue;
-        hib_ao *h = &v[n++];
-        pthread_mutex_lock(&a->m);
-        h->g = (uint64_t)(uintptr_t)a->g; h->event = (uint64_t)(uintptr_t)a->event; h->ch = a->ch; h->state = atomic_load(&a->state); h->id = a->id; h->vol = atomic_load(&a->vol); h->pos = a->pos;
-        for (uint32_t k = atomic_load(&a->q_head), e = atomic_load(&a->q_tail); k != e && h->nq < QMAX; k++) h->q[h->nq++] = (uint64_t)(uintptr_t)a->q[k & (QMAX - 1)];
-        for (uint32_t k = atomic_load(&a->rel_head), e = atomic_load(&a->rel_tail); k != e && h->nrel < RELMAX; k++) h->rel[h->nrel++] = (uint64_t)(uintptr_t)a->rel[k & (RELMAX - 1)];
-        pthread_mutex_unlock(&a->m);
-    }
-    pthread_mutex_unlock(&g_aos_lock);
-    *out = (uint8_t *)v; return (size_t)n * sizeof *v;
-}
-int dm_hib_audio_restore(const uint8_t *b, size_t n) {
-    if (n % sizeof(hib_ao)) return -1;
-    for (size_t i = 0; i < n / sizeof(hib_ao); i++) {
-        const hib_ao *h = (const hib_ao *)b + i;
-        aout *a = calloc(1, sizeof *a);
-        pthread_mutex_init(&a->m, NULL); a->g = (void *)(uintptr_t)h->g; a->event = (void *)(uintptr_t)h->event; a->ch = h->ch; a->id = h->id; a->pos = h->pos;
-        atomic_init(&a->state, STATE_STOPPED); atomic_init(&a->vol, h->vol);
-        for (int k = 0; k < h->nq; k++) a->q[k] = (gbuf *)(uintptr_t)h->q[k];
-        atomic_init(&a->q_head, 0); atomic_init(&a->q_tail, (uint32_t)h->nq);
-        for (int k = 0; k < h->nrel; k++) a->rel[k] = (gbuf *)(uintptr_t)h->rel[k];
-        atomic_init(&a->rel_head, 0); atomic_init(&a->rel_tail, (uint32_t)h->nrel);
-        atomic_init(&a->null_run, 0); atomic_init(&a->notify_run, 1); atomic_init(&a->notify_pending, 0); atomic_init(&a->notify_armed, 0);
-        a->notify_sem = dispatch_semaphore_create(0);
-        pthread_create(&a->notify_th, NULL, event_notify, a);
-        int use_au = real_audio();
-        if (use_au) au_open(a);
-        objmap_put(a->g, a);
-        pthread_mutex_lock(&g_aos_lock);
-        int slot = -1; for (int k = 0; k < AOMAX; k++) if (!g_aos[k]) { slot = k; break; }
-        if (slot < 0) die("more than %d AudioOuts open at once", AOMAX);
-        g_aos[slot] = a;
-        if (h->state == STATE_STARTED) { atomic_store(&a->state, STATE_STARTED); if (a->au && !g_suspended) au_go(a, now_ns()); else null_start(a); }
-        pthread_mutex_unlock(&g_aos_lock);
-        if (use_au) { static pthread_once_t wd = PTHREAD_ONCE_INIT; pthread_once(&wd, au_watchdog_start); }
-        LOG("audio #%d restored: %d channels, %s, %d buffers queued, %d released", a->id, a->ch, h->state == STATE_STARTED ? "playing" : "stopped", h->nq, h->nrel);
-    }
-    return 0;
 }

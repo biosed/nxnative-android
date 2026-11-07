@@ -5,7 +5,6 @@
 
 // Notification event that never fires (GetSystemEvent-style calls return a pointer; bound on the guest thread on first use)
 static _Alignas(16) uint8_t g_ev_notify[0x100], g_ev_invite[0x100];
-HLE_HIB_STATIC(g_ev_notify) HLE_HIB_STATIC(g_ev_invite)
 static void *quiet_event(uint8_t *ev) { hle_bind_system_event(ev, 0); return ev; }
 
 HLE_FORCE("_ZN2nn7friends10InitializeEv", "connects to the friends service (cut)", void, h_fr_Initialize, void) {}

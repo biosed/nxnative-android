@@ -46,7 +46,7 @@ module_t *g_mod;
 int g_nmod;
 uint64_t g_t0_ns;
 __thread _Atomic int dm_host_work;
-pthread_key_t g_key18, g_keytls, g_keytlr;
+pthread_key_t g_key18;
 void crash_thread_init(void) {}
 void guest_thread_init(void) {}
 void guest_thread_set_id(uint64_t id) { (void)id; }

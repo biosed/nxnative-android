@@ -44,7 +44,7 @@ MANIFEST = '''<?xml version="1.0" encoding="utf-8"?>
               android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode|screenLayout|smallestScreenSize"/>
     <activity android:name="android.app.NativeActivity" android:process=":game" android:exported="false" android:screenOrientation="sensorLandscape"
               android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode|screenLayout|smallestScreenSize|density|fontScale|locale|layoutDirection|touchscreen|colorMode">
-      <meta-data android:name="android.app.lib_name" android:value="dmboot"/>
+      <meta-data android:name="android.app.lib_name" android:value="dmhost"/>
     </activity>
     <service android:name="com.nxnative.GameService" android:process=":game" android:exported="false" android:foregroundServiceType="specialUse">
       <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Keeps a suspended game in memory while the player is away, as a game console's sleep mode"/>
@@ -55,9 +55,7 @@ MANIFEST = '''<?xml version="1.0" encoding="utf-8"?>
 
 def build(a):
     lib = os.path.join(ANDROID, 'gen', a.id, 'libdmhost.so')
-    boot = os.path.join(ANDROID, 'gen', a.id, 'libdmboot.so')   # the NativeActivity library: loads libdmhost.so at a fixed address (dm/android/boot/boot.c)
-    for f in (lib, boot):
-        if not os.path.exists(f): sys.exit(f'[RED] {f} missing: make -C dm/android GAME={a.id} first')
+    if not os.path.exists(lib): sys.exit(f'[RED] {lib} missing: make -C dm/android GAME={a.id} first')
     w = tempfile.mkdtemp(prefix='apk_', dir=os.environ.get('WORK'))
     label = (a.label or a.id) + (' (prueba)' if a.test else '')
     vc = int(subprocess.run(['date', '+%y%m%d%H'], capture_output=True, text=True).stdout.strip())   # each build installs over the last
@@ -78,7 +76,6 @@ def build(a):
     with zipfile.ZipFile(base, 'a', zipfile.ZIP_DEFLATED) as z:
         z.write(os.path.join(w, 'classes.dex'), 'classes.dex')
         z.write(lib, 'lib/arm64-v8a/libdmhost.so')
-        z.write(boot, 'lib/arm64-v8a/libdmboot.so')
         if a.cheats: z.write(a.cheats, 'assets/cheats.txt')
         for name, f in controls_atlas.build_all(os.path.join(w, 'gfx')).items():   # every graphic, rasterized from the SVG masters (app/res_svg); PNGs stored, compressed already
             z.write(f, name, zipfile.ZIP_STORED if name.endswith('.png') else zipfile.ZIP_DEFLATED)

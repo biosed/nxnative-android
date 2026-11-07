@@ -1204,7 +1204,6 @@ struct vtex {
     uint64_t dfr_gen;   // a storage image a deferred dispatch writes (defer generation g_defer_gen while it is pending)
     uint64_t vhaz_epoch; uint8_t vhaz;   // DM_VK_PASS_BARRIER: written by a pass whose end barrier left vertex shaders out, in that barrier epoch (see pass_barrier_on)
     int storage;   // made with VK_IMAGE_USAGE_STORAGE_BIT (an NVN image texture whose format Vulkan can store to)
-    int copied;   // a GPU copy (copy_b2t) or a shader's image store wrote into it: hibernation reads it back before a snapshot even when it was uploaded first
     uint8_t late;   // made before the game wrote its storage, watched for that (late_fill)
     uint32_t mir_lv;   // levels a GPU copy wrote whose bytes were written into the storage too (copy_b2t / copy_t2t mirror): the storage holds them, as the image does
     uint32_t linrow, linbpb;   // a linear 2D texture (LINEAR / LINEAR_RENDER_TARGET) the CPU can read: its row pitch and bytes per texel; what passes render into it goes back to its storage (lin_writeback)
@@ -2605,12 +2604,11 @@ static void *pso_precreate(void *a) { pthread_setname_np("dm-psopre");
 // from DM_VK_CTL_FILE ("set <name> <value>", vk_ctl: the file is read again only when its modification time changes, at most once a frame). The value is an atomic; the
 // recording thread takes a copy of every value once per submission (tog_latch at mtl_sub_begin) and reads only that copy (tog), so a switch never changes in the middle
 // of a submission. A name not on the run-time list is refused when the file sets it (it is read at start only)
-enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_PACE, TG_DC2, TG_N };
+enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_PACE, TG_N };
 static struct { const char *name; int runtime; _Atomic int val; int def; } g_tog[TG_N] = {   // def: the value without the variable (on by default after its A/B; =0 turns it off)
     [TG_SHADOW] = {"DM_VK_SHADOW", 1},   // diagnostic: what a persistent cache could save (copy_in / index-scan misses whose bytes an earlier copy already had)
     [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1, 0, 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2); on by default from vk19.65 (session 1: -1.0 ms)
     [TG_PACE] = {"DM_VK_PRESENT_PACE", 0},   // vk19.63: one setFrameRate request for the cap at the first swapchain, FIFO when the cap is at most the panel's rate; start only
-    [TG_DC2] = {"DM_VK_DC_WAYS2", 1},   // vk19.69: copy_in's table two-way set-associative (C5); on the run-time list (a mode change only costs misses)
     [TG_LEAN] = {"DM_VK_LEAN", 0, 0, 1},   // vk19.62: small hot-path items (trace pointers, the memo hash, the timer conversion, sampled descriptor-set timing); start only; on by default from vk19.65 (session 1: RHIThread -1.0 ms)
     [TG_FB_FAST] = {"DM_VK_FB_FAST", 1, 0, 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2); on by default from vk19.65 (session 1: -0.4 ms)
 };
@@ -2742,16 +2740,7 @@ static void wlog_add(uint64_t a, uint64_t n) {
     g_wlo[g_nwlog] = a; g_whi[g_nwlog] = a + n; g_nwlog++;
 }
 static VkDeviceSize copy_in(uint64_t addr, uint64_t size, VkDeviceSize align, int caller) {   // guest memory → ring, reused when the same range is asked for again unchanged (hashed by address)
-    dcopy *e; int why;
-    // DM_VK_DC_WAYS2 (vk19.69, plan C5, off by default): two ways a set (NDC / 2 sets): the way holding this address, else a free or older-submission one, else the one
-    // used less recently. Session 1: 37% of copies found the slot held by another range; the same-submission repeats (275 copies, 2.0 MB a frame) are what it can catch
-    static uint8_t lru[NDC / 2];   // the way to replace next in each set
-    if (tog(TG_DC2)) {
-        uint32_t st = (uint32_t)((addr >> 4 ^ addr >> 13) % (NDC / 2)); dcopy *w = &g_dc[2 * st];
-        int k = w[0].addr == addr ? 0 : w[1].addr == addr ? 1 : -1;
-        if (k < 0) k = w[0].gen != g_wgen ? 0 : w[1].gen != g_wgen ? 1 : lru[st];   // a miss of another range: a free or stale way first
-        e = &w[k]; lru[st] = (uint8_t)!k;   // the other way is now the less recently used
-    } else e = &g_dc[(addr >> 4 ^ addr >> 13) % NDC];
+    dcopy *e = &g_dc[(addr >> 4 ^ addr >> 13) % NDC]; int why;
     if (e->addr == addr && e->size >= size && e->gen == g_wgen && e->gen && e->off % align == 0 && e->seq <= g_nwlog) {
         uint64_t hi = addr + size; uint32_t k = e->seq;
         for (; k < g_nwlog; k++) if (g_wlo[k] < hi && g_whi[k] > addr) break;
@@ -2792,8 +2781,7 @@ static uint64_t texu_slot(int stage, const sbind *b) {   // as a bound slot's ha
 // per texture ID, the image and view the first lookup of the submission found, valid while no registration changed (g_reg_gen); a hit touches the image as tex_get does (kept
 // from eviction for this submission) and goes the full way when the image was evicted, released, written since its upload and not yet checked this submission, or is a
 // CPU-written linear texture. Samplers by ID likewise, without the lock. Counted in the descriptor line
-// On by default from vk19.67 (session 2: at matched cpu7 clocks, recording -0.9 and RHIThread -1.0 ms); DM_VK_HTAB=0 resolves every handle the full way again
-static int htab_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_HTAB"); v = !(e && atoi(e) == 0); if (v) LOG("vk: DM_VK_HTAB on: texture and sampler handles resolved once a submission"); else LOG("vk: DM_VK_HTAB=0: every texture and sampler handle resolved the full way"); } return v; }
+static int htab_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_HTAB"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_HTAB=1: texture and sampler handles resolved once a submission"); } return v; }
 static struct { uint32_t tid; uint64_t gen, reg; vtex *v; VkImageView view; int ok; } g_ht[8192];
 static struct { int sid; uint64_t gen, reg; VkSampler s; } g_hs[1024];
 static uint64_t g_ht_hit, g_ht_miss, g_ht_slow;
@@ -3197,8 +3185,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                     if (v && stage == 5) { if (P.open && ws_is_att(v)) g_ws_att = 1; if (g_nws_simg < 16) g_ws_simg[g_nws_simg++] = v; }   // what a deferred dispatch writes (defer_on)
                     else if (v && g_ndefer && v->dfr_gen == g_defer_gen) g_defer_haz = 1;
                     VkImageView iv = v && v->storage ? tex_view(v, &tr.t, &tr.v, tr.has_v, -1, 2) : VK_NULL_HANDLE;
-                    if (iv) { view = iv; v->copied = 1; }   // written on the GPU: hibernation reads it back (mtl_hib_readback)
-                    else RED_ONCE(73, "shader %s: image slot %d is not a storage-capable image here: its writes are lost", s->key, b->reg + (int)e);
+                    if (iv) view = iv; else RED_ONCE(73, "shader %s: image slot %d is not a storage-capable image here: its writes are lost", s->key, b->reg + (int)e);
                 }
                 if (b->type == BT_CIS && have) sm = bind_samp(stage, b, th, (int)e);
                 else if (b->type == BT_CIS && dyn && (th >> 20)) { lk_(&g_rmu, LW_RMU); sm = samp_get((int)(th >> 20)); pthread_mutex_unlock(&g_rmu); }
@@ -3773,7 +3760,6 @@ static void copy_b2t(const p_copy_b2t *c) {
     if (g_plog) LOG("plog:  b2t serial %llu fmt %#x %dx%d at %d,%d,%d", (unsigned long long)c->tex->serial, c->tex->d.format, c->r.width, c->r.height, c->r.xoffset, c->r.yoffset, c->r.zoffset);
     vtex *v = tex_get(c->tex, 0); if (!v) return;
     if (v->f.dec) { RED_ONCE(50, "buffer-to-texture copy into a BC texture: not decoded yet"); return; }
-    v->copied = 1;
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh); if (!bpb) return;
     const NVNcopyRegion *r = &c->r; uint32_t w = (uint32_t)r->width, h = (uint32_t)r->height, d = (uint32_t)(r->depth > 0 ? r->depth : 1);
     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((w + bw - 1) / bw) * bpb, img = S.copy_img_stride ? (size_t)S.copy_img_stride : row * ((h + bh - 1) / bh);
@@ -4510,8 +4496,7 @@ static uint16_t glyph(char c) {   // rows top to bottom, 3 bits each
                                     "7111001001001001", "8111101111101111", "9111101111001111", "A010101111101101", "B110101110101110", "X101101010101101", "Y101101010010010",
                                     "L100100100100111", "R110101110101101", "Z111001010100111", "+000010111010000", "-000000111000000",
                                     "M101111111101101", "E111100111100111", "N110101101101101", "I111010010010111", "P110101110100100", "K101101110101101", "S111100111001111",
-                                    "H101101111101101", "D110101101101110", "T111010010010010", "U101101101101111", "W101101111111101", "/001001010100100", ".000000000000010",
-                                    "J001001001101111"};
+                                    "H101101111101101", "D110101101101110", "T111010010010010", "U101101101101111", "W101101111111101", "/001001010100100", ".000000000000010"};
     for (size_t i = 0; i < sizeof G / sizeof *G; i++) if (G[i][0] == c) { uint16_t g = 0; for (int k = 1; k <= 15; k++) g = (uint16_t)(g << 1 | (G[i][k] == '1')); return g; }
     return 0;
 }
@@ -4627,18 +4612,7 @@ static void *pw_worker(void *a) { pthread_setname_np("dm-prewarm");
     for (uint32_t i; (i = atomic_fetch_add(&g_pw_next, 1)) < g_pw_total;) { pso_precreate_one(&g_pw_recs[i]); atomic_fetch_add(&g_pw_done, 1); }
     return NULL;
 }
-static void screen_draw(const char *t1, const char *t2, uint32_t done, uint32_t total);
 static void pw_draw(uint32_t done, uint32_t total) {   // one frame of the pre-warm screen
-    char t1[64]; snprintf(t1, sizeof t1, "MENYIAPKAN SHADER %u / %u", done, total);
-    screen_draw(t1, "KETUK UNTUK LEWATI", done, total);
-}
-// The hibernation restore's screen (app/front_android.c, before the host reads the snapshot): drawn until the game's first frame replaces it
-void dm_vk_message(const char *t1, const char *t2) {
-    vk_init();
-    int gen; for (int i = 0; i < 40; i++) { front_window_lock(1); ANativeWindow *aw = front_native_window(&gen); front_window_lock(0); if (aw) break; usleep(50000); }
-    for (int i = 0; i < 3; i++) screen_draw(t1, t2, 0, 0);
-}
-static void screen_draw(const char *t1, const char *t2, uint32_t done, uint32_t total) {   // one frame: t1 large, t2 small, a progress bar when total > 0
     int gen; front_window_lock(1); ANativeWindow *aw = front_native_window(&gen);
     if (!aw || gen != W.gen) { win_drop(); W.gen = gen; if (aw) win_make(aw); }
     if (!aw || !W.sc) { front_window_lock(0); return; }
@@ -4659,13 +4633,15 @@ static void screen_draw(const char *t1, const char *t2, uint32_t done, uint32_t 
     rp_desc d = {.n = 1, .cv = {W.view[idx]}, .cf = {W.fmt}, .cl = {VK_ATTACHMENT_LOAD_OP_LOAD}, .w = W.ext.width, .h = W.ext.height, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     P_->fb = rp_begin(cb, &d);
     static VkClearRect tr[2048]; uint32_t nt = 0, ww = W.ext.width, hh = W.ext.height, cell = hh / 90 ? hh / 90 : 2;
+    char t1[64]; snprintf(t1, sizeof t1, "MENYIAPKAN SHADER %u / %u", done, total);
+    const char *t2 = "KETUK UNTUK LEWATI";
     nt = text_rects(tr, nt, 2048, t1, (int32_t)((ww - strlen(t1) * 4 * cell) / 2), (int32_t)(hh / 2 - 9 * cell), cell);
     uint32_t c2 = cell * 2 / 3 ? cell * 2 / 3 : 1; nt = text_rects(tr, nt, 2048, t2, (int32_t)((ww - strlen(t2) * 4 * c2) / 2), (int32_t)(hh / 2 + 8 * cell), c2);
     uint32_t bw = ww * 6 / 10, bx = (ww - bw) / 2, by = hh / 2, bh = cell * 3, fw = total ? (uint32_t)((uint64_t)bw * done / total) : 0;
     VkClearRect outline = {{{(int32_t)bx, (int32_t)by}, {bw, bh}}, 0, 1}, fill = {{{(int32_t)bx, (int32_t)by}, {fw ? fw : 1, bh}}, 0, 1};
     VkClearAttachment white = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.85f, 0.85f, 0.9f, 1}}}}, dark = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.2f, 0.22f, 0.3f, 1}}}},
                       bar = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {.color = {{0.35f, 0.7f, 1.0f, 1}}}};
-    if (total) { ovl_clear(cb, &dark, 1, &outline); if (fw) ovl_clear(cb, &bar, 1, &fill); }
+    ovl_clear(cb, &dark, 1, &outline); if (fw) ovl_clear(cb, &bar, 1, &fill);
     if (nt) ovl_clear(cb, &white, nt, tr);
     rp_end(cb);
     img_barrier(cb, W.img[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
@@ -5014,6 +4990,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)period_s;
     uint64_t n = atomic_fetch_add(&g_presents, 1) + 1;
     g_frame_draw = 0; vk_ctl(n);
+    { extern _Atomic uint64_t dm_present_ns; atomic_store(&dm_present_ns, now_ns()); }   // hle_thread.c: DM_HITCH_DUMP measures stalls from it (nvn_mtl.m sets it on Apple; never set here before, so the dump never fired on Android)
     { uint64_t now = now_ns(); if (g_pp_last) g_pp[g_npp++ % 600] = (uint32_t)((now - g_pp_last) / 1000 > UINT32_MAX ? UINT32_MAX : (now - g_pp_last) / 1000); g_pp_last = now; }   // present to present (us)
     if (n == 1 || n % 600 == 0) { void vk_stats_window(uint64_t frames); vk_stats_window(n); }   // heat and energy (vk_stats.c): started at the first frame, a window each 600
     {   // the frame's work for the hint session: the time since the last present (its CPU side) and the GPU time per frame of the last completed submissions
@@ -5361,98 +5338,3 @@ void mtl_hybrid_stats(uint64_t *draws, uint64_t *made, uint64_t *none) { *draws 
 void mtl_geomesh_stats(uint64_t *a, uint64_t *b) { *a = *b = 0; }
 void mtl_geohoist_stats(uint64_t *a, uint64_t *b, uint64_t *c) { *a = *b = 0; memset(c, 0, 6 * sizeof *c); }
 void mtl_cshoist_stats(uint64_t *a, uint64_t *b, uint64_t *c) { *a = *b = 0; memset(c, 0, 8 * sizeof *c); }
-
-// ---------- Hibernation (dm/host/hle_hibsnap.c): this backend's lasting state in a snapshot ----------
-// The images, views, samplers and pipelines are caches filled from guest memory as draws need them. What the game set up through NVN calls is kept: the memory pools, the texture
-// and sampler descriptor tables, the textures the CPU writes, the depth and origin modes, and the fence counter (sync objects in guest memory hold fence values: every one up to the
-// snapshot's is complete in the restored process). GPU-only content: before the snapshot, every registered texture the GPU filled (copies, render passes) is read back into its
-// storage in guest memory and listed as written by the CPU, so the restored process uploads it from there (mtl_hib_readback, as nvn_mtl.m does; FINAL FANTASY XII THE ZODIAC AGE fills
-// its UI atlases by GPU copies). Single-sampled colour textures only, and none the host decodes for want of the format (their image is not the storage's format)
-typedef struct { uint32_t npool, ntreg, nsreg, ncpu; int32_t origin_ll, depth_zero; uint64_t fence; } hib_vk;
-typedef struct { uint64_t mem, size; } hib_vpool;
-typedef struct { int32_t idx, has_v; tex_t t; view_t v; } hib_vtreg;
-typedef struct { int32_t idx, pad; samp_par p; } hib_vsreg;
-static uint64_t *g_hib_rb; static uint32_t g_hib_nrb;
-void mtl_hib_readback(void) {   // inside a submission (hle_nvn.c dm_hib_nvn_prepare), every guest thread parked and the GPU drained
-    free(g_hib_rb); g_hib_rb = NULL; g_hib_nrb = 0;
-    pthread_mutex_lock(&g_rmu);
-    tex_t *ts = malloc(((size_t)g_ntreg + 1) * sizeof *ts); int nt = 0;
-    for (int i = 0; i < g_ntreg; i++) if (g_treg[i].ok && g_treg[i].t.serial) ts[nt++] = g_treg[i].t;
-    pthread_mutex_unlock(&g_rmu);
-    typedef struct { tex_t t; unsigned lv, ly; uint32_t w, h, dz; size_t row, img; VkDeviceSize off; } rb_t;   // dz: a 3D level's slices (one copy of the whole level)
-    rb_t *rb = malloc(((size_t)nt * 16 + 1) * sizeof *rb); int nrb = 0; VkDeviceSize total = 0;
-    g_hib_rb = malloc(((size_t)nt + 1) * sizeof *g_hib_rb);
-    for (int i = 0; i < nt; i++) {
-        const tex_t *t = &ts[i]; int dup = 0;
-        for (uint32_t k = 0; k < g_hib_nrb && !dup; k++) dup = g_hib_rb[k] == t->serial;
-        if (dup || !t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER
-            || (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || t->has_layout) continue;
-        pthread_mutex_lock(&g_rmu); vtex *v = tex_find(t->serial); int cpu = cpu_written(t->serial); pthread_mutex_unlock(&g_rmu);
-        if (!v || v->dead || !v->img || v->evicted || cpu ||   // released: kept findable until freed (mtl_tex_release), its storage may be another's now
-            v->f.dec || v->f.depth || !(v->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || (v->uploaded && !v->gpu && !v->copied && !(v->gpu_lv & ~v->mir_lv))) continue;   // copied levels whose bytes reached the storage too (mir_lv) need nothing   // not made, uploaded from its storage, or not its storage's format
-        int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); if (!bpb) continue;
-        for (unsigned lv = 0; lv < v->levels && lv < 16; lv++) {
-            uint32_t w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1, dz = t->d.target == NVN_TEXTURE_TARGET_3D ? (v->d >> lv ? v->d >> lv : 1) : 1;
-            size_t row = (size_t)((w + bw - 1) / bw) * bpb, img = row * ((h + bh - 1) / bh);
-            for (unsigned ly = 0; ly < v->layers; ly++) {
-                rb = realloc(rb, ((size_t)nrb + 1) * sizeof *rb);
-                rb[nrb++] = (rb_t){*t, lv, ly, w, h, dz, row, img, total}; total += (img * dz + 15) & ~(VkDeviceSize)15;
-            }
-        }
-        g_hib_rb[g_hib_nrb++] = t->serial;
-    }
-    if (nrb) {
-        VkDeviceMemory m; void *map = NULL; VkBuffer b = buf_new(total, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &m, &map);
-        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
-        pass_end();
-        vkCmdPipelineBarrier(C->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-        for (int i = 0; i < nrb; i++) {
-            pthread_mutex_lock(&g_rmu); vtex *v = tex_find(rb[i].t.serial); pthread_mutex_unlock(&g_rmu);
-            VkBufferImageCopy c = {rb[i].off, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, rb[i].lv, rb[i].ly, 1}, {0, 0, 0}, {rb[i].w, rb[i].h, rb[i].dz}};
-            vkCmdCopyImageToBuffer(C->cb, v->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &c);
-        }
-        C->used = 1;
-        uint64_t f = mtl_sub_commit(); mtl_wait(f, UINT64_MAX);   // the copies done: their bytes into the textures' storage
-        for (int i = 0; i < nrb; i++) {
-            NVNcopyRegion r = {0, 0, 0, (int)rb[i].w, (int)rb[i].h, (int)rb[i].dz};
-            if (nvn_tex_mirror_b2t(&rb[i].t, rb[i].lv, rb[i].ly, &r, (const uint8_t *)map + rb[i].off, rb[i].row, rb[i].img)) { static int n; if (n++ < 4) LOG("[RED] hibernate: texture ser=%llu level %u not written into its storage", (unsigned long long)rb[i].t.serial, rb[i].lv); }
-        }
-        vkDestroyBuffer(g_dev, b, NULL); vkFreeMemory(g_dev, m, NULL);
-        mtl_sub_begin();   // the caller commits a submission of its own
-    }
-    LOG("hibernate: %u GPU-filled textures read back into their storage (%.1f MB)", g_hib_nrb, total / 1048576.0);
-    free(rb); free(ts);
-}
-void nvn_dirty_add_range(const void *mem, size_t size);
-size_t mtl_hib_save(uint8_t **out) {
-    hib_vk h = {0};
-    pthread_mutex_lock(&g_pool_mu); h.npool = (uint32_t)g_npool; pthread_mutex_unlock(&g_pool_mu);
-    pthread_mutex_lock(&g_rmu); for (int i = 0; i < g_ntreg; i++) h.ntreg += g_treg[i].ok != 0; for (int i = 0; i < g_nsreg; i++) h.nsreg += g_sreg_ok[i] != 0; h.ncpu = (uint32_t)g_ncpu + g_hib_nrb; pthread_mutex_unlock(&g_rmu);
-    h.origin_ll = g_origin_ll; h.depth_zero = g_depth_zero; pthread_mutex_lock(&g_mu); h.fence = g_fence; pthread_mutex_unlock(&g_mu);
-    size_t n = sizeof h + h.npool * sizeof(hib_vpool) + h.ntreg * sizeof(hib_vtreg) + h.nsreg * sizeof(hib_vsreg) + h.ncpu * 8;
-    uint8_t *b = calloc(1, n), *p = b; memcpy(p, &h, sizeof h); p += sizeof h;
-    pthread_mutex_lock(&g_pool_mu); for (uint32_t i = 0; i < h.npool; i++) { hib_vpool e = {(uint64_t)(uintptr_t)g_pool[i].mem, g_pool[i].size}; memcpy(p, &e, sizeof e); p += sizeof e; } pthread_mutex_unlock(&g_pool_mu);
-    pthread_mutex_lock(&g_rmu);
-    for (int i = 0; i < g_ntreg; i++) if (g_treg[i].ok) { hib_vtreg e = {i, g_treg[i].has_v, g_treg[i].t, g_treg[i].v}; memcpy(p, &e, sizeof e); p += sizeof e; }
-    for (int i = 0; i < g_nsreg; i++) if (g_sreg_ok[i]) { hib_vsreg e = {i, 0, g_sreg[i]}; memcpy(p, &e, sizeof e); p += sizeof e; }
-    memcpy(p, g_cpu_written, (size_t)g_ncpu * 8); p += (size_t)g_ncpu * 8;
-    pthread_mutex_unlock(&g_rmu);
-    memcpy(p, g_hib_rb, (size_t)g_hib_nrb * 8); free(g_hib_rb); g_hib_rb = NULL; g_hib_nrb = 0;   // read back for the snapshot: uploaded from their storage when restored
-    *out = b; return n;
-}
-int mtl_hib_restore(const uint8_t *b, size_t n) {
-    hib_vk h; if (n < sizeof h) return -1; memcpy(&h, b, sizeof h);
-    if (n != sizeof h + h.npool * sizeof(hib_vpool) + h.ntreg * sizeof(hib_vtreg) + h.nsreg * sizeof(hib_vsreg) + h.ncpu * 8) return -1;
-    const uint8_t *p = b + sizeof h;
-    for (uint32_t i = 0; i < h.npool; i++) { hib_vpool e; memcpy(&e, p, sizeof e); p += sizeof e; mtl_pool_add((const void *)(uintptr_t)e.mem, e.size); nvn_dirty_add_range((const void *)(uintptr_t)e.mem, e.size); }
-    for (uint32_t i = 0; i < h.ntreg; i++) { hib_vtreg e; memcpy(&e, p, sizeof e); p += sizeof e; mtl_reg_tex(e.idx, &e.t, e.has_v ? &e.v : NULL); }
-    for (uint32_t i = 0; i < h.nsreg; i++) { hib_vsreg e; memcpy(&e, p, sizeof e); p += sizeof e; mtl_reg_samp(e.idx, &e.p); }
-    pthread_mutex_lock(&g_rmu);
-    for (uint32_t i = 0; i < h.ncpu; i++) { uint64_t s; memcpy(&s, p, 8); p += 8;
-        if (!cpu_written(s)) { if (g_ncpu == g_ccpu) { g_ccpu = g_ccpu ? 2 * g_ccpu : 64; g_cpu_written = realloc(g_cpu_written, g_ccpu * sizeof *g_cpu_written); } g_cpu_written[g_ncpu++] = s; } }
-    pthread_mutex_unlock(&g_rmu);
-    g_origin_ll = h.origin_ll; g_depth_zero = h.depth_zero;
-    pthread_mutex_lock(&g_mu); g_fence = g_done = h.fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);   // every fence the snapshot's syncs hold is complete
-    LOG("hibernate: Vulkan replay state restored: %u pools, %u texture and %u sampler descriptors, %u CPU-written textures, fence %llu", h.npool, h.ntreg, h.nsreg, h.ncpu, (unsigned long long)h.fence);
-    return 0;
-}
