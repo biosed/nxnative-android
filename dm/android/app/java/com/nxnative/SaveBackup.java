@@ -32,6 +32,7 @@ final class SaveBackup {
     private static final int KEEP = 5;
     private final Context ctx;
     private final File save, ext, backups;
+    String last = "no backup line";   // the last line logged: MenuActivity hands it to the game's log (play_token)
 
     SaveBackup(Context c) {
         ctx = c; save = new File(c.getFilesDir(), "save");
@@ -51,6 +52,7 @@ final class SaveBackup {
     String run(boolean allowImport) {
         if (backups == null) { log("no external folder: no backup"); return null; }
         String ts = stamp();
+        log("start: " + save + (save.isDirectory() ? " (" + count(save)[0] + " files)" : " (none)") + ", external " + ext);
         backup(ts);
         if (!allowImport || !importWaiting()) return null;
         File in = new File(ext, "save_import");
@@ -154,10 +156,15 @@ final class SaveBackup {
         if (f.isDirectory()) { String[] l = f.list(); if (l != null) for (String n : l) deleteTree(new File(f, n)); }
         f.delete();
     }
+    // Warning level: HyperOS's logcat dropped this app's info lines (no nxsave line on the Xiaomi Pad 8 while Harvest Moon was started several times)
     private void log(String s) {
-        Log.i(TAG, s);
+        Log.w(TAG, s); last = s;
         if (backups == null) return;
-        backups.mkdirs();
+        if (!backups.isDirectory() && !backups.mkdirs()) {   // the folder cannot be made (the external folder made by another app or adb): said where adb looks first
+            Log.e(TAG, "cannot make " + backups + "; " + s);
+            try (OutputStream o = new FileOutputStream(new File(ext, "save_backup_error.txt"), true)) { o.write(("cannot make " + backups + ": " + s + "\n").getBytes(StandardCharsets.UTF_8)); } catch (Exception e) { /* logcat has it */ }
+            return;
+        }
         String line = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT).format(new Date()) + " " + s + "\n";
         try (OutputStream o = new FileOutputStream(new File(backups, "log.txt"), true)) { o.write(line.getBytes(StandardCharsets.UTF_8)); } catch (Exception e) { /* logcat has it */ }
     }

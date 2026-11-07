@@ -50,6 +50,8 @@ public class MenuActivity extends Activity {
     private TextView status; private android.widget.ProgressBar bar; private volatile boolean unpacking;
     private static boolean savesDone;   // the start's backup / import, once per process (not again when the activity is made anew in it)
     private boolean saveBusy, playWaiting;
+    private boolean backupFresh;
+    private String lastBackup = "none";   // SaveBackup's last line, written into <files>/play_token for the game's log   // a backup finished since the last game start: every start of the game gets one, also when this process (and savesDone) outlived the last game
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -391,10 +393,12 @@ public class MenuActivity extends Activity {
         saveBusy = true;
         new Thread(() -> {
             String msg = null;
-            try { msg = new SaveBackup(this).run(true); } catch (Throwable t) { android.util.Log.e("nxsave", "save backup", t); }
+            SaveBackup sb = null;
+            try { sb = new SaveBackup(this); msg = sb.run(true); } catch (Throwable t) { android.util.Log.e("nxsave", "save backup", t); }
+            final String line = sb != null ? sb.last : "save backup threw (logcat nxsave)";
             final String m = msg;
             runOnUiThread(() -> {
-                saveBusy = false;
+                saveBusy = false; backupFresh = true; lastBackup = line;
                 if (m != null) android.widget.Toast.makeText(this, m, android.widget.Toast.LENGTH_LONG).show();
                 if (playWaiting) { playWaiting = false; if (!isFinishing() && !isDestroyed()) play(); }
             });
@@ -403,10 +407,13 @@ public class MenuActivity extends Activity {
     private void play() {
         if (unpacking) return;
         if (saveBusy) { playWaiting = true; return; }
+        if (!backupFresh) { playWaiting = true; saves(); return; }   // the save backed up right before each start of the game, not only at the menu's first start in a process
         if (!new File(getFilesDir(), "settings.env").exists()) save();
         new File(getFilesDir(), "game_failed").delete(); new File(getFilesDir(), "game_running").delete();   // the player starts it: not a restart after a death
         if (status != null && !unpacking) status.setVisibility(View.GONE);
-        launched = true;
+        // <files>/play_token: this start came from the menu, after the backup (the game's front end logs it as 'boot: save backup before this start: ...', or a red line when it is missing)
+        try (OutputStream o = new FileOutputStream(new File(getFilesDir(), "play_token"))) { o.write(lastBackup.getBytes(StandardCharsets.UTF_8)); } catch (Exception e) { /* the game logs it as missing */ }
+        launched = true; backupFresh = false;
         Intent i = new Intent(); i.setClassName(this, "android.app.NativeActivity");
         startActivity(i);
     }
