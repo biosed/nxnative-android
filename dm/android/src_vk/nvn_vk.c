@@ -2984,7 +2984,7 @@ typedef struct { VkFormat f; VkDeviceSize n; VkBufferView v; } ts_view_t;
 typedef struct { uint64_t addr, len, regid, stamp, fence, tick, serial; const void *span; uint32_t off_g, ng; uint8_t used, dirty, nv, kind; ts_view_t v[4]; uint8_t *shadow; } ts_ent;   // kind: TSK_* (vk19.72)
 enum { TSK_TEXEL, TSK_VTX, TSK_IDXPOOL };
 static ts_ent g_ts[TS_NENT];
-static struct { uint64_t addr, len, h, hframe, bl_until; uint32_t nmis; uint8_t kind; } g_tc[TS_NCAND];   // nmis: hashes that differed from the last (vk19.70b: 3 and it is refused for 10 s)
+static struct { uint64_t addr, len, h, hframe, bl_until; uint32_t nmis; uint8_t kind, nbl; } g_tc[TS_NCAND];   // nbl: times refused (vk19.74a: 10 s, then 60 s, then for the session)   // nmis: hashes that differed from the last (vk19.70b: 3 and it is refused for 10 s)
 typedef struct { VkBufferView v[4]; int nv; uint32_t off_g, ng; uint64_t fence; } ts_ret_t;
 static ts_ret_t *g_ts_ret; static int g_ts_nret, g_ts_cret;   // blocks and views waiting for their readers: grows as needed (vk19.70b: a block is never forgotten)
 static ts_ret_t *ts_ret_push(void) {
@@ -3075,9 +3075,10 @@ static int ts_fill(ts_ent *e, uint64_t addr, uint64_t len, const void *span, uin
     return 1;
 }
 static uint32_t ts_cand(uint64_t addr, uint64_t len, int kind) { return (uint32_t)((addr >> 6 ^ addr >> 19 ^ len * 0x9e3779b1u ^ (uint64_t)kind * 0x5bd1e995u) % TS_NCAND); }
-static void ts_blacklist(uint64_t addr, uint64_t len, int kind) {
+static void ts_blacklist(uint64_t addr, uint64_t len, int kind) {   // refused for 10 s, again 60 s, a third time for the session (vk19.74a: a range that keeps failing stops costing hashes and copies)
     typeof(g_tc[0]) *c = &g_tc[ts_cand(addr, len, kind)];
-    c->addr = addr; c->len = len; c->kind = (uint8_t)kind; c->h = 0; c->hframe = 0; c->nmis = 0; c->bl_until = ts_now_s() + 10; g_ts_bl++;
+    uint8_t nbl = c->addr == addr && c->len == len && c->kind == kind && c->nbl < 255 ? c->nbl + 1 : 1;
+    c->addr = addr; c->len = len; c->kind = (uint8_t)kind; c->h = 0; c->hframe = 0; c->nmis = 0; c->nbl = nbl; c->bl_until = nbl >= 3 ? UINT64_MAX : ts_now_s() + (nbl == 1 ? 10 : 60); g_ts_bl++;
 }
 void ts_pool_deleted(const void *mem, uint64_t size) {   // mtl_pool_del (any thread), holding g_pool_mu: the recording thread drops its blocks at its next lookup
     int n = atomic_load(&g_ts_npdel); if (n < 64) { g_ts_pdel[n].mem = (uint64_t)(uintptr_t)mem; g_ts_pdel[n].size = size; atomic_store(&g_ts_npdel, n + 1); }
@@ -3096,6 +3097,7 @@ static ts_ent *ts_get(uint64_t addr, uint64_t n, VkDeviceSize al, int kind) {
         atomic_store(&g_ts_npdel, 0); pthread_mutex_unlock(&g_pool_mu); }
     ts_reap();
     if (al > TS_GRAN || !n || n > (64u << 20) || (g_ts_ngran && n > (uint64_t)g_ts_ngran * TS_GRAN / 4)) return NULL;   // at most a quarter of the store a range
+    if (kind != TSK_TEXEL && n > (2u << 20)) return NULL;   // vk19.74a: vertex streams and the index pool at most 2 MB a range (an 8 MB index pool cost 1.5-2.5 ms a hash and as much a copy when written)
     ts_ent *e = ts_slot(addr, n, kind);
     if (e->used && e->addr == addr && e->len == n && e->kind == kind) {
         uint64_t rid = nvn_dirty_span_regid(e->span);
@@ -3112,13 +3114,13 @@ static ts_ent *ts_get(uint64_t addr, uint64_t n, VkDeviceSize al, int kind) {
     }
     g_ts_miss++;
     typeof(g_tc[0]) *c = &g_tc[ts_cand(addr, n, kind)];
-    if (c->addr != addr || c->len != n || c->kind != kind) { if (c->bl_until > ts_now_s()) return NULL; c->addr = addr; c->len = n; c->kind = (uint8_t)kind; c->h = 0; c->hframe = 0; c->bl_until = 0; c->nmis = 0; return NULL; }   // its first miss: noted, not hashed
+    if (c->addr != addr || c->len != n || c->kind != kind) { if (c->bl_until > ts_now_s()) return NULL; c->addr = addr; c->len = n; c->kind = (uint8_t)kind; c->h = 0; c->hframe = 0; c->bl_until = 0; c->nmis = 0; c->nbl = 0; return NULL; }   // its first miss: noted, not hashed
     if (c->bl_until && c->bl_until > ts_now_s()) return NULL;
     uint64_t fr = atomic_load_explicit(&g_presents, memory_order_relaxed);
     if (c->hframe == fr) return NULL;   // hashed in this frame already
     uint64_t h = ts_span_hash(addr, n);
     if (!(c->hframe && c->hframe + 1 == fr && c->h == h)) {
-        if (c->hframe && c->h != h && ++c->nmis >= 3) { ts_blacklist(addr, n, kind); return NULL; }   // never stable: not hashed again for 10 s (a hash costs about a copy)
+        if (c->hframe && c->h != h && ++c->nmis >= 3) { ts_blacklist(addr, n, kind); return NULL; }   // never stable: not hashed again for a while (a hash costs about a copy)
         c->h = h; c->hframe = fr; return NULL; }
     // the same bytes in two consecutive frames: admitted, if it qualifies
     const void *span = nvn_dirty_span((const void *)(uintptr_t)addr, (size_t)n); uint64_t rid = nvn_dirty_span_regid(span);
