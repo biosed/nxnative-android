@@ -1866,7 +1866,8 @@ typedef struct {
     int ssbo_wr;   // the module stores to or atomically updates a storage buffer (spv_ssbo_writes): only then is a draw's storage buffer a write that gets lost
     uint32_t io_mask;   // user interface locations: a vertex shader's outputs, a pixel shader's inputs (spv_io): an input no output feeds is an interface mismatch (vs_pad_mod)
     uint16_t in_type[32];   // a pixel shader's input type per location (spv_io: 1-4 components | 0x100 int | 0x200 uint; 0 = not a plain 32-bit scalar or vector)
-    struct { uint32_t mask; VkShaderModule m; } pad[4]; int npad;   // a vertex shader's padded variants, by the locations added (vs_pad_mod)
+    struct { uint32_t mask; VkShaderModule m; } pad[8]; int npad, pad_full;   // a vertex shader's padded variants, by the locations added (vs_pad_mod)
+    int io_complex;   // a user interface variable that is not a scalar or vector (an array, matrix or struct takes several locations): never padded
 } shader_t;
 static shader_t **g_sh; static int g_nsh;
 static int g_depth_zero;   // NVN depth mode (mtl_set_depth_zero, defined with the replay state)
@@ -1925,7 +1926,7 @@ static uint32_t *spv_dual(const uint32_t *w, size_t nw, size_t *out_n) {
 }
 // The user locations of a module's interface: Output variables of a vertex shader or Input variables of a pixel shader (built-ins left out), and for a pixel shader each input's
 // type when it is a 32-bit float / int / uint scalar or vector with no Component decoration (in_type; 0 otherwise)
-static uint32_t spv_io(const uint32_t *w, size_t nw, int sc, uint16_t *types) {
+static uint32_t spv_io(const uint32_t *w, size_t nw, int sc, uint16_t *types, int *complex) {
     enum { OpTypeInt = 21, OpTypeFloat = 22, OpTypeVector = 23, OpTypePointer = 32, OpVariable = 59, OpDecorate = 71, OpMemberDecorate = 72, Location = 30, Component = 31, BuiltIn = 11 };
     uint32_t bound = nw > 3 ? w[3] : 0, mask = 0; if (!bound || bound > (1u << 22)) return 0;
     int32_t *loc = malloc(bound * 4); uint8_t *bi = calloc(bound, 1), *comp = calloc(bound, 1); uint32_t *tdef = calloc(bound, 4);
@@ -1940,6 +1941,7 @@ static uint32_t spv_io(const uint32_t *w, size_t nw, int sc, uint16_t *types) {
         if (op == OpTypePointer && len >= 4 && w[i + 1] < bound && w[i + 2] == (uint32_t)sc && w[i + 3] < bound) tdef[w[i + 1]] = 0x10000 | w[i + 3];   // a pointer: its pointee
         if (op == OpVariable && len >= 4 && w[i + 3] == (uint32_t)sc && w[i + 2] < bound && w[i + 1] < bound && !bi[w[i + 2]] && loc[w[i + 2]] >= 0 && loc[w[i + 2]] < 32) {
             mask |= 1u << loc[w[i + 2]];
+            { uint32_t pt = tdef[w[i + 1]]; if (!(pt >> 16) || !tdef[pt & 0xffff]) *complex = 1; }   // an array / matrix / struct covers more locations than its bit: the mask is not exact
             if (types) { uint32_t pt = tdef[w[i + 1]], ty = pt >> 16 ? tdef[pt & 0xffff] : 0; types[loc[w[i + 2]]] = comp[w[i + 2]] || ty > 0x2ff ? 0 : (uint16_t)ty; }
         }
         i += len; }
@@ -2011,10 +2013,14 @@ static pthread_mutex_t g_padmu = PTHREAD_MUTEX_INITIALIZER;
 // The vertex shader to draw with a pixel shader: itself when it writes every location the pixel shader reads (every pair in FINAL FANTASY RESONANCE, FINAL FANTASY XII and Harvest
 // Moon), else a variant padded with zero outputs at the missing ones (spv_pad_outputs), made from the shader file with the same transforms as the plain one, cached by the mask
 static VkShaderModule vs_pad_mod(shader_t *vs, const shader_t *fs) {
-    uint32_t miss = fs ? fs->io_mask & ~vs->io_mask : 0; if (!miss) return vs->mod;
+    uint32_t miss = fs ? fs->io_mask & ~vs->io_mask : 0; if (!miss || vs->io_complex) return vs->mod;   // a vertex shader with an array / matrix / struct output: its mask is not exact, never padded
     pthread_mutex_lock(&g_padmu);
     VkShaderModule m = VK_NULL_HANDLE; int found = 0;
     for (int i = 0; i < vs->npad; i++) if (vs->pad[i].mask == miss) { m = vs->pad[i].m; found = 1; break; }
+    if (!found && vs->npad == 8) {   // full: drawn unpadded, as before (logged once per shader)
+        if (!vs->pad_full) { vs->pad_full = 1; LOG("vk: vertex shader %s: more than 8 padded variants; pixel shader %s drawn with the plain one", vs->key, fs->key); }
+        pthread_mutex_unlock(&g_padmu); return vs->mod;
+    }
     if (!found) {
         char path[1024]; size_t ns = 0, n = 0; snprintf(path, sizeof path, "%s/%s.spv", g_vkdir, vs->key);
         uint32_t *spv = read_file(path, &ns), *w = spv ? spv_pad_outputs(spv, ns / 4, miss, fs->in_type, &n) : NULL; free(spv);
@@ -2022,7 +2028,7 @@ static VkShaderModule vs_pad_mod(shader_t *vs, const shader_t *fs) {
                  VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, nb, w};
                  if (vkCreateShaderModule(g_dev, &mi, NULL, &m) != VK_SUCCESS) m = VK_NULL_HANDLE; free(w); }
         LOG("vk: vertex shader %s padded with zero outputs at locations %#x for pixel shader %s (it reads inputs the vertex shader does not write): %s", vs->key, miss, fs->key, m ? "made" : "not possible, drawn unpadded");
-        if (vs->npad < 4) { vs->pad[vs->npad].mask = miss; vs->pad[vs->npad].m = m; vs->npad++; }
+        vs->pad[vs->npad].mask = miss; vs->pad[vs->npad].m = m; vs->npad++;
     }
     pthread_mutex_unlock(&g_padmu);
     return m ? m : vs->mod;
@@ -2287,7 +2293,7 @@ static shader_t *shader_get_(const uint8_t md[8]) {
     for (size_t i = 5; i + 4 < ns / 4;) { uint32_t op = spv[i] & 0xffff, n = spv[i] >> 16; if (!n) break;   // BuiltIn Layer (9): OpDecorate / OpMemberDecorate
         if ((op == 71 && n >= 4 && spv[i + 2] == 11 && spv[i + 3] == 9) || (op == 72 && n >= 5 && spv[i + 3] == 11 && spv[i + 4] == 9)) s->layer_out = 1;
         i += n; }
-    s->io_mask = s->stage == 0 ? spv_io(spv, ns / 4, 3, NULL) : s->stage == 1 ? spv_io(spv, ns / 4, 1, s->in_type) : 0;   // outputs / inputs (vs_pad_mod)
+    s->io_mask = s->stage == 0 ? spv_io(spv, ns / 4, 3, NULL, &s->io_complex) : s->stage == 1 ? spv_io(spv, ns / 4, 1, s->in_type, &s->io_complex) : 0;   // outputs / inputs (vs_pad_mod)
     spv = vs_transform(s, spv, &ns, 1);
     VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, ns, spv};
     VkResult r = vkCreateShaderModule(g_dev, &mi, NULL, &s->mod); free(spv);
