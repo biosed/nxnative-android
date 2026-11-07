@@ -2985,7 +2985,8 @@ typedef struct { uint64_t addr, len, regid, stamp, fence, tick, serial; const vo
 enum { TSK_TEXEL, TSK_VTX, TSK_IDXPOOL };
 static ts_ent g_ts[TS_NENT];
 static struct { uint64_t addr, len, h, hframe, bl_until; uint32_t nmis; uint8_t kind, nbl; } g_tc[TS_NCAND];   // nbl: times refused (vk19.74a: 10 s, then 60 s, then for the session)   // nmis: hashes that differed from the last (vk19.70b: 3 and it is refused for 10 s)
-typedef struct { VkBufferView v[4]; int nv; uint32_t off_g, ng; uint64_t fence; } ts_ret_t;
+typedef struct { VkBufferView v[4]; int nv; uint32_t off_g, ng; uint64_t fence; uint8_t kind; } ts_ret_t;
+static uint32_t g_ts_bgran;   // granules held by vertex and index-pool blocks: at most half the store (vk19.74b: they never push texel blocks out)
 static ts_ret_t *g_ts_ret; static int g_ts_nret, g_ts_cret;   // blocks and views waiting for their readers: grows as needed (vk19.70b: a block is never forgotten)
 static ts_ret_t *ts_ret_push(void) {
     if (g_ts_nret == g_ts_cret) { int c = g_ts_cret ? 2 * g_ts_cret : 256; ts_ret_t *n = realloc(g_ts_ret, (size_t)c * sizeof *n); if (!n) die("texel store: retired-block list allocation failed"); g_ts_ret = n; g_ts_cret = c; }
@@ -3004,7 +3005,7 @@ static int ts_init(void) {
     if (zc_mode()) { RED_ONCE(110, "DM_VK_TEXEL_STORE is refused together with DM_VK_ZEROCOPY"); return 0; }
     const char *e = getenv("DM_VK_TEXEL_STORE_MB"); int mb = e && atoi(e) > 0 ? atoi(e) : 32; if (mb > 256) mb = 256;
     g_ts_ngran = (uint32_t)((uint64_t)mb << 20) / TS_GRAN; g_ts_used = calloc(g_ts_ngran, 1); if (!g_ts_used) return 0;
-    g_ts_buf = buf_new((VkDeviceSize)g_ts_ngran * TS_GRAN, ALL_BUF_USAGE, &g_ts_mem, (void **)&g_ts_p); g_ts_next = 0; g_ts_inuse = 0; g_ts_dropping = 0;
+    g_ts_buf = buf_new((VkDeviceSize)g_ts_ngran * TS_GRAN, ALL_BUF_USAGE, &g_ts_mem, (void **)&g_ts_p); g_ts_next = 0; g_ts_inuse = 0; g_ts_bgran = 0; g_ts_dropping = 0;
     LOG("vk: the range store: %d MB for ranges that stay the same across frames (DM_VK_TEXEL_STORE=%d: texel buffers; DM_VK_BUF_STORE=%d: vertex streams and the indirect index pool; 2: each use compared with a host copy)", mb, tog(TG_TSTORE), tog(TG_BSTORE));
     return 1;
 }
@@ -3019,7 +3020,7 @@ static int ts_gran_alloc(uint32_t n) {   // next fit over the granule map: -1 wh
 }
 static void ts_retire(ts_ent *e) {   // the block and its views go when its readers are done
     if (!e->used) return;
-    { ts_ret_t *r = ts_ret_push(); r->nv = e->nv; for (int i = 0; i < e->nv; i++) r->v[i] = e->v[i].v; r->off_g = e->off_g; r->ng = e->ng; r->fence = e->fence; }
+    { ts_ret_t *r = ts_ret_push(); r->nv = e->nv; for (int i = 0; i < e->nv; i++) r->v[i] = e->v[i].v; r->off_g = e->off_g; r->ng = e->ng; r->fence = e->fence; r->kind = e->kind; }
     free(e->shadow); memset(e, 0, sizeof *e);
 }
 static void ts_reap(void) {   // blocks whose readers are done: views destroyed, granules freed; a dropped store's buffer last
@@ -3027,7 +3028,7 @@ static void ts_reap(void) {   // blocks whose readers are done: views destroyed,
     for (int i = 0; i < g_ts_nret;) { ts_ret_t *r = &g_ts_ret[i];
         if (r->fence > done) { i++; continue; }
         for (int k = 0; k < r->nv; k++) vkDestroyBufferView(g_dev, r->v[k], NULL);
-        ts_gran_set(r->off_g, r->ng, 0); g_ts_ret[i] = g_ts_ret[--g_ts_nret]; }
+        ts_gran_set(r->off_g, r->ng, 0); if (r->kind != TSK_TEXEL) g_ts_bgran -= r->ng; g_ts_ret[i] = g_ts_ret[--g_ts_nret]; }
     if (g_ts_dropping && !g_ts_nret && g_ts_buf) { vkDestroyBuffer(g_dev, g_ts_buf, NULL); vkFreeMemory(g_dev, g_ts_mem, NULL); g_ts_buf = VK_NULL_HANDLE; g_ts_p = NULL; free(g_ts_used); g_ts_used = NULL; g_ts_dropping = 0;
                                                     LOG("vk: DM_VK_TEXEL_STORE: the store was dropped (memory pressure); made again when it has gone"); }
 }
@@ -3055,26 +3056,32 @@ static int ts_fill(ts_ent *e, uint64_t addr, uint64_t len, const void *span, uin
     int newblock = fresh || e->fence > __atomic_load_n(&g_done, __ATOMIC_ACQUIRE) || e->ng < ng;
     uint32_t off_g = e->off_g;
     if (newblock) {
-        int o = ts_gran_alloc(ng);
-        for (int tries = 0; o < 0 && tries < 64; tries++) {   // full: the least recently used block whose readers are done
+        int bk = kind != TSK_TEXEL;   // a vertex or index-pool block: within half the store, and it pushes out only blocks of its own kinds (vk19.74b)
+        int over = bk && g_ts_bgran + ng > g_ts_ngran / 2;
+        int o = over ? -1 : ts_gran_alloc(ng);
+        for (int tries = 0; o < 0 && tries < 64; tries++) {   // full (or the buffer kinds' half full): the least recently used block whose readers are done
             ts_ent *v = NULL; uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
-            for (int i = 0; i < TS_NENT; i++) if (g_ts[i].used && &g_ts[i] != e && g_ts[i].fence <= done && (!v || g_ts[i].tick < v->tick)) v = &g_ts[i];
+            for (int i = 0; i < TS_NENT; i++) if (g_ts[i].used && &g_ts[i] != e && g_ts[i].fence <= done && (!bk || g_ts[i].kind != TSK_TEXEL) && (!v || g_ts[i].tick < v->tick)) v = &g_ts[i];
             if (!v) break;
-            ts_retire(v); g_ts_evict++; ts_reap(); o = ts_gran_alloc(ng);
+            ts_retire(v); g_ts_evict++; ts_reap();
+            over = bk && g_ts_bgran + ng > g_ts_ngran / 2; o = over ? -1 : ts_gran_alloc(ng);
         }
         if (o < 0) return 0;
+        if (bk) g_ts_bgran += ng;
         if (!fresh) ts_retire(e);   // the old block stays for its readers
         off_g = (uint32_t)o;
     }
     uint64_t stamp = nvn_dirty_now();
-    if (!nvn_dirty_protect((const void *)(uintptr_t)addr, (size_t)len)) { if (newblock) ts_gran_set(off_g, ng, 0); if (!newblock || !fresh) ts_retire(e); return 0; }
+    if (!nvn_dirty_protect((const void *)(uintptr_t)addr, (size_t)len)) { if (newblock) { ts_gran_set(off_g, ng, 0); if (kind != TSK_TEXEL) g_ts_bgran -= ng; } if (!newblock || !fresh) ts_retire(e); return 0; }
     memcpy(g_ts_p + (size_t)off_g * TS_GRAN, (const void *)(uintptr_t)addr, (size_t)len);
     if (newblock) { memset(e, 0, sizeof *e); e->off_g = off_g; e->ng = ng; e->serial = ++g_ts_serial; }
     e->addr = addr; e->len = len; e->regid = regid; e->span = span; e->stamp = stamp; e->used = 1; e->tick = ++g_ts_tick; e->fence = g_fence + 1; e->kind = (uint8_t)kind;
     if (ts_kmode(kind) == 2) { if (!e->shadow) e->shadow = malloc((size_t)len); if (e->shadow) memcpy(e->shadow, (const void *)(uintptr_t)addr, (size_t)len); }
     return 1;
 }
-static uint32_t ts_cand(uint64_t addr, uint64_t len, int kind) { return (uint32_t)((addr >> 6 ^ addr >> 19 ^ len * 0x9e3779b1u ^ (uint64_t)kind * 0x5bd1e995u) % TS_NCAND); }
+static uint32_t ts_cand(uint64_t addr, uint64_t len, int kind) {   // vertex and index-pool candidates use the upper half of the table only (vk19.74b)
+    uint64_t h = addr >> 6 ^ addr >> 19 ^ len * 0x9e3779b1u ^ (uint64_t)kind * 0x5bd1e995u;
+    return kind == TSK_TEXEL ? (uint32_t)(h % TS_NCAND) : (uint32_t)(TS_NCAND / 2 + h % (TS_NCAND / 2)); }
 static void ts_blacklist(uint64_t addr, uint64_t len, int kind) {   // refused for 10 s, again 60 s, a third time for the session (vk19.74a: a range that keeps failing stops costing hashes and copies)
     typeof(g_tc[0]) *c = &g_tc[ts_cand(addr, len, kind)];
     uint8_t nbl = c->addr == addr && c->len == len && c->kind == kind && c->nbl < 255 ? c->nbl + 1 : 1;
@@ -3125,7 +3132,7 @@ static ts_ent *ts_get(uint64_t addr, uint64_t n, VkDeviceSize al, int kind) {
     // the same bytes in two consecutive frames: admitted, if it qualifies
     const void *span = nvn_dirty_span((const void *)(uintptr_t)addr, (size_t)n); uint64_t rid = nvn_dirty_span_regid(span);
     if (!span || !rid || gw_any(addr, n) || pool_class(addr) == PC_GPU) { g_ts_refused++; ts_blacklist(addr, n, kind); return NULL; }
-    if (e->used) { if (e->fence > __atomic_load_n(&g_done, __ATOMIC_ACQUIRE)) { g_ts_refused++; return NULL; } ts_retire(e); g_ts_evict++; }
+    if (e->used) { if (e->fence > __atomic_load_n(&g_done, __ATOMIC_ACQUIRE) || (kind != TSK_TEXEL && e->kind == TSK_TEXEL)) { g_ts_refused++; return NULL; } ts_retire(e); g_ts_evict++; }   // a vertex / index-pool range never takes a texel block's slot (vk19.74b)
     if (!ts_fill(e, addr, n, span, rid, 1, kind)) { g_ts_refused++; ts_blacklist(addr, n, kind); return NULL; }
     g_ts_adm++; g_ts_kadm[kind]++; c->addr = 0;
     return e;
