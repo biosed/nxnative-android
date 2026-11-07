@@ -2782,7 +2782,8 @@ static uint64_t texu_slot(int stage, const sbind *b) {   // as a bound slot's ha
 // per texture ID, the image and view the first lookup of the submission found, valid while no registration changed (g_reg_gen); a hit touches the image as tex_get does (kept
 // from eviction for this submission) and goes the full way when the image was evicted, released, written since its upload and not yet checked this submission, or is a
 // CPU-written linear texture. Samplers by ID likewise, without the lock. Counted in the descriptor line
-static int htab_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_HTAB"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_HTAB=1: texture and sampler handles resolved once a submission"); } return v; }
+// On by default from vk19.67 (session 2: at matched cpu7 clocks, recording -0.9 and RHIThread -1.0 ms); DM_VK_HTAB=0 resolves every handle the full way again
+static int htab_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_HTAB"); v = !(e && atoi(e) == 0); if (v) LOG("vk: DM_VK_HTAB on: texture and sampler handles resolved once a submission"); else LOG("vk: DM_VK_HTAB=0: every texture and sampler handle resolved the full way"); } return v; }
 static struct { uint32_t tid; uint64_t gen, reg; vtex *v; VkImageView view; int ok; } g_ht[8192];
 static struct { int sid; uint64_t gen, reg; VkSampler s; } g_hs[1024];
 static uint64_t g_ht_hit, g_ht_miss, g_ht_slow;
