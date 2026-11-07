@@ -78,11 +78,13 @@ static void clusters(char *out, size_t n) {
         else o += (size_t)snprintf(out + o, n - o, "%scpu%d+ %s (limit %ld)", i ? ", " : "", g_pol[i].cpu, ok ? "idle" : "no time_in_state", lim);
     }
 }
+static _Atomic int g_maps_last = -1;
+int vk_stats_maps_last(void) { return atomic_load(&g_maps_last); }   // the last count (the texel store's line)
 static int maps_lines(void) {
     int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
     static char b[65536]; int n = 0; ssize_t k;
     while ((k = read(fd, b, sizeof b)) > 0) for (ssize_t i = 0; i < k; i++) n += b[i] == '\n';
-    close(fd); return n;
+    close(fd); atomic_store(&g_maps_last, n); return n;
 }
 
 // The once-a-second samples
