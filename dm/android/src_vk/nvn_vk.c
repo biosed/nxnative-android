@@ -4513,7 +4513,14 @@ static void ctx_pick(void) {
         else if (f < soon_at) { soon_at = f; soon = k; } }
     int grow = best < 0 && NCTX < cap;
     pthread_mutex_unlock(&g_mu);
+    // One choice: a free context, else a new one, else a wait at the cap. The ring-reuse upkeep below used to sit between the first and the other two (H0.5), which broke the
+    // chain: with RING_REUSE off every free pick was then overridden by the wait branch (the busy context that frees first: the previous submission, CPU and GPU in turns;
+    // FINAL FANTASY XII on main waited 22 ms a frame), with it on no context was ever made or waited for
     if (best >= 0) { g_ci = best; g_pick_free++; }
+    else if (grow) { ctx_init(NCTX); lk_(&g_mu, LW_MU); g_ci = NCTX; NCTX++; pthread_mutex_unlock(&g_mu); g_pick_grow++; if (NCTX > g_pick_hw) g_pick_hw = NCTX;
+                     static int nl; if (nl++ < 12) LOG("vk: DM_VK_CTX_PICK: no free context: context %d made", g_ci); }
+    else { g_ci = soon >= 0 ? soon : (g_ci + 1) % NCTX; g_pick_wait++;   // at the cap: the one that frees first (the wait itself is counted below, as before)
+           if (g_ctx[g_ci].hold > g_ctx[g_ci].fence_val) g_pick_wait_hold++; else g_pick_wait_fence++; }
     if (ring_reuse_on()) {   // DM_VK_RING_REUSE: contexts unused for 300 submissions give their grown ring back (checked every 64 submissions)
         static uint64_t n; if (!(++n & 63)) for (int k = 0; k < NCTX; k++) { ctx_t *c = &g_ctx[k];
             if (k == g_ci || c == C || c->ring0_size <= RING_MIN || c->h05_last + 300 > g_fence) continue;
@@ -4521,10 +4528,6 @@ static void ctx_pick(void) {
             vkDestroyBuffer(g_dev, c->ring0, NULL); vkFreeMemory(g_dev, c->ringm0, NULL); atomic_fetch_sub(&g_ring0_bytes, c->ring0_size);
             c->ring0 = buf_new(RING_MIN, ALL_BUF_USAGE, &c->ringm0, (void **)&c->ringp0); c->ring0_size = RING_MIN; atomic_fetch_add(&g_ring0_bytes, RING_MIN); c->win_max = 0; c->nwin = 0; g_h05_shrunk++; }
     }
-    else if (grow) { ctx_init(NCTX); lk_(&g_mu, LW_MU); g_ci = NCTX; NCTX++; pthread_mutex_unlock(&g_mu); g_pick_grow++; if (NCTX > g_pick_hw) g_pick_hw = NCTX;
-                     static int nl; if (nl++ < 12) LOG("vk: DM_VK_CTX_PICK: no free context: context %d made", g_ci); }
-    else { g_ci = soon >= 0 ? soon : (g_ci + 1) % NCTX; g_pick_wait++;   // at the cap: the one that frees first (the wait itself is counted below, as before)
-           if (g_ctx[g_ci].hold > g_ctx[g_ci].fence_val) g_pick_wait_hold++; else g_pick_wait_fence++; }
     if (g_pick_hw < NCTX) g_pick_hw = NCTX;
     lk_(&g_gwmu, LW_GWMU);   // copies forwarded into this context's ring are its old submission's: forgotten
     for (int i = 0; i < g_ngw; i++) if (g_gw[i].ffence && g_gw[i].fci == g_ci) g_gw[i].ffence = 0;
