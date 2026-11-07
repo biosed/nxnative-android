@@ -209,6 +209,22 @@ APK `ffr_hib_vk19_74.apk` (android-ffr 539a707d, hib 728f6d64), dungeon spot, de
 - Verdict: a small win, on by default from vk19.75b (vertex only in practice).
 - The vk19.58 arm did not run: Android refused the install as a version downgrade (26110622 under 26110718; HyperOS refuses -d), so that run went on vk19.74 and is not counted. `ffr_hib_vk19_58_v26110719.apk` is the same source (hib fd79ad5d) with only the version code raised (its .text is byte-identical to the original), and the final `ffr_hib_vk19_75b.apk` carries 26110720 to install over it. The end-to-end numbers follow.
 
+## End to end: vk19.58 vs final vk19.75b
+
+Re-run 19:11–19:20, device-side script, dungeon spot: `ffr_hib_vk19_58_v26110719.apk` (vk19.58's source, only the version code raised) then `ffr_hib_vk19_75b.apk` installed over it (android-ffr 73ceb47b, hib 790a8083); both runs alive to the end. Compared on the lines both builds log: the per-frame GPU / recording line, the clocks line (an instantaneous sample) and the [nvn] present timing.
+
+| | vk19.58 | vk19.75b | Change |
+|---|---|---|---|
+| Recording, cpu7 at 1670 MHz (vk19.58 w9–15, final w16–19) | 17.0–18.0 ms (avg ~17.6) | 12.8–13.3 ms (avg ~13.0) | −4.6 ms (−26%) |
+| GPU per frame, same windows | 19.2 ms | 14.2 ms | −5.0 ms (vk19.58 does not log the GPU clock: with caution) |
+| Recording, cpu7 sampled at 633 MHz | 18.0–18.3 ms | 16.0–16.5 ms | −2 ms |
+| Present, last 8 × 300-frame windows (cpu7 ~1.5–1.67 GHz): p50 / p95 | 23.31 ms (42.9 fps) / 28.9 | 17.86 ms (56.0 fps) / 22.6 | +13 fps (+31%) |
+| Long-frame anchors | 42.2 fps | 49.1 fps | |
+
+RHIThread, all-thread CPU and energy are not comparable end to end: vk19.58 predates those lines. The matched-clock gains of each step are in sessions 1–5 above. On by default in vk19.75b against vk19.58: DM_VK_IDX_NEON, DM_VK_FB_FAST, DM_VK_LEAN, DM_VK_HTAB, DM_WAKE_AFTER_G (Android), DM_VK_TEXEL_STORE, DM_VK_BUF_STORE (DM_VK_CTX_PICK was already on in vk19.58).
+
+**FFR is frozen at vk19.75b** (android-ffr 73ceb47b, android-ffr-hib 790a8083): no further FFR code changes; the "later" items in Open stay deferred.
+
 ## Opt-in switches of vk19.47–19.56 and their verdicts
 
 | Switch | Build | Verdict | Dead weight to remove later? |
