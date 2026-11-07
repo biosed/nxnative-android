@@ -293,6 +293,15 @@ static VkBuffer xring_get(VkDeviceSize want, VkDeviceSize *size, VkDeviceMemory 
     return b;
 }
 static uint64_t g_h05_evict;   // DM_VK_RING_REUSE: smaller kept rings let go to keep a bigger one
+// DM_VK_RING_REUSE: rings let go while the completion thread holds g_gwmu (ctx_complete, xr_free) are destroyed after it lets go of it, so the recorder's lookups do not wait
+// for vkFreeMemory (grill-risk re-check)
+static struct { VkBuffer b; VkDeviceMemory m; } g_xdef[64]; static int g_nxdef;
+static void xring_drain(void) {
+    if (!ring_reuse_on()) return;
+    struct { VkBuffer b; VkDeviceMemory m; } d[64]; int n;
+    pthread_mutex_lock(&g_xcmu); n = g_nxdef; memcpy(d, g_xdef, (size_t)n * sizeof d[0]); g_nxdef = 0; pthread_mutex_unlock(&g_xcmu);
+    for (int i = 0; i < n; i++) { vkDestroyBuffer(g_dev, d[i].b, NULL); vkFreeMemory(g_dev, d[i].m, NULL); }
+}
 static void xring_put(VkBuffer b, VkDeviceMemory m, VkDeviceSize size) {   // a freed extra ring: kept for reuse, or destroyed
     pthread_mutex_lock(&g_xcmu); void *p = NULL; int k = 0;
     for (; k < g_nxmap; k++) if (g_xmap[k].m == m) { p = g_xmap[k].p; break; }
@@ -308,9 +317,14 @@ static void xring_put(VkBuffer b, VkDeviceMemory m, VkDeviceSize size) {   // a 
                 for (int j = 0; j < g_nxmap; j++) if (g_xmap[j].m == g_xc[sm].m) { g_xmap[j] = g_xmap[--g_nxmap]; if (k == g_nxmap) k = j; break; }
                 g_xc[sm] = g_xc[--g_nxc]; g_h05_evict++; }
     }
-    if (p && g_nxc < (ring_reuse_on() ? NXC : 8) && g_xc_bytes + size <= xring_keep() && !(ring_reuse_on() ? g_mem_real_low : g_mem_tight)) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size; pthread_mutex_unlock(&g_xcmu); for (int i = 0; i < nev; i++) { vkDestroyBuffer(g_dev, ev[i].b, NULL); vkFreeMemory(g_dev, ev[i].m, NULL); } return; }
+    if (p && g_nxc < (ring_reuse_on() ? NXC : 8) && g_xc_bytes + size <= xring_keep() && !(ring_reuse_on() ? g_mem_real_low : g_mem_tight)) { g_xc[g_nxc++] = (typeof(g_xc[0])){b, m, p, size}; g_xc_bytes += size;
+        if (nev && g_nxdef + nev <= 64) { for (int i = 0; i < nev; i++) { g_xdef[g_nxdef].b = ev[i].b; g_xdef[g_nxdef].m = ev[i].m; g_nxdef++; } nev = 0; }
+        pthread_mutex_unlock(&g_xcmu); for (int i = 0; i < nev; i++) { vkDestroyBuffer(g_dev, ev[i].b, NULL); vkFreeMemory(g_dev, ev[i].m, NULL); } return; }
     atomic_fetch_add(&g_h0_xr_nokeep[!p ? 0 : g_nxc >= (ring_reuse_on() ? NXC : 8) ? 1 : g_xc_bytes + size > xring_keep() ? 2 : 3], 1);   // H0: why it was not kept
     if (k < g_nxmap) g_xmap[k] = g_xmap[--g_nxmap];
+    if (ring_reuse_on() && g_nxdef + nev + 1 <= 64) {   // destroyed by xring_drain once the caller let go of g_gwmu
+        for (int i = 0; i < nev; i++) { g_xdef[g_nxdef].b = ev[i].b; g_xdef[g_nxdef].m = ev[i].m; g_nxdef++; }
+        g_xdef[g_nxdef].b = b; g_xdef[g_nxdef].m = m; g_nxdef++; pthread_mutex_unlock(&g_xcmu); return; }
     pthread_mutex_unlock(&g_xcmu);
     for (int i = 0; i < nev; i++) { vkDestroyBuffer(g_dev, ev[i].b, NULL); vkFreeMemory(g_dev, ev[i].m, NULL); }
     vkDestroyBuffer(g_dev, b, NULL); vkFreeMemory(g_dev, m, NULL);
@@ -765,6 +779,7 @@ static void xr_free(uint64_t done) {
         xring_put(g_xr[i].b, g_xr[i].m, g_xr[i].size); atomic_fetch_sub(&g_extra_ring_bytes, g_xr[i].size); g_xr[i] = g_xr[--g_nxr];
     }
     H0_GWH_END(1); pthread_mutex_unlock(&g_gwmu);
+    xring_drain();
 }
 // GPU time per region signature: what each kind of pass or dispatch costs a frame (registered by the submit thread with its description, timed by the completion thread)
 enum { NGSIG = 1024 };
@@ -915,6 +930,7 @@ static void ctx_complete(ctx_t *c) {
             g_xr[g_nxr++] = (typeof(g_xr[0])){c->extra[i].b, c->extra[i].m, hold > c->fence_val ? hold : c->fence_val + 1, c->extra[i].size}; continue; }
         xring_put(c->extra[i].b, c->extra[i].m, c->extra[i].size); atomic_fetch_sub(&g_extra_ring_bytes, c->extra[i].size); }
     H0_GWH_END(1); pthread_mutex_unlock(&g_gwmu);
+    xring_drain();
     c->nextra = 0;
     for (int i = 0; i < c->nfb; i++) vkDestroyFramebuffer(g_dev, c->fb[i], NULL);
     c->nfb = 0;
@@ -4676,8 +4692,9 @@ void mtl_exec_rest(const uint64_t *handles, int n) { g_rest = handles; g_nrest =
 // patched into later reads (gw_cpu_dirty), as for any dispatch range. Counted in the per-600 line 'vk: DM_VK_GW_PAD'
 static int gw_pad_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_PAD"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_PAD=1: small copies of GPU-written bytes padded with the guest's bytes around them"); } return v; }
 static uint64_t g_pad_n, g_pad_into, g_pad_over, g_pad_why[5], g_pad_retired, g_pad_cur; static int g_pad_curi[16];   // g_pad_why: 1 no pool, 2 this submission's other GPU writes there, 3 no room, 4 too many GPU-written parts   // g_pad_sync: in-stream writes put into windows; g_pad_cur: this submission's GPU writes laid into new windows
-// This submission's padded windows (recording thread only): each window's range and ring place, and the parts of it GPU work wrote (the copies into it, an earlier submission's
-// writes laid in, this submission's exact writes taken in)
+// This submission's padded windows (recording thread only): each window's range and ring place, and the parts GPU copies wrote into it (the copy that made it, the copies that
+// went into it). An earlier submission's writes laid in and this submission's exact writes taken in are not listed: their own entries stay live and serve those bytes once the
+// window goes (grill-risk re-check: listing them made this submission's snapshot-less entries hide the earlier ones and their CPU-rewrite patching)
 enum { NPADW = 128, NPADSUB = 48 };
 typedef struct { uint64_t lo, hi, fence; VkBuffer buf; VkDeviceSize off; uint8_t *p; int nsub, dead; struct { uint64_t a, b; } sub[NPADSUB]; } padw_t;
 static padw_t g_padw[NPADW]; static int g_padw_n;
@@ -4743,15 +4760,12 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
                 uint64_t a0 = e->addr > lo ? e->addr : lo, a1 = e->addr + e->size < hi ? e->addr + e->size : hi;
                 VkBufferCopy bc = {e->off + (a0 - e->addr), ro + (a0 - lo), a1 - a0}; vkCmdCopyBuffer(C->up, e->buf, rb, 1, &bc); C->up_used = 1;
                 if (gw_cpu_dirty(e, a0, a1)) gw_patch(e, a0, a1, rb, ro + (a0 - lo));
-                ctx_t *o = &g_ctx[e->ci]; if (o->hold < g_fence + 1) o->hold = g_fence + 1; xr_raise(e->buf, g_fence + 1); g_pad_over++;
-                if (w->nsub < NPADSUB) { w->sub[w->nsub].a = a0; w->sub[w->nsub].b = a1; w->nsub++; } else w->nsub = NPADSUB + 1; }
+                ctx_t *o = &g_ctx[e->ci]; if (o->hold < g_fence + 1) o->hold = g_fence + 1; xr_raise(e->buf, g_fence + 1); g_pad_over++; }   // not a part to retire: the entry stays live and serves those bytes (with its CPU-rewrite patching) once the window goes
             for (int x = 0; x < ncur; x++) {   // this submission's exact GPU writes there, in order after them (the window's copy is recorded here, past them)
                 const gw_t *e = &g_gw[g_pad_curi[x]]; uint64_t a0 = e->addr > lo ? e->addr : lo, a1 = e->addr + e->size < hi ? e->addr + e->size : hi;
-                VkBufferCopy cc = {e->off + (a0 - e->addr), ro + (a0 - lo), a1 - a0}; vkCmdCopyBuffer(C->cb, e->buf, rb, 1, &cc); g_pad_cur++;
-                if (w->nsub < NPADSUB) { w->sub[w->nsub].a = a0; w->sub[w->nsub].b = a1; w->nsub++; } else w->nsub = NPADSUB + 1; }
+                VkBufferCopy cc = {e->off + (a0 - e->addr), ro + (a0 - lo), a1 - a0}; vkCmdCopyBuffer(C->cb, e->buf, rb, 1, &cc); g_pad_cur++; }   // its entry stays live: not a part to retire
             pthread_mutex_unlock(&g_gwmu);
             if (ncur) barrier_xfer(C->cb);   // those copies before the copy into the window below
-            if (w->nsub > NPADSUB) { snap_free(snap, hi - lo); w->fence = 0; g_pad_why[4]++; goto nopad_after; }   // too many parts to retire it later: not a window (the copies above went into an unused ring block)
             VkBufferCopy bc = {so, ro + (dst - lo), n}; vkCmdCopyBuffer(C->cb, sb, rb, 1, &bc); barrier_xfer(C->cb);
             w->sub[w->nsub].a = dst; w->sub[w->nsub].b = dst + n; w->nsub++;
             g_gw_add_pad = 1; gw_add(lo, hi - lo, rb, ro, rp, g_fence + 1, g_ci, snap, 1); g_gw_add_pad = 0;
@@ -4761,7 +4775,7 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
         if (snap) snap_free(snap, hi - lo);
         g_pad_why[why]++;
     }
-    nopad: nopad_after:;
+    nopad:;
     VkDeviceSize ro = ring_alloc(n, 16); if (ro == VK_WHOLE_SIZE) { RED_ONCE(93, "a buffer copy of GPU-written bytes found no room in the ring: copied from guest memory"); return; }
     VkBufferCopy bc = {so, ro, n}; vkCmdCopyBuffer(C->cb, sb, C->ring, 1, &bc); barrier_xfer(C->cb);
     gw_add(dst, n, C->ring, ro, C->ringp + ro, g_fence + 1, g_ci, NULL, 1); post_add((post_t){3, (void *)(uintptr_t)dst, 0, 0, 0, 0, C->ringp + ro, n});
