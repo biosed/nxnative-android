@@ -39,3 +39,7 @@ shader_note	Harvest Moon: Echoes of Teradea shaders (provisional profile)
 # The game calls nvnDeviceSetDepthMode(near=0) (run log: "depth mode near=0"), so its vertex shaders use the main0_z entries; the pipeline bases made before it runs are made for that mode (as Silver Pines)
 depth_mode	zero
 # address regions: 2026-11-07, in its first 15 s in nnMain the game's regions reach alias +1.26 GB, within the 4.38 GB alias region; about 2.5 GB resident in the first forest (Mac)
+
+# ---- Shader build ----
+# Packed-half results clamped to the half range on the Mac (dmsh_build.py half_clamp): the toon eye pass 937e832a1b3b3068 overflowed to inf in Metal and drew the eyes white
+shader_half_clamp	on
