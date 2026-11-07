@@ -223,6 +223,8 @@ static void *ctl_main(void *arg) {
                 if (!strcmp(line, "dump")) { crash_dump_now("DM_CTL dump"); continue; }
                 if (!strncmp(line, "hib ", 4)) { if (dm_hib_ctl_hook) dm_hib_ctl_hook(line + 4); continue; }   // hibernation (hle_hib.c)
                 if (!strncmp(line, "shot ", 5)) { dm_gfx_shot_at(1, line + 5); LOG("DM_CTL: screenshot of the next frame → %s", line + 5); continue; }
+                if (!strncmp(line, "shots ", 6)) { char *e2; long n = strtol(line + 6, &e2, 10); while (*e2 == ' ') e2++;
+                    dm_gfx_shot_burst(n, e2); LOG("DM_CTL: screenshots of the next %ld frames → %s", n, e2); continue; }   // "shots <n> <path with %d>": every frame, for flicker checks
                 if (!strncmp(line, "texlist ", 8)) { void dm_gfx_texlist(int target); dm_gfx_texlist(atoi(line + 8)); continue; }
                 if (!strncmp(line, "texraw ", 7)) { void dm_gfx_texraw(uint64_t serial, const char *path); char *e2; uint64_t s = strtoull(line + 7, &e2, 10); while (*e2 == ' ') e2++; dm_gfx_texraw(s, e2); continue; }
                 if (!strncmp(line, "peek ", 5)) { void dm_ctl_peek(uint64_t a, int n); char *e2; uint64_t a = strtoull(line + 5, &e2, 16); dm_ctl_peek(a, (int)strtol(e2, NULL, 0)); continue; }

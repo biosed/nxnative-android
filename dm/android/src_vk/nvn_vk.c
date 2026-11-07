@@ -6297,6 +6297,7 @@ int mtl_pso_prebuild_tool(void) { return 0; }
 void mtl_pso_line(char *out, size_t n) { if (n) snprintf(out, n, "vulkan: %d made", g_npso); }
 void nvn_cap_submit(int n, const uint64_t *h) { (void)n; (void)h; }
 void nvn_cap_present(const tex_t *t, const int crop[4]) { (void)t; (void)crop; }
+void dm_gfx_shot_burst(long n, const char *path) { (void)n; (void)path; LOG("[RED] vk: DM_CTL shots is Metal-only (DM_VK_SHOTS writes chosen frames)"); }
 void dm_gfx_shot_at(long k, const char *path) { (void)k; (void)path; LOG("[RED] vk: DM_CTL shot is Metal-only (DM_VK_SHOTS writes frames here)"); }
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
 void dm_gfx_texlist(int target) { (void)target; }

@@ -10973,6 +10973,11 @@ static void grab_present(id<MTLTexture> src, const int crop[4], CGSize sz) {
         [draw addCompletedHandler:^(id<MTLCommandBuffer> c) { readback(c.status == MTLCommandBufferStatusCompleted); }]; [draw commit];
     }
 }
+// DM_CTL "shots <n> <path with %d>": the next n presented frames, each as its own PNG (%d = the frame number), for flicker / pop-in checks frame by frame
+static pthread_mutex_t g_burst_mu = PTHREAD_MUTEX_INITIALIZER; static long g_burst_left; static char g_burst_path[1024];
+void dm_gfx_shot_burst(long n, const char *path) {
+    pthread_mutex_lock(&g_burst_mu); g_burst_left = n > 0 ? n : 0; strlcpy(g_burst_path, path, sizeof g_burst_path); pthread_mutex_unlock(&g_burst_mu);
+}
 void dm_gfx_shot_at(long k, const char *path) {
     pthread_mutex_lock(&g_shotq_mu);
     if (g_nshotq < SHOTQ_MAX) { g_shotq[g_nshotq].frame = g_present_n + (uint64_t)(k > 0 ? k : 0); strlcpy(g_shotq[g_nshotq].path, path, sizeof g_shotq[0].path); g_nshotq++; }
@@ -11511,6 +11516,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     pthread_mutex_lock(&g_shotq_mu);
     for (int i = 0; i < g_nshotq;) if (g_present_n >= g_shotq[i].frame) { mtl_finish_gpu(); shot(src, g_shotq[i].path, 1, crop); g_shotq[i] = g_shotq[--g_nshotq]; } else i++;
     pthread_mutex_unlock(&g_shotq_mu);
+    pthread_mutex_lock(&g_burst_mu);
+    if (g_burst_left > 0) { char path[1100]; snprintf(path, sizeof path, g_burst_path, (int)g_present_n); g_burst_left--; pthread_mutex_unlock(&g_burst_mu); mtl_finish_gpu(); shot(src, path, 1, crop); }
+    else pthread_mutex_unlock(&g_burst_mu);
 
     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
     if (!layer) return 0;
