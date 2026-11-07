@@ -4,6 +4,7 @@
 #include "hle.h"
 
 static _Alignas(16) uint8_t g_ev_ldn[0x100];
+HLE_HIB_STATIC(g_ev_ldn)
 
 // ---------- prepo: telemetry reports. Saving / submitting all report success; nothing is sent ----------
 HLE_FORCE("_ZN2nn5prepo10PlayReport4SaveERKNS_7account3UidE", "telemetry report save (user); nothing is sent, reports success", Result, h_prepo_SaveU, void *self, const void *uid) { (void)self; (void)uid; return RES_OK; }

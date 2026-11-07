@@ -156,6 +156,77 @@ and `memory-tsan`; `memory` includes undefined-behavior and address sanitizers.
 The heap-probe check imports the production profile reader and needs only the
 Python standard library; LZ4 is loaded when decoding NSO files.
 
+## Hibernation (save state to disk)
+
+`DM_HIBERNATE=1` (in development, off by default) lets the game survive the
+process: a snapshot of the whole game written when the app leaves the screen,
+and a later process (`DM_HIB_RESTORE`) resumes exactly there. A Switch game
+keeps no host state of its own, but this host's HLE layer does, so the
+snapshot is guest memory plus each subsystem's state, and the restore puts
+both back before any guest thread runs.
+
+- **Fixed layout** (`dm/host/hle_hib.c`). Guest memory holds host addresses:
+  GOT entries, NVN procedure tables the game copied, return addresses into
+  `dm_thread_enter`, pointers to host statics. So everything they point into
+  sits at one address on every boot: the modules and the guest address space
+  in one reservation (`0x8000000000` on the Mac, where macOS reserves
+  `0xfc0000000`-`0x7000000000`; `0x1000000000` on Android), the host
+  executable at its link address (the Mac executes itself again with
+  `_POSIX_SPAWN_DISABLE_ASLR`, keeping its process ID; Android loads
+  `libdmhost.so` at a reserved address), libc functions the guest imports
+  through thunks in the executable, and host objects the guest points to
+  (thread-local regions, host-created threads' `ThreadType`, the guest main
+  thread's stack) from a host arena in the reservation. The pointer audit
+  (`DM_CTL` `hib audit <path>`, `hle_hibaudit.c`) scans guest memory for words
+  that still point outside the layout.
+- **Park** (`hle_thread.c` `dm_guest_park_all`). Every guest thread stops at
+  a gate: before its SVC runs, at the SVC's exit, in its kernel wait (no
+  timeout fires meanwhile), or blocked in a restartable host call (an import
+  marked `HLE_HIB_RESTARTABLE`, such as `oe::PopNotificationMessage`, or a
+  host-created thread's body, whose stub records the registers at its entry).
+  Timer reads are gates too. Never inside guest code: the rewriter's slot
+  sequences keep host values in registers for a few instructions.
+- **Snapshot** (`hle_hibsnap.c`). The threads, each subsystem's section
+  (kernel, svc, arena, host statics the guest uses as its own objects, oe,
+  fs, movie, audio, NVN and the replay layer, hid), then the window's memory
+  with zero pages left out, LZ4-compressed on four threads, a CRC-32C per
+  chunk, a chunk table and a trailer. It is written to `snap.tmp`, synced and
+  renamed to `snap.bin` (`DM_HIB_DIR`, by default `hibernate` beside the save
+  folder), so a kill at any moment leaves the previous snapshot whole. Before
+  it every GPU-filled texture is read back into its storage in guest memory.
+  No snapshot is written while a movie decoder exists, a directory handle is
+  open, the in-process audio renderer has an output, a sparse virtual pool
+  exists or a command buffer has overflowed into host memory.
+- **Restore**. The whole file is checked first: game, host build and
+  address, layout, modules, thread-slot keys and the save folder's
+  fingerprint; a mismatch or a damaged chunk boots the game as usual. Then
+  memory, the kernel (every thread object and every kernel wait at once), the
+  sections, and every thread on a new pthread back where it stopped. A
+  snapshot is restored once (renamed `.restored`).
+
+- **Unreal Engine games** (`hle_ueheap.c`). The heap the host runs for Unreal
+  (`hle_uemalloc.c`) holds nearly all of the game's objects; with hibernation
+  it is dlmalloc (`dm/third_party/dlmalloc`) in a 16 GB host heap region at
+  the end of the reservation, its allocator state inside it, so the snapshot
+  carries it. GPU-written 3D textures are read back too (Unreal builds its
+  colour grading LUT once and keeps it; without it a restored scene is black).
+- **Before an app update**: `DM_CTL` `hib freeze` writes the snapshot and keeps
+  the game stopped until the process ends (`hib thaw` lets it go on).
+  `dm/android/tools/hib_install.sh <apk>` does it on a device: freeze through
+  `<external>/hib_ctl.txt` (made by the app when `DM_HIBERNATE` is on; it
+  takes `hib` commands only), `adb install -r`, start, and the game resumes
+  behind a "MELANJUTKAN..." screen. Only an update with the same
+  `libdmhost.so` build can resume: another build refuses the snapshot and the
+  menu shows.
+
+The front ends call `dm_hib_suspend(1)` at the end of their suspend sequence
+(the Mac's minimised window, `DM_OE_SCRIPT` `bg=1`) and `dm_hib_suspend(0)`
+before resuming. `DM_CTL` `hib save`, `hib verify`, `hib park` and
+`hib unpark` drive it by hand; `DM_HIB_VERIFY=<file>` checks a snapshot. On Android the app goes straight back into
+the game when a snapshot exists and `DM_HIBERNATE` is on (`settings.env` or
+`<external>/env.txt`); a refused snapshot is removed and the menu shows, and
+holding − and + (back to the menu) ends the game without one.
+
 ## Continuous integration
 
 `.github/workflows/tests.yml` runs host and CPU graphics tests, Python tool

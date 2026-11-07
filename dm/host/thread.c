@@ -9,7 +9,7 @@
 #define THREAD_OBJ_SIZE 0x400
 static pthread_key_t g_keyown;   // raw pointers of the TLS block / thread-local region this thread allocated (see the end of guest_thread_init)
 static pthread_once_t g_keyown_once = PTHREAD_ONCE_INIT;
-static void own_free(void *p) { void **own = p; free(own[0]); free(own[1]); free(own); }
+static void own_free(void *p) { void **own = p; if (!dm_hib_free(own[0])) free(own[0]); if (!dm_hib_free(own[1])) free(own[1]); free(own); }
 static void own_key_init(void) { if (pthread_key_create(&g_keyown, own_free)) die("cannot create the free key for thread-local blocks"); }
 void guest_thread_init(void) {
     dm_slot_set(g_key18, 0);
@@ -17,9 +17,10 @@ void guest_thread_init(void) {
     // the raw pointers that were allocated are recorded separately on this file's own key g_keyown and freed by its destructor (key destructors run at pthread_exit, like crash.c's signal alternate stack; the destructor only calls free, which is safe on a guest thread's small stack too).
     // They used not to be freed: every short-lived thread the game started leaked 8192 + 0x200 + 0x400 = 9728 bytes. The thread-local region and the current thread object are one block (the SDK may also overwrite the TLR[0x1f8] slot)
     pthread_once(&g_keyown_once, own_key_init);
-    void **own = calloc(2, sizeof *own); uint8_t *tlr = calloc(1, TLR_SIZE + THREAD_OBJ_SIZE);
+    // With hibernation both come from the host arena (dm.h dm_hib_calloc): guest stacks keep the thread-local region's address (each thread's outermost frame holds it)
+    void **own = calloc(2, sizeof *own); uint8_t *tlr = dm_hib_calloc(TLR_SIZE + THREAD_OBJ_SIZE); if (!tlr) tlr = calloc(1, TLR_SIZE + THREAD_OBJ_SIZE);
     if (!own || !tlr) die("guest thread-local block allocation failed");
-    own[0] = calloc(1, TLS_SIZE); own[1] = tlr;
+    own[0] = dm_hib_calloc(TLS_SIZE); if (!own[0]) own[0] = calloc(1, TLS_SIZE); own[1] = tlr;
     if (!own[0]) die("guest thread TLS block allocation failed");
     *(void **)(tlr + 0x1f8) = tlr + TLR_SIZE;               // current thread object
     dm_slot_set(g_keytls, own[0]); dm_slot_set(g_keytlr, tlr);
