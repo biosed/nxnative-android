@@ -88,6 +88,9 @@ static void image_id(uint8_t out[20]) {
     elf_build_id(dm_hib_image_base(), out);
 #endif
 }
+// A build without an identity (an Android library linked without a GNU build ID note: every build had image_id all zeros) cannot tell its snapshots from another
+// build's: none is written, none is restored (until a snapshot can be carried across host builds)
+static int image_id_known(const uint8_t id[20]) { for (int i = 0; i < 20; i++) if (id[i]) return 1; return 0; }
 
 // ---- the save folder's fingerprint: names, sizes and modification times; a snapshot is only restored over the save data it was written with ----
 static uint64_t save_fingerprint(void) {
@@ -218,6 +221,7 @@ int dm_hib_movie_defer_thread(int set);
 size_t dm_hib_nvn_save(uint8_t **out); int dm_hib_nvn_restore(const uint8_t *b, size_t n); const char *dm_hib_nvn_refuse(void);
 size_t dm_hib_hid_save(uint8_t **out); int dm_hib_hid_restore(const uint8_t *b, size_t n);
 size_t dm_hib_fs_save(uint8_t **out); int dm_hib_fs_restore(const uint8_t *b, size_t n);
+size_t dm_hib_ueheap_save(uint8_t **out); int dm_hib_ueheap_restore(const uint8_t *b, size_t n);
 size_t dm_hib_audio_save(uint8_t **out); int dm_hib_audio_restore(const uint8_t *b, size_t n); int dm_hib_audio_host_outputs(void);
 // The host statics the guest uses as its own objects (hle.h HLE_HIB_STATIC): their bytes, in section order
 static size_t statics_save(uint8_t **out) {
@@ -243,6 +247,7 @@ static const struct { const char *name; size_t (*save)(uint8_t **); int (*restor
     {"kernel", dm_hib_kernel_save, NULL},   // restored with the thread records (dm_hib_restore_prepare)
     {"svc", dm_hib_svc_save, dm_hib_svc_restore},
     {"arena", dm_hib_arena_save, dm_hib_arena_restore_state},
+    {"ueheap", dm_hib_ueheap_save, dm_hib_ueheap_restore},
     {"statics", statics_save, statics_restore},
     {"oe", dm_hib_oe_save, dm_hib_oe_restore},
     {"fs", dm_hib_fs_save, dm_hib_fs_restore},
@@ -272,18 +277,20 @@ static void hib_dir(char *out, size_t n) {
 // What the snapshot cannot hold yet: then there is none (the game simply restarts as before). NULL when nothing stands in the way
 int dm_movie_live(void); int dm_fs_dirs_open(void);
 static const char *policy(void) {
+    { uint8_t id[20]; image_id(id); if (!image_id_known(id)) return "this host build has no build ID (link it with -Wl,--build-id): its snapshot could not be told from another build's"; }
     if (dm_movie_live()) return "a movie decoder exists (its state is in libvpx / VideoToolbox)";
     if (dm_fs_dirs_open()) return "a directory handle is open (the guest holds a host pointer)";
     if (dm_hib_audio_host_outputs()) return "the in-process audio renderer has an output open (not kept yet)";
     const char *g = dm_hib_nvn_refuse(); if (g) return g;
     return NULL;
 }
-static int g_saving, g_forgotten;
+static int g_saving, g_forgotten, g_freeze_req, g_frozen;
 // Writes the snapshot. Returns 0 on success; the world runs again afterwards either way (the caller decides whether the process then goes on or stops).
 // gfx_closed: the caller closed the graphics gate already (its suspend sequence): it is opened for the park, so that a thread waiting at it reaches a gate of its own, and closed again
 int dm_hib_save_ex(int gfx_closed) {
     if (!dm_hib_on()) { LOG("[RED] hibernate: not on (DM_HIBERNATE=1 from the start)"); return -1; }
     if (__atomic_load_n(&g_forgotten, __ATOMIC_SEQ_CST)) return -1;   // the game is ending (dm_hib_forget)
+    if (g_frozen) { LOG("hibernate: frozen: the snapshot is written already"); return 0; }
     uint8_t *win, *arena; size_t win_len, mod_used, arena_used; dm_hib_layout(&win, &win_len, &mod_used, &arena, &arena_used);
     if (!win) { LOG("[RED] hibernate: no fixed layout this session"); return -1; }
     if (__atomic_exchange_n(&g_saving, 1, __ATOMIC_SEQ_CST)) { LOG("[RED] hibernate: a snapshot is already being written"); return -1; }
@@ -345,12 +352,35 @@ int dm_hib_save_ex(int gfx_closed) {
         } else { LOG("[RED] hibernate: writing %s failed (errno %d, synced %d)", tmp, w.err, synced); unlink(tmp); }
         free(w.tab); free(w.zbuf);
     }
+    if (rc == 0 && g_freeze_req) {   // hib freeze: the world stays parked and the GPU closed until the process ends (an app update) or hib thaw
+        g_frozen = 1; g_saving = 0;
+        LOG("hibernate: frozen after the snapshot (an update may replace the app now; DM_CTL hib thaw goes on)");
+        return rc;
+    }
     if (!gfx_closed) dm_gfx_suspend(0);
     dm_guest_unpark_all();
     g_saving = 0;
     return rc;
 }
 int dm_hib_save(void) { return dm_hib_save_ex(0); }
+// DM_CTL "hib freeze": a snapshot, then nothing runs on (an app update installs over the process: the next start resumes exactly there). "hib thaw": the game goes on and the
+// snapshot, stale from then on, is removed
+int dm_hib_freeze(void) {
+    if (g_frozen) { LOG("hibernate: already frozen"); return 0; }
+    // what stands in the way passes (a cutscene's movie decoder, a directory being listed): waited for, up to two minutes
+    for (int t = 0; t < 240; t++) { const char *no = policy(); if (!no) break; if (!t) LOG("hibernate: freeze waits: %s", no); usleep(500000); }
+    g_freeze_req = 1; int rc = dm_hib_save_ex(0);
+    for (int k = 0; rc && k < 3 && !g_frozen; k++) { usleep(1000000); rc = dm_hib_save_ex(0); }   // a thread that did not park in time, or a movie that started meanwhile: tried again
+    g_freeze_req = 0;
+    if (rc) LOG("[RED] hibernate: not frozen: no snapshot (above); the game goes on");
+    return rc;
+}
+void dm_hib_thaw(void) {
+    if (!g_frozen) { LOG("hibernate: not frozen"); return; }
+    g_frozen = 0; dm_gfx_suspend(0); dm_guest_unpark_all();
+    char dir[1024], p[1100]; hib_dir(dir, sizeof dir); snprintf(p, sizeof p, "%s/snap.bin", dir);
+    if (!unlink(p)) LOG("hibernate: thawed: the game goes on, its snapshot is removed");
+}
 // The front ends' suspend sequence (the app leaving the screen): the snapshot is written on a thread of its own after the suspend, and the resume waits for it first
 static pthread_t g_sth; static int g_sth_on;
 static void *suspend_save(void *arg) { (void)arg; dm_hib_save_ex(1); return NULL; }
@@ -372,7 +402,8 @@ void dm_hib_suspend_now(int on) {
     else if (!on && g_sth_on) {
         pthread_join(g_sth, NULL); g_sth_on = 0;
         char dir[1024], p[1100]; hib_dir(dir, sizeof dir); snprintf(p, sizeof p, "%s/snap.bin", dir);
-        if (!unlink(p)) LOG("hibernate: back in the foreground: the snapshot is stale now, removed");
+        if (g_frozen) LOG("hibernate: back in the foreground, still frozen: the snapshot stays");
+        else if (!unlink(p)) LOG("hibernate: back in the foreground: the snapshot is stale now, removed");
     }
 }
 
@@ -446,6 +477,7 @@ static int hdr_check(const hib_hdr *h, char *why, size_t n) {
     uint8_t *win, *arena; size_t win_len, mod_used, arena_used; dm_hib_layout(&win, &win_len, &mod_used, &arena, &arena_used);
     uint8_t id[20]; image_id(id); uint8_t *gb; size_t gs; svc_guest_range(&gb, &gs);
     if (strcmp(h->game, DM_GAME_ID)) { snprintf(why, n, "written for game %s", h->game); return -1; }
+    if (!image_id_known(id) || !image_id_known(h->image_id)) { snprintf(why, n, "no host build ID (%s): it cannot be told from another build's", image_id_known(id) ? "the snapshot's" : "this host's"); return -1; }
     if (h->image_base != dm_hib_image_base() || memcmp(h->image_id, id, 20)) { snprintf(why, n, "written by another host build or at another address (%#llx)", (unsigned long long)h->image_base); return -1; }
     if (!win || h->win != (uint64_t)(uintptr_t)win || h->win_len != win_len || h->mod_used != mod_used || h->arena != (uint64_t)(uintptr_t)arena) { snprintf(why, n, "another address layout"); return -1; }
     if (h->nmod != (uint32_t)g_nmod) { snprintf(why, n, "%u modules, this host loaded %d", h->nmod, g_nmod); return -1; }

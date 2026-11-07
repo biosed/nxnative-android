@@ -24,7 +24,7 @@ SRC := $(HOST)/main.c $(HOST)/loader.c $(HOST)/hle.c $(HOST)/crash.c $(HOST)/pro
        ../gfx/hle_nv.c ../gfx/hle_vi.c $(sort $(wildcard ../gfx/nvn/*.c ../gfx/nvn/*.S ../gfx/tex/*.c))
 # Graphics backend: BACKEND=vk (default, src/nvn_vk.c) or null (null/nvn_null.c: nothing drawn, the game runs)
 BACKEND ?= vk
-LOCAL := compat/compat.c $(sort $(wildcard src/*.c)) $(if $(filter null,$(BACKEND)),null/nvn_null.c,src_vk/nvn_vk.c)
+LOCAL := compat/compat.c $(sort $(wildcard src/*.c)) $(if $(filter null,$(BACKEND)),null/nvn_null.c,src_vk/nvn_vk.c src_vk/vk_stats.c)
 OBJ := $(patsubst ../%,$(OUT)/obj/%.o,$(SRC)) $(patsubst %,$(OUT)/obj/android/%.o,$(LOCAL))
 VPX := ../third_party/libvpx
 VPX_OBJ := $(patsubst $(VPX)/%.c,gen/vpx/%.o,$(sort $(shell find $(VPX) -name '*.c')))
@@ -36,7 +36,7 @@ all: $(OUT)/libdmhost.so $(OUT)/libdmboot.so
 # libdmboot.so, the app's NativeActivity library: loads libdmhost.so at a fixed address for hibernation (boot/boot.c), then hands the activity to it
 $(OUT)/libdmboot.so: boot/boot.c
 	@mkdir -p $(dir $@)
-	$(CC) -shared -fPIC -O2 -fvisibility=hidden -Wall -o $@ $< -Wl,--no-undefined -Wl,-z,max-page-size=16384 -landroid -llog -ldl
+	$(CC) -shared -fPIC -O2 -fvisibility=hidden -Wall -o $@ $< -Wl,--build-id=sha1 -Wl,--no-undefined -Wl,-z,max-page-size=16384 -landroid -llog -ldl
 .PHONY: profile clean
 profile:
 	$(MAKE) -C $(HOST) GAME=$(GAME) game_profile
@@ -64,9 +64,9 @@ $(OUT)/obj/%.o: ../% | profile
 	$(CC) $(CFLAGS) -c $< -o $@
 APP_OBJ := $(patsubst %,$(OUT)/obj/android/%.o,app/front_android.c)
 $(OUT)/libdmhost.so: $(OBJ) $(APP_OBJ) gen/vpx/libvpx.a
-	$(CC) -shared -o $@ $(OBJ) $(APP_OBJ) gen/vpx/libvpx.a -Wl,--no-undefined -Wl,--error-limit=0 -Wl,-z,max-page-size=16384 -landroid -llog -laaudio -lvulkan -lmediandk -ljnigraphics -lm -ldl
+	$(CC) -shared -o $@ $(OBJ) $(APP_OBJ) gen/vpx/libvpx.a -Wl,--build-id=sha1 -Wl,--no-undefined -Wl,--error-limit=0 -Wl,-z,max-page-size=16384 -landroid -llog -laaudio -lvulkan -lmediandk -ljnigraphics -lm -ldl
 $(OUT)/dmhost: $(OBJ) $(CLI_OBJ) gen/vpx/libvpx.a
-	$(CC) -pie -o $@ $(OBJ) $(CLI_OBJ) gen/vpx/libvpx.a -Wl,--no-undefined -Wl,--error-limit=0 -Wl,-z,max-page-size=16384 -landroid -llog -laaudio -lvulkan -lmediandk -lm -ldl
+	$(CC) -pie -o $@ $(OBJ) $(CLI_OBJ) gen/vpx/libvpx.a -Wl,--build-id=sha1 -Wl,--no-undefined -Wl,--error-limit=0 -Wl,-z,max-page-size=16384 -landroid -llog -laaudio -lvulkan -lmediandk -lm -ldl
 dmhost: $(OUT)/dmhost
 .PHONY: dmhost
 -include $(shell find gen -name '*.d' 2>/dev/null)

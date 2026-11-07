@@ -93,9 +93,16 @@ static uint64_t g_latch, g_prev; static uint64_t g_press_at[16];
 static pthread_mutex_t g_pmu = PTHREAD_MUTEX_INITIALIZER;
 static void pads_push_(void);
 static void pads_push(void) { pthread_mutex_lock(&g_pmu); pads_push_(); pthread_mutex_unlock(&g_pmu); }
+// DM_LATCH_BLOCK=1 (vk19.64, off by default): the thread sleeps on a condition while nothing is latched and − + is not held, woken by pads_push_ when either starts,
+// instead of waking every 4 ms whatever happens (profile P1: 93 ms of nanosleep in 750 frames, 250 wake-ups a second for nothing)
+static pthread_cond_t g_latch_cv = PTHREAD_COND_INITIALIZER; static int g_latch_block = -1;
 static void *latch_thread(void *a) {
     (void)a;
-    for (;;) { usleep(4000); pthread_mutex_lock(&g_pmu); if (g_latch || g_combo_since) pads_push_(); pthread_mutex_unlock(&g_pmu); }   // also times − and + held with no new events
+    if (g_latch_block < 0) { const char *e = getenv("DM_LATCH_BLOCK"); g_latch_block = e && atoi(e) != 0; if (g_latch_block) LOG("front end: DM_LATCH_BLOCK=1: the input latch thread sleeps while nothing is held"); }
+    for (;;) {
+        if (g_latch_block) { pthread_mutex_lock(&g_pmu); while (!g_latch && !g_combo_since) pthread_cond_wait(&g_latch_cv, &g_pmu); pthread_mutex_unlock(&g_pmu); }
+        usleep(4000); pthread_mutex_lock(&g_pmu); if (g_latch || g_combo_since) pads_push_(); pthread_mutex_unlock(&g_pmu);   // also times − and + held with no new events
+    }
     return NULL;
 }
 static void pads_push_(void) {
@@ -126,6 +133,7 @@ static void pads_push_(void) {
     if (!combo) g_combo_since = 0;
     else if (!g_combo_since) g_combo_since = now_ns();
     else if (now_ns() - g_combo_since > 2000000000ull) back_to_menu();
+    if (g_latch || g_combo_since) pthread_cond_signal(&g_latch_cv);   // DM_LATCH_BLOCK: the latch thread has something to time (g_pmu is held)
 }
 // ---------- On-screen controls ----------
 // Groups of buttons -- A B X Y bottom right (by position, as on the Switch), the D-pad bottom left, L / ZL and R / ZR in the top corners, − and + top centre -- and two
@@ -348,7 +356,7 @@ static void input_release_all(void) {
     pthread_mutex_unlock(&g_pmu);
 }
 // The shader pre-warm (src_vk/nvn_vk.c dm_vk_prewarm): the pipelines earlier runs made are made again before the game starts, behind a progress screen; a tap skips it
-int dm_vk_prewarm(void) __attribute__((weak)); void dm_vk_prewarm_cancel(void) __attribute__((weak));
+int dm_vk_prewarm(void) __attribute__((weak)); void dm_vk_prewarm_cancel(void) __attribute__((weak)); void dm_vk_message(const char *t1, const char *t2) __attribute__((weak));
 static _Atomic int g_prewarming;
 static int on_input(AInputEvent *e) {
     int32_t type = AInputEvent_getType(e), src = AInputEvent_getSource(e);
@@ -444,6 +452,12 @@ static void boot_env(const char *files, const char *ext) {
         setenv("DM_HIB_RESTORE", p, 0); dm_hib_refused_hook = hib_refused;   // a snapshot the host refuses (another build, damaged) is removed, and the menu shows
         fprintf(stderr, "boot: hibernate: snapshot %s found, DM_HIBERNATE on: restoring it\n", p);
     } else fprintf(stderr, "boot: hibernate: %s, %s: no restore\n", hib_on ? "DM_HIBERNATE on" : "DM_HIBERNATE off", snap ? "a snapshot exists (left as it is)" : "no snapshot");
+    // With hibernation, <external>/hib_ctl.txt takes DM_CTL's "hib" commands from adb (dm/android/tools/hib_install.sh writes "hib freeze" before an update installs over the
+    // game): made by the app, so that the shell's appends reach it (a file adb makes there is the shell's, and the app cannot read it). Other DM_CTL commands are not taken from it
+    if (hib_on && !getenv("DM_CTL")) {
+        snprintf(p, sizeof p, "%s/hib_ctl.txt", ext); FILE *c = fopen(p, "w");
+        if (c) { fclose(c); chmod(p, 0666); setenv("DM_CTL", p, 1); setenv("DM_CTL_HIB_ONLY", "1", 1); fprintf(stderr, "boot: hibernate: control file %s (hib commands only)\n", p); }
+    }
     chdir(files);
     g_argv[0] = strdup("dmhost"); snprintf(p, sizeof p, "%s/dm", ext); g_argv[1] = strdup(p);
 }
@@ -472,6 +486,7 @@ static void *boot_thread(void *a) {
     (void)a;
     static char alt[65536]; stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt}; sigaltstack(&ss, 0);
     if (dm_vk_prewarm) { atomic_store(&g_prewarming, 1); dm_vk_prewarm(); atomic_store(&g_prewarming, 0); }
+    if (getenv("DM_HIB_RESTORE") && dm_vk_message) dm_vk_message("MELANJUTKAN...", "DARI HIBERNASI");   // the snapshot takes seconds to read: the player sees why the screen waits
     int rc = dm_main(2, g_argv);
     fprintf(stderr, "boot: dm_main returned %d\n", rc);
     game_failed(); ANativeActivity_finish(g_act);   // the host is over: back to the menu, which shows the log's error
@@ -489,7 +504,8 @@ static void immersive(ANativeActivity *a) {
 }
 
 // ---------- Activity callbacks ----------
-static void on_window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; pthread_mutex_lock(&g_wmu); g_win = w; atomic_fetch_add(&g_win_gen, 1); pthread_mutex_unlock(&g_wmu); LOG("front end: window %dx%d", ANativeWindow_getWidth(w), ANativeWindow_getHeight(w)); }
+static void panel_read_activity(ANativeActivity *a);
+static void on_window_created(ANativeActivity *a, ANativeWindow *w) { panel_read_activity(a); pthread_mutex_lock(&g_wmu); g_win = w; atomic_fetch_add(&g_win_gen, 1); pthread_mutex_unlock(&g_wmu); LOG("front end: window %dx%d", ANativeWindow_getWidth(w), ANativeWindow_getHeight(w)); }
 // The window goes when the activity stops (screen off, another app): the swapchain and surface are released with it, before Android takes the window back
 static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; pthread_mutex_lock(&g_wmu); g_win = NULL; atomic_fetch_add(&g_win_gen, 1); dm_vk_window_lost(); pthread_mutex_unlock(&g_wmu); }
 static void on_window_resized(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; atomic_fetch_add(&g_win_gen, 1); }
@@ -527,10 +543,139 @@ static void game_service(ANativeActivity *a, const char *method, int arg) {
 }
 static void on_start(ANativeActivity *a) { game_suspend(0); game_service(a, "setSuspended", 0); }
 static void on_stop(ANativeActivity *a) { game_suspend(1); game_service(a, "setSuspended", 1); }
-static void on_resume(ANativeActivity *a) { (void)a; }
+static void game_mode_read(ANativeActivity *a);
+static void on_resume(ANativeActivity *a) { game_mode_read(a); }
 // Android is short of memory (other apps are being killed): free pages go back to the system now, and the graphics backend's rings shrink to their minimum (dm_vk_trim)
 void dm_vk_trim(void) __attribute__((weak));
 static void on_low_memory(ANativeActivity *a) { (void)a; LOG("front end: low memory: freeing what can be freed"); mallopt(M_PURGE, 0); if (dm_vk_trim) dm_vk_trim(); }
+// onTrimMemory (TrimWatch.java): RUNNING_LOW (10) and up purge as onLowMemory does; RUNNING_MODERATE (5) is only logged
+static void JNICALL trim_native(JNIEnv *env, jclass cl, jint level) {
+    (void)env; (void)cl; static int nl;
+    if (nl++ < 30) LOG("front end: onTrimMemory level %d%s", (int)level, level >= 10 ? ": freeing what can be freed" : "");
+    if (level >= 10) { mallopt(M_PURGE, 0); if (dm_vk_trim) dm_vk_trim(); }
+}
+static void trim_watch(ANativeActivity *a) {   // TrimWatch.register(activity), through the activity's class loader, with nativeTrim bound to trim_native
+    JNIEnv *env = a->env;
+    jobject ld = (*env)->CallObjectMethod(env, a->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "getClassLoader", "()Ljava/lang/ClassLoader;"));
+    jstring nm = (*env)->NewStringUTF(env, "com.nxnative.TrimWatch");
+    jclass cl = ld ? (jclass)(*env)->CallObjectMethod(env, ld, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, ld), "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;"), nm) : NULL;
+    if (cl && !(*env)->ExceptionCheck(env)) {
+        JNINativeMethod m = {"nativeTrim", "(I)V", (void *)trim_native};
+        if ((*env)->RegisterNatives(env, cl, &m, 1) == 0) {
+            jmethodID r = (*env)->GetStaticMethodID(env, cl, "register", "(Landroid/content/Context;)V");
+            if (r && !(*env)->ExceptionCheck(env)) (*env)->CallStaticVoidMethod(env, cl, r, a->clazz);
+        }
+    }
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); LOG("[RED] front end: TrimWatch not registered: only onLowMemory reaches the host"); }
+    else LOG("front end: onTrimMemory watched (TrimWatch)");
+    (*env)->DeleteLocalRef(env, nm);
+}
+// The Android game mode (GameManager.getGameMode, API 31: 0 unsupported, 1 standard, 2 performance, 3 battery, 4 custom), read at start and on each resume into dm_game_mode for the
+// backend's clock line. The manifest declares the performance and battery modes (game_mode_config) so the system's game settings can choose them for this app
+extern int dm_game_mode __attribute__((weak));
+static void game_mode_read(ANativeActivity *a) {
+    if (!&dm_game_mode) return;
+    JNIEnv *env = a->env; jstring nm = (*env)->NewStringUTF(env, "game");
+    jobject gm = (*env)->CallObjectMethod(env, a->clazz, (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"), nm);
+    int mode = -1;
+    if (gm && !(*env)->ExceptionCheck(env)) { jmethodID m = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, gm), "getGameMode", "()I"); if (m && !(*env)->ExceptionCheck(env)) mode = (*env)->CallIntMethod(env, gm, m); }
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mode = -1; }
+    (*env)->DeleteLocalRef(env, nm);
+    if (mode != dm_game_mode) LOG("front end: Android game mode %d (0 unsupported, 1 standard, 2 performance, 3 battery, 4 custom)", mode);
+    dm_game_mode = mode;
+}
+// The battery for the backend's heat-and-energy line (vk19.59, src_vk/vk_stats.c), from its sampling thread dm-stats only (never a game, guest or RHI thread; at most once a
+// second): BatteryManager's CHARGE_COUNTER and CURRENT_NOW (binder calls into the health HAL, which can block for milliseconds: hence that thread), and the sticky
+// ACTION_BATTERY_CHANGED intent's voltage (mV) and plugged state when want_v. It uses the JavaVM and a global reference to the application context, both taken once on the
+// activity thread at onCreate (battery_init_activity): never g_act, whose ANativeActivity is freed when Android destroys the activity while the process stays (vk19.59c).
+// The thread attaches once, as a daemon. Every JNI call is followed by an exception check; a failed setup is not tried again. Returns 0 when there is nothing to read
+static JavaVM *g_vm; static jobject g_appctx;
+static JNIEnv *stats_env(void) {   // dm-stats only: attached once as a daemon (0 when there is no VM)
+    static JNIEnv *env; static int tried;
+    if (!env && !tried) { tried = 1; JavaVMAttachArgs aa = {JNI_VERSION_1_6, "dm-stats", NULL}; if (!g_vm || (*g_vm)->AttachCurrentThreadAsDaemon(g_vm, &env, &aa) != JNI_OK) env = NULL; }
+    return env;
+}
+static void battery_init_activity(ANativeActivity *a) {   // the activity thread, first onCreate of the process
+    JNIEnv *env = a->env; g_vm = a->vm;
+    jmethodID m = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, a->clazz), "getApplicationContext", "()Landroid/content/Context;");
+    jobject c = !(*env)->ExceptionCheck(env) && m ? (*env)->CallObjectMethod(env, a->clazz, m) : NULL;
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); c = NULL; }
+    if (c) { g_appctx = (*env)->NewGlobalRef(env, c); (*env)->DeleteLocalRef(env, c); }
+}
+#define JX(env) ((*(env))->ExceptionCheck(env) ? ((*(env))->ExceptionClear(env), 1) : 0)
+// The panel's refresh rate as reported (vk19.63, DM_VK_PRESENT_PACE; only with the switch on): Display.getRefreshRate through DisplayManager, in millihertz. The activity thread reads it when a window is
+// made (panel_read_activity: the backend's swapchain chooses FIFO from it); dm-stats reads it again once a window (dm_front_panel_mhz_now: the rate actually granted after
+// the backend's setFrameRate request, for the heat-and-energy line). No game, guest or RHI thread calls into Java
+static _Atomic int g_panel_mhz;
+static int pace_on(void) { const char *e = getenv("DM_VK_PRESENT_PACE"); return e && atoi(e) != 0; }   // off: no panel query at all (vk19.63c)
+// Display.getRefreshRate of the default display through DisplayManager.getDisplay(DEFAULT_DISPLAY) (not the window manager of a non-visual context: StrictMode), inside a
+// local frame so a long-lived thread keeps no local references (vk19.63c). The rate as reported: it can be the app's own requested rate rather than the panel's mode
+static int panel_query(JNIEnv *env, jobject ctx, int log_modes) {
+    if ((*env)->PushLocalFrame(env, 16) < 0) { (*env)->ExceptionClear(env); return 0; }
+    int mhz = 0;
+#define PQ_BAD() ((*env)->ExceptionCheck(env) ? ((*env)->ExceptionClear(env), 1) : 0)
+    jstring nm = (*env)->NewStringUTF(env, "display"); if (PQ_BAD() || !nm) goto out;
+    jmethodID gss = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, ctx), "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"); if (PQ_BAD() || !gss) goto out;
+    jobject dm = (*env)->CallObjectMethod(env, ctx, gss, nm); if (PQ_BAD() || !dm) goto out;
+    jmethodID gd = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, dm), "getDisplay", "(I)Landroid/view/Display;"); if (PQ_BAD() || !gd) goto out;
+    jobject d = (*env)->CallObjectMethod(env, dm, gd, 0); if (PQ_BAD() || !d) goto out;   // Display.DEFAULT_DISPLAY
+    jclass dc = (*env)->GetObjectClass(env, d); jmethodID gr = (*env)->GetMethodID(env, dc, "getRefreshRate", "()F"); if (PQ_BAD() || !gr) goto out;
+    { jfloat r = (*env)->CallFloatMethod(env, d, gr); if (!PQ_BAD()) mhz = (int)(r * 1000.0f + 0.5f); }
+    if (log_modes) {   // the panel's modes, once (Display.getSupportedModes, API 23)
+        jmethodID gm = (*env)->GetMethodID(env, dc, "getSupportedModes", "()[Landroid/view/Display$Mode;"); jobjectArray ms = !PQ_BAD() && gm ? (*env)->CallObjectMethod(env, d, gm) : NULL;
+        if (PQ_BAD()) ms = NULL;
+        char b[256] = ""; size_t o = 0; jsize n = ms ? (*env)->GetArrayLength(env, ms) : 0;
+        for (jsize i = 0; i < n && i < 24 && o < sizeof b - 12; i++) { jobject m = (*env)->GetObjectArrayElement(env, ms, i); if (PQ_BAD() || !m) continue;
+            jmethodID mr = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, m), "getRefreshRate", "()F"); jfloat r = !PQ_BAD() && mr ? (*env)->CallFloatMethod(env, m, mr) : 0;
+            if (PQ_BAD()) r = 0;
+            o += (size_t)snprintf(b + o, sizeof b - o, "%s%.0f", o ? " " : "", (double)r); (*env)->DeleteLocalRef(env, m); }
+        LOG("front end: panel refresh rate %.2f Hz reported now; modes %s Hz", mhz / 1000.0, o ? b : "?");
+    }
+out:
+#undef PQ_BAD
+    (*env)->PopLocalFrame(env, NULL);
+    return mhz;
+}
+static void panel_read_activity(ANativeActivity *a) { if (!pace_on()) return; static int logged; int m = panel_query(a->env, a->clazz, !logged++); if (m) atomic_store(&g_panel_mhz, m); }
+__attribute__((visibility("default"))) int dm_front_panel_mhz(void) { return atomic_load(&g_panel_mhz); }   // the activity thread's last reading (any thread may read it)
+__attribute__((visibility("default"))) int dm_front_panel_mhz_now(void) { if (!pace_on()) return 0; JNIEnv *env = g_appctx ? stats_env() : NULL; return env ? panel_query(env, g_appctx, 0) : 0; }   // dm-stats only
+__attribute__((visibility("default"))) int dm_front_battery(long *charge_uah, long *current_ua, int *mv, int *plugged, int want_v) {
+    static int state; static JNIEnv *env; static jobject bm, s_act, s_volt, s_plug; static jclass ifc; static jmethodID get_int, if_new, reg, get_extra;
+    if (state < 0) return 0;
+    if (!state) {
+        state = -1;   // until the whole setup has worked: one try only
+        if (!g_vm || !g_appctx || !(env = stats_env())) return 0;
+        jclass cc = (*env)->GetObjectClass(env, g_appctx); if (JX(env) || !cc) return 0;
+        jmethodID gss = (*env)->GetMethodID(env, cc, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;"); if (JX(env) || !gss) return 0;
+        reg = (*env)->GetMethodID(env, cc, "registerReceiver", "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;)Landroid/content/Intent;"); if (JX(env) || !reg) return 0;
+        jstring nm = (*env)->NewStringUTF(env, "batterymanager"); if (JX(env) || !nm) return 0;
+        jobject o = (*env)->CallObjectMethod(env, g_appctx, gss, nm); (*env)->DeleteLocalRef(env, nm); if (JX(env) || !o) return 0;
+        get_int = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, o), "getIntProperty", "(I)I"); if (JX(env) || !get_int) return 0;
+        jclass fc = (*env)->FindClass(env, "android/content/IntentFilter"); if (JX(env) || !fc) return 0;
+        if_new = (*env)->GetMethodID(env, fc, "<init>", "(Ljava/lang/String;)V"); if (JX(env) || !if_new) return 0;
+        jclass ic = (*env)->FindClass(env, "android/content/Intent"); if (JX(env) || !ic) return 0;
+        get_extra = (*env)->GetMethodID(env, ic, "getIntExtra", "(Ljava/lang/String;I)I"); if (JX(env) || !get_extra) return 0;
+        jstring a1 = (*env)->NewStringUTF(env, "android.intent.action.BATTERY_CHANGED"), a2 = (*env)->NewStringUTF(env, "voltage"), a3 = (*env)->NewStringUTF(env, "plugged");
+        if (JX(env) || !a1 || !a2 || !a3) return 0;
+        // every lookup worked: the global references, made once
+        bm = (*env)->NewGlobalRef(env, o); ifc = (*env)->NewGlobalRef(env, fc); s_act = (*env)->NewGlobalRef(env, a1); s_volt = (*env)->NewGlobalRef(env, a2); s_plug = (*env)->NewGlobalRef(env, a3);
+        (*env)->DeleteLocalRef(env, o); (*env)->DeleteLocalRef(env, fc); (*env)->DeleteLocalRef(env, ic); (*env)->DeleteLocalRef(env, a1); (*env)->DeleteLocalRef(env, a2); (*env)->DeleteLocalRef(env, a3);
+        if (!bm || !ifc || !s_act || !s_volt || !s_plug) return 0;
+        state = 1;
+    }
+    jint q = (*env)->CallIntMethod(env, bm, get_int, 1); if (JX(env)) return 0;   // BATTERY_PROPERTY_CHARGE_COUNTER
+    jint i = (*env)->CallIntMethod(env, bm, get_int, 2); if (JX(env)) return 0;   // BATTERY_PROPERTY_CURRENT_NOW
+    *charge_uah = q; *current_ua = i;
+    if (want_v) {
+        jobject f = (*env)->NewObject(env, ifc, if_new, s_act); if (JX(env)) f = NULL;
+        jobject in = f ? (*env)->CallObjectMethod(env, g_appctx, reg, NULL, f) : NULL; if (JX(env)) in = NULL;
+        if (in) { jint v = (*env)->CallIntMethod(env, in, get_extra, s_volt, -1); if (!JX(env)) *mv = v;
+                  jint p = (*env)->CallIntMethod(env, in, get_extra, s_plug, -1); if (!JX(env)) *plugged = p; (*env)->DeleteLocalRef(env, in); }
+        if (f) (*env)->DeleteLocalRef(env, f);
+    }
+    return 1;
+}
+#undef JX
 static void on_pause(ANativeActivity *a) { (void)a; dm_focus_set(2); }   // still visible behind something (a dialog, a split screen): out of focus, running
 static void on_focus(ANativeActivity *a, int f) { if (f) immersive(a); else input_release_all(); dm_focus_set(f ? 1 : 2); }
 // Destroyed by the player leaving (− and + held, back_to_menu, finish) the game ends; destroyed by Android while the process stays (to reclaim memory, its activity
@@ -556,6 +701,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     ANativeActivity_setWindowFlags(a, 0x80 /* KEEP_SCREEN_ON */ | 0x400 /* FULLSCREEN */, 0);
     immersive(a);
     if (g_booted) return;   // the activity can be made again (rotation, a return): the host runs once per process
+    trim_watch(a); game_mode_read(a); battery_init_activity(a);
     snprintf(g_files, sizeof g_files, "%s", a->internalDataPath);
     mallopt(M_DECAY_TIME, 1);   // freed memory (Unreal's heap runs on host malloc) goes back to the system after about a second instead of being kept
     char mk[600]; marker_path(mk, sizeof mk, "game_running");

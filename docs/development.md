@@ -204,6 +204,21 @@ both back before any guest thread runs.
   sections, and every thread on a new pthread back where it stopped. A
   snapshot is restored once (renamed `.restored`).
 
+- **Unreal Engine games** (`hle_ueheap.c`). The heap the host runs for Unreal
+  (`hle_uemalloc.c`) holds nearly all of the game's objects; with hibernation
+  it is dlmalloc (`dm/third_party/dlmalloc`) in a 16 GB host heap region at
+  the end of the reservation, its allocator state inside it, so the snapshot
+  carries it. GPU-written 3D textures are read back too (Unreal builds its
+  colour grading LUT once and keeps it; without it a restored scene is black).
+- **Before an app update**: `DM_CTL` `hib freeze` writes the snapshot and keeps
+  the game stopped until the process ends (`hib thaw` lets it go on).
+  `dm/android/tools/hib_install.sh <apk>` does it on a device: freeze through
+  `<external>/hib_ctl.txt` (made by the app when `DM_HIBERNATE` is on; it
+  takes `hib` commands only), `adb install -r`, start, and the game resumes
+  behind a "MELANJUTKAN..." screen. Only an update with the same
+  `libdmhost.so` build can resume: another build refuses the snapshot and the
+  menu shows.
+
 The front ends call `dm_hib_suspend(1)` at the end of their suspend sequence
 (the Mac's minimised window, `DM_OE_SCRIPT` `bg=1`) and `dm_hib_suspend(0)`
 before resuming. `DM_CTL` `hib save`, `hib verify`, `hib park` and

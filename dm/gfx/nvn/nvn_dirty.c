@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <mach/mach_time.h>
 #include <sched.h>
+#include <errno.h>
 
 // Order of page state and mprotect: the side changing protection first sets the state to BUSY and sets the final state only after mprotect has landed; other threads wait when they see BUSY.
 //   set read-only: NONE -> BUSY -> mprotect(read-only) -> PROT; unprotect: PROT -> BUSY -> mprotect(writable) -> NONE.
@@ -27,7 +28,8 @@ enum { BLK_SHIFT = 10, BLK = 1 << BLK_SHIFT, NBLK = 256, MAX_RANGE = BLK * NBLK 
 // Ranges are rounded to host pages (16 KB) but guest memory pools are only 4 KB aligned: adjacent pools share their first / last pages, so one address can fall in several registered ranges.
 // So: "is this texture tracked" looks for a range that holds its whole span; a fault / host pre-write unprotects and stamps every range covering that page; pool destruction identifies its range by the pool's exact start mem.
 // (Previously the first range containing the address was always taken: two SMBW ASTC 6x5 textures whose pool's first page is shared with a small preceding pool were judged untracked and re-uploaded on every use, about 6 MB per frame)
-typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live; } range_t;
+typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live; _Atomic uint64_t regid; } range_t;   // regid: this registration's id (a reused slot gets a new one: vk19.70)
+static _Atomic uint64_t g_regid;
 static _Atomic(range_t *) g_blk[NBLK];
 static inline range_t *rg(int i) { return &atomic_load_explicit(&g_blk[i >> BLK_SHIFT], memory_order_acquire)[i & (BLK - 1)]; }
 static _Atomic int g_nr;
@@ -40,9 +42,12 @@ void nvn_dirty_stat(int *live, int *peak, int *cap) { *live = atomic_load(&g_liv
 static _Atomic int g_overflow_logged;
 static pthread_mutex_t g_slot_mu = PTHREAD_MUTEX_INITIALIZER;   // Pool creation, retirement and protection serialize descriptor lifetime; the page-fault path does not touch this mutex
 static _Atomic uint64_t g_mp_calls, g_mp_pages, g_mp_ticks;   // This module's mprotect: call count, pages covered, time spent (mach timebase, safe in the page-fault path too)
-static void mp(uintptr_t a, size_t len, int prot) {
-    uint64_t t = mach_absolute_time(); mprotect((void *)a, len, prot);
+static _Atomic uint64_t g_mp_fail;   // mprotect calls that failed (vk19.70: a protect that failed leaves its pages untracked and always dirty, never reported as protected)
+static int mp(uintptr_t a, size_t len, int prot) {
+    uint64_t t = mach_absolute_time(); int r = mprotect((void *)a, len, prot);
     atomic_fetch_add(&g_mp_ticks, mach_absolute_time() - t); atomic_fetch_add(&g_mp_calls, 1); atomic_fetch_add(&g_mp_pages, len >> g_shift);
+    if (r) { atomic_fetch_add(&g_mp_fail, 1); static _Atomic int logged; if (!atomic_exchange(&logged, 1)) LOG("[RED] dirty-page tracking: mprotect(%p, %zu, %d) failed (errno %d): those pages stay untracked and count as written", (void *)a, len, prot, errno); }
+    return r == 0;
 }
 
 static mach_timebase_info_data_t g_tb;   // obtained when the first pool is registered (the fault path only multiplies and divides)
@@ -73,20 +78,38 @@ static void stamp_page(range_t *r, uintptr_t p) {
     // must invalidate that cached clock, as the page stays writable until the next upload protects it again.
     atomic_fetch_add(&g_now, 1);
 }
-static void unprotect_page(range_t *r, uintptr_t p) {   // The caller has already changed the state from PROT to BUSY
-    mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
+static int unprotect_page(range_t *r, uintptr_t p) {   // The caller has already changed the state from PROT to BUSY; 0: mprotect failed
+    if (!mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE)) {   // vk19.70b: still read-only (or partly changed): kept PROT and always dirty, never reported writable
+        atomic_store(&r->gen[p], UINT64_MAX); atomic_store(&r->state[p], PG_PROT); return 0; }
     stamp_page(r, p);
     atomic_store(&r->state[p], PG_NONE);
+    return 1;
 }
 // Unprotect one page of a range: if protected, unprotect and stamp it; if another thread is changing its protection, wait for it to finish and look again -- if the other side was setting read-only, the page is PROT after the wait and still has to be unprotected
 // (an unprotect-before-write never reaches the fault handler, so it must be done here). Returns 1 = this page is managed by this module; 0 = it is not, or the wait on BUSY timed out
 static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
     for (;;) {
         uint8_t st = PG_PROT;
-        if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); if (count) atomic_fetch_add(count, 1); return 1; }
+        if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { if (!unprotect_page(r, p)) return 0; if (count) atomic_fetch_add(count, 1); return 1; }   // a failed unprotect is not ours: the crash handler reports it (no re-fault loop)
         if (st != PG_BUSY) return atomic_load(&r->gen[p]) != 0;   // already NONE: just unprotected by another thread (the fault happened before the unprotect) -> re-execute; pages never protected are not ours
         if (!busy_wait(r, p)) return 0;
     }
+}
+// Faults by thread (Android, vk19.59 measurement): a fixed table claimed by compare-and-swap, safe in the fault path (gettid is a plain system call); a thread past the
+// table's 32 slots is counted in the last one
+enum { NFT = 32 };
+static struct { _Atomic int tid; _Atomic uint64_t n; } g_ft[NFT];
+static void fault_by_thread(void) {
+#if defined(__ANDROID__)
+    int t = (int)gettid();
+    for (int i = 0; i < NFT; i++) { int c = atomic_load_explicit(&g_ft[i].tid, memory_order_relaxed);
+        if (!c) { int z = 0; if (atomic_compare_exchange_strong(&g_ft[i].tid, &z, t)) c = t; else c = z; }
+        if (c == t || i == NFT - 1) { atomic_fetch_add_explicit(&g_ft[i].n, 1, memory_order_relaxed); return; } }
+#endif
+}
+int nvn_dirty_thread_faults(int *tid, uint64_t *n, int max) {
+    int k = 0; for (int i = 0; i < NFT && k < max; i++) { int t = atomic_load(&g_ft[i].tid); if (!t) break; tid[k] = t; n[k] = atomic_load(&g_ft[i].n); k++; }
+    return k;
 }
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
@@ -94,6 +117,7 @@ static int on_fault(void *addr, int is_write, void *uc) {
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
         { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
+    if (ours) fault_by_thread();
     return ours;
 }
 // Unprotect pages p..q of a range with one mprotect per run of protected pages (a host write over a whole texture, e.g. WriteTexels, used to make one system call per 16 KB page:
@@ -104,8 +128,8 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
         uint8_t st = PG_PROT; int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
         if (took) { if (!open) { run = i; open = 1; } continue; }
         if (open) {
-            mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ | PROT_WRITE);
-            for (uintptr_t k = run; k < i; k++) { stamp_page(r, k); atomic_store(&r->state[k], PG_NONE); }
+            if (mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ | PROT_WRITE)) for (uintptr_t k = run; k < i; k++) { stamp_page(r, k); atomic_store(&r->state[k], PG_NONE); }
+            else for (uintptr_t k = run; k < i; k++) { atomic_store(&r->gen[k], UINT64_MAX); atomic_store(&r->state[k], PG_PROT); }   // vk19.70b: kept PROT and always dirty
             if (count) atomic_fetch_add(count, i - run);
             open = 0;
         }
@@ -157,7 +181,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     } else {
         memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen);
     }
-    r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen;
+    r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen; atomic_store(&r->regid, atomic_fetch_add(&g_regid, 1) + 1);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
     pthread_mutex_unlock(&g_slot_mu);
@@ -176,12 +200,13 @@ int nvn_dirty_tracked(const void *addr, size_t len) {
 // The tracked range holding [addr, addr+len), as a handle a caller keeps (packaged textures: the scan over every range ran twice per texture lookup). NULL = untracked
 const void *nvn_dirty_span(const void *addr, size_t len) { return len ? find_span((uintptr_t)addr, len) : NULL; }
 // Set read-only: mark the pages BUSY first and mark them PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file)
-void nvn_dirty_protect(const void *addr, size_t len) {
+int nvn_dirty_protect(const void *addr, size_t len) {   // 1: every page of the span is read-only and tracked (vk19.70; 0: untracked, or an mprotect failed)
     // Keep this descriptor live through the last mprotect. Retirement restores
     // RW under this same mutex; it must not finish between lookup and PG_BUSY.
     pthread_mutex_lock(&g_slot_mu);
     range_t *r = len ? find_span((uintptr_t)addr, len) : NULL;
-    if (!r) { pthread_mutex_unlock(&g_slot_mu); return; }
+    if (!r) { pthread_mutex_unlock(&g_slot_mu); return 0; }
+    int failed = 0;
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     // Consecutive pages are merged into one mprotect (per-page calls reach thousands per frame on the first upload of large textures; character select page startup frame 5: 4888 calls).
     // Pages already PROT / BUSY break the consecutive run: do not protect again, and do not touch pages another thread is changing.
@@ -192,12 +217,18 @@ void nvn_dirty_protect(const void *addr, size_t len) {
         uint8_t st = PG_NONE;
         int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
         if (took && !open) { run = i; open = 1; }
-        if (!took && open) { mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT); open = 0; }
+        if (!took && open) {
+            if (mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ)) for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT);
+            else { for (uintptr_t k = run; k < i; k++) { atomic_store(&r->gen[k], UINT64_MAX); atomic_store(&r->state[k], PG_NONE); } failed = 1; }   // writable, its writes unseen: always dirty from now on
+            open = 0; }
         if (!took && i <= q && st == PG_BUSY && busy_wait(r, i)) i--;   // this page again
     }
     pthread_mutex_unlock(&g_slot_mu);
+    return !failed;
 }
 uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }
+uint64_t nvn_dirty_span_regid(const void *span) { const range_t *r = span; return r && atomic_load_explicit(&r->live, memory_order_acquire) ? atomic_load(&r->regid) : 0; }   // 0: not a live registration
+uint64_t nvn_dirty_mp_failures(void) { return atomic_load(&g_mp_fail); }
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp) {
     if (!len) return 0;
     range_t *r = (range_t *)span; uintptr_t a0 = (uintptr_t)addr;   // the kept handle still holds the span (a slot reused by another pool over the same memory is as good): no scan

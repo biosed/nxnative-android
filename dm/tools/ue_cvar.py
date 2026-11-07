@@ -11,7 +11,13 @@ import re, struct, sys, os
 
 # The variables the host may write: the engine's frame limit, its present interval (rhi., or nvn. in the Switch RHI of UE 4.18), the texture streaming pool, and a game's own frame-limit
 # variable a profile names with ue_fps_cvar (SHIN MEGAMI TENSEI V: Vengeance's Project.FrameRateLimit, which its settings apply to t.MaxFPS). A name a profile names must be listed here
-NAMES = ('t.MaxFPS', 'rhi.SyncInterval', 'nvn.SyncInterval', 'r.Streaming.PoolSize', 'Project.FrameRateLimit')
+# and the dynamic resolution's budget, mode and bounds (hle_uecvar.c DM_UE_DRS: a Switch build budgets 33.3 ms, so at 60 fps the headroom went to resolution, not frames)
+NAMES = ('t.MaxFPS', 'rhi.SyncInterval', 'nvn.SyncInterval', 'r.Streaming.PoolSize', 'Project.FrameRateLimit',
+         'r.DynamicRes.OperationMode', 'r.DynamicRes.FrameTimeBudget', 'r.DynamicRes.MinScreenPercentage', 'r.DynamicRes.MaxScreenPercentage', 'r.ScreenPercentage',
+         # the render features a performance profile may turn down (hle_uecvar.c DM_UE_PERF / DM_UE_CVARS)
+         'r.SSR.Quality', 'r.AmbientOcclusionLevels', 'r.ContactShadows', 'r.Shadow.CSM.MaxCascades', 'r.Shadow.MaxResolution', 'r.Shadow.MaxCSMResolution', 'r.ShadowQuality',
+         'r.Shadow.DistanceScale', 'r.MotionBlurQuality', 'r.BloomQuality', 'r.LensFlareQuality', 'r.SceneColorFringeQuality', 'r.EyeAdaptationQuality', 'r.SSS.Quality',
+         'r.RefractionQuality', 'r.ParticleLightQuality', 'r.LightFunctionQuality', 'r.DepthOfFieldQuality', 'r.ViewDistanceScale', 'r.EmitterSpawnRateScale', 'r.Streaming.MipBias')
 RET = 0xD65F03C0
 
 def adrp_page(w, pc):

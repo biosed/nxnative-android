@@ -4,6 +4,7 @@
 //   HIB_BASE                        modules (map_image, in load order; 16 KB aligned)
 //   HIB_BASE + HIB_MODWIN - ARENA   host arena (objects the guest holds pointers to: hle_hib_arena)
 //   HIB_BASE + HIB_MODWIN           guest address space (hle_svc.c mem_init_once: alias, stack, heap)
+//   after the guest address space   the host heap region (HIB_HEAP): an Unreal Engine game's heap when the host runs it (hle_ueheap.c), grown as it is used
 // The base differs by platform. Android arm64 has a 39-bit address space (512 GB) and maps libraries and mmap(NULL) top down from near its end, so 64 GB is free there.
 // macOS reserves 0xfc0000000-0x7000000000 (vm_region tag 31; a hint inside it lands at 0x7000000000) and hands out mmap(NULL) upward from 0x7000000000, so the Mac's base is above that, at 512 GB.
 // When the range is taken, hibernation is off for the session (the game runs as without it); it is never moved, a snapshot names the base it was written with.
@@ -26,6 +27,7 @@
 #endif
 #define HIB_MODWIN 0x100000000ull      // 4 GB for the modules and the arena (address space only; pages are committed as they are mapped)
 #define HIB_ARENA  0x10000000ull       // 256 MB arena at the top of the module window
+#define HIB_HEAP   0x400000000ull      // 16 GB of address space for the host-run game heap (hle_ueheap.c): Unreal's FMalloc, which the host takes over, keeps the game's objects there
 
 static int g_hib = -1;                 // -1 unread, 0 off, 1 on
 static uint8_t *g_win; static size_t g_win_len;   // the reservation (NULL when not reserved)
@@ -46,7 +48,7 @@ size_t svc_guest_reserve_size(void);   // hle_svc.c: the guest address space blo
 static void win_init(void) {
     static int done; if (done) return; done = 1;
     if (!dm_hib_on()) return;
-    size_t len = HIB_MODWIN + svc_guest_reserve_size();
+    size_t len = HIB_MODWIN + svc_guest_reserve_size() + HIB_HEAP;
     uint8_t *want = (uint8_t *)(uintptr_t)HIB_BASE;
 #ifdef MAP_FIXED_NOREPLACE
     uint8_t *p = mmap(want, len, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
@@ -60,7 +62,8 @@ static void win_init(void) {
     }
     g_win = p; g_win_len = len;
     uintptr_t dm_hib_image_base(void);
-    LOG("hibernate: fixed layout at %p: modules + arena %#llx, guest address space %p +%#zx; host image at %#lx", (void *)p, (unsigned long long)HIB_MODWIN, (void *)(p + HIB_MODWIN), len - (size_t)HIB_MODWIN, (unsigned long)dm_hib_image_base());
+    LOG("hibernate: fixed layout at %p: modules + arena %#llx, guest address space %p +%#zx, host heap region %p +%#llx; host image at %#lx", (void *)p, (unsigned long long)HIB_MODWIN, (void *)(p + HIB_MODWIN),
+        len - (size_t)(HIB_MODWIN + HIB_HEAP), (void *)(p + len - HIB_HEAP), (unsigned long long)HIB_HEAP, (unsigned long)dm_hib_image_base());
 }
 
 // Module memory (loader.c map_image): len bytes, readable and writable, at the next 16 KB of the module window; mmap(NULL) without hibernation
@@ -86,10 +89,20 @@ void *dm_hib_guest_as(size_t len) {
     win_init();
     void *r = NULL;
     if (g_win) {
-        if (len != g_win_len - HIB_MODWIN) die("hibernate: guest address space %#zx, the reservation was made for %#zx", len, g_win_len - (size_t)HIB_MODWIN);
+        if (len != g_win_len - HIB_MODWIN - HIB_HEAP) die("hibernate: guest address space %#zx, the reservation was made for %#zx", len, g_win_len - (size_t)(HIB_MODWIN + HIB_HEAP));
         r = g_win + HIB_MODWIN;
     }
     pthread_mutex_unlock(&g_hib_lock);
+    return r;
+}
+
+// The host heap region at the end of the reservation (hle_ueheap.c hands it out; PROT_NONE until then): NULL when there is no fixed layout this session
+void *dm_hib_heap_region(size_t *len) {
+    pthread_mutex_lock(&g_hib_lock);
+    win_init();
+    void *r = g_win ? g_win + g_win_len - HIB_HEAP : NULL;
+    pthread_mutex_unlock(&g_hib_lock);
+    if (len) *len = r ? (size_t)HIB_HEAP : 0;
     return r;
 }
 
@@ -159,11 +172,14 @@ void dm_hib_layout(uint8_t **win, size_t *win_len, size_t *mod_used, uint8_t **a
     if (arena_used) *arena_used = g_arena_used;
 }
 
-// DM_CTL "hib <command>": "audit <path>" writes the pointer audit (hle_hibaudit.c), "save" writes the snapshot and "verify [path]" checks one (hle_hibsnap.c), "park" / "unpark" stop and start every guest thread
+// DM_CTL "hib <command>": "audit <path>" writes the pointer audit (hle_hibaudit.c), "save" writes the snapshot, "freeze" writes it and keeps the game stopped (before an app update),
+// "thaw" lets a frozen game go on, and "verify [path]" checks one (hle_hibsnap.c), "park" / "unpark" stop and start every guest thread
 void dm_hib_audit(const char *path);
 void dm_hib_ctl(const char *cmd) {
     if (!strncmp(cmd, "audit ", 6)) { dm_hib_audit(cmd + 6); return; }
     if (!strcmp(cmd, "save")) { int dm_hib_save(void); dm_hib_save(); return; }
+    if (!strcmp(cmd, "freeze")) { int dm_hib_freeze(void); dm_hib_freeze(); return; }
+    if (!strcmp(cmd, "thaw")) { void dm_hib_thaw(void); dm_hib_thaw(); return; }
     if (!strncmp(cmd, "verify", 6)) { int dm_hib_verify(const char *); const char *p = cmd + 6; while (*p == ' ') p++; dm_hib_verify(p); return; }
     if (!strcmp(cmd, "park")) { char why[1024]; if (dm_guest_park_all(3000, why, sizeof why)) LOG("[RED] hib park: %s", why); else LOG("hib park: parked"); return; }
     if (!strcmp(cmd, "unpark")) { dm_guest_unpark_all(); LOG("hib unpark: running"); return; }

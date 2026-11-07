@@ -92,6 +92,18 @@ the menu asks for it once through the system file picker and checks it belongs t
 
 The log is `/sdcard/Android/data/<package>/files/log.txt`; an `env.txt` beside it (KEY=VALUE lines) sets diagnostic switches.
 
+The save is in the app's internal folder (`<files>/save`), which adb cannot read on a release build, so the menu copies it
+out (`app/java/com/nxnative/SaveBackup.java`) at each start and when the player comes back from the game, before the game
+starts: `<external>/save_backup/latest/` (replaced) and `save_backup/<yyyyMMdd-HHmmss>/` (the last 5); `save_backup/log.txt`
+and logcat tag `nxsave` say what was done. A save from elsewhere (the same files: `GameSaveData0`, `OptionSaveData`, ...)
+comes in through `<external>/save_import/` at the next start; the save it replaces is kept in `save_backup/pre-import-<time>/`:
+
+```bash
+E=/sdcard/Android/data/<package>/files
+adb pull $E/save_backup/latest ./save_from_android
+adb push ./my_save $E/save_import && adb shell chmod -R o+rX $E/save_import   # adb's files are the shell's: the app reads them only after the chmod
+```
+
 ## Next
 
 The missing backend features above; GPU time (images stay in `GENERAL` layout, which keeps Mali from compressing them);

@@ -751,8 +751,41 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
     return RES_OK;
 }
+// IO back-pressure (DM_IO_THROTTLE, default 1; Android): while the graphics backend reports memory pressure (dm_mem_io_pressure: MemAvailable under 900 MB or 300 MB down in a
+// second), each read waits 10 ms, plus 10 ms per 4 MB, at most 50 ms, and at most DM_IO_THROTTLE_MAX_MS (default 2000) in all per episode (it ends after 5 s without pressure).
+// FINAL FANTASY RESONANCE's 116 MB IoStore read was followed by 457 MB more resident memory in one second and the low-memory killer 5 s later: slower reads give reclaim and swap
+// time. Unreal's IoDispatcher waits for its reads as it would on a slow SD card. Each held read is logged (at most 200 lines), and each episode's total
+#ifdef __ANDROID__
+int dm_mem_io_pressure(void) __attribute__((weak));   // nvn_vk.c
+#else
+static int (*const dm_mem_io_pressure)(void) = 0;     // the Mac has no such watch
+#endif
+static void io_throttle(size_t sz) {
+    if (!dm_mem_io_pressure) return;
+    static int on = -1; static long maxms;
+    if (on < 0) { const char *e = getenv("DM_IO_THROTTLE"); maxms = (e = getenv("DM_IO_THROTTLE_MAX_MS")) ? atol(e) : 2000; e = getenv("DM_IO_THROTTLE"); on = !e || atoi(e) != 0; }
+    if (!on) return;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t ep0, last_p; static long slept, nreads; static int in_ep, nlog;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    int av = dm_mem_io_pressure(); long ms = 0;
+    pthread_mutex_lock(&mu);
+    if (in_ep && !av && now - last_p > 5000000000ull) {
+        LOG("[fs] memory pressure over: %ld reads held %ld ms in all over %.1f s", nreads, slept, (last_p - ep0) / 1e9); in_ep = 0;
+    }
+    if (av) {
+        if (!in_ep) { in_ep = 1; ep0 = now; slept = 0; nreads = 0; LOG("[fs] memory pressure (%d MB available): file reads slowed, at most %ld ms in all", av, maxms); }
+        last_p = now;
+        ms = 10 + (long)(sz >> 22) * 10; if (ms > 50) ms = 50; if (slept + ms > maxms) ms = maxms - slept; if (ms < 0) ms = 0;
+        if (ms) { slept += ms; nreads++; }
+    }
+    pthread_mutex_unlock(&mu);
+    if (!ms) return;
+    if (nlog++ < 200) LOG("[fs] read of %.1f MB held %ld ms (%d MB available)", sz / 1048576.0, ms, av);
+    usleep((useconds_t)ms * 1000);
+}
 HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) { h = FH_IN(h);
     if (!h) { *out = 0; return RES_FAIL; }   // a file handle is an fd; 0 is stdin and never a file the game opened: the null handle the game keeps using after a failed open
+    io_throttle(sz);
     size_t got = 0; int reprep = 0, fd = (int)h; int64_t base = 0;
     if (IMG_H(h)) {   // an image entry: read the image's descriptor at the entry's offset, never past its end
         const img_ent *x = &g_mnt[IMG_M(h)].img->e[IMG_K(h)];
