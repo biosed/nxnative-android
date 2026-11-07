@@ -3076,17 +3076,29 @@ static fbsnap_t *fb_snap_for(vtex *v, int i) {   // the snapshot image for attac
     e->src = v; e->lv = lv; e->ly = ly; P.cwr[i] = 0; g_fb_copies++;
     return e;
 }
-// Whether a draw sampling texture v through the view tr holds really reads attachment a's level and layer (as nvn_mtl.m fb_prepare decides): a view whose levels or layers do
-// not include the attachment's is no feedback at all, and a view over several levels or layers is a mip-chain or layer pass -- level n drawn while level n-1 is sampled, the
-// view covering the chain -- which Metal leaves as is too. Snapshotting those split the pass and copied a level for every draw of every mip chain: Tomodachi Life: Living the
-// Dream builds 64x64 → 1x1 and 122x82 → 1x1 chains each frame, 287 render passes a frame on the Adreno (182 on the Mac), vkCmdBeginRendering ~28 ms a frame
-static int fb_view_hits(const treg_t *tr, const vtex *v, int a) {
+// Whether a draw sampling texture v through the view tr holds really reads attachment a's level and layer, as nvn_mtl.m fb_prepare decides: 1 = snapshot it (fb_snap_for).
+// A view whose levels or layers exclude the attachment's is no feedback. A view over several levels -- a mip-chain pass, level n drawn while level n-1 is sampled, the view
+// covering the chain -- is not snapshotted either (a 1-level snapshot in place of the chain read the wrong level), but on Vulkan the sampled view must not include the level
+// drawn: a view overlapping the attachment's subresource in the same pass lost the Adreno 825 (VK_ERROR_DEVICE_LOST in Tomodachi Life's t5, where Metal draws it fine). So the
+// draw samples a view of the same image cut to the levels below the one drawn (same base, so the shader's level numbers hold; reading the level drawn or above clamps to the
+// last one below, which a downsample chain never does), registered like a snapshot (g_fb_src / g_fb_view). Drawing the view's base level itself, or a layer of a single-level
+// multi-layer view, has no such cut: snapshotted as before. Tomodachi Life: Living the Dream builds 64x64 → 1x1, 122x82 → 1x1 and a 66-layer cube chain every frame: a pass
+// split and a snapshot per level made 287 render passes a frame on the Adreno (182 on the Mac) and vkCmdBeginRendering ~28 ms a frame
+static uint64_t g_fb_chain;   // mip-chain draws given a view cut below the level they draw (counted beside the snapshots)
+static int fb_view_hits(const treg_t *tr, vtex *v, int a) {
     uint32_t bl = tr->has_v && tr->v.set_levels ? tr->v.base_level : 0, nl = tr->has_v && tr->v.set_levels ? tr->v.nlevels : (v->levels > bl ? v->levels - bl : 1);
     uint32_t b0 = tr->has_v && tr->v.set_layers ? tr->v.min_layer : 0, nly = tr->has_v && tr->v.set_layers ? tr->v.nlayers : (v->layers > b0 ? v->layers - b0 : 1);
     if (!nl) nl = 1; if (!nly) nly = 1;
-    if (P.clv[a] < bl || P.clv[a] >= bl + nl || P.cly[a] < b0 || P.cly[a] >= b0 + nly) return 0;   // another level or layer of the same texture
-    if (nl > 1 || nly > 1) { static int once; if (!once++) LOG("vk: same-pass feedback: a view over levels %u+%u, layers %u+%u sampled while level %u layer %u is drawn: a mip-chain or layer pass, left as is (as on Metal)", bl, nl, b0, nly, P.clv[a], P.cly[a]); return 0; }
-    return 1;
+    uint32_t L = P.clv[a];
+    if (L < bl || L >= bl + nl || P.cly[a] < b0 || P.cly[a] >= b0 + nly) return 0;   // another level or layer of the same texture
+    if (nl == 1 || L == bl) return 1;   // the very level drawn (or a layer of it), or the chain's base level: a snapshot
+    for (int q = 0; q < g_fb_n; q++) if (g_fb_src[q] == v) return 0;   // cut already (DM_VK_FB_FAST=2 asks twice)
+    view_t vv = tr->has_v ? tr->v : (view_t){0}; vv.set_levels = 1; vv.base_level = (uint8_t)bl; vv.nlevels = (uint8_t)(L - bl);
+    VkImageView cut = tex_view(v, &tr->t, &vv, 1, -1, 0);
+    if (!cut || g_fb_n >= 8) return 1;   // no view to cut to: a snapshot after all
+    g_fb_src[g_fb_n] = v; g_fb_view[g_fb_n++] = cut; g_fb_chain++;
+    static int once; if (!once++) LOG("vk: same-pass feedback: a view over levels %u+%u, layers %u+%u sampled while level %u layer %u is drawn: a mip-chain pass, sampled through levels %u+%u (no overlap with the level drawn)", bl, nl, b0, nly, L, P.cly[a], bl, L - bl);
+    return 0;
 }
 static int fb_want_full(shader_t *fs, int want[8]) {   // the attachments the draw samples: each texture binding through tex_get, compared with the pass's attachments
     int any = 0;
@@ -5771,7 +5783,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     }
     if (n % 600 == 0) { uint64_t live = 0, held = 0; int nb = 0; lk_(&g_blkmu, LW_BLKMU); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) { nb++; held += g_blk[i].size; live += g_blk[i].live; } pthread_mutex_unlock(&g_blkmu);
                         LOG("vk: image memory: %d blocks of 64 MB (%.0f MB, %llu live images in them), big images %.0f MB now; rings %.0f MB extra", nb, held / 1048576.0, (unsigned long long)live, atomic_load(&g_big_bytes) / 1048576.0, atomic_load(&g_extra_ring_bytes) / 1048576.0); }
-    if (n % 600 == 0 && g_fb_copies) LOG("vk: same-pass feedback snapshots so far: %llu", (unsigned long long)g_fb_copies);
+    if (n % 600 == 0 && (g_fb_copies || g_fb_chain)) LOG("vk: same-pass feedback snapshots so far: %llu; mip-chain draws through a view cut below the level drawn: %llu", (unsigned long long)g_fb_copies, (unsigned long long)g_fb_chain);
     if (n % 600 == 0) LOG("vk: texture slots read as black so far: no handle %llu, handle not registered %llu, texture not created %llu, no view %llu; lookups of a dead texture object %llu (registrations of one %llu)", (unsigned long long)g_tex_miss[0],
                           (unsigned long long)g_tex_miss[1], (unsigned long long)g_tex_miss[2], (unsigned long long)g_tex_miss[3], (unsigned long long)g_tex_dead, (unsigned long long)g_treg_dead);
     if (n % 600 == 0) { extern uint64_t g_nsub_stat; static uint64_t ls;
