@@ -3110,7 +3110,7 @@ static void ts_tick(void) {
 // The range's block in the store (filled now if just admitted or written since), NULL: the caller copies as before. kind: texel buffer, vertex stream, indirect index pool
 static ts_ent *ts_get(uint64_t addr, uint64_t n, VkDeviceSize al, int kind) {
     int mode = ts_kmode(kind); if (!mode || !g_ts_buf || g_ts_dropping || g_mem_low || g_mem_tight) return NULL;   // the store's upkeep runs once a submission (ts_tick)
-    if (al > TS_GRAN || !n || n > (64u << 20) || (g_ts_ngran && n > (uint64_t)g_ts_ngran * TS_GRAN / 4)) return NULL;   // at most a quarter of the store a range
+    if (al > TS_GRAN || !n || n > (64u << 20)) return NULL;   // a texel range as in vk19.70 (vk19.74d: no further cap for texel buffers)
     if (kind != TSK_TEXEL && n > (2u << 20)) return NULL;   // vk19.74a: vertex streams and the index pool at most 2 MB a range (an 8 MB index pool cost 1.5-2.5 ms a hash and as much a copy when written)
     ts_ent *e = ts_slot(addr, n, kind);
     if (e->used && e->addr == addr && e->len == n && e->kind == kind) {
@@ -5199,7 +5199,7 @@ static void meas_lines(void) {
             g_ts_khit[0] / 600.0, g_ts_khit_b[0] / 600.0 / 1048576.0, g_ts_kadm[0] / 600.0, g_ts_khit[1] / 600.0, g_ts_khit_b[1] / 600.0 / 1048576.0, g_ts_kadm[1] / 600.0,
             g_ts_khit[2] / 600.0, g_ts_khit_b[2] / 600.0 / 1048576.0, g_ts_kadm[2] / 600.0);
         memset(g_ts_khit, 0, sizeof g_ts_khit); memset(g_ts_khit_b, 0, sizeof g_ts_khit_b); memset(g_ts_kadm, 0, sizeof g_ts_kadm);
-        LOG("vk: DM_VK_TEXEL_STORE=%d per frame over the last 600: %.1f served (%.2f MB), %.1f missed, %.2f admitted, %.2f copied again, %.2f evicted, %.2f refused for a while (%.2f could not be admitted); views reused %.1f, made %.2f; verify %.1f checked, %llu differed; store %.1f of %.0f MB in %d blocks, %d waiting for readers, dropped %llu times; mprotect failures %llu; memory map %d lines",
+        LOG("vk: range store (DM_VK_TEXEL_STORE=%d) per frame over the last 600, all kinds: %.1f served (%.2f MB), %.1f missed, %.2f admitted, %.2f copied again, %.2f evicted, %.2f refused for a while (%.2f could not be admitted); views reused %.1f, made %.2f; verify %.1f checked, %llu differed; store %.1f of %.0f MB in %d blocks, %d waiting for readers, dropped %llu times; mprotect failures %llu; memory map %d lines",
             ts_mode(), g_ts_hit / 600.0, g_ts_hit_b / 600.0 / 1048576.0, g_ts_miss / 600.0, g_ts_adm / 600.0, g_ts_recopy / 600.0, g_ts_evict / 600.0, g_ts_bl / 600.0, g_ts_refused / 600.0, g_ts_vreuse / 600.0, g_ts_vmade / 600.0,
             g_ts_vchk / 600.0, (unsigned long long)g_ts_vbad, g_ts_inuse * (double)TS_GRAN / 1048576.0, g_ts_ngran * (double)TS_GRAN / 1048576.0, ne, g_ts_nret, (unsigned long long)g_ts_drops,
             (unsigned long long)nvn_dirty_mp_failures(), vk_stats_maps_last());
