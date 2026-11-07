@@ -199,6 +199,32 @@ APK `ffr_hib_vk19_71.apk` (android-ffr 82c07833, hib e02144e8), dungeon spot, on
 - `DM_VK_TEXEL_STORE=1` against base: at ~1.17 GHz (T w16–19 against B w10–15) recording 15.40 against 16.03 ms (−0.6), RHIThread 19.6 against 20.25 (−0.6), all threads 55.7 against 57.1 (−1.4); at ~1.63 GHz (T w8–13 against B w6, w7, w18) recording 12.97 against 13.87 (−0.9), RHIThread 16.6 against 17.4 (−0.8). 17.6 MB a frame served from the store, 0 evicted, 0 mprotect failures, the game alive at the end of all three runs.
 - Verdict: win, on by default from vk19.73a.
 
+## Session 5 (vk19.74): vertex streams and the index pool in the store
+
+APK `ffr_hib_vk19_74.apk` (android-ffr 539a707d, hib 728f6d64), dungeon spot, device-side script (18:35–18:52); windows at matched cpu7 clocks.
+
+- `DM_VK_BUF_STORE=2` (verify): vertex uses checked 383–612 a frame, 0 differed in every window. Memory was low (about 750 MB available): the store was dropped under pressure several times and made again, without errors. The index pool was never served (every range over 2 MB, or refused): the switch stores vertex streams only in practice.
+- `DM_VK_BUF_STORE=1` per kind: texel 1,545 served a frame (17.7 MB, as session 4: the texel share of vk19.74b holds), vertex ~710 (4.1 MB); the store 6.4 of 32 MB in 607 blocks, 0 mprotect failures, the game alive.
+- Against base at ~1.65–1.7 GHz: recording 12.55 against 12.78 ms (−0.2), RHIThread 15.95 against 16.2 (−0.25); the switch on at 1.77–1.87 GHz (recording 12.2–12.5) is also faster than base at 2.0–2.2 GHz (12.6–12.7).
+- Verdict: a small win, on by default from vk19.75b (vertex only in practice).
+- The vk19.58 arm did not run: Android refused the install as a version downgrade (26110622 under 26110718; HyperOS refuses -d), so that run went on vk19.74 and is not counted. `ffr_hib_vk19_58_v26110719.apk` is the same source (hib fd79ad5d) with only the version code raised (its .text is byte-identical to the original), and the final `ffr_hib_vk19_75b.apk` carries 26110720 to install over it. The end-to-end numbers follow.
+
+## End to end: vk19.58 vs final vk19.75b
+
+Re-run 19:11–19:20, device-side script, dungeon spot: `ffr_hib_vk19_58_v26110719.apk` (vk19.58's source, only the version code raised) then `ffr_hib_vk19_75b.apk` installed over it (android-ffr 73ceb47b, hib 790a8083); both runs alive to the end. Compared on the lines both builds log: the per-frame GPU / recording line, the clocks line (an instantaneous sample) and the [nvn] present timing.
+
+| | vk19.58 | vk19.75b | Change |
+|---|---|---|---|
+| Recording, cpu7 at 1670 MHz (vk19.58 w9–15, final w16–19) | 17.0–18.0 ms (avg ~17.6) | 12.8–13.3 ms (avg ~13.0) | −4.6 ms (−26%) |
+| GPU per frame, same windows | 19.2 ms | 14.2 ms | −5.0 ms (vk19.58 does not log the GPU clock: with caution) |
+| Recording, cpu7 sampled at 633 MHz | 18.0–18.3 ms | 16.0–16.5 ms | −2 ms |
+| Present, last 8 × 300-frame windows (cpu7 ~1.5–1.67 GHz): p50 / p95 | 23.31 ms (42.9 fps) / 28.9 | 17.86 ms (56.0 fps) / 22.6 | +13 fps (+31%) |
+| Long-frame anchors | 42.2 fps | 49.1 fps | |
+
+RHIThread, all-thread CPU and energy are not comparable end to end: vk19.58 predates those lines. The matched-clock gains of each step are in sessions 1–5 above. On by default in vk19.75b against vk19.58: DM_VK_IDX_NEON, DM_VK_FB_FAST, DM_VK_LEAN, DM_VK_HTAB, DM_WAKE_AFTER_G (Android), DM_VK_TEXEL_STORE, DM_VK_BUF_STORE (DM_VK_CTX_PICK was already on in vk19.58).
+
+**FFR is frozen at vk19.75b** (android-ffr 73ceb47b, android-ffr-hib 790a8083): no further FFR code changes; the "later" items in Open stay deferred.
+
 ## Opt-in switches of vk19.47–19.56 and their verdicts
 
 | Switch | Build | Verdict | Dead weight to remove later? |
@@ -224,7 +250,7 @@ APK `ffr_hib_vk19_71.apk` (android-ffr 82c07833, hib e02144e8), dungeon spot, on
 | `DM_WAKE_AFTER_G` | 19.68 (default on, Android, from 19.71) | all threads −2…−3 ms, G waits −85% (session 3): kept, on by default | no |
 | `DM_VK_DC_WAYS2` | 19.69 | neutral (session 3): off | yes: the two-way path in copy_in |
 | `DM_VK_TEXEL_STORE` | 19.70 (default on from 19.73) | verify 0 differences; recording −0.6…−0.9, RHIThread −0.6…−0.8, all threads −1.4 ms (session 4): kept, on by default | no |
-| `DM_VK_BUF_STORE` | 19.72 | not measured yet (=2 verify, then =1) | — |
+| `DM_VK_BUF_STORE` | 19.72 (default on from 19.75b) | verify 0 differences; recording −0.2, RHIThread −0.25 ms (session 5): kept, on by default (vertex only in practice) | no |
 | `DM_VK_ZEROCOPY` (Z0) | 19.46 | −0.6 ms rec, −230 MB MemAvailable (L): off | candidate: zc_back / zc_find / the AHB import (kept only if Z1/Z2 are ever tried) |
 
 ## Open
