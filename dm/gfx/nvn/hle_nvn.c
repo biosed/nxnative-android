@@ -2357,6 +2357,22 @@ NVN(nvnTextureGetFormat, NVNformat, const NVNtexture *t) { return (NVNformat)CTX
 NVN(nvnTextureGetTarget, NVNtextureTarget, const NVNtexture *t) { return (NVNtextureTarget)CTX(t)->d.target; }
 NVN(nvnTextureSetDebugLabel, void, NVNtexture *t, const char *s) { (void)t; (void)s; }
 NVN(nvnTextureViewGetLevels, NVNboolean, const NVNtextureView *v, int *base, int *n) { const view_t *w = (const view_t *)v; *base = w->base_level; *n = w->nlevels; return w->set_levels; }
+// DM_NVN_VIEW_COMPARE (Harvest Moon's dark vegetation; off by default): nvnTextureViewCompare was unimplemented (the stub answered 0, "different", ~40 calls a run). =1 compares the
+// two views' settings: each set_* flag and, where set, its values (levels, layers, format, target, swizzle, depth-stencil mode); NVN_TRUE when they match
+static int view_cmp_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_VIEW_COMPARE"); v = e && atoi(e) != 0; if (v) LOG("DM_NVN_VIEW_COMPARE=1: nvnTextureViewCompare compares the views"); } return v; }   // answers 1 (true) when they match
+NVN(nvnTextureViewCompare, NVNboolean, const NVNtextureView *a, const NVNtextureView *b) {
+    if (!view_cmp_on()) { static int once; if (!once++) LOG("nvnTextureViewCompare called: answers 0 as the unimplemented stub did (DM_NVN_VIEW_COMPARE=1 compares)"); return 0; }
+    const view_t *x = (const view_t *)a, *y = (const view_t *)b; if (!x || !y) return x == y;
+    int eq = x->set_levels == y->set_levels && x->set_layers == y->set_layers && x->set_format == y->set_format && x->set_target == y->set_target && x->set_swizzle == y->set_swizzle && x->set_dsmode == y->set_dsmode;
+    if (eq && x->set_levels) eq = x->base_level == y->base_level && x->nlevels == y->nlevels;
+    if (eq && x->set_layers) eq = x->min_layer == y->min_layer && x->nlayers == y->nlayers;
+    if (eq && x->set_format) eq = x->format == y->format;
+    if (eq && x->set_target) eq = x->target == y->target;
+    if (eq && x->set_swizzle) eq = !memcmp(x->swz, y->swz, 4);
+    if (eq && x->set_dsmode) eq = x->dsmode == y->dsmode;
+    static int nl; if (nl++ < 8) LOG("nvnTextureViewCompare: %s", eq ? "equal" : "different");
+    return eq ? 1 : 0;
+}
 NVN(nvnTextureViewGetTarget, NVNboolean, const NVNtextureView *v, NVNtextureTarget *t) { const view_t *w = (const view_t *)v; *t = (NVNtextureTarget)w->target; return w->set_target; }
 NVN(nvnTextureViewSetDepthStencilMode, void, NVNtextureView *v, NVNtextureDepthStencilMode m) { VW(v)->set_dsmode = 1; VW(v)->dsmode = (uint8_t)m; }   // STENCIL: the replay binds a stencil-only view (tex_by_id)
 NVN(nvnTextureViewSetSwizzle, void, NVNtextureView *v, NVNtextureSwizzle r, NVNtextureSwizzle g, NVNtextureSwizzle bl, NVNtextureSwizzle a) {

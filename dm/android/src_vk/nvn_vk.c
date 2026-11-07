@@ -3602,7 +3602,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                 { vtex *pv = NULL; lk_(&g_rmu, LW_RMU); if (tr.ok) pv = tex_find(tr.t.serial); pthread_mutex_unlock(&g_rmu);
                   o += snprintf(ln + o, sizeof ln - o, " lv %u view %d+%d gpu %d gpu_lv %#x", tr.t.d.levels, tr.has_v && tr.v.set_levels ? tr.v.base_level : 0, tr.has_v && tr.v.set_levels ? tr.v.nlevels : 0,
                                 pv ? pv->gpu : -1, pv ? pv->gpu_lv : 0);
-                  int sid = (int)(h >> 20); if (b->type == BT_CIS && sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) { const samp_par *sp = &g_sreg[sid]; o += snprintf(ln + o, sizeof ln - o, " samp min %d mag %d lod %g..%g bias %g", sp->minf, sp->magf, sp->lod_min, sp->lod_max, sp->lod_bias); } }
+                  int sid = (int)(h >> 20); if (b->type == BT_CIS && sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) { const samp_par *sp = &g_sreg[sid]; o += snprintf(ln + o, sizeof ln - o, " samp min %d mag %d lod %g..%g bias %g cmp mode %d func %d red %d", sp->minf, sp->magf, sp->lod_min, sp->lod_max, sp->lod_bias, sp->cmp_mode, sp->cmp_func, sp->reduction); } }
                 o += snprintf(ln + o, sizeof ln - o, " tex %llu %ux%u fmt %#x%s%s", tr.ok ? (unsigned long long)tr.t.serial : 0ull, tr.t.d.width, tr.t.d.height, tr.t.d.format,
                               ii[ne].imageView == g_dummy_view || ii[ne].imageView == g_dummy_simg_view ? " DUMMY" : "", tr.has_v && tr.v.set_dsmode && tr.v.dsmode ? " stencil" : "");
             } else if (b->type == BT_TBUF || b->type == BT_UTB || b->type == BT_STB) {
@@ -3909,6 +3909,11 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (P.dt) { k.df = P.dt->f.f; k.stencil = P.dt->f.stencil; k.ds = S.ds; }
     if (g_plog) LOG("plog:  draw vs %s fs %s n %u depth t%d w%d f%d stencil %d f%d ops %d/%d/%d ref %u vm %#x wm %#x blend %#x mask %#x cull %d", vs->key, fs ? fs->key : "-", dw ? dw->count : di->count,
                     S.ds.dt, S.ds.dw, S.ds.df, S.ds.st, S.ds.sf_f, S.ds.fail_f, S.ds.zfail_f, S.ds.zpass_f, S.st_ref[0], S.st_vmask[0], S.st_wmask[0], S.color.blend_en, S.chmask.mask, S.poly.cull);
+    if (g_plog) {   // the vertex inputs the shader reads: attribute, stream, offset, NVN and Vulkan formats; the streams' strides and divisors (the dark vegetation capture)
+        char ab[768]; int ao = 0;
+        for (int i = 0; i < S.nattr && ao < (int)sizeof ab - 48; i++) if (vs->vin_mask >> i & 1) ao += snprintf(ab + ao, sizeof ab - ao, " a%d s%u +%u fmt %#x vk %d", i, (unsigned)S.attr[i].stream, (unsigned)S.attr[i].offset, (unsigned)S.attr[i].fmt, (int)vfmt(S.attr[i].fmt));
+        for (int st = 0; st < S.nstream && st < 16 && ao < (int)sizeof ab - 40; st++) if (S.vbuf[st].address) ao += snprintf(ab + ao, sizeof ab - ao, " | s%d stride %u div %u bound %#llx +%llu", st, (unsigned)S.stream[st].stride, (unsigned)S.stream[st].divisor, (unsigned long long)S.vbuf[st].address, (unsigned long long)S.vbuf[st].size);
+        LOG("plog:   vertex inputs%s%s", ab, ao ? "" : " none"); }
     VkPipelineLayout pl; VkPipeline pp;
     if (state_skip() && g_ds_last.vs == vs && g_ds_last.fs == fs && g_ds_last.gs == gs && g_ds_last.pp && !memcmp(&g_ds_last.k, &k, sizeof k)) { pl = g_ds_last.pl; pp = g_ds_last.pp; g_pso_memo++; }   // the last draw's pipeline (DM_VK_STATE_SKIP)
     else {
