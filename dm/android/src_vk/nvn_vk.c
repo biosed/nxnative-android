@@ -2604,12 +2604,13 @@ static void *pso_precreate(void *a) { pthread_setname_np("dm-psopre");
 // from DM_VK_CTL_FILE ("set <name> <value>", vk_ctl: the file is read again only when its modification time changes, at most once a frame). The value is an atomic; the
 // recording thread takes a copy of every value once per submission (tog_latch at mtl_sub_begin) and reads only that copy (tog), so a switch never changes in the middle
 // of a submission. A name not on the run-time list is refused when the file sets it (it is read at start only)
-enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_PACE, TG_DC2, TG_TSTORE, TG_N };
+enum { TG_SHADOW, TG_IDX_NEON, TG_FB_FAST, TG_LEAN, TG_PACE, TG_DC2, TG_TSTORE, TG_BSTORE, TG_N };
 static struct { const char *name; int runtime; _Atomic int val; int def; } g_tog[TG_N] = {   // def: the value without the variable (on by default after its A/B; =0 turns it off)
     [TG_SHADOW] = {"DM_VK_SHADOW", 1},   // diagnostic: what a persistent cache could save (copy_in / index-scan misses whose bytes an earlier copy already had)
     [TG_IDX_NEON] = {"DM_VK_IDX_NEON", 1, 0, 1},   // vk19.60: the index scan with NEON min/max (1), checked against the scalar scan (2); on by default from vk19.65 (session 1: -1.0 ms)
     [TG_PACE] = {"DM_VK_PRESENT_PACE", 0},   // vk19.63: one setFrameRate request for the cap at the first swapchain, FIFO when the cap is at most the panel's rate; start only
     [TG_TSTORE] = {"DM_VK_TEXEL_STORE", 0},   // vk19.70: uniform texel buffers kept across frames in a store, validated by nvn_dirty (1), checked against a host copy (2); start only
+    [TG_BSTORE] = {"DM_VK_BUF_STORE", 0},   // vk19.72: vertex streams and the indirect draws' index pool in the same store (1), checked against a host copy (2); start only
     [TG_DC2] = {"DM_VK_DC_WAYS2", 1},   // vk19.69: copy_in's table two-way set-associative (C5); on the run-time list (a mode change only costs misses)
     [TG_LEAN] = {"DM_VK_LEAN", 0, 0, 1},   // vk19.62: small hot-path items (trace pointers, the memo hash, the timer conversion, sampled descriptor-set timing); start only; on by default from vk19.65 (session 1: RHIThread -1.0 ms)
     [TG_FB_FAST] = {"DM_VK_FB_FAST", 1, 0, 1},   // vk19.61: same-pass feedback found by texture serial, a per-shader cache of "samples none" (1), checked against the full way (2); on by default from vk19.65 (session 1: -0.4 ms)
@@ -2980,9 +2981,10 @@ static int gw_any(uint64_t a, uint64_t n);
 static VkBuffer g_ts_buf; static VkDeviceMemory g_ts_mem; static uint8_t *g_ts_p; static uint32_t g_ts_ngran, g_ts_next; static uint8_t *g_ts_used; static int g_ts_dropping;
 enum { TS_GRAN = 4096, TS_NENT = 4096, TS_NCAND = 8192 };
 typedef struct { VkFormat f; VkDeviceSize n; VkBufferView v; } ts_view_t;
-typedef struct { uint64_t addr, len, regid, stamp, fence, tick, serial; const void *span; uint32_t off_g, ng; uint8_t used, dirty, nv; ts_view_t v[4]; uint8_t *shadow; } ts_ent;
+typedef struct { uint64_t addr, len, regid, stamp, fence, tick, serial; const void *span; uint32_t off_g, ng; uint8_t used, dirty, nv, kind; ts_view_t v[4]; uint8_t *shadow; } ts_ent;   // kind: TSK_* (vk19.72)
+enum { TSK_TEXEL, TSK_VTX, TSK_IDXPOOL };
 static ts_ent g_ts[TS_NENT];
-static struct { uint64_t addr, len, h, hframe, bl_until; uint32_t nmis; } g_tc[TS_NCAND];   // nmis: hashes that differed from the last (vk19.70b: 3 and it is refused for 10 s)
+static struct { uint64_t addr, len, h, hframe, bl_until; uint32_t nmis; uint8_t kind; } g_tc[TS_NCAND];   // nmis: hashes that differed from the last (vk19.70b: 3 and it is refused for 10 s)
 typedef struct { VkBufferView v[4]; int nv; uint32_t off_g, ng; uint64_t fence; } ts_ret_t;
 static ts_ret_t *g_ts_ret; static int g_ts_nret, g_ts_cret;   // blocks and views waiting for their readers: grows as needed (vk19.70b: a block is never forgotten)
 static ts_ret_t *ts_ret_push(void) {
@@ -2993,6 +2995,9 @@ static uint64_t g_ts_tick, g_ts_serial, g_ts_hit, g_ts_hit_b, g_ts_miss, g_ts_ad
 static uint32_t g_ts_inuse;   // granules in use
 static struct { uint64_t mem, size; } g_ts_pdel[64]; static _Atomic int g_ts_npdel;   // deleted pools to drop (under g_pool_mu)
 static int ts_mode(void) { return tog(TG_TSTORE); }
+static int ts_kmode(int kind) { return kind == TSK_TEXEL ? tog(TG_TSTORE) : tog(TG_BSTORE); }   // the switch of a kind of range (vk19.72)
+static int ts_any(void) { return tog(TG_TSTORE) || tog(TG_BSTORE); }
+static uint64_t g_ts_khit[3], g_ts_khit_b[3], g_ts_kadm[3];   // per kind (the store line)
 static uint64_t ts_now_s(void) { return now_ns() / 1000000000ull; }
 static int ts_init(void) {
     if (g_ts_buf) return 1;
@@ -3000,7 +3005,7 @@ static int ts_init(void) {
     const char *e = getenv("DM_VK_TEXEL_STORE_MB"); int mb = e && atoi(e) > 0 ? atoi(e) : 32; if (mb > 256) mb = 256;
     g_ts_ngran = (uint32_t)((uint64_t)mb << 20) / TS_GRAN; g_ts_used = calloc(g_ts_ngran, 1); if (!g_ts_used) return 0;
     g_ts_buf = buf_new((VkDeviceSize)g_ts_ngran * TS_GRAN, ALL_BUF_USAGE, &g_ts_mem, (void **)&g_ts_p); g_ts_next = 0; g_ts_inuse = 0; g_ts_dropping = 0;
-    LOG("vk: DM_VK_TEXEL_STORE=%d: a %d MB store for texel buffers that stay the same across frames%s", ts_mode(), mb, ts_mode() == 2 ? " (verify: each use compared with a host copy)" : "");
+    LOG("vk: the range store: %d MB for ranges that stay the same across frames (DM_VK_TEXEL_STORE=%d: texel buffers; DM_VK_BUF_STORE=%d: vertex streams and the indirect index pool; 2: each use compared with a host copy)", mb, tog(TG_TSTORE), tog(TG_BSTORE));
     return 1;
 }
 static void ts_gran_set(uint32_t o, uint32_t n, uint8_t v) { memset(g_ts_used + o, v, n); if (v) g_ts_inuse += n; else g_ts_inuse -= n; }
@@ -3035,7 +3040,7 @@ static uint64_t ts_span_hash(uint64_t addr, uint64_t len) {   // the page-aligne
     uint64_t a = addr & ~(pg - 1), b = (addr + len + pg - 1) & ~(pg - 1);
     return shadow_hash((const uint8_t *)(uintptr_t)a, b - a);
 }
-static ts_ent *ts_slot(uint64_t addr, uint64_t len) { return &g_ts[(addr >> 6 ^ addr >> 19 ^ len * 0x9e3779b1u) % TS_NENT]; }
+static ts_ent *ts_slot(uint64_t addr, uint64_t len, int kind) { return &g_ts[(addr >> 6 ^ addr >> 19 ^ len * 0x9e3779b1u ^ (uint64_t)kind * 0x5bd1e995u) % TS_NENT]; }
 static VkBufferView ts_view(ts_ent *e, VkFormat f, VkDeviceSize n) {
     for (int i = 0; i < e->nv; i++) if (e->v[i].f == f && e->v[i].n == n) { g_ts_vreuse++; return e->v[i].v; }
     VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, NULL, 0, g_ts_buf, f, (VkDeviceSize)e->off_g * TS_GRAN, n};
@@ -3045,7 +3050,7 @@ static VkBufferView ts_view(ts_ent *e, VkFormat f, VkDeviceSize n) {
     e->v[e->nv++] = (ts_view_t){f, n, v};
     return v;
 }
-static int ts_fill(ts_ent *e, uint64_t addr, uint64_t len, const void *span, uint64_t regid, int fresh) {   // stamp -> protect -> read, into e's block (or a new one)
+static int ts_fill(ts_ent *e, uint64_t addr, uint64_t len, const void *span, uint64_t regid, int fresh, int kind) {   // stamp -> protect -> read, into e's block (or a new one)
     uint32_t ng = (uint32_t)((len + TS_GRAN - 1) / TS_GRAN);
     int newblock = fresh || e->fence > __atomic_load_n(&g_done, __ATOMIC_ACQUIRE) || e->ng < ng;
     uint32_t off_g = e->off_g;
@@ -3065,64 +3070,74 @@ static int ts_fill(ts_ent *e, uint64_t addr, uint64_t len, const void *span, uin
     if (!nvn_dirty_protect((const void *)(uintptr_t)addr, (size_t)len)) { if (newblock) ts_gran_set(off_g, ng, 0); if (!newblock || !fresh) ts_retire(e); return 0; }
     memcpy(g_ts_p + (size_t)off_g * TS_GRAN, (const void *)(uintptr_t)addr, (size_t)len);
     if (newblock) { memset(e, 0, sizeof *e); e->off_g = off_g; e->ng = ng; e->serial = ++g_ts_serial; }
-    e->addr = addr; e->len = len; e->regid = regid; e->span = span; e->stamp = stamp; e->used = 1; e->tick = ++g_ts_tick; e->fence = g_fence + 1;
-    if (ts_mode() == 2) { if (!e->shadow) e->shadow = malloc((size_t)len); if (e->shadow) memcpy(e->shadow, (const void *)(uintptr_t)addr, (size_t)len); }
+    e->addr = addr; e->len = len; e->regid = regid; e->span = span; e->stamp = stamp; e->used = 1; e->tick = ++g_ts_tick; e->fence = g_fence + 1; e->kind = (uint8_t)kind;
+    if (ts_kmode(kind) == 2) { if (!e->shadow) e->shadow = malloc((size_t)len); if (e->shadow) memcpy(e->shadow, (const void *)(uintptr_t)addr, (size_t)len); }
     return 1;
 }
-static void ts_blacklist(uint64_t addr, uint64_t len) {
-    typeof(g_tc[0]) *c = &g_tc[(addr >> 6 ^ addr >> 19 ^ len * 0x9e3779b1u) % TS_NCAND];
-    c->addr = addr; c->len = len; c->h = 0; c->hframe = 0; c->nmis = 0; c->bl_until = ts_now_s() + 10; g_ts_bl++;
+static uint32_t ts_cand(uint64_t addr, uint64_t len, int kind) { return (uint32_t)((addr >> 6 ^ addr >> 19 ^ len * 0x9e3779b1u ^ (uint64_t)kind * 0x5bd1e995u) % TS_NCAND); }
+static void ts_blacklist(uint64_t addr, uint64_t len, int kind) {
+    typeof(g_tc[0]) *c = &g_tc[ts_cand(addr, len, kind)];
+    c->addr = addr; c->len = len; c->kind = (uint8_t)kind; c->h = 0; c->hframe = 0; c->nmis = 0; c->bl_until = ts_now_s() + 10; g_ts_bl++;
 }
 void ts_pool_deleted(const void *mem, uint64_t size) {   // mtl_pool_del (any thread), holding g_pool_mu: the recording thread drops its blocks at its next lookup
     int n = atomic_load(&g_ts_npdel); if (n < 64) { g_ts_pdel[n].mem = (uint64_t)(uintptr_t)mem; g_ts_pdel[n].size = size; atomic_store(&g_ts_npdel, n + 1); }
     else { g_ts_pdel[63].mem = 0; g_ts_pdel[63].size = UINT64_MAX; }   // too many at once: every block goes
 }
 static pthread_mutex_t g_pool_mu;
-// Served from the store: a view over the range's block; 0: the caller copies as before
-static int ts_lookup(uint64_t addr, uint64_t n, VkFormat f, VkDeviceSize al, VkBufferView *out) {
-    if (!ts_mode() || zc_mode()) return 0;
-    if (g_mem_low || g_mem_tight) { if (g_ts_buf && !g_ts_dropping) ts_drop_all(); if (g_ts_buf) ts_reap(); return 0; }
-    if (g_ts_dropping) { ts_reap(); return 0; }
-    if (!g_ts_buf && !ts_init()) return 0;
+// The range's block in the store (filled now if just admitted or written since), NULL: the caller copies as before. kind: texel buffer, vertex stream, indirect index pool
+static ts_ent *ts_get(uint64_t addr, uint64_t n, VkDeviceSize al, int kind) {
+    int mode = ts_kmode(kind); if (!mode || zc_mode()) return NULL;
+    if (g_mem_low || g_mem_tight) { if (g_ts_buf && !g_ts_dropping) ts_drop_all(); if (g_ts_buf) ts_reap(); return NULL; }
+    if (g_ts_dropping) { ts_reap(); return NULL; }
+    if (!g_ts_buf && !ts_init()) return NULL;
     if (atomic_load(&g_ts_npdel)) {   // pools deleted since: their blocks go
         pthread_mutex_lock(&g_pool_mu); int k = atomic_load(&g_ts_npdel);
         for (int j = 0; j < k; j++) for (int i = 0; i < TS_NENT; i++) if (g_ts[i].used && g_ts[i].addr + g_ts[i].len > g_ts_pdel[j].mem && g_ts[i].addr < g_ts_pdel[j].mem + g_ts_pdel[j].size) ts_retire(&g_ts[i]);
         atomic_store(&g_ts_npdel, 0); pthread_mutex_unlock(&g_pool_mu); }
     ts_reap();
-    if (al > TS_GRAN || !n || n > (64u << 20)) return 0;
-    ts_ent *e = ts_slot(addr, n);
-    if (e->used && e->addr == addr && e->len == n) {
+    if (al > TS_GRAN || !n || n > (64u << 20) || (g_ts_ngran && n > (uint64_t)g_ts_ngran * TS_GRAN / 4)) return NULL;   // at most a quarter of the store a range
+    ts_ent *e = ts_slot(addr, n, kind);
+    if (e->used && e->addr == addr && e->len == n && e->kind == kind) {
         uint64_t rid = nvn_dirty_span_regid(e->span);
-        if (!rid || rid != e->regid) { ts_retire(e); g_ts_miss++; return 0; }   // the pool's registration changed (checked before since: a reused slot starts with zeroed generations)
+        if (!rid || rid != e->regid) { ts_retire(e); g_ts_miss++; return NULL; }   // the pool's registration changed (checked before since: a reused slot starts with zeroed generations)
         int clean = !nvn_dirty_since_span(e->span, (const void *)(uintptr_t)addr, (size_t)n, e->stamp) && !gw_any(addr, n);
-        if (clean && ts_mode() == 2 && e->shadow) { g_ts_vchk++;
-            if (memcmp(e->shadow, (const void *)(uintptr_t)addr, (size_t)n)) { g_ts_vbad++; clean = 0; static int nl; if (nl++ < 8) LOG("[RED] vk: DM_VK_TEXEL_STORE=2: %#llx (%llu bytes) differs from its stored copy while nvn_dirty says unwritten", (unsigned long long)addr, (unsigned long long)n); } }
-        if (clean) { VkBufferView v = ts_view(e, f, n); if (!v) return 0;
-                     e->fence = g_fence + 1; e->tick = ++g_ts_tick; g_ts_hit++; g_ts_hit_b += n; *out = v; return 1; }
-        if (++e->dirty >= 3 || gw_any(addr, n)) { ts_retire(e); ts_blacklist(addr, n); g_ts_miss++; return 0; }   // written again and again: refused for a while
+        if (clean && mode == 2 && e->shadow) { g_ts_vchk++;
+            if (memcmp(e->shadow, (const void *)(uintptr_t)addr, (size_t)n)) { g_ts_vbad++; clean = 0; static int nl; if (nl++ < 8) LOG("[RED] vk: range store, verify: %s range %#llx (%llu bytes) differs from its stored copy while nvn_dirty says unwritten", kind == TSK_TEXEL ? "texel" : kind == TSK_VTX ? "vertex" : "index-pool", (unsigned long long)addr, (unsigned long long)n); } }
+        if (clean) { e->fence = g_fence + 1; e->tick = ++g_ts_tick; g_ts_hit++; g_ts_hit_b += n; g_ts_khit[kind]++; g_ts_khit_b[kind] += n; return e; }
+        if (++e->dirty >= 3 || gw_any(addr, n)) { ts_retire(e); ts_blacklist(addr, n, kind); g_ts_miss++; return NULL; }   // written again and again: refused for a while
         uint8_t d = e->dirty;
-        if (!ts_fill(e, addr, n, e->span, rid, 0)) { g_ts_miss++; return 0; }
+        if (!ts_fill(e, addr, n, e->span, rid, 0, kind)) { g_ts_miss++; return NULL; }
         e->dirty = d; g_ts_recopy++;
-        VkBufferView v = ts_view(e, f, n); if (!v) return 0; *out = v; return 1;
+        return e;
     }
     g_ts_miss++;
-    typeof(g_tc[0]) *c = &g_tc[(addr >> 6 ^ addr >> 19 ^ n * 0x9e3779b1u) % TS_NCAND];
-    if (c->addr != addr || c->len != n) { if (c->bl_until > ts_now_s()) return 0; c->addr = addr; c->len = n; c->h = 0; c->hframe = 0; c->bl_until = 0; c->nmis = 0; return 0; }   // its first miss: noted, not hashed
-    if (c->bl_until && c->bl_until > ts_now_s()) return 0;
+    typeof(g_tc[0]) *c = &g_tc[ts_cand(addr, n, kind)];
+    if (c->addr != addr || c->len != n || c->kind != kind) { if (c->bl_until > ts_now_s()) return NULL; c->addr = addr; c->len = n; c->kind = (uint8_t)kind; c->h = 0; c->hframe = 0; c->bl_until = 0; c->nmis = 0; return NULL; }   // its first miss: noted, not hashed
+    if (c->bl_until && c->bl_until > ts_now_s()) return NULL;
     uint64_t fr = atomic_load_explicit(&g_presents, memory_order_relaxed);
-    if (c->hframe == fr) return 0;   // hashed in this frame already
+    if (c->hframe == fr) return NULL;   // hashed in this frame already
     uint64_t h = ts_span_hash(addr, n);
     if (!(c->hframe && c->hframe + 1 == fr && c->h == h)) {
-        if (c->hframe && c->h != h && ++c->nmis >= 3) { ts_blacklist(addr, n); return 0; }   // never stable: not hashed again for 10 s (a hash costs about a copy)
-        c->h = h; c->hframe = fr; return 0; }
+        if (c->hframe && c->h != h && ++c->nmis >= 3) { ts_blacklist(addr, n, kind); return NULL; }   // never stable: not hashed again for 10 s (a hash costs about a copy)
+        c->h = h; c->hframe = fr; return NULL; }
     // the same bytes in two consecutive frames: admitted, if it qualifies
     const void *span = nvn_dirty_span((const void *)(uintptr_t)addr, (size_t)n); uint64_t rid = nvn_dirty_span_regid(span);
-    if (!span || !rid || gw_any(addr, n) || pool_class(addr) == PC_GPU) { g_ts_refused++; ts_blacklist(addr, n); return 0; }
-    if (e->used) { if (e->fence > __atomic_load_n(&g_done, __ATOMIC_ACQUIRE)) { g_ts_refused++; return 0; } ts_retire(e); g_ts_evict++; }
-    if (!ts_fill(e, addr, n, span, rid, 1)) { g_ts_refused++; ts_blacklist(addr, n); return 0; }
-    g_ts_adm++; c->addr = 0;
+    if (!span || !rid || gw_any(addr, n) || pool_class(addr) == PC_GPU) { g_ts_refused++; ts_blacklist(addr, n, kind); return NULL; }
+    if (e->used) { if (e->fence > __atomic_load_n(&g_done, __ATOMIC_ACQUIRE)) { g_ts_refused++; return NULL; } ts_retire(e); g_ts_evict++; }
+    if (!ts_fill(e, addr, n, span, rid, 1, kind)) { g_ts_refused++; ts_blacklist(addr, n, kind); return NULL; }
+    g_ts_adm++; g_ts_kadm[kind]++; c->addr = 0;
+    return e;
+}
+// A texel buffer: the store's own view over the block (DM_VK_TEXEL_STORE)
+static int ts_lookup(uint64_t addr, uint64_t n, VkFormat f, VkDeviceSize al, VkBufferView *out) {
+    ts_ent *e = ts_get(addr, n, al, TSK_TEXEL); if (!e) return 0;
     VkBufferView v = ts_view(e, f, n); if (!v) return 0;
     *out = v; return 1;
+}
+// A vertex stream or the indirect index pool: the store's buffer at the block (DM_VK_BUF_STORE, vk19.72)
+static int ts_buf(uint64_t addr, uint64_t n, VkDeviceSize al, int kind, VkBuffer *b, VkDeviceSize *o) {
+    ts_ent *e = ts_get(addr, n, al, kind); if (!e) return 0;
+    *b = g_ts_buf; *o = (VkDeviceSize)e->off_g * TS_GRAN; return 1;
 }
 static VkBufferView tbuf_view(int stage, uint64_t h, int storage) {
     int tid = (int)(h & 0xfffff); if (!tid) { g_tbuf_miss[0]++; return VK_NULL_HANDLE; }
@@ -3761,6 +3776,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         if (to > size) to = size;
         if (S.vbuf[s].address && to > from && gw_find(S.vbuf[s].address + from, to - from, 1, &b, &o, NULL)) {}   // vertices a dispatch wrote (GPU particles)
         else if (S.vbuf[s].address && to > from && zc_mode() && zc_find(S.vbuf[s].address + from, to - from, &b, &o)) {}   // in a zero-copy pool: read where it is
+        else if (S.vbuf[s].address && to > from && tog(TG_BSTORE) && ts_buf(S.vbuf[s].address + from, to - from, 16, TSK_VTX, &b, &o)) {}   // DM_VK_BUF_STORE (vk19.72): the store's block
         else if (S.vbuf[s].address && to > from) { VkDeviceSize ro = copy_in(S.vbuf[s].address + from, to - from, 16, CI_VTX); if (ro != VK_WHOLE_SIZE) { b = C->ring; o = ro; } }
         vbs[s] = b; vos[s] = o;
     }
@@ -3775,9 +3791,11 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (ind_b) {   // arguments the GPU writes (ind_args): the records are in the ring where the dispatch leaves them
         if (dw) DRAWQ(vkCmdDrawIndirect(cb, ind_b, ind_o, 1, 16));
         else {
-            uint64_t n = pool_left(di->ibuf, 8u << 20); VkDeviceSize o = n ? copy_in(di->ibuf, n, 16, CI_IDXPOOL) : VK_WHOLE_SIZE;
+            uint64_t n = pool_left(di->ibuf, 8u << 20); VkBuffer ibs = C->ring; VkDeviceSize o = VK_WHOLE_SIZE;
+            if (n && tog(TG_BSTORE) && ts_buf(di->ibuf, n, 16, TSK_IDXPOOL, &ibs, &o)) {}   // DM_VK_BUF_STORE (vk19.72): the store's block
+            else { o = n ? copy_in(di->ibuf, n, 16, CI_IDXPOOL) : VK_WHOLE_SIZE; ibs = C->ring; }
             if (o == VK_WHOLE_SIZE) { RED_ONCE(38, "a GPU-written indirect indexed draw: its index buffer is not in a known pool"); return; }
-            g_ds_last.ib_ok = 0; vkCmdBindIndexBuffer(cb, C->ring, o, isz == 1 ? VK_INDEX_TYPE_UINT8_EXT : isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+            g_ds_last.ib_ok = 0; vkCmdBindIndexBuffer(cb, ibs, o, isz == 1 ? VK_INDEX_TYPE_UINT8_EXT : isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
             DRAWQ(vkCmdDrawIndexedIndirect(cb, ind_b, ind_o, 1, 20));
         }
     } else if (dw) {
@@ -5158,8 +5176,12 @@ static void meas_lines(void) {
       memcpy(ptid, tid, sizeof tid); memcpy(pnf, nf, sizeof nf); pk = k;
       LOG("vk: guest-memory protection per frame over the last 600: page faults %.2f (%s); mprotect %.1f calls, %.3f ms", all / 600.0, q ? fb : "none", (mc - pmc) / 600.0, (mns - pmns) / 600e6);
       pmc = mc; pmns = mns; }
-    if (ts_mode()) { int vk_stats_maps_last(void);   // DM_VK_TEXEL_STORE (vk19.70)
+    if (ts_any()) { int vk_stats_maps_last(void);   // DM_VK_TEXEL_STORE (vk19.70), DM_VK_BUF_STORE (vk19.72)
         int ne = 0; for (int i = 0; i < TS_NENT; i++) ne += g_ts[i].used;
+        LOG("vk: range store per kind per frame over the last 600: texel %.1f served (%.2f MB), %.2f admitted; vertex %.1f (%.2f MB), %.2f; index pool %.2f (%.2f MB), %.2f",
+            g_ts_khit[0] / 600.0, g_ts_khit_b[0] / 600.0 / 1048576.0, g_ts_kadm[0] / 600.0, g_ts_khit[1] / 600.0, g_ts_khit_b[1] / 600.0 / 1048576.0, g_ts_kadm[1] / 600.0,
+            g_ts_khit[2] / 600.0, g_ts_khit_b[2] / 600.0 / 1048576.0, g_ts_kadm[2] / 600.0);
+        memset(g_ts_khit, 0, sizeof g_ts_khit); memset(g_ts_khit_b, 0, sizeof g_ts_khit_b); memset(g_ts_kadm, 0, sizeof g_ts_kadm);
         LOG("vk: DM_VK_TEXEL_STORE=%d per frame over the last 600: %.1f served (%.2f MB), %.1f missed, %.2f admitted, %.2f copied again, %.2f evicted, %.2f refused for a while (%.2f could not be admitted); views reused %.1f, made %.2f; verify %.1f checked, %llu differed; store %.1f of %.0f MB in %d blocks, %d waiting for readers, dropped %llu times; mprotect failures %llu; memory map %d lines",
             ts_mode(), g_ts_hit / 600.0, g_ts_hit_b / 600.0 / 1048576.0, g_ts_miss / 600.0, g_ts_adm / 600.0, g_ts_recopy / 600.0, g_ts_evict / 600.0, g_ts_bl / 600.0, g_ts_refused / 600.0, g_ts_vreuse / 600.0, g_ts_vmade / 600.0,
             g_ts_vchk / 600.0, (unsigned long long)g_ts_vbad, g_ts_inuse * (double)TS_GRAN / 1048576.0, g_ts_ngran * (double)TS_GRAN / 1048576.0, ne, g_ts_nret, (unsigned long long)g_ts_drops,
