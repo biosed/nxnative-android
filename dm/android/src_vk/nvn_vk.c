@@ -2157,7 +2157,7 @@ static shader_t *shader_get_(const uint8_t md[8]) {
             int dynarr = DM_GAME_TEX_DYN_SLOTS && e->count > 1 && e->reg < 0 && (e->type == BT_UTB || e->type == BT_TBUF || e->type == BT_SAMP || e->type == BT_TEX || e->type == BT_CIS);
             if (dynarr) s->dyn = 1;
             else if (e->kind == K_UNK) LOG("[RED] vk: shader %s binding %d has kind %s, not implemented (reads zero)", key, b, kind);
-            if (e->kind == K_TEXU && e->count > 1) LOG("[RED] vk: shader %s binding %d: an array of %u handles in a uniform buffer, not implemented (reads zero)", key, b, e->count);
+            if (e->kind == K_TEXU && e->count > 1) LOG("vk: shader %s binding %d: an array of %u handles in a uniform buffer (texu_elem: element k at byte %d + 8k of slot %d)", key, b, e->count, e->off, e->reg);
         }
     }
     free(txt);
@@ -2963,6 +2963,21 @@ static uint64_t texu_slot(int stage, const sbind *b) {   // as a bound slot's ha
     uint32_t h = texu_handle(stage, b), t = h & 0xfffff, sm = h >> 20;
     return (uint64_t)(t ? t + (uint32_t)S.tex_base : 0) | (uint64_t)(sm ? sm + (uint32_t)S.samp_base : 0) << 20;
 }
+// An array of handles in a uniform buffer that the shader indexes at run time (dmsh_build.py tex_ubo with a count; Ryujinx's texture array from a buffer): element k is the
+// handle at byte off + 8k (an NVN handle is 64-bit; the IDs are in its low word), its sampler the same word's high bits unless a separate sampler word is named (soff + 8k).
+// As nvn_mtl.m fills it for Metal: only an element whose texture ID is registered is looked up -- most elements are other data the shader never picks as a handle -- and the
+// rest are the binding's stand-in. Tomodachi Life: Living the Dream's island ground (c7f9b506209fc76d binding 18) and sea (bb62dd4dd4f94aa7, 1b611e4eb2a2d0eb) read 32 each;
+// left unwritten they read black
+static uint64_t texu_elem(int stage, const sbind *b, int k) {
+    uint32_t h = ubo_word(stage, b->reg, b->off + 8 * k);
+    if (b->skind == S_SAMP_UBO && b->soff >= 0 && (b->sreg != b->reg || b->soff != b->off)) h |= ubo_word(stage, b->sreg, b->soff + 8 * k);
+    uint32_t t = h & 0xfffff, sm = h >> 20;
+    if (!t) return 0;
+    t += (uint32_t)S.tex_base;
+    lk_(&g_rmu, LW_RMU); int ok = t < (uint32_t)g_ntreg && g_treg[t].ok; pthread_mutex_unlock(&g_rmu);
+    if (!ok) return 0;
+    return (uint64_t)t | (uint64_t)(sm ? sm + (uint32_t)S.samp_base : 0) << 20;
+}
 // DM_VK_HTAB=1 (vk19.52, opt-in; ffr-par's stage 0b): texture and sampler handles resolved once a submission. A texture slot was a registration lock with a 240-byte copy, tex_get
 // (another lock, the table lookup, the eviction and dirty checks) and tex_view (a walk of the image's views) for every element of every binding, 60-80 a stage. The table keeps,
 // per texture ID, the image and view the first lookup of the submission found, valid while no registration changed (g_reg_gen); a hit touches the image as tex_get does (kept
@@ -3570,8 +3585,9 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                 VkSampler sm = b->type == BT_TEX || simg ? VK_NULL_HANDLE : g_dummy_samp; VkImageView view = b->type == BT_SAMP ? VK_NULL_HANDLE : simg ? g_dummy_simg_view : g_dummy_view;
                 uint64_t th = 0; int have = 0;
                 int dyn = s->dyn && cnt > 1 && b->reg < 0;
-                if (b->type != BT_SAMP && !simg && (dyn || (b->kind == K_TEX && b->reg >= 0 && b->reg + (int)e < NTEX) || (b->kind == K_TEXU && cnt == 1))) {
-                    th = dyn ? dyn_slot(stage, (int)e) : b->kind == K_TEXU ? texu_slot(stage, b) : S.tex[stage][b->reg + e]; have = !dyn;
+                uint64_t tel = b->type != BT_SAMP && !simg && b->kind == K_TEXU && cnt > 1 ? texu_elem(stage, b, (int)e) : 0;   // an element of a handle array: 0 = no texture there (the stand-in)
+                if (b->type != BT_SAMP && !simg && (dyn || (b->kind == K_TEX && b->reg >= 0 && b->reg + (int)e < NTEX) || (b->kind == K_TEXU && (cnt == 1 || tel)))) {
+                    th = dyn ? dyn_slot(stage, (int)e) : b->kind == K_TEXU ? (cnt > 1 ? tel : texu_slot(stage, b)) : S.tex[stage][b->reg + e]; have = !dyn;
                     int ok; vtex *tv; view = tex_slot(stage, th, &sm, &ok, &tv);
                     if (fit) { if (b->kind == K_TEXU) { fit = 0; g_wsc_nf[WSC_NF_TEXU]++; } else if (tv) { if (nc.nv < 64) nc.v[nc.nv++] = tv; else { fit = 0; g_wsc_nf[WSC_NF_MANY]++; } } }
                     if (stage == 0 && tv && tv->vhaz && tv->vhaz_epoch == g_vbar_epoch) g_vs_haz = 1;   // written by a pass whose end barrier left vertex shaders out (DM_VK_PASS_BARRIER)
