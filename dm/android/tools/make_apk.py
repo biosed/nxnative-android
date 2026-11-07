@@ -60,7 +60,7 @@ def build(a):
         if not os.path.exists(f): sys.exit(f'[RED] {f} missing: make -C dm/android GAME={a.id} first')
     w = tempfile.mkdtemp(prefix='apk_', dir=os.environ.get('WORK'))
     label = (a.label or a.id) + (' (prueba)' if a.test else '')
-    vc = int(subprocess.run(['date', '+%y%m%d%H'], capture_output=True, text=True).stdout.strip())   # each build installs over the last
+    vc = int(os.environ.get('APK_VERSION_CODE') or subprocess.run(['date', '+%y%m%d%H'], capture_output=True, text=True).stdout.strip())   # each build installs over the last; APK_VERSION_CODE= sets it (several builds in one hour)
     open(os.path.join(w, 'AndroidManifest.xml'), 'w').write(MANIFEST.format(pkg=package(a.id, a.test), vc=vc, vn='0.1.' + str(vc), label=label.replace('&', '&amp;')))
     res = os.path.join(w, 'res', 'mipmap'); os.makedirs(res)
     os.makedirs(os.path.join(w, 'res', 'xml'))   # the Android game modes this app supports (the system's game settings may choose performance or battery for it)
