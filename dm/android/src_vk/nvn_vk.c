@@ -173,26 +173,81 @@ static int fr_take(mblock *b, VkDeviceSize size, VkDeviceSize align, VkDeviceSiz
     return 0;
 }
 static int img_mem_(VkMemoryRequirements r, VkDeviceMemory *m, VkDeviceSize *off);
+static void blk_spare_want(uint32_t type);
 static int img_mem(VkMemoryRequirements r, VkDeviceMemory *m, VkDeviceSize *off) { lk_(&g_blkmu, LW_BLKMU); int b = img_mem_(r, m, off); pthread_mutex_unlock(&g_blkmu); return b; }
+// DM_VK_SPARE_BLOCK (vk-t9, default 1): an empty image block is kept ready, so a texture that fits no block takes it instead of allocating 64 MB on the recording thread.
+// The Adreno driver zero-fills a new block inside vkAllocateMemory (kgsl ioctls): Tomodachi Life's island profiles put ~0.5 G cycles (~0.4 s) on the recording thread for each
+// of the two blocks its texture loads added, a stall at every new block. Now the dm-blkspare thread makes one when the blocks of that memory type have less than 16 MB of
+// free room left, and the last block to empty stays as the spare instead of being freed (it was freed and made again as textures came and went). Not while memory is short
+// (g_mem_low: none made) and let go under real pressure (g_mem_tight; blk_spare_trim from the trims). g_blk_new_rec / g_blk_spare_used / g_blk_spare_made: the memory line
+static int g_mem_low, g_mem_tight;   // (defined with mem_watch below)
+static uint64_t g_blk_new_rec, g_blk_spare_used, g_blk_spare_made, g_blk_spare_freed;
+static int spare_block_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_SPARE_BLOCK"); v = !e || atoi(e) != 0; LOG("vk: DM_VK_SPARE_BLOCK=%d: %s", v, v ? "an empty image block kept ready (made off the recording thread)" : "image blocks made when needed, freed when empty"); } return v; }
+static int blk_empty(const mblock *b) { return b->m && !b->live; }
 static int img_mem_(VkMemoryRequirements r, VkDeviceMemory *m, VkDeviceSize *off) {
     uint32_t type = mem_type(r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (r.size > (32u << 20)) { *m = mem_alloc(r, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); *off = 0; atomic_fetch_add(&g_big_bytes, r.size); return -1; }   // big images get memory of their own
-    for (int i = 0; i < g_nblk; i++) { mblock *b = &g_blk[i]; if (b->m && b->type == type && fr_take(b, r.size, r.alignment, off)) { b->live++; *m = b->m; return i; } }
+    for (int pass = 0; pass < 2; pass++)   // blocks in use first, the empty spare only when none has room (so it stays empty while it can)
+        for (int i = 0; i < g_nblk; i++) { mblock *b = &g_blk[i]; if (b->m && b->type == type && blk_empty(b) == pass && fr_take(b, r.size, r.alignment, off)) {
+            b->live++; *m = b->m;   // counted before the spare checks below: an emptied spare taken now is no longer one
+            if (pass) { g_blk_spare_used++; if (spare_block_on()) blk_spare_want(type); }
+            else if (spare_block_on()) { VkDeviceSize room = 0; for (int k = 0; k < g_nblk; k++) if (g_blk[k].m && g_blk[k].type == type) for (int j = 0; j < g_blk[k].nfr; j++) room += g_blk[k].fr[j].size;
+                                         if (room < (16u << 20)) blk_spare_want(type); }
+            return i; } }
     int i = 0; while (i < g_nblk && g_blk[i].m) i++;
     if (i == NBLK) die("Vulkan: image memory blocks exhausted");
     if (i == g_nblk) g_nblk++;
     mblock *b = &g_blk[i];
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, 64u << 20, type};
-    VKCHECK(vkAllocateMemory(g_dev, &ai, NULL, &b->m));
+    VKCHECK(vkAllocateMemory(g_dev, &ai, NULL, &b->m)); g_blk_new_rec++;
     b->size = 64u << 20; b->live = 0; b->type = type; b->nfr = 0; fr_put(b, 0, b->size);
     if (!fr_take(b, r.size, r.alignment, off)) die("Vulkan: an image of %llu bytes does not fit a new memory block", (unsigned long long)r.size);
-    b->live++; *m = b->m; return i;
+    b->live++; *m = b->m;
+    if (spare_block_on()) blk_spare_want(type);
+    return i;
 }
 static void img_mem_free(int blk, VkDeviceMemory m, VkDeviceSize off, VkDeviceSize size) {
     if (blk < 0) { vkFreeMemory(g_dev, m, NULL); atomic_fetch_sub(&g_big_bytes, size); return; }
     lk_(&g_blkmu, LW_BLKMU);
     mblock *b = &g_blk[blk]; fr_put(b, off, size);
-    if (!--b->live) { vkFreeMemory(g_dev, b->m, NULL); b->m = VK_NULL_HANDLE; b->nfr = 0; }
+    if (!--b->live) {   // empty: kept as the spare when it is the only empty block of its type (DM_VK_SPARE_BLOCK) and memory is not tight
+        int keep = spare_block_on() && !g_mem_tight;
+        for (int k = 0; keep && k < g_nblk; k++) if (k != blk && blk_empty(&g_blk[k]) && g_blk[k].type == b->type) keep = 0;
+        if (!keep) { vkFreeMemory(g_dev, b->m, NULL); b->m = VK_NULL_HANDLE; b->nfr = 0; }
+    }
+    pthread_mutex_unlock(&g_blkmu);
+}
+// The spare's maker: one thread, woken by blk_spare_want (under g_blkmu); the 64 MB allocation runs with the lock released
+static pthread_cond_t g_spare_cv = PTHREAD_COND_INITIALIZER; static int g_spare_want = -1, g_spare_busy;
+static void *blk_spare_thread(void *arg) {
+    (void)arg; pthread_setname_np("dm-blkspare");
+    lk_(&g_blkmu, LW_BLKMU);
+    for (;;) {
+        while (g_spare_want < 0) pthread_cond_wait(&g_spare_cv, &g_blkmu);
+        uint32_t type = (uint32_t)g_spare_want; g_spare_want = -1;
+        int have = 0; for (int k = 0; k < g_nblk; k++) if (blk_empty(&g_blk[k]) && g_blk[k].type == type) have = 1;
+        if (have || g_mem_low) continue;
+        g_spare_busy = 1; pthread_mutex_unlock(&g_blkmu);
+        VkDeviceMemory mm = VK_NULL_HANDLE; VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, 64u << 20, type};
+        VkResult rr = vkAllocateMemory(g_dev, &ai, NULL, &mm);
+        lk_(&g_blkmu, LW_BLKMU); g_spare_busy = 0;
+        if (rr != VK_SUCCESS) { static int nl; if (nl++ < 4) LOG("vk: spare image block not made (%d)", (int)rr); continue; }
+        int i = 0; while (i < g_nblk && g_blk[i].m) i++;
+        if (i == NBLK) { vkFreeMemory(g_dev, mm, NULL); continue; }
+        if (i == g_nblk) g_nblk++;
+        mblock *b = &g_blk[i]; b->m = mm; b->size = 64u << 20; b->live = 0; b->type = type; b->nfr = 0; fr_put(b, 0, b->size); g_blk_spare_made++;
+    }
+    return NULL;
+}
+static void blk_spare_want(uint32_t type) {   // under g_blkmu
+    static int started; if (g_mem_low || g_spare_busy) return;
+    for (int k = 0; k < g_nblk; k++) if (blk_empty(&g_blk[k]) && g_blk[k].type == type) return;
+    if (!started) { pthread_t th; if (pthread_create(&th, NULL, blk_spare_thread, NULL)) return; pthread_detach(th); started = 1; }
+    g_spare_want = (int)type; pthread_cond_signal(&g_spare_cv);
+}
+static void blk_spare_trim(void) {   // the trims: empty blocks go back to the system
+    lk_(&g_blkmu, LW_BLKMU);
+    for (int k = 0; k < g_nblk; k++) if (blk_empty(&g_blk[k])) { vkFreeMemory(g_dev, g_blk[k].m, NULL); g_blk[k].m = VK_NULL_HANDLE; g_blk[k].nfr = 0; g_blk_spare_freed++; }
     pthread_mutex_unlock(&g_blkmu);
 }
 
@@ -1613,7 +1668,8 @@ static void tex_evict(uint64_t trim_gen) {
     static uint64_t last; uint64_t n = atomic_load(&g_presents); int trim = trim_gen != g_trim_gen_tex; g_trim_gen_tex = trim_gen;
     if (!trim && n - last < 60) return;
     last = n;
-    uint64_t held = 0; lk_(&g_blkmu, LW_BLKMU); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) held += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);
+    uint64_t held = 0; lk_(&g_blkmu, LW_BLKMU); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m && g_blk[i].live) held += g_blk[i].size; pthread_mutex_unlock(&g_blkmu);   // the empty spare (DM_VK_SPARE_BLOCK) not counted
+    if (trim) blk_spare_trim();
     if (!trim && held < EVICT_FLOOR) return;
     static int64_t eage = -1; if (eage < 0) { const char *e = getenv("DM_VK_EVICT_AGE"); eage = e && atoll(e) > 0 ? atoll(e) : 300; }
     uint64_t age = trim ? (uint64_t)atomic_load(&g_trim_age) : (uint64_t)eage, done; lk_(&g_mu, LW_MU); done = g_done; pthread_mutex_unlock(&g_mu);
@@ -5971,9 +6027,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
         int nb = 0; lk_(&g_blkmu, LW_BLKMU); for (int i = 0; i < g_nblk; i++) if (g_blk[i].m) nb++; pthread_mutex_unlock(&g_blkmu);
         long cached = 0, avail = 0; if ((f = fopen("/proc/meminfo", "re"))) { while (fgets(ln, sizeof ln, f)) { sscanf(ln, "Cached: %ld", &cached); sscanf(ln, "MemAvailable: %ld", &avail); } fclose(f); }
         extern _Atomic uint64_t g_fs_dropped;
-        LOG("vk: memory: process RSS %.0f MB (anonymous %.0f MB), PSS %.0f MB; Vulkan rings %.0f MB + extra %.0f MB, image blocks %d x 64 MB, big images %.0f MB, %d descriptor pools;"
+        LOG("vk: memory: process RSS %.0f MB (anonymous %.0f MB), PSS %.0f MB; Vulkan rings %.0f MB + extra %.0f MB, image blocks %d x 64 MB (new ones made on the recording thread %llu, spares made %llu / used %llu / freed by trims %llu), big images %.0f MB, %d descriptor pools;"
             " system: available %.0f MB, page cache %.0f MB; game file reads dropped from the page cache so far %.0f MB; textures evicted %llu, made again %llu; drawn before their data came and filled when it did %llu of %llu; GPU copies written into storage too: buffer %llu, texture %llu",
-            rss / 1024.0, anon / 1024.0, pss / 1024.0, atomic_load(&g_ring0_bytes) / 1048576.0, atomic_load(&g_extra_ring_bytes) / 1048576.0, nb, atomic_load(&g_big_bytes) / 1048576.0, atomic_load(&g_ndp_total),
+            rss / 1024.0, anon / 1024.0, pss / 1024.0, atomic_load(&g_ring0_bytes) / 1048576.0, atomic_load(&g_extra_ring_bytes) / 1048576.0, nb, (unsigned long long)g_blk_new_rec, (unsigned long long)g_blk_spare_made, (unsigned long long)g_blk_spare_used, (unsigned long long)g_blk_spare_freed, atomic_load(&g_big_bytes) / 1048576.0, atomic_load(&g_ndp_total),
             avail / 1024.0, cached / 1024.0, atomic_load(&g_fs_dropped) / 1048576.0, (unsigned long long)g_evicted, (unsigned long long)g_remade, (unsigned long long)g_late_fill, (unsigned long long)g_late_watch, (unsigned long long)g_mir_b2t, (unsigned long long)g_mir_t2t);
     }
     if (n % 600 == 0) { static uint64_t pr, prs, pd, pq; LOG("vk: occlusion per frame over the last 600 (DM_VK_OCC_MODE %d%s): %.1f samples-passed reports, %.1f resets, %.1f draws counted in %.1f queries", occ_mode(), g_occ_cum ? ", counting everything" : "",
