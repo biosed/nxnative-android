@@ -215,8 +215,8 @@ static void img_mem_free(int blk, VkDeviceMemory m, VkDeviceSize off, VkDeviceSi
     if (blk < 0) { vkFreeMemory(g_dev, m, NULL); atomic_fetch_sub(&g_big_bytes, size); return; }
     lk_(&g_blkmu, LW_BLKMU);
     mblock *b = &g_blk[blk]; fr_put(b, off, size);
-    if (!--b->live) {   // empty: kept as the spare when it is the only empty block of its type (DM_VK_SPARE_BLOCK) and memory is not tight
-        int keep = spare_block_on() && !g_mem_tight;
+    if (!--b->live) {   // empty: kept as the spare when it is the only empty block of its type (DM_VK_SPARE_BLOCK) and no spare would be made now (spare_hold)
+        int keep = spare_block_on() && !spare_hold();
         for (int k = 0; keep && k < g_nblk; k++) if (k != blk && blk_empty(&g_blk[k]) && g_blk[k].type == b->type) keep = 0;
         if (!keep) { vkFreeMemory(g_dev, b->m, NULL); b->m = VK_NULL_HANDLE; b->nfr = 0; }
     }
