@@ -299,6 +299,7 @@ typedef struct {
     int plog;   // a pass-logged frame recorded into it: its small write-backs are logged at completion (the values a dispatch computed, e.g. Unreal's exposure)
     VkBufferView *bv; int nbv, cbv;   // texel buffer views of this submission's descriptors (write_set), destroyed when it is done
     int reset_done;   // its command and descriptor pools were reset by the completion thread (ctx_complete), off the submit thread (each reset took ~9% of it)
+    int resetting;   // the completion thread is resetting its pools after it signalled the fence (DM_VK_EARLY_DONE, under g_mu): not taken until done
     uint64_t hold;   // the last later submission that reads this one's ring (gw_find): the ring is not reused, nor its extra rings freed, before that one is done too
     // The work recorded into it (draws and dispatches), the last TRN kept and the heaviest noted: dumped when the GPU is lost (trace_dump), to name what hung it
     struct trace { char kind, gpu_ind; char a[17], b[17]; const char *pa, *pb; uint32_t n0, n1, n2, zero_tb; } tr[48]; uint32_t ntr, ndraw, ndisp, max_groups; struct trace heavy;
@@ -878,6 +879,14 @@ static void snap_free(void *p, size_t n) {
 // as the Metal host does by command buffer (nvn_mtl.m rep_ticks), TIMESTAMP_TOP takes the submission's GPU start and the others its GPU end: the end is the completion (the
 // guest clock when the completion thread saw the fence), the start that minus the submission's GPU span. DM_VK_GPU_TS=0: one time for all, as before
 static int gpu_ts_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GPU_TS"); v = !(e && !strcmp(e, "0")); if (!v) LOG("DM_VK_GPU_TS=0: counter timestamps all take the completion time"); } return v; }
+// DM_VK_EARLY_DONE (vk-t9, default 1): a submission's fence is signalled (g_done, what the game's sync waits and fence queries see) as soon as its completion work that
+// the game can see is done -- write-backs into guest memory, GPU-written ranges -- and its command and descriptor pools are reset after that. The pool reset is the Adreno
+// driver freeing every pass's command memory (Tomodachi Life's island: 182 passes, ~3.9 ms a reset, 11.6 ms a frame of dm-complete) and it used to come first: each guest
+// wait on the GPU (SyncWait twice a frame) saw the end of its submission that much later, and later submissions' ends queued behind it. A context being reset is not taken
+// (c->resetting); DM_VK_EARLY_DONE=0: the reset first, as before. g_cl_*: the time from the fence to g_done, and the game's waits (mtl_wait), the command-pool line
+static int early_done_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_EARLY_DONE"); v = !(e && atoi(e) == 0); LOG("vk: DM_VK_EARLY_DONE=%d: %s", v, v ? "fences signalled before the pool resets" : "pools reset before the fence is signalled"); } return v; }
+static _Atomic uint64_t g_cl_ns, g_cl_n, g_gw8_ns, g_gw8_n;   // fence observed -> g_done; the game's waits on the GPU (mtl_wait): time, count
+static void ctx_reset(ctx_t *c);
 static void ctx_complete(ctx_t *c) {
     if (c->nh0ip) {   // H0: the GPU-written indirect arguments this submission drew with (vertex or index count, instances)
         static uint64_t prev; uint64_t tot = 0, mx = atomic_load(&g_h0_ii_max);
@@ -972,12 +981,14 @@ static void ctx_complete(ctx_t *c) {
     // The pools are idle now and the submit thread does not touch this context until g_done passes it (set after this returns): reset them here, off its time.
     // DM_VK_POOL_RESET=1 (vk19.64): the two command buffers one by one (the pool made with RESET_COMMAND_BUFFER_BIT), the whole pool when secondaries were used. Timed (the
     // profile put 1.56 ms a frame of dm-complete in vkResetCommandPool): the per-600 command-pool line
+    if (!early_done_on()) { ctx_reset(c); c->reset_done = 1; }   // else after the fence is signalled (completion_thread)
+}
+static void ctx_reset(ctx_t *c) {
     { uint64_t t0 = now_ns();
       if (pool_reset_mode() == 1 && !c->nsec) { VKCHECK(vkResetCommandBuffer(c->cb, 0)); VKCHECK(vkResetCommandBuffer(c->up, 0)); atomic_fetch_add(&g_cpr_bufs, 1); }
       else VKCHECK(vkResetCommandPool(g_dev, c->pool, 0));
       atomic_fetch_add(&g_cpr_ns, now_ns() - t0); atomic_fetch_add(&g_cpr_n, 1); }
     for (int i = 0; i < c->ndp; i++) VKCHECK(vkResetDescriptorPool(g_dev, c->dps[i], 0));
-    c->reset_done = 1;
 }
 // Lost device (a GPU hang the driver's watchdog ended): the work of every submission not known complete, so the log names the shaders and sizes that were running
 static void trace_dump(const char *why) {
@@ -1009,10 +1020,15 @@ static void *completion_thread(void *a) { pthread_setname_np("dm-complete");
         pthread_mutex_unlock(&g_mu);
         VkResult r = vkWaitForFences(g_dev, 1, &c->fence, VK_TRUE, UINT64_MAX);
         if (r != VK_SUCCESS) { trace_dump("waiting for a submission failed"); die("Vulkan: waiting for a submission failed (%d)", (int)r); }
+        uint64_t tf = now_ns();
         ctx_complete(c);
+        int early = early_done_on();
         lk_(&g_mu, LW_MU);
         g_done = c->fence_val; memmove(g_pend, g_pend + 1, --g_npend * sizeof *g_pend);
+        if (early) c->resetting = 1;
         pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+        atomic_fetch_add(&g_cl_ns, now_ns() - tf); atomic_fetch_add(&g_cl_n, 1);
+        if (early) { ctx_reset(c); lk_(&g_mu, LW_MU); c->reset_done = 1; c->resetting = 0; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu); }
         garbage_free(c->fence_val); xr_free(c->fence_val);
     }
     return NULL;
@@ -4780,7 +4796,7 @@ static void ctx_pick(void) {
     int best = -1, soon = -1; uint64_t soon_at = UINT64_MAX;
     for (int k = 0; k < NCTX; k++) { ctx_t *c = &g_ctx[k]; if (c == C) continue;   // the one just committed: its fence is not done yet anyway
         uint64_t f = c->fence_val > c->hold ? c->fence_val : c->hold;
-        if (f <= g_done) { if (best < 0) best = k;
+        if (f <= g_done && !c->resetting) { if (best < 0) best = k;
                            else if (!ring_reuse_on()) { if (c->fence_val < g_ctx[best].fence_val) best = k; }
                            else if (c->reset_done > g_ctx[best].reset_done || (c->reset_done == g_ctx[best].reset_done && c->fence_val > g_ctx[best].fence_val)) best = k; }   // DM_VK_RING_REUSE: the most recent
         else if (f < soon_at) { soon_at = f; soon = k; } }
@@ -4824,6 +4840,7 @@ void mtl_sub_begin(void) {
     lk_(&g_mu, LW_MU);
     { uint64_t t1 = now_ns(); while (c->fence_val > g_done) pthread_cond_wait(&g_cv, &g_mu); uint64_t t2 = now_ns(); while (c->hold > g_done) pthread_cond_wait(&g_cv, &g_mu);
       atomic_fetch_add(&g_wait_fence_ns, t2 - t1); atomic_fetch_add(&g_wait_hold_ns, now_ns() - t2); }   // its own submission still running / a later one still reading its ring
+    while (c->resetting) pthread_cond_wait(&g_cv, &g_mu);   // its pools still being reset (DM_VK_EARLY_DONE): ctx_pick avoids it, a wait at the cap may not
     pthread_mutex_unlock(&g_mu);
     lk_(&g_gwmu, LW_GWMU); c->hold = 0; pthread_mutex_unlock(&g_gwmu);
     atomic_fetch_add(&g_wait_ns, now_ns() - w0); atomic_fetch_add(&g_wait_cum, now_ns() - w0);
@@ -5024,13 +5041,16 @@ void mtl_rec_drain_hook(void (*f)(void)) { g_rec_drain = f; }
 uint64_t mtl_present_count(void) { return atomic_load(&g_presents); }
 void mtl_wait_committed(uint64_t fence) { lk_(&g_mu, LW_MU); while (g_fence < fence) pthread_cond_wait(&g_cv, &g_mu); pthread_mutex_unlock(&g_mu); }   // until the record thread has submitted it (mtl_sub_commit broadcasts g_cv)
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
-    lk_(&g_mu, LW_MU);
+    uint64_t w0 = now_ns(); int waited = 0;
+    lk_(&g_mu, LW_MU); waited = g_done < fence;
     if (timeout_ns == UINT64_MAX || timeout_ns > 60ull * 1000000000ull) { while (g_done < fence) pthread_cond_wait(&g_cv, &g_mu); }
     else {
         struct timespec t; clock_gettime(CLOCK_REALTIME, &t); uint64_t ns = (uint64_t)t.tv_nsec + timeout_ns; t.tv_sec += (time_t)(ns / 1000000000ull); t.tv_nsec = (long)(ns % 1000000000ull);
         while (g_done < fence) if (pthread_cond_timedwait(&g_cv, &g_mu, &t)) break;
     }
-    int ok = g_done >= fence; pthread_mutex_unlock(&g_mu); return ok;
+    int ok = g_done >= fence; pthread_mutex_unlock(&g_mu);
+    if (waited) { atomic_fetch_add(&g_gw8_ns, now_ns() - w0); atomic_fetch_add(&g_gw8_n, 1); }
+    return ok;
 }
 void mtl_finish(void) { if (g_rec_drain) g_rec_drain(); mtl_wait(g_fence, UINT64_MAX); }
 void mtl_drain(void) { mtl_finish(); pcache_save(); }   // going to the background: the pipelines made so far are kept for the next run
@@ -5880,6 +5900,9 @@ static void meas_lines(void) {
     { uint64_t n = atomic_exchange(&g_cpr_n, 0), ns = atomic_exchange(&g_cpr_ns, 0), nb = atomic_exchange(&g_cpr_bufs, 0), nr = atomic_exchange(&g_cpr_rec, 0);
       LOG("vk: command pools per frame over the last 600 (DM_VK_POOL_RESET %d): %.1f reset by dm-complete (%.3f ms, %.1f of them buffer by buffer), %.2f left to the recording thread; %d submission contexts",
           pool_reset_mode(), n / 600.0, ns / 600e6, nb / 600.0, nr / 600.0, NCTX); }
+    { uint64_t cn = atomic_exchange(&g_cl_n, 0), cns = atomic_exchange(&g_cl_ns, 0), wn = atomic_exchange(&g_gw8_n, 0), wns = atomic_exchange(&g_gw8_ns, 0);
+      LOG("vk: completion per frame over the last 600 (DM_VK_EARLY_DONE %d): a fence reached the game %.3f ms after the GPU ended it on average (%.1f submissions); the game waited for the GPU %.1f times, %.2f ms",
+          early_done_on(), cn ? cns / (double)cn / 1e6 : 0.0, cn / 600.0, wn / 600.0, wns / 600e6); }
     uint64_t hit = 0, miss = 0, mb = 0; for (int i = 0; i < CI_N; i++) { hit += g_ci_hit[i]; miss += g_ci_miss[i]; mb += g_ci_mbytes[i]; }
     static const char *cn[CI_N] = {"vertex", "index", "index pool", "uniform", "storage", "texel", "image copy"};
     char cb[600]; size_t o = 0; cb[0] = 0;
