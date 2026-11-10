@@ -35,7 +35,9 @@ Mac M1, `--platform mac` with `shader_half_clamp`, new save, driven with `DM_CTL
 - **Seen:** title, character creation (eyes correct), the intro and the first forest, the dream farm with its crops, butterflies and harvest prompts, the waking-up dialogue, and the real farm's prologue (Carol's close-ups, the Soilbot machine, tutorial pop-ups).
 - **Frame by frame (DM_CTL `shots`, a frame difference test plus contact sheets):** 150 consecutive frames still and 150 while panning in the first forest, 120 in the dream farm, 120 on the real farm. No object vanished and came back.
 - **Also seen in a second run:** the in-game menu (tips pages, options, save screen), the HUD (clock, stamina, minimap), and the village houses and farm buildings in a full camera turn. The menu opens only after the dream sequence.
-- **Not reached:** an indoor scene. On the first morning Carol stops the player from leaving the farm until the tutorial jobs are done (Soilbot, tilling, sowing, watering).
+- **Farm tutorial (third run):** Soilbot field list and farm overview, tilling, sowing, watering at the well and fertilizing (6 tiles each), tip pages and the objective screens, then free roam at noon. The game writes `AutoSave.sav` there, so later runs continue from it.
+- **Indoor (fourth run, from that autosave):** the player's house (kitchen, fridge, stove, radio, window light, wood floor) and the way out through both doors. 90 still frames inside: no transients (4 changed pixels in all, from the eye blink). 120 frames while turning the camera: the only jumps are the camera pushing in at walls and hiding the player for a frame when it passes through him (the camera's own behaviour, the frames after it agree). The black opening by the back door is the exit to the yard, which is loaded only when you walk through it.
+- **Driving tips:** the camera turns with the player, so short stick taps leave the player facing a diagonal. A half tilt (`L0/0.5~0.5`) turns him in place, and the tool prompt (Till, Plant, Water, Fertilize) shows which tile is targeted.
 - **Only red line:** `nvnTextureViewCompare`.
 
 ## Open
