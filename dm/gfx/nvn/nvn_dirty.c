@@ -238,6 +238,10 @@ int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     return 0;
 }
+int nvn_dirty_page_info(const void *addr, uint64_t *gen, int *state) {   // diagnostics (DM_VK_IDXPOOL_KEEP=2's difference lines)
+    range_t *r = find_span((uintptr_t)addr, 1); if (!r) return 0;
+    uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift; *gen = atomic_load(&r->gen[p]); *state = atomic_load(&r->state[p]); return 1;
+}
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) { return nvn_dirty_since_span(NULL, addr, len, stamp); }
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total) {
     int n = atomic_load(&g_nr), active = 0;
