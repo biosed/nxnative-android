@@ -5067,7 +5067,12 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     if (waited) { atomic_fetch_add(&g_gw8_ns, now_ns() - w0); atomic_fetch_add(&g_gw8_n, 1); }
     return ok;
 }
-void mtl_finish(void) { if (g_rec_drain) g_rec_drain(); mtl_wait(g_fence, UINT64_MAX); }
+void mtl_finish(void) {
+    if (g_rec_drain) g_rec_drain(); mtl_wait(g_fence, UINT64_MAX);
+    lk_(&g_mu, LW_MU);   // and the pool resets that follow a fence (DM_VK_EARLY_DONE): a drain (hibernation's snapshot) leaves no context half reset
+    for (int k = 0; k < NCTX; k++) while (g_ctx[k].resetting) pthread_cond_wait(&g_cv, &g_mu);
+    pthread_mutex_unlock(&g_mu);
+}
 void mtl_drain(void) { mtl_finish(); pcache_save(); }   // going to the background: the pipelines made so far are kept for the next run
 
 // The picture as last presented (its crop's size, and whether it is stretched over the window): app/front_android.c maps a finger on the window onto the game's touch screen
@@ -6436,7 +6441,7 @@ int mtl_hib_restore(const uint8_t *b, size_t n) {
         if (!cpu_written(s)) { if (g_ncpu == g_ccpu) { g_ccpu = g_ccpu ? 2 * g_ccpu : 64; g_cpu_written = realloc(g_cpu_written, g_ccpu * sizeof *g_cpu_written); } g_cpu_written[g_ncpu++] = s; } }
     pthread_mutex_unlock(&g_rmu);
     g_origin_ll = h.origin_ll; g_depth_zero = h.depth_zero;
-    pthread_mutex_lock(&g_mu); g_fence = g_done = h.fence; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);   // every fence the snapshot's syncs hold is complete
+    pthread_mutex_lock(&g_mu); g_fence = g_done = h.fence; for (int k = 0; k < NCTX_MAX; k++) g_ctx[k].resetting = 0; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);   // (no reset is running after a restore: none half done)   // every fence the snapshot's syncs hold is complete
     LOG("hibernate: Vulkan replay state restored: %u pools, %u texture and %u sampler descriptors, %u CPU-written textures, fence %llu", h.npool, h.ntreg, h.nsreg, h.ncpu, (unsigned long long)h.fence);
     return 0;
 }
