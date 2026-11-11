@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- UI icon stick_fixed: a stick pinned to one place (the stick-mode switch); original artwork -->
+  <circle cx="128" cy="150" r="78" fill="none" stroke="#ffffff" stroke-width="16" stroke-opacity="0.6"/>
+  <circle cx="128" cy="150" r="34" fill="#ffffff"/>
+  <path d="M128 36 V112 M100 36 H156 M110 64 H146" fill="none" stroke="#ffffff" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

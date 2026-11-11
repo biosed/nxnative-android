@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- on-screen button Y: solid colour, soft shadow, rim light; original artwork -->
+  <defs>
+    <radialGradient id="y_fill" cx="0.38" cy="0.32" r="0.8"><stop offset="0" stop-color="#7fe08a"/><stop offset="1" stop-color="#2e9e48"/></radialGradient>
+  </defs>
+  <circle cx="128" cy="136" r="112" fill="#000000" fill-opacity="0.35"/>
+  <circle cx="128" cy="126" r="110" fill="url(#y_fill)" stroke="#13501f" stroke-width="7"/>
+  <path d="M46 98 A88 88 0 0 1 182 46" fill="none" stroke="#ffffff" stroke-opacity="0.35" stroke-width="9" stroke-linecap="round"/>
+  <path d="M94 76 L128 124 L162 76 M128 124 V174" fill="none" stroke="#ffffff" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

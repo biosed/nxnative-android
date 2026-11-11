@@ -28,6 +28,7 @@ int g_nmod;
 uint64_t g_t0_ns;
 uint64_t now_ns(void) { return 0; }
 int dm_sdk_major(void) { return 20; }
+int dm_guest_as_contains(uintptr_t a) { (void)a; return 0; }   // hle_svc.c: no guest address space here (hle_bigstack.c runs take-overs on the calling stack)
 int dm_main_imports(const char *prefix) { (void)prefix; return 1; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
 void dm_backtrace(uint64_t fp) { (void)fp; }

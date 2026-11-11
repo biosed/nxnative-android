@@ -5,7 +5,9 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdatomic.h>
 #include <sys/resource.h>
+#ifdef __APPLE__
 #include <sys/sysctl.h>
+#endif
 #include <sys/time.h>
 #include <unistd.h>
 void probe_install(void); void hid_keys_init(void); void stubs_report(void); void crash_install(void); void guest_thread_init(void); void guest_gate_stack(int own_stack); uint32_t svc_thread_main_init(void);
@@ -40,6 +42,18 @@ static void guest_main(void) {
     LOG("nnMain returned");
 }
 
+// Hibernation (DM_HIBERNATE, hle_hib.c): guest memory points into the guest main thread's stack (the SDK's thread records, objects it lives on), so with hibernation it runs on a
+// 64 MB stack in the host arena, at a fixed address, on a pthread of its own; the front end's thread waits for it as it would for guest_main
+static void *guest_main_arena(void *a) { (void)a; guest_main(); return NULL; }
+static void guest_main_entry(void) {
+    void *st = dm_hib_calloc(64u << 20);
+    if (!st) { guest_main(); return; }
+    void svc_set_main_stack(uint64_t lo, uint64_t hi); svc_set_main_stack((uint64_t)(uintptr_t)st, (uint64_t)(uintptr_t)st + (64u << 20));
+    pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstack(&at, st, 64u << 20);
+    pthread_t th; if (pthread_create(&th, &at, guest_main_arena, NULL)) die("cannot start the guest main thread on its arena stack");
+    pthread_join(th, NULL);
+}
+
 struct dm_flags g_flag;
 uint64_t g_t0_ns;
 static void flags_init(void) {
@@ -49,6 +63,18 @@ static void flags_init(void) {
 }
 
 // Zero point of the boot timeline = process creation time (p_starttime from sysctl KERN_PROC_PID, wall clock) converted to the now_ns monotonic time base; same definition on Mac / iOS
+#ifndef __APPLE__
+// Linux: field 22 of /proc/self/stat is the start time in clock ticks after boot, on CLOCK_BOOTTIME's time base
+static uint64_t proc_start_mono_ns(void) {
+    uint64_t mono = now_ns(); struct timespec bt; char b[1024]; unsigned long long st = 0;
+    FILE *f = fopen("/proc/self/stat", "r"); size_t n = f ? fread(b, 1, sizeof b - 1, f) : 0; if (f) fclose(f); b[n] = 0;
+    char *p = strrchr(b, ')'); int field = 2;
+    for (; p && *p && field < 22; p++) if (*p == ' ') field++;
+    if (!p || sscanf(p, "%llu", &st) != 1 || clock_gettime(CLOCK_BOOTTIME, &bt)) return mono;
+    int64_t age = (int64_t)bt.tv_sec * 1000000000ll + bt.tv_nsec - (int64_t)(st * (1000000000ull / (unsigned long long)sysconf(_SC_CLK_TCK)));
+    return age > 0 ? mono - (uint64_t)age : mono;
+}
+#else
 static uint64_t proc_start_mono_ns(void) {
     struct kinfo_proc kp; size_t n = sizeof kp; int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
     uint64_t mono = now_ns(); struct timeval tv; gettimeofday(&tv, NULL);
@@ -56,6 +82,7 @@ static uint64_t proc_start_mono_ns(void) {
     int64_t age = (int64_t)(tv.tv_sec - kp.kp_proc.p_starttime.tv_sec) * 1000000000ll + (tv.tv_usec - kp.kp_proc.p_starttime.tv_usec) * 1000ll;
     return age > 0 ? mono - (uint64_t)age : mono;
 }
+#endif
 
 // Host loading (independent of UIKit / Metal): read the NSO, relocate, forced take-over, probes / tick gate / keys, start prefetch. By default it runs synchronously in main;
 // the iOS front end can call dm_host_preload_start(same arguments) at the very start of the App's main() so that it runs first on a background thread, in parallel with the UIKit startup chain (⓪ + ① ≈ max(UIKit chain, host loading)).
@@ -77,8 +104,11 @@ static void host_preload(int argc, char **argv) {
     }
     crash_install();
     {   // Which build this is: the commit the packer stamped into the app (DMCommit; a run outside an app has none), the shader chain the host loads, the profile
-        CFBundleRef b = CFBundleGetMainBundle(); CFTypeRef c = b ? CFBundleGetValueForInfoDictionaryKey(b, CFSTR("DMCommit")) : NULL; char cs[64] = "not recorded";
+        char cs[64] = "not recorded";
+#ifdef __APPLE__
+        CFBundleRef b = CFBundleGetMainBundle(); CFTypeRef c = b ? CFBundleGetValueForInfoDictionaryKey(b, CFSTR("DMCommit")) : NULL;
         if (c && CFGetTypeID(c) == CFStringGetTypeID()) CFStringGetCString((CFStringRef)c, cs, sizeof cs, kCFStringEncodingUTF8);
+#endif
         LOG("build: commit %s, shader chain %s, profile %s", cs, DMSH_CHAIN, DM_GAME_ID);
     }
     const char *race = getenv("DM_TEST_KEYRACE");
@@ -102,6 +132,7 @@ static void host_preload(int argc, char **argv) {
     }
     if (!n) { static const char *def[] = DM_GAME_MODULES; for (int k = 0; k < DM_GAME_NMOD; k++) names[n++] = def[k]; }   // default module list from the game profile's modules (Mario: main sdk)
     load_modules(argv[1], names, n);
+    dm_cheats_init();   // the Atmosphère cheat files for this build (hle_cheats.c): picked by first 16 hex digits of main's build ID, which the loader knows now
     dm_sdk_major();   // logs the SDK version, which SDK-dependent behaviour follows (loader.c)
     uint64_t ta = now_ns();
     probe_install();   // DM_PROBE probes (for diagnostics)
@@ -130,6 +161,7 @@ void dm_host_preload_start(int argc, char **argv) {
     if (pthread_create(&g_pre.th, &a, preload_thread, NULL)) die("dm_host_preload_start: cannot start the thread");
 }
 int main(int argc, char **argv) {
+    { void dm_hib_exec_fixed(int, char **); dm_hib_exec_fixed(argc, argv); }   // DM_HIBERNATE: the executable at its link address (hle_hib.c); first, before any thread or file
     { int mtl_pso_prebuild_tool(void); if (mtl_pso_prebuild_tool()) return 0; }   // DM_PSO_PREBUILD=tool: the pipeline archive's prebuild alone, no game (nvn_mtl.m)
     if (getenv("DM_PRELOAD")) dm_host_preload_start(argc, argv);   // Exercise the early-start path on Mac (on iOS it is called from the App's main())
     if (atomic_load(&g_pre.started)) {
@@ -140,6 +172,8 @@ int main(int argc, char **argv) {
         LOG("host loading already finished early in the background (dm_host_preload_start)");
     } else host_preload(argc, argv);
     { void dm_fps_state_apply(void); dm_fps_state_apply(); }   // frame rate and render scale into the frame step state page (loader.c): the iOS launcher sets them after the loading began
-    front_run(guest_main);
+    { int dm_hib_restore_prepare(void); void dm_hib_restore_main(void);   // DM_HIBERNATE with DM_HIB_RESTORE: back where a snapshot left the game (hle_hibsnap.c)
+      if (dm_hib_restore_prepare()) { front_run(dm_hib_restore_main); return 0; } }
+    front_run(guest_main_entry);
     return 0;
 }

@@ -1,0 +1,41 @@
+# Game profile of Harvest Moon: Echoes of Teradea 1.2.0 (update v131072; Unity 6000.3.7f1 IL2CPP, FMOD, SDK 20.5.24, NVN).
+# Format: see dm/games/README.md; bring-up and measurements in README.md beside this file. Started from the NSP script's provisional profile (survey 2026-11-07).
+
+# ---- Identity ----
+title_id	0100839022642000
+program_id	0100839022642000
+
+# ---- App ----
+name	Harvest Moon: Echoes of Teradea
+ipa	HarvestMoonEchoesOfTeradea.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v131072	1.2.0	main=3dcc79312b977cd1c611b271830ac354	subsdk0=99e21f98a397434b534c1459fc38a2b8	sdk=bc204aae7319bab274894f1cc3f5da92
+package	v131072
+shader_versions	v131072
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 sdk
+romfs_marker	Data/StreamingAssets/aa/Switch/bgm_assets_all_1be12380495c43682e5acc002093a068.bundle
+zip_store	.assets:.bin:.bundle:.dat:.png:.ress:.metallib
+
+# ---- Memory ----
+# the NPDM declares 16 MB of system resource (virtual address memory) and main never sets a heap: a 5 GB block with a 4.375 GB alias region, where the game maps its memory itself
+mem_reserve	0x140000000
+mem_alias	0x118000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 16 MB of system resource
+sys_resource	0x1000000
+
+# ---- Shader split ----
+shader_groups	/Data/=data
+shader_note	Harvest Moon: Echoes of Teradea shaders (provisional profile)
+
+
+# ---- Graphics ----
+# The game calls nvnDeviceSetDepthMode(near=0) (run log: "depth mode near=0"), so its vertex shaders use the main0_z entries; the pipeline bases made before it runs are made for that mode (as Silver Pines)
+depth_mode	zero
+# address regions: 2026-11-07, in its first 15 s in nnMain the game's regions reach alias +1.26 GB, within the 4.38 GB alias region; about 2.5 GB resident in the first forest (Mac)

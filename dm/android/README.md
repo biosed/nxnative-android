@@ -1,0 +1,110 @@
+# Android host (bring-up)
+
+The host in `dm/host` and `dm/gfx` built for Android (arm64, API 30 = Android 11 and newer, Vulkan 1.1 and newer) with the NDK. Status: the game's code runs
+natively, with sound (AAudio), saves and a Vulkan graphics backend (`src_vk/nvn_vk.c`), as an app (`app/`, `tools/make_apk.py`)
+or an adb program. Checked with Hollow Knight 1.5.12620 on an ANBERNIC RG Slide (Unisoc T820, Mali-G57, Android 13): the app
+plays it in handheld mode at about 59 fps (GPU 16 ms a frame in Dirtmouth), with controllers, the start-up menu and cheats.
+
+## How it differs from the Apple host
+
+- **Thread slots.** Rewritten game code reads its four thread slots (x18, tpidr_el0, tpidrro_el0, the gate) through
+  `tpidr_el0` and bionic's `TLS_SLOT_APP` instead of Apple's pthread TSD. Rewrite the modules with
+  `DM_PATCH_TP=android dm/tools/patch_nso.py ...` into a folder of their own: the loader refuses modules rewritten
+  for the other platform (`TP_SLOT` in `<module>.fixups.tsv`).
+- **Apple APIs.** `compat/` supplies the Mach, libdispatch, QoS, malloc-zone, CommonCrypto, clonefile and xattr calls
+  the shared code makes (see `compat/README.md`).
+- **Platform parts.** Audio output is an AAudio stream (`hle_audio.c`). H.264 is decoded by the NDK's MediaCodec
+  (`hle_movie_avc.c`, Annex B access units, pictures converted to NV12 / RGBA); AAC is not there yet (`hle_movie.c` logs
+  `[RED]` and goes on with silence). The system's Roboto stands in when a game asks for the shared font and none is there.
+- **Scheduling.** Horizon runs one thread at a time per core; a phone with eight big cores runs a Switch core's threads
+  truly in parallel, which raced Super Mario Odyssey's core-0 threads into heap corruption at boot. On Android each guest
+  thread pinned to one core holds that core's token while it runs (`hle_thread.c` `core_serial`, `DM_CORE_SERIAL=0` turns
+  it off): it gives it up while it waits (SVC waits, sleeps, yields, GPU waits in `hle_nvn.c`), hands it to a
+  higher-priority thread at its next SVC, and takes the token of its new core when its mask changes, also when another
+  thread changed it. A line every 5 s names the thread that waited longest and the one that held the core against it.
+- **Graphics.** `src_vk/nvn_vk.c` replays the NVN layer's command lists into Vulkan (its file header has the design:
+  ring-buffer copies of what draws read, images in `GENERAL` layout, fragment resources in set 1). Shaders are the
+  Metal chain's own SPIR-V, exported by `tools/spv_android.py` (below). BC formats are decoded on upload (BC4-7 by `third_party/bcdec`, MIT / Unlicense), and every
+  submission waits on GPU for the one before through a timeline semaphore. Compute dispatches run, and buffers they write
+  are tracked until the submission ends (`gw_*`), so draws that read them wait for it. Cube, 3D and array textures used
+  as attachments get 2D views (a cube view as an attachment loses the Mali device). Images come from 64 MB blocks with a
+  free list; pipelines go through a pipeline cache saved beside the game files. Not there yet: indirect draws, buffer
+  textures, geometry / tessellation stages. Diagnostics (`env.txt`): `DM_VK_PASSLOG=<frame>[+]` logs a frame's passes,
+  draws, copies and dispatches, `DM_VK_RTDUMP=<frame>` writes its render targets, `DM_VK_SKIP=<mask>` drops kinds of work
+  (1 buffer→texture, 2 texture→texture, 4 texture→buffer, 8 clears, 16 uploads, 32 draws / dispatches).
+  `BACKEND=null` builds the null backend (`null/nvn_null.c`) instead.
+
+## Shaders
+
+```bash
+DM_GAME=<id> DM_GAMES_DIR=<NSP folder>/<id>_build/profile .venv/bin/python dm/android/tools/spv_android.py \
+    <NSP folder>/<id>_build/shader/pkg <NSP folder>/<id>_build/shader/cache <NSP folder>/<id>_build/shader/vk
+```
+
+It runs the Metal shader build once more into a scratch cache with the translator wrapped, keeping each shader's
+SPIR-V (`<key>.spv`, unused capabilities stripped: Mali refuses a module that declares Float64 or fragment interlock)
+and its bindings (`<key>.vk.txt`). The chain version does not change. The host finds them through `DM_VK_DIR`.
+
+## Build
+
+```bash
+DM_GAMES_DIR=<NSP folder>/<id>_build/profile make -C dm/android GAME=<id> dmhost
+```
+
+`NDK=` overrides the NDK (default: Homebrew's `android-ndk` cask). `dmhost` is the host as a command-line program
+(`cli/front_cli.c`, no window); the default target builds `libdmhost.so`, the library for the Android app, and
+`libdmboot.so`, the app's NativeActivity library (`boot/boot.c`), which loads `libdmhost.so` at a fixed address for
+hibernation (`DM_HIBERNATE`, [docs/development.md](../../docs/development.md#hibernation-save-state-to-disk)) and hands the activity to it.
+
+## Run over adb
+
+```bash
+adb push gen/<id>/dmhost <patched modules folder> <RomFS> /data/local/tmp/nx/...
+adb shell 'cd /data/local/tmp/nx && DM_ROMFS=$PWD/romfs DM_SAVE=$PWD/save DM_TEMP=$PWD/temp DM_FONT_DIR=$PWD/font ./dmhost $PWD/dm main subsdk0 sdk'
+```
+
+Add `DM_VK_DIR=$PWD/vk` (the shader folder) and, to see frames, `DM_VK_SHOTS=600,1200 DM_VK_SHOT_DIR=$PWD/shots`.
+The log goes to stderr, as on the Mac. `tests/t_tls_slot.c` checks a device for what the port relies on
+(`TLS_SLOT_APP` free and kept, executable anonymous memory).
+
+## The app
+
+`app/front_android.c` is the NativeActivity (process `:game`): window → Vulkan swapchain (Android rotates it on phones whose
+screen is portrait by nature), controllers by position (the console's own and any other, e.g. an Xbox pad), on-screen
+controls drawn over the picture at the first touch (hidden again when a controller is used), − and + held two seconds →
+back to the menu. The game's touch screen: a finger that lands on no on-screen control touches it, mapped onto the picture as it is letterboxed (`app/touch_map.h`, checked by `tests/touch_map_test.c`; a finger on a black bar is ignored), up to 16 fingers, in handheld mode only as on the Switch; `DM_TOUCH_MODE` (the menu's "Touch screen", default the profile's `touch_mode`) chooses 0 = floating sticks take the fingers as before, 1 = buttons and fixed sticks stay and every other finger touches, 2 = no on-screen controls; one log line per finger down (the first 40, then every 100th). Without dynamic rendering (Vulkan 1.1 / 1.2 GPUs without `VK_KHR_dynamic_rendering`) the backend uses
+render passes made per pass; `DM_VK_NO_DYNREND=1` forces that path for testing. `app/java/com/nxnative/MenuActivity.java`
+is the Spanish start-up menu (mode, frame rate, screen fit, language, frame-rate counter, the build's cheats, "no volver a
+mostrar"); it writes `<files>/settings.env`, seeds `<files>/save` from `assets/save` on first start and copies `assets/cheats.txt`.
+
+```bash
+make -C dm/android GAME=<id>
+python3 dm/android/tools/make_apk.py <id> <NSP folder>/<id>_build <out>.apk --label <name> [--save <save folder>] [--cheats <file>]
+adb install -r <out>.apk
+python3 dm/android/tools/make_apk.py --deploy <id> <NSP folder>/<id>_build   # game files into /sdcard/Android/data/<package>/files
+```
+
+`--bundle` puts the game files inside the APK instead (deflated: Hollow Knight's 3.6 GB make a 1.06 GB APK; Android takes
+APKs below 4 GB): one file to install without a computer, which the menu unpacks on its first start. Repeated pieces of
+archives are stored once. Past 3.8 GB, whole files go to `<APK name>-datos.zip` (no ZIP64, which Android does not read);
+the menu asks for it once through the system file picker and checks it belongs to this APK. `--test` makes a
+`<package>.prueba` copy that installs beside the real app.
+
+The log is `/sdcard/Android/data/<package>/files/log.txt`; an `env.txt` beside it (KEY=VALUE lines) sets diagnostic switches.
+
+The save is in the app's internal folder (`<files>/save`), which adb cannot read on a release build, so the menu copies it
+out (`app/java/com/nxnative/SaveBackup.java`) at each start and when the player comes back from the game, before the game
+starts: `<external>/save_backup/latest/` (replaced) and `save_backup/<yyyyMMdd-HHmmss>/` (the last 5); `save_backup/log.txt`
+and logcat tag `nxsave` say what was done. A save from elsewhere (the same files: `GameSaveData0`, `OptionSaveData`, ...)
+comes in through `<external>/save_import/` at the next start; the save it replaces is kept in `save_backup/pre-import-<time>/`:
+
+```bash
+E=/sdcard/Android/data/<package>/files
+adb pull $E/save_backup/latest ./save_from_android
+adb push ./my_save $E/save_import && adb shell chmod -R o+rX $E/save_import   # adb's files are the shell's: the app reads them only after the chmod
+```
+
+## Next
+
+The missing backend features above; GPU time (images stay in `GENERAL` layout, which keeps Mali from compressing them);
+a user-facing script in `scripts/` that goes from NSP to installed app; AAC through MediaCodec.

@@ -292,7 +292,7 @@ static void geo_access_add(geo_access *a, uint64_t lo, uint64_t size, int write)
 // only when external buffer accesses cannot communicate between its jobs.
 static geo_access geo_access_of(NvProg *pr, NvShader *gs) {
     geo_access a={0};
-    for (int i=0;i<16;i++) geo_access_add(&a,S.vbuf[i].address,S.vbuf[i].size,0);
+    for (int i=0;i<16;i++) if (S.vbuf[i].size) geo_access_add(&a,S.vbuf[i].address,S.vbuf[i].size,0);   // an empty stream reads nothing (an unknown range otherwise)
     for (int st=0;st<3;st++) {
         NvShader *sh=st==2?gs:pr->sh[st]; if (!sh) continue;
         if (sh->rf.drv_read[0]) a.unknown=1;
@@ -372,7 +372,9 @@ static int geo_mesh_on(void) {
 }
 enum { GEO_MESH_PRIMS = 32, GEO_MESH_DRAW_SLOT = 12, GEO_MESH_GS_SLOT = 13 };   // = dmsh_mesh.py PRIMS, DRAW_SLOT, GS_SLOT
 typedef struct { uint64_t ib; uint32_t itype, first, count; int32_t base_vertex; uint32_t base_instance, pad; } geo_mesh_args;   // dmsh_mesh.py dm_mesh_draw
-static struct { int on, miss; __unsafe_unretained id<MTLFunction> fn; __unsafe_unretained NvShader *lean; geo_mesh_args a; } g_geo_mesh;
+enum { LINE_MESH_SEGS = 32 };   // = dmsh_mesh.py SEGS
+typedef struct { uint64_t ib; uint32_t itype, first, count; int32_t base_vertex; uint32_t base_instance, pad; float half_viewport[2], half_width; } line_mesh_args;   // dmsh_mesh.py dm_line_draw
+static struct { int on, miss, line; __unsafe_unretained id<MTLFunction> fn; __unsafe_unretained NvShader *lean; geo_mesh_args a; line_mesh_args la; } g_geo_mesh;   // line: a wide-line draw (line_mesh_draw)
 // The mesh entry for this draw's program, or nil (the compute path draws it)
 static id<MTLFunction> geo_mesh_fn(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     if (!geo_mesh_on()) return nil;
@@ -410,7 +412,7 @@ static id<MTLRenderPipelineState> geo_mesh_pso(NvProg *pr) {
         m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
         for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
         m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
-        const char *vk = vs->key, *fk = fs ? fs->key : "-", *gk = g_geo_mesh.lean->key; pso_key kk = k;
+        const char *vk = vs->key, *fk = fs ? fs->key : "-", *gk = g_geo_mesh.lean ? g_geo_mesh.lean->key : "wide lines"; pso_key kk = k;
         dispatch_async(pp_bg_queue(), ^{
             NSError *e = nil; uint64_t t0 = bp_now();
             id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&e];
@@ -426,6 +428,13 @@ static id<MTLRenderPipelineState> geo_mesh_pso(NvProg *pr) {
 static void geo_mesh_encode(id<MTLRenderCommandEncoder> en_) {
     id<MTL4RenderCommandEncoder> en = (id<MTL4RenderCommandEncoder>)en_;
     [en setArgumentTable:g_vt atStages:MTLRenderStageMesh];
+    if (g_geo_mesh.line) {   // dmsh_mesh.py compose_lines: 2 threads a segment run the vertex shader, one emits its quad
+        id<MTLBuffer> b; size_t o = arena_alloc(64, &b); memcpy((uint8_t *)b.contents + o, &g_geo_mesh.la, sizeof g_geo_mesh.la);
+        enc_r_vbuf(en, GEO_MESH_DRAW_SLOT, b.gpuAddress + o);
+        uint32_t segs = g_geo_mesh.la.count / 2;
+        [en drawMeshThreadgroups:MTLSizeMake((segs + LINE_MESH_SEGS - 1) / LINE_MESH_SEGS, 1, 1) threadsPerObjectThreadgroup:MTLSizeMake(1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(2 * LINE_MESH_SEGS, 1, 1)];
+        return;
+    }
     uint32_t tris = g_geo_mesh.a.count / 3;
     id<MTLBuffer> b; size_t o = arena_alloc(64, &b); uint8_t *p = (uint8_t *)b.contents + o;
     uint32_t info[8] = {0, 1, 0, 0, tris, 0, 0, 0}; memcpy(p, info, 32); memcpy(p + 32, &g_geo_mesh.a, sizeof g_geo_mesh.a);
@@ -454,6 +463,47 @@ static int geo_mesh_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     if (g_geo_mesh.miss) { g_geo_mesh_wait++; return 0; }
     swrite_note(pr); udc_note_draw(pr); g_wr_epoch++; g_mdx_epoch++;   // the kernel's storage writes
     if (!g_geo_mesh_n++) MLOG("geometry mesh: first mesh draw, vertex %s kernel %s, %u triangles", pr->sh[0]->key, g_geo_mesh.lean->key, g_geo_mesh.a.count / 3);
+    return 1;
+}
+// Wide lines: Metal rasterizes lines one pixel wide, and SetLineWidth asks for more (FINAL FANTASY XII THE ZODIAC AGE's target lines, 3 pixels: as one-pixel lines
+// they showed as scattered dots). A line-list draw wider than one pixel whose vertex shader has a wide-line library, <vertex key>_ln (dmsh_mesh.py compose_lines,
+// built for the vertex shaders in the profile's line_mesh.tsv), is one mesh draw in the open pass that emits each segment as a quad; any other line draw, and this
+// one while its pipeline is built in the background, is drawn one pixel wide as before. DM_NVN_LINE_MESH=0 turns it off
+static uint64_t g_line_mesh_n;
+static id<MTLFunction> line_mesh_fn(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_LINE_MESH"); on = !(e && !strcmp(e, "0")); }
+    NvShader *vs = pr->sh[0];
+    int instances = dw ? dw->instances : di->instances, count = dw ? dw->count : di->count;
+    if (!on || count < 2 || instances > 1 || (dw ? dw->ind || dw->mdi_cnt : di->ind || di->mdi_cnt) || (di && (S.restart.on || di->itype < 0 || di->itype > 2)) || S.rast_discard || S.tf_on ||
+        !vs || !vs->has_pull || vs->layer_out || vs->discard_fn || !vs->fn || pr->sh[2] || pr->sh[3] || pr->sh[4]) return nil;
+    if (!vs->geo_mesh) vs->geo_mesh = [NSMutableDictionary dictionary];
+    id f = vs->geo_mesh[@"ln"];
+    if (!f) {
+        NSString *path = [NSString stringWithFormat:@"%@/%.16s_ln.metallib", g_msl_dir, vs->key];
+        id<MTLLibrary> lib = [NSFileManager.defaultManager fileExistsAtPath:path] ? [g_dev newLibraryWithURL:[NSURL fileURLWithPath:path] error:nil] : nil;
+        f = lib ? [lib newFunctionWithName:[vs->fn.name isEqualToString:@"main0_z"] ? @"dm_line_z" : @"dm_line"] : nil;
+        static int n; if (f || n++ < 16) MLOG("wide lines %.1f px: vertex %s %s", S.line_w, vs->key, f ? "has a wide-line library" : "has no wide-line library (line_mesh.tsv): drawn one pixel wide");
+        vs->geo_mesh[@"ln"] = f = f ?: NSNull.null;
+    }
+    return f == NSNull.null ? nil : f;
+}
+static int line_mesh_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
+    float vw = fabsf(S.vp[0][2]), vh = fabsf(S.vp[0][3]);
+    if (!S.has_vp || vw < 1 || vh < 1) return 0;
+    id<MTLFunction> fn = line_mesh_fn(pr, dw, di); if (!fn) return 0;
+    uint64_t ib = 0; void *mb; uint64_t mo;
+    if (di && !mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &ib)) return 0;
+    uint32_t bi = (uint32_t)(dw ? dw->base_instance : di->base_instance), count = (uint32_t)(dw ? dw->count : di->count) & ~1u;
+    NvProg *raster = pr->geo_lean_raster;   // the vertex and pixel shaders alone (a line program has no geometry stage, so the slot is free)
+    if (!raster || raster->sh[0] != pr->sh[0] || raster->sh[1] != pr->sh[1]) { raster = [NvProg new]; raster->sh[0] = pr->sh[0]; raster->sh[1] = pr->sh[1]; pr->geo_lean_raster = raster; }
+    g_geo_mesh.on = 1; g_geo_mesh.line = 1; g_geo_mesh.miss = 0; g_geo_mesh.fn = fn; g_geo_mesh.lean = nil;
+    g_geo_mesh.la = (line_mesh_args){ib, di ? 1u << di->itype : 0, dw ? (uint32_t)dw->first : 0, count, di ? di->base_vertex : 0, bi, 0, {vw * 0.5f, vh * 0.5f}, S.line_w * 0.5f};
+    g_geo_program = raster;
+    p_draw synthetic = {.prim = 4, .count = 3, .instances = 1, .base_instance = (int32_t)bi};
+    draw(&synthetic, NULL);
+    g_geo_program = nil; g_geo_mesh.on = 0; g_geo_mesh.line = 0; args_dirty_all();
+    if (g_geo_mesh.miss) return 0;   // its pipeline is still being built: one-pixel lines this time
+    if (!g_line_mesh_n++) MLOG("wide lines: first mesh draw, vertex %s, %u segments %.1f px wide", pr->sh[0]->key, count / 2, S.line_w);
     return 1;
 }
 typedef struct {
@@ -495,7 +545,8 @@ static int geo_prep(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0, geo_jo
     // of intervening draws. The single-draw path keeps main's ordered copies.
     if (!may_wait) {
         if (ind) return -1;
-        for (int i = 0; i < 16; i++) if (S.vbuf[i].address & 3) return -1;
+        // An empty stream is never copied (vbuf_unaligned): FINAL FANTASY XII THE ZODIAC AGE leaves one bound at address 1, size 0, which kept every one of its geometry draws out of a run
+        for (int i = 0; i < 16; i++) if (S.vbuf[i].size && (S.vbuf[i].address & 3)) return -1;
     }
     int drained = g_geo_split_depth != 0;
     if (geo_conversion_hazard(vs) || (ind && geo_cpu_hazard(ind, dw0 ? 16 : 20))) {

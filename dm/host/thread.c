@@ -9,26 +9,27 @@
 #define THREAD_OBJ_SIZE 0x400
 static pthread_key_t g_keyown;   // raw pointers of the TLS block / thread-local region this thread allocated (see the end of guest_thread_init)
 static pthread_once_t g_keyown_once = PTHREAD_ONCE_INIT;
-static void own_free(void *p) { void **own = p; free(own[0]); free(own[1]); free(own); }
+static void own_free(void *p) { void **own = p; if (!dm_hib_free(own[0])) free(own[0]); if (!dm_hib_free(own[1])) free(own[1]); free(own); }
 static void own_key_init(void) { if (pthread_key_create(&g_keyown, own_free)) die("cannot create the free key for thread-local blocks"); }
 void guest_thread_init(void) {
-    pthread_setspecific(g_key18, 0);
+    dm_slot_set(g_key18, 0);
     // The TLS block and the thread-local region are freed when the thread exits. The guest overwrites the slots of the TLS / thread-local-region keys (it sets its own thread pointer), so they cannot be freed by the current value in the key:
     // the raw pointers that were allocated are recorded separately on this file's own key g_keyown and freed by its destructor (key destructors run at pthread_exit, like crash.c's signal alternate stack; the destructor only calls free, which is safe on a guest thread's small stack too).
     // They used not to be freed: every short-lived thread the game started leaked 8192 + 0x200 + 0x400 = 9728 bytes. The thread-local region and the current thread object are one block (the SDK may also overwrite the TLR[0x1f8] slot)
     pthread_once(&g_keyown_once, own_key_init);
-    void **own = calloc(2, sizeof *own); uint8_t *tlr = calloc(1, TLR_SIZE + THREAD_OBJ_SIZE);
+    // With hibernation both come from the host arena (dm.h dm_hib_calloc): guest stacks keep the thread-local region's address (each thread's outermost frame holds it)
+    void **own = calloc(2, sizeof *own); uint8_t *tlr = dm_hib_calloc(TLR_SIZE + THREAD_OBJ_SIZE); if (!tlr) tlr = calloc(1, TLR_SIZE + THREAD_OBJ_SIZE);
     if (!own || !tlr) die("guest thread-local block allocation failed");
-    own[0] = calloc(1, TLS_SIZE); own[1] = tlr;
+    own[0] = dm_hib_calloc(TLS_SIZE); if (!own[0]) own[0] = calloc(1, TLS_SIZE); own[1] = tlr;
     if (!own[0]) die("guest thread TLS block allocation failed");
     *(void **)(tlr + 0x1f8) = tlr + TLR_SIZE;               // current thread object
-    pthread_setspecific(g_keytls, own[0]); pthread_setspecific(g_keytlr, tlr);
+    dm_slot_set(g_keytls, own[0]); dm_slot_set(g_keytlr, tlr);
     void **prev = pthread_getspecific(g_keyown); if (prev) own_free(prev);   // re-initialised on the same thread: free the previous set first (the new one is what the slots now point to)
     pthread_setspecific(g_keyown, own);
 }
 // The thread's kernel ID at TLR[0x110], the one svcGetThreadId answers (hle_thread.c's thr_t id, never 0: 0 is the owner word of an unlocked mutex). Without it every
 // unlocked SDK 22 mutex reads as the caller's and the first heap lock aborts (docs/reference/threads.md)
-void guest_thread_set_id(uint64_t id) { *(uint32_t *)((uint8_t *)pthread_getspecific(g_keytlr) + 0x110) = (uint32_t)id; }
+void guest_thread_set_id(uint64_t id) { *(uint32_t *)((uint8_t *)dm_slot_get(g_keytlr) + 0x110) = (uint32_t)id; }
 
 // Gate stacks (entry.S dm_gate): the SVC gate's register frame and the host's SVC handlers run on a stack of the thread's own, never below the guest's sp, as on Horizon, whose kernel leaves a
 // thread's stack untouched during an SVC. Each thread holds a gate slot k: its KGATE slot points to entry.S stub k, which loads dm_gate_top[k]. A guest thread (hle_thread.c thread_main) runs
@@ -71,5 +72,5 @@ __attribute__((noinline)) void guest_gate_stack(int own_stack) {
         pthread_setspecific(g_keygslot, (void *)(uintptr_t)(k + 1));
     }
     dm_gate_top[k] = (uint64_t)(uintptr_t)top & ~15ull;
-    pthread_setspecific(g_keygate, (void *)(dm_gate_stubs + 16 * k));
+    dm_slot_set(g_keygate, (void *)(dm_gate_stubs + 16 * k));
 }

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- UI icon gesture_pinch: two fingertips moving apart and together (resize); original artwork -->
+  <circle cx="70" cy="186" r="24" fill="#ffffff"/>
+  <circle cx="186" cy="70" r="24" fill="#ffffff"/>
+  <path d="M100 156 L156 100 M112 104 L156 100 L152 144 M144 152 L100 156 L104 112" stroke="#ffffff" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" fill="none" stroke-opacity="0.8"/>
+</svg>

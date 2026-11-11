@@ -130,9 +130,11 @@ static int dm_fs_test_fail(const char *pt) {
 static int in_txn_dir(const char *hp) { return save_txn_from_path(hp); }
 static int rm_tree(const char *p);
 // Reads and checks a RomFS image's header and index; NULL (and a red line) when it is not a complete image
+_Atomic uint64_t g_fs_dropped;   // bytes of large reads dropped from the page cache (the graphics memory stats line)
 static romfs_img *img_open(const char *path) {
     romfs_img *m = romfs_image_open(path);
-    if (m) LOG("fs RomFS image %s: %llu entries", path, (unsigned long long)m->n);
+    if (m) { struct stat st; uint64_t idx = 0; if (!fstat(m->fd, &st)) { uint64_t ioff; if (romfs_image_read(m->fd, &ioff, 8, 8)) idx = (uint64_t)st.st_size - ioff; }
+             LOG("fs RomFS image %s: %llu entries; read at mount: its header and index only (%.1f MB), files are read on demand", path, (unsigned long long)m->n, idx / 1048576.0); }
     else LOG("[RED] fs RomFS image %s is not a complete image (copied in part? errno=%d)", path, errno);
     return m;
 }
@@ -226,7 +228,7 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
         // A path that is neither is a stale or mistyped one (an old run command still naming the RomFS folder a rebuild replaced with RomFS.img): stop here, not at the game's
         // first failed read (Echoes of Wisdom crashed 0.3 s after nnMain, GitHub issue #615). Add-on content and system data check their own paths before they mount
         if (stat(dir, &ist) || !(S_ISDIR(ist.st_mode) || S_ISREG(ist.st_mode)))
-            die("the game files %s (%s:) are missing: neither a folder nor a RomFS image (the rom mount is DM_ROMFS, or $DM_ROOT/romfs when DM_ROMFS is unset)", dir, name);
+            die("the game files %s (%s:) are missing (%s): neither a folder nor a RomFS image (the rom mount is DM_ROMFS, or $DM_ROOT/romfs when DM_ROMFS is unset)", dir, name, strerror(errno));
         if (S_ISREG(ist.st_mode) && !(g_mnt[g_nmnt].img = img_open(dir))) die("the game files %s are not a complete RomFS image", dir);
     }
     g_nmnt++;
@@ -414,7 +416,7 @@ static int set_guest_name(const char *hp, const char *path) {
     memcpy(guest, start, k); guest[k] = 0;
     const char *physical = strrchr(hp, '/') + 1;
     if (strcmp(physical, guest)) return setxattr(hp, FS_GUEST_NAME, guest, strlen(guest), 0, XATTR_NOFOLLOW);
-    if (!removexattr(hp, FS_GUEST_NAME, XATTR_NOFOLLOW) || errno == ENOATTR) return 0;
+    if (!removexattr(hp, FS_GUEST_NAME, XATTR_NOFOLLOW) || errno == ENOATTR || errno == ENOTSUP || errno == EOPNOTSUPP) return 0;   // a file system without xattrs (Android's /data for a shell) holds no stale name either
     return -1;
 }
 static Result err_res(const char *op, const char *path) {
@@ -749,8 +751,41 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
     return RES_OK;
 }
+// IO back-pressure (DM_IO_THROTTLE, default 1; Android): while the graphics backend reports memory pressure (dm_mem_io_pressure: MemAvailable under 900 MB or 300 MB down in a
+// second), each read waits 10 ms, plus 10 ms per 4 MB, at most 50 ms, and at most DM_IO_THROTTLE_MAX_MS (default 2000) in all per episode (it ends after 5 s without pressure).
+// FINAL FANTASY RESONANCE's 116 MB IoStore read was followed by 457 MB more resident memory in one second and the low-memory killer 5 s later: slower reads give reclaim and swap
+// time. Unreal's IoDispatcher waits for its reads as it would on a slow SD card. Each held read is logged (at most 200 lines), and each episode's total
+#ifdef __ANDROID__
+int dm_mem_io_pressure(void) __attribute__((weak));   // nvn_vk.c
+#else
+static int (*const dm_mem_io_pressure)(void) = 0;     // the Mac has no such watch
+#endif
+static void io_throttle(size_t sz) {
+    if (!dm_mem_io_pressure) return;
+    static int on = -1; static long maxms;
+    if (on < 0) { const char *e = getenv("DM_IO_THROTTLE"); maxms = (e = getenv("DM_IO_THROTTLE_MAX_MS")) ? atol(e) : 2000; e = getenv("DM_IO_THROTTLE"); on = !e || atoi(e) != 0; }
+    if (!on) return;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t ep0, last_p; static long slept, nreads; static int in_ep, nlog;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    int av = dm_mem_io_pressure(); long ms = 0;
+    pthread_mutex_lock(&mu);
+    if (in_ep && !av && now - last_p > 5000000000ull) {
+        LOG("[fs] memory pressure over: %ld reads held %ld ms in all over %.1f s", nreads, slept, (last_p - ep0) / 1e9); in_ep = 0;
+    }
+    if (av) {
+        if (!in_ep) { in_ep = 1; ep0 = now; slept = 0; nreads = 0; LOG("[fs] memory pressure (%d MB available): file reads slowed, at most %ld ms in all", av, maxms); }
+        last_p = now;
+        ms = 10 + (long)(sz >> 22) * 10; if (ms > 50) ms = 50; if (slept + ms > maxms) ms = maxms - slept; if (ms < 0) ms = 0;
+        if (ms) { slept += ms; nreads++; }
+    }
+    pthread_mutex_unlock(&mu);
+    if (!ms) return;
+    if (nlog++ < 200) LOG("[fs] read of %.1f MB held %ld ms (%d MB available)", sz / 1048576.0, ms, av);
+    usleep((useconds_t)ms * 1000);
+}
 HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) { h = FH_IN(h);
     if (!h) { *out = 0; return RES_FAIL; }   // a file handle is an fd; 0 is stdin and never a file the game opened: the null handle the game keeps using after a failed open
+    io_throttle(sz);
     size_t got = 0; int reprep = 0, fd = (int)h; int64_t base = 0;
     if (IMG_H(h)) {   // an image entry: read the image's descriptor at the entry's offset, never past its end
         const img_ent *x = &g_mnt[IMG_M(h)].img->e[IMG_K(h)];
@@ -777,6 +812,11 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
         got += r;
     }
     *out = got;
+#ifdef __ANDROID__
+    // A large read (the game's packages, movies) is not kept in the page cache once it is in guest memory: across a session the cache of a 9 GB RomFS grew to gigabytes, and
+    // with it the memory pressure under which HyperOS closed other apps (FINAL FANTASY RESONANCE). Small reads (headers, indexes, read again and again) stay cached
+    if (got >= (256u << 10)) { (void)posix_fadvise(fd, (off_t)(base + off), (off_t)got, POSIX_FADV_DONTNEED); atomic_fetch_add(&g_fs_dropped, got); }
+#endif
     if (g_fslog) { pthread_mutex_lock(&g_fslog_lock);
         static int hash_on = -1; if (hash_on < 0) hash_on = getenv("DM_FSLOG_HASH") != NULL;   // DM_FSLOG_HASH=1: append a column with the FNV-1a 64 of the content read (to compare whether the bytes read from two resource packs match)
         uint64_t fh = 0xcbf29ce484222325ull; if (hash_on) for (size_t i = 0; i < got; i++) fh = (fh ^ ((uint8_t *)buf)[i]) * 0x100000001b3ull;
@@ -919,6 +959,9 @@ HLE_FORCE("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", "fsp-srv → 
 
 // ---------- Directories ----------
 typedef struct { DIR *d; char path[1024]; DIR *od; char opath[1024]; DirectoryEntry *snap; int64_t nsnap, psnap; int mode; } dirh_t;
+// Open directory handles: the guest holds them as host pointers, so hibernation writes no snapshot while one is open
+static _Atomic int g_dirs_open;
+int dm_fs_dirs_open(void) { return atomic_load(&g_dirs_open); }
 static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
     char fwd[1024]; rest = fwd_slashes(rest, fwd, sizeof fwd);
     char *roots = strdup(m->overlay);
@@ -971,7 +1014,7 @@ HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → o
         if (k >= 0 && g_mnt[mi].img->e[k].type) errno = ENOTDIR, k = -1;
         if (k < 0) return err_res("opendir", path);
         const romfs_img *m = g_mnt[mi].img; const img_ent *x = &m->e[k];
-        dirh_t *h = calloc(1, sizeof *h); if (!h || !(h->snap = calloc(x->b ? x->b : 1, sizeof *h->snap))) die("RomFS image directory allocation failed");
+        dirh_t *h = calloc(1, sizeof *h); atomic_fetch_add(&g_dirs_open, 1); if (!h || !(h->snap = calloc(x->b ? x->b : 1, sizeof *h->snap))) die("RomFS image directory allocation failed");
         h->nsnap = (int64_t)x->b; h->mode = mode; strlcpy(h->path, path, sizeof h->path);
         for (uint64_t j = 0; j < x->b; j++) {
             const img_ent *c = &m->e[x->a + j]; DirectoryEntry *o = &h->snap[j];
@@ -982,7 +1025,7 @@ HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → o
     }
     HP(path); DIR *d = opendir(hp);
     if (!d) return err_res("opendir", hp);
-    dirh_t *h = calloc(1, sizeof *h); h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
+    dirh_t *h = calloc(1, sizeof *h); atomic_fetch_add(&g_dirs_open, 1); h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
     const char *c = strchr(path, ':');
     if (c) for (int i = 0; i < g_nmnt; i++) if (g_mnt[i].overlay[0] && strlen(g_mnt[i].name) == (size_t)(c - path) && !strncmp(g_mnt[i].name, path, (size_t)(c - path))) {
         dir_snapshot(h, &g_mnt[i], c + 1); break;
@@ -1009,7 +1052,7 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
 }
 HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → closedir(3)", void, h_fs_CloseDirectory, uint64_t hh) {
     if (!hh) return;   // the game also closes after a failed open (handle 0): nothing to do in the original either
-    dirh_t *h = (dirh_t *)hh; if (h->d) closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);
+    dirh_t *h = (dirh_t *)hh; if (h->d) closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h); atomic_fetch_sub(&g_dirs_open, 1);
 }
 
 // ---------- Overloads from newer SDKs (SDK 16: MountRom without a cache, ReadFile without the bytes-read output / with read options, directory entry count) ----------
@@ -1042,3 +1085,61 @@ HLE_FORCE("_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE", "fsp-srv; save dat
 HLE_FORCE("_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE", "fsp-srv; file read priority, ignored by the host", void, h_fs_SetPrio, int prio) { (void)prio; }
 HLE_FORCE("_ZN2nn2fs6detail18IsEnabledAccessLogEj", "fsp-srv; access log always off (returns bool)", unsigned, h_fs_AccessLogMask, unsigned mask) { (void)mask; return 0; }
 HLE_FORCE("_ZN2nn2fs6detail18IsEnabledAccessLogEv", "fsp-srv; access log always off (returns bool)", unsigned, h_fs_AccessLog, void) { return 0; }
+
+// Hibernation (hle_hibsnap.c): the mount table and the open files in a snapshot. A mount comes back as it was, not mounted again: a save mount's work directory holds the
+// writes since its last Commit, which a new mount would drop (the snapshot's save fingerprint covers that directory). A RomFS image is opened again; an image entry handle
+// names its mount by index, the same after the restore. A plain file comes back on the same descriptor number (the guest holds it), opened again by its path
+typedef struct { char name[32], dir[1024], overlay[4096], commit[1024]; int32_t ro, txn_root, poison, img; } hib_mnt;
+typedef struct { int32_t fd, mode, txn, pad; char path[1024]; } hib_fd;
+size_t dm_hib_fs_save(uint8_t **out) {
+    pthread_mutex_lock(&g_lock);
+    int nfd = 0; for (int fd = 0; fd < 65536; fd++) if (g_fmode[fd]) nfd++;
+    size_t n = 8 + (size_t)g_nmnt * sizeof(hib_mnt) + (size_t)nfd * sizeof(hib_fd);
+    uint8_t *b = calloc(1, n), *p = b; int32_t c[2] = {g_nmnt, nfd}; memcpy(p, c, 8); p += 8;
+    for (int i = 0; i < g_nmnt; i++) {
+        hib_mnt *m = (hib_mnt *)p; p += sizeof *m;
+        memcpy(m->name, g_mnt[i].name, sizeof m->name); memcpy(m->dir, g_mnt[i].dir, sizeof m->dir); memcpy(m->overlay, g_mnt[i].overlay, sizeof m->overlay); memcpy(m->commit, g_mnt[i].commit, sizeof m->commit);
+        m->ro = g_mnt[i].ro; m->txn_root = g_mnt[i].txn_root; m->poison = atomic_load(&g_mnt[i].poison); m->img = g_mnt[i].img != NULL;
+    }
+    for (int fd = 0; fd < 65536; fd++) if (g_fmode[fd]) {
+        hib_fd *f = (hib_fd *)p; p += sizeof *f;
+        f->fd = fd; f->mode = g_fmode[fd]; f->txn = atomic_load(&g_ftxn[fd]);
+#ifdef __APPLE__
+        if (fcntl(fd, F_GETPATH, f->path)) f->path[0] = 0;
+#else
+        char lk[64]; snprintf(lk, sizeof lk, "/proc/self/fd/%d", fd); ssize_t k = readlink(lk, f->path, sizeof f->path - 1); f->path[k > 0 ? k : 0] = 0;
+#endif
+    }
+    pthread_mutex_unlock(&g_lock);
+    *out = b; return n;
+}
+int dm_hib_fs_restore(const uint8_t *b, size_t n) {
+    int32_t c[2]; if (n < 8) return -1; memcpy(c, b, 8);
+    if (c[0] < 0 || c[0] > MAX_MOUNT || c[1] < 0 || n != 8 + (size_t)c[0] * sizeof(hib_mnt) + (size_t)c[1] * sizeof(hib_fd)) return -1;
+    const hib_mnt *m = (const hib_mnt *)(b + 8); const hib_fd *f = (const hib_fd *)(m + c[0]);
+    pthread_once(&g_txn_lock_once, txn_locks_init);
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < c[0]; i++) {
+        memcpy(g_mnt[i].name, m[i].name, sizeof m[i].name); memcpy(g_mnt[i].dir, m[i].dir, sizeof m[i].dir); memcpy(g_mnt[i].overlay, m[i].overlay, sizeof m[i].overlay); memcpy(g_mnt[i].commit, m[i].commit, sizeof m[i].commit);
+        g_mnt[i].ro = m[i].ro; g_mnt[i].txn_root = m[i].txn_root; atomic_store(&g_mnt[i].poison, m[i].poison); atomic_store(&g_mnt[i].first_write_ns, 0);
+        g_mnt[i].img = m[i].img ? img_open(m[i].dir) : NULL;
+        if (m[i].img && !g_mnt[i].img) { pthread_mutex_unlock(&g_lock); LOG("[RED] hibernate: the RomFS image %s cannot be opened again", m[i].dir); return -1; }
+        LOG("fs mount %s restored: %s", g_mnt[i].name, g_mnt[i].dir);
+    }
+    g_nmnt = c[0];
+    int bad = 0;
+    for (int i = 0; i < c[1] && !bad; i++) {
+        int want = f[i].fd, mode = f[i].mode;
+        int fd = open(f[i].path, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
+        if (fd < 0) { LOG("[RED] hibernate: file %s cannot be opened again (errno %d)", f[i].path, errno); bad = 1; break; }
+        if (fd != want) {
+            if (fcntl(want, F_GETFD) != -1) { LOG("[RED] hibernate: descriptor %d of %s is taken in this process", want, f[i].path); close(fd); bad = 1; break; }
+            if (dup2(fd, want) != want) { close(fd); bad = 1; break; }
+            close(fd);
+        }
+        g_fmode[want] = (uint8_t)mode; atomic_store(&g_ftxn[want], (uint16_t)f[i].txn);
+        LOG("fs file restored on descriptor %d: %s", want, f[i].path);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return bad ? -1 : 0;
+}

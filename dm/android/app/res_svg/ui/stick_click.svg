@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- UI icon stick_click: a stick tapped twice (double tap = the stick's click, L3 / R3); original artwork -->
+  <circle cx="128" cy="140" r="84" fill="none" stroke="#ffffff" stroke-width="14" stroke-opacity="0.55"/>
+  <circle cx="128" cy="140" r="38" fill="#ffffff"/>
+  <path d="M96 52 A40 40 0 0 1 160 52 M76 30 A68 68 0 0 1 180 30" fill="none" stroke="#ffffff" stroke-width="14" stroke-linecap="round"/>
+</svg>

@@ -7,8 +7,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <limits.h>
+#ifdef __APPLE__
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
+#endif
 #include "hle.h"
 
 module_t *g_mod;
@@ -20,6 +22,7 @@ pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
 enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_N };
 
 uint64_t resolve_import(module_t *m, const char *name);
+static void *module_map(size_t len) { return dm_hib_module_map_hook ? dm_hib_module_map_hook(len) : mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); }
 int hle_implements(const char *name);
 void gate_register(uint64_t ret_addr, const char *kind, int arg, uint64_t orig);
 
@@ -29,6 +32,41 @@ static pthread_key_t key_value(unsigned i) {
     default: return g_keygate;
     }
 }
+#ifdef __ANDROID__
+// The slot block of this thread (index 0 unused, so that no key page entry is 0), freed by a key destructor at thread exit; bionic's TLS_SLOT_APP is left to apps
+enum { TP_SLOT_APP = 2 };
+static pthread_key_t g_keyblock;
+static void slot_block_free(void *b) {
+    void **tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    if (tp[TP_SLOT_APP] == b) tp[TP_SLOT_APP] = NULL;
+    free(b);
+}
+void dm_slot_set(pthread_key_t k, const void *v) {
+    void **tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    void **b = tp[TP_SLOT_APP];
+    if (!b) {
+        if (!v) return;
+        if (!(b = calloc(1 + KEY_N, sizeof *b))) die("thread slot block allocation failed");
+        tp[TP_SLOT_APP] = b; pthread_setspecific(g_keyblock, b);
+    }
+    b[k] = (void *)v;
+}
+static void create_keys(void) {
+    if (pthread_key_create(&g_keyblock, slot_block_free)) die("cannot create the slot block key");
+    g_key18 = 1 + KEY_K18; g_keytls = 1 + KEY_KTLS; g_keytlr = 1 + KEY_KTLR; g_keygate = 1 + KEY_KGATE;
+    void **tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    if (tp[TP_SLOT_APP]) die("bionic's TLS_SLOT_APP is already in use (%p): the thread slots cannot live there", tp[TP_SLOT_APP]);
+    LOG("thread slots behind TLS_SLOT_APP, indices K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", (unsigned long)g_key18, (unsigned long)g_keytls, (unsigned long)g_keytlr, (unsigned long)g_keygate);
+}
+// Slot check: what the rewritten code reads (tpidr_el0 → TLS_SLOT_APP → block + 8 * key page entry) is what dm_slot_set wrote
+static void tsd_check(void) {
+    dm_slot_set(g_key18, (void *)0x1234);
+    void **tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
+    if (((uint64_t *)tp[TP_SLOT_APP])[off / 8] != 0x1234) die("thread slot layout mismatch");
+    dm_slot_set(g_key18, 0);
+}
+#else
 static void create_keys(void) {
     if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) ||
         pthread_key_create(&g_keytlr, NULL) || pthread_key_create(&g_keygate, NULL)) die("cannot create the host key");
@@ -43,6 +81,7 @@ static void tsd_check(void) {
     if (((uint64_t *)(base & ~7ull))[off / 8] != 0x1234) die("TSD layout mismatch");
     pthread_setspecific(g_key18, 0);
 }
+#endif
 
 static void build_symhash(module_t *m);
 static void parse_dynamic(module_t *m) {
@@ -151,7 +190,7 @@ static uint64_t resolve_sym(module_t *m, const char *name) {
 static const hle_force_ent *g_force; static unsigned g_nforce; static unsigned *g_force_hits;
 static unsigned *g_fidx, g_fmask;   // name hash over the table: force_lookup runs for every named relocation, and each lookup used to strcmp its way through all 722 entries (the swhle table's scan is hashed the same way, hle.c)
 static void force_init(void) {
-    unsigned long sz; g_force = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &sz);
+    unsigned long sz; g_force = (const hle_force_ent *)DM_SECTION_DATA(swforce, &sz);
     g_nforce = g_force ? (unsigned)(sz / sizeof *g_force) : 0;
     g_force_hits = calloc(g_nforce + 1, sizeof *g_force_hits);
     unsigned cap = 16; while (cap < g_nforce * 2) cap <<= 1;
@@ -168,7 +207,9 @@ static void *force_lookup(const char *name) {
         unsigned i = g_fidx[j] - 1;
         if (!strcmp(g_force[i].name, name)) {
             if (!g_force_hits[i]++ && g_flag.imports) LOG("force %s  (%s)", name, g_force[i].why);
-            void *hlecount_wrap(const char *, const char *, void *); return hlecount_wrap("FORCE", name, g_force[i].fn);   // A counting stub when DM_HLECOUNT is set
+            void *fn = g_force[i].fn;
+            if (dm_hib_thunk_hook) { void *h = dm_hib_thunk_hook(fn); if (h) fn = h; }   // hibernation: a restartable call's stub (hle_hib.c)
+            void *hlecount_wrap(const char *, const char *, void *); return hlecount_wrap("FORCE", name, fn);   // A counting stub when DM_HLECOUNT is set
         }
     }
     return NULL;
@@ -186,7 +227,7 @@ static void force_check(void) {
 static void read_layout(module_t *m, const char *dir) {
     char path[1024]; snprintf(path, sizeof path, "%s/%s.fixups.tsv", dir, m->name);
     FILE *f = fopen(path, "r");
-    if (!f) die("open %s", path);
+    if (!f) die("open %s: %s", path, strerror(errno));
     static const char *kn[KEY_N] = {"K18", "KTLS", "KTLR", "KGATE"};
     char line[256], key[48]; unsigned long v; unsigned seen = 0;
     while (fgets(line, sizeof line, f)) {
@@ -208,6 +249,7 @@ static void read_layout(module_t *m, const char *dir) {
             if (m->n_ue_cvar == (int)(sizeof m->ue_cvar / sizeof *m->ue_cvar) || strlen(key + 8) >= sizeof m->ue_cvar[0].name) die("%s: too many Unreal console variables, or too long a name: %s", path, key);
             strcpy(m->ue_cvar[m->n_ue_cvar].name, key + 8); m->ue_cvar[m->n_ue_cvar++].off = v;
         }
+        else if (!strcmp(key, "TP_SLOT")) m->tp_slot = (unsigned)v;
         else if (!strcmp(key, "BUILD_ID")) sscanf(line, "# %*s %32s", m->build_id);
         else for (int k = 0; k < KEY_N; k++) {
             size_t n = strlen(kn[k]);
@@ -219,6 +261,11 @@ static void read_layout(module_t *m, const char *dir) {
     fclose(f);
     if (!m->patch_off || m->key_page_off % 0x4000 || m->key_page_size != 0x4000 || seen != (1u << KEY_N) - 1)
         die("%s: the output comes from an old rewriter; rewrite the modules again with dm/tools/patch_nso.py", path);
+#ifdef __ANDROID__
+    if (m->tp_slot != 2) die("%s: rewritten for Apple's thread slots; rewrite the modules for Android (DM_PATCH_TP=android dm/tools/patch_nso.py)", path);
+#else
+    if (m->tp_slot) die("%s: rewritten for Android's thread slots (TP_SLOT %u); rewrite the modules without DM_PATCH_TP", path, m->tp_slot);
+#endif
     if (m->patch_off < 0 && (!m->image_size || !m->file_image_len || m->file_image_len % 0x4000 || m->patch_off % 0x4000 || m->key_page_off + m->key_page_size > m->image_size))
         die("%s: patch area before the base, but IMAGE_SIZE / FILE_IMAGE_LEN missing or wrong", path);
     if ((m->back_off || m->back_len) && (m->patch_off >= 0 || !m->back_len || m->back_off % 0x4000 || m->back_len % 0x4000 || m->back_off < m->key_page_off + m->key_page_size
@@ -573,7 +620,7 @@ static void map_image(module_t *m, const char *dir) {
 #else
 static uint8_t *slurp(const char *path, size_t *n) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) die("open %s", path);
+    if (fd < 0) die("open %s: %s", path, strerror(errno));
     struct stat st; fstat(fd, &st);
     uint8_t *p = malloc(st.st_size);
     if (read(fd, p, st.st_size) != st.st_size) die("read %s", path);
@@ -592,7 +639,7 @@ static void map_image(module_t *m, const char *dir) {
         if (sz < fl + bl) die("%s is shorter than FILE_IMAGE_LEN %#llx + BACK_LEN %#llx", path, (unsigned long long)fl, (unsigned long long)bl);
         m->size = m->image_size; m->patch_len = (sz - bl - fl + 0x3FFF) & ~0x3FFFull;
         if (m->patch_len > pre) die("%s patch area of %#llx bytes does not fit in the %#llx before the base", path, (unsigned long long)m->patch_len, (unsigned long long)pre);
-        uint8_t *a = mmap(NULL, pre + m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        uint8_t *a = module_map(pre + m->size);   // mmap(NULL), or the fixed module window with DM_HIBERNATE (hle_hib.c)
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - bl - fl); if (bl) memcpy(m->base + m->back_off, raw + sz - bl, bl);
@@ -605,7 +652,7 @@ static void map_image(module_t *m, const char *dir) {
         return;
     }
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
-    m->base = mmap(NULL, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    m->base = module_map(m->size);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
     memcpy(m->base, raw, sz); free(raw); install_key_page(m);
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
@@ -615,7 +662,11 @@ static void map_image(module_t *m, const char *dir) {
 }
 #endif
 
+static char g_module_dir[1024];   // the folder the modules were loaded from (dm_module_dir)
+const char *dm_module_dir(void) { return g_module_dir; }
+
 void load_modules(const char *dir, const char **names, int n) {
+    strlcpy(g_module_dir, dir, sizeof g_module_dir);
     // Map everything and parse the symbol tables first, then relocate all at once (cross-module symbols must all be in place first)
     // DM_BOOTPROF: breakdown of ① host loading (milliseconds), to set the upper bound for ③ pre-relocation / mmap
     uint64_t t0 = now_ns(), tm = 0, tp = 0, tg = 0, tr = 0, t;

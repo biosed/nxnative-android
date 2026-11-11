@@ -30,6 +30,12 @@ zip_store	.pak:.ttf:.txt:.ucas:.utoc:.metallib
 # the game by the time that really passed: DM_NVN_REGLUM traces of the same keys from the same save at 30 and 60 fps (59.8 fps, frame time p99 18 ms on the Mac) match from the load
 # through a 3 s walk (thumbnail difference ≤ 0.006). DM_FPS_TARGET=30 (Documents/env.txt on the iPhone) keeps the game's 30 and saves power
 fps_target	60
+# The game sets the near = 0 depth mode (nvnDeviceSetDepthMode; Unreal's reversed-Z): the pipeline bases made before it runs (the NSP script's prebuild, the shipped lists) take the main0_z
+# vertex entries. Without the key the prebuild made all 9,253 bases for near = -w, and a first start made them again behind "Preparing pipelines" (199 s on an M1)
+depth_mode	zero
+# Android: both range stores on (nvn_vk.c): uniform texel buffers and vertex streams kept across frames in a host buffer, validated by write-protected pages (nvn_dirty).
+# Session 4 / 5 at matched clocks: recording -0.6...-0.9 ms (texel) and -0.2 ms (buf), verify 0 differences; per game, since they write-protect guest pages
+range_store	texel buf
 
 # ---- Memory ----
 # Unreal Engine 5.6.1: nninitStartup (main+0x13370) reserves one 62 GB region for the engine, and its FMallocBinned3

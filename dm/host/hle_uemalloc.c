@@ -43,6 +43,10 @@ static const struct { const char *build, *what; int layout; uint64_t obj, vtable
 enum { NSLOT = 32 };
 
 static malloc_zone_t *g_zone;
+// With hibernation the heap runs in the fixed layout instead (hle_ueheap.c), so that a snapshot holds it: the zone calls below go there
+static int g_ueh;
+void *dm_ueheap_alloc(size_t n, size_t align); void dm_ueheap_free(void *p); size_t dm_ueheap_size(const void *p); void *dm_ueheap_realloc(void *p, size_t n); int dm_ueheap_init(void);
+static size_t blk_size(const void *p) { return g_ueh ? dm_ueheap_size(p) : malloc_size(p); }
 static _Atomic int64_t g_used, g_peak;   // bytes in use (usable sizes) and their high-water mark, for the [mem] line (one per 256 MB of new peak)
 static void used(int64_t d) {
     int64_t after = atomic_fetch_add(&g_used, d) + d, peak = atomic_load(&g_peak);
@@ -51,40 +55,78 @@ static void used(int64_t d) {
 }
 static size_t align_of(uint32_t a) { return a > 16 ? a : 16; }   // 0 = DEFAULT_ALIGNMENT, 16 bytes as Binned3 gives
 static void *alloc(size_t n, uint32_t a) {
-    void *p = align_of(a) == 16 ? malloc_zone_malloc(g_zone, n ? n : 1) : malloc_zone_memalign(g_zone, align_of(a), n ? n : 1);
-    if (p) used((int64_t)malloc_size(p));
+    void *p = g_ueh ? dm_ueheap_alloc(n ? n : 1, align_of(a)) : align_of(a) == 16 ? malloc_zone_malloc(g_zone, n ? n : 1) : malloc_zone_memalign(g_zone, align_of(a), n ? n : 1);
+    if (p) used((int64_t)blk_size(p));
     return p;
 }
-static void release(void *p) { if (p) { used(-(int64_t)malloc_size(p)); malloc_zone_free(g_zone, p); } }
+static void release(void *p) { if (p) { used(-(int64_t)blk_size(p)); if (g_ueh) dm_ueheap_free(p); else malloc_zone_free(g_zone, p); } }
 static void *realloc_aligned(void *p, size_t n, uint32_t a) {
     if (!p) return alloc(n, a);
     if (!n) { release(p); return NULL; }
-    size_t old = malloc_size(p);
-    if (align_of(a) == 16) { void *q = malloc_zone_realloc(g_zone, p, n); if (q) used((int64_t)malloc_size(q) - (int64_t)old); return q; }
+    size_t old = blk_size(p);
+    if (align_of(a) == 16) { void *q = g_ueh ? dm_ueheap_realloc(p, n) : malloc_zone_realloc(g_zone, p, n); if (q) used((int64_t)blk_size(q) - (int64_t)old); return q; }
     if (!((uintptr_t)p & (align_of(a) - 1)) && old >= n) return p;
     void *q = alloc(n, a); if (!q) return NULL;
     memcpy(q, p, old < n ? old : n); release(p); return q;
 }
 
+// Big allocations. FINAL FANTASY RESONANCE's heap stepped from 0.75 to 1.05 GB in use within seconds on the Xiaomi Pad 8, and each run where it did was ended by the low-memory
+// killer seconds later. Each allocation or reallocation of DM_UE_BIGALLOC_MB (default 8; 0: off) or more is logged with the guest code that asked for it (the return address and
+// up to five frames up the frame-pointer chain, each as module+offset; the chain is read with vm_read_overwrite, so a broken one ends the walk instead of faulting), the thread,
+// and the heap's total after it; at most 400 lines. dm_ue_heap_used / dm_ue_heap_big: the graphics backend's per-second growth line and its early trim (nvn_vk.c mem_watch)
+static int64_t g_big_min = -1; static _Atomic int g_big_n; static _Atomic int64_t g_big_bytes;
+int64_t dm_ue_heap_used(void) { return atomic_load(&g_used); }
+int64_t dm_ue_heap_big(void) { return atomic_load(&g_big_bytes); }   // what the big allocations and reallocations added, all told (frees not taken off)
+static int big_where(uint64_t v, char *o, size_t n) {
+    for (int k = 0; k < g_nmod; k++) { uint64_t b = (uint64_t)(uintptr_t)g_mod[k].base; if (v >= b && v < b + g_mod[k].size) return snprintf(o, n, " %s+%#llx", g_mod[k].name, (unsigned long long)(v - b)); }
+    return snprintf(o, n, " %#llx", (unsigned long long)v);
+}
+static void big_note(const char *op, size_t n, size_t old, uint32_t a, void *lr, void *fp) {
+    atomic_fetch_add(&g_big_bytes, (int64_t)n - (int64_t)old);
+    if (atomic_fetch_add(&g_big_n, 1) >= 400) return;
+    char ch[256]; int at = 0;
+    at += big_where((uint64_t)(uintptr_t)lr, ch + at, sizeof ch - at);
+    uint64_t f = fp ? *(uint64_t *)fp : 0;   // this function's frame record: the guest caller's frame pointer
+    for (int i = 0; i < 5 && f && at < (int)sizeof ch - 40; i++) {
+        uint64_t rec[2]; vm_size_t got = 0;
+        if (f & 7 || vm_read_overwrite(mach_task_self(), (vm_address_t)f, sizeof rec, (vm_address_t)rec, &got) != KERN_SUCCESS || got != sizeof rec || !rec[1]) break;
+        at += snprintf(ch + at, sizeof ch - at, " <"); at += big_where(rec[1], ch + at, sizeof ch - at);
+        if (rec[0] <= f || rec[0] - f > (1u << 20)) break;
+        f = rec[0];
+    }
+    char tn[32] = "?"; pthread_getname_np(pthread_self(), tn, sizeof tn);
+    if (old) LOG("[mem] Unreal %s %.1f MB (was %.1f MB, alignment %u) on '%s', the heap now %.0f MB in use; from%s", op, n / 1048576.0, old / 1048576.0, a, tn, atomic_load(&g_used) / 1048576.0, ch);
+    else LOG("[mem] Unreal %s %.1f MB (alignment %u) on '%s', the heap now %.0f MB in use; from%s", op, n / 1048576.0, a, tn, atomic_load(&g_used) / 1048576.0, ch);
+}
+static bool m_GetAllocationSize(void *self, void *p, size_t *out);
+static size_t m_old_size(void *p) { size_t n = 0; m_GetAllocationSize(NULL, p, &n); return n; }
+static inline int big(size_t n) {
+    if (g_big_min < 0) { const char *e = getenv("DM_UE_BIGALLOC_MB"); g_big_min = (e ? atoll(e) : 8) << 20; }
+    return g_big_min > 0 && n >= (size_t)g_big_min;
+}
+#define BIG(op, n, old, a, q) do { if ((q) && big(n)) big_note(op, n, old, a, __builtin_return_address(0), __builtin_frame_address(0)); } while (0)
+
 static void *m_Malloc(void *self, size_t n, uint32_t a) {
     (void)self; void *p = alloc(n, a);
     if (!p) die("Unreal heap: out of memory (%zu bytes, alignment %u, %.2f GB in use)", n, a, atomic_load(&g_used) / 1073741824.0);
+    BIG("Malloc", n, 0, a, p);
     return p;
 }
-static void *m_TryMalloc(void *self, size_t n, uint32_t a) { (void)self; return alloc(n, a); }
+static void *m_TryMalloc(void *self, size_t n, uint32_t a) { (void)self; void *p = alloc(n, a); BIG("TryMalloc", n, 0, a, p); return p; }
 static void *m_Realloc(void *self, void *p, size_t n, uint32_t a) {
-    (void)self; void *q = realloc_aligned(p, n, a);
+    (void)self; size_t old = p && big(n) ? m_old_size(p) : 0; void *q = realloc_aligned(p, n, a);
     if (!q && n) die("Unreal heap: out of memory in Realloc (%zu bytes, alignment %u, %.2f GB in use)", n, a, atomic_load(&g_used) / 1073741824.0);
+    BIG("Realloc", n, old, a, q);
     return q;
 }
-static void *m_TryRealloc(void *self, void *p, size_t n, uint32_t a) { (void)self; return realloc_aligned(p, n, a); }
+static void *m_TryRealloc(void *self, void *p, size_t n, uint32_t a) { (void)self; size_t old = p && big(n) ? m_old_size(p) : 0; void *q = realloc_aligned(p, n, a); BIG("TryRealloc", n, old, a, q); return q; }
 static void m_Free(void *self, void *p) { (void)self; release(p); }
 static size_t m_QuantizeSize(void *self, size_t n, uint32_t a) { (void)self; (void)a; return malloc_good_size(n); }
-static bool m_GetAllocationSize(void *self, void *p, size_t *out) { (void)self; if (!p) return false; *out = malloc_size(p); return true; }
+static bool m_GetAllocationSize(void *self, void *p, size_t *out) { (void)self; if (!p) return false; *out = blk_size(p); return true; }
 static void *m_Malloc32(void *self, uint32_t n, uint32_t a) { return m_Malloc(self, n, a); }
 static void *m_Realloc32(void *self, void *p, uint32_t n, uint32_t a) { return m_Realloc(self, p, n, a); }
 static uint32_t m_QuantizeSize32(void *self, uint32_t n, uint32_t a) { (void)self; (void)a; size_t q = malloc_good_size(n); return q > UINT32_MAX ? n : (uint32_t)q; }
-static bool m_GetAllocationSize32(void *self, void *p, uint32_t *out) { (void)self; if (!p) return false; *out = (uint32_t)malloc_size(p); return true; }
+static bool m_GetAllocationSize32(void *self, void *p, uint32_t *out) { (void)self; if (!p) return false; *out = (uint32_t)blk_size(p); return true; }
 static void m_Nothing(void *self) { (void)self; }   // Trim (its bool argument is ignored), the thread-local cache setup and teardown, DumpAllocatorStats
 static void *g_vt[NSLOT];
 static const char *g_what;
@@ -102,6 +144,10 @@ static void obj_made(uint64_t *regs, int param) {
 // outside the guest block, so the check refused it and the SDK aborted in MapAliasStack before the game started (the caller has already checked the guest block's own regions)
 int dm_ue_heap_owns(uint64_t a, uint64_t n) {
     if (!g_zone || !a || !n) return 0;
+#ifdef __ANDROID__
+    a &= 0x00FFFFFFFFFFFFFFull;   // a heap pointer's top byte is a tag on Android (the app turns tagging off in its manifest; the adb program keeps it)
+#endif
+    if (g_ueh) { int dm_ueheap_owns(uint64_t a, uint64_t n); return dm_ueheap_owns(a, n); }   // the heap in the hibernation layout (hle_ueheap.c)
     int dm_guest_as_contains(uintptr_t a);   // hle_svc.c
     if (dm_guest_as_contains((uintptr_t)a) || dm_guest_as_contains((uintptr_t)(a + n - 1))) return 0;   // inside the guest block: not this heap
     vm_address_t at = (vm_address_t)a; vm_size_t sz = 0; vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
@@ -120,6 +166,7 @@ static void fill(const uint8_t *vtable, int L, const char *what) {
     g_vt[k_lay[L].quantize] = s32 ? (void *)m_QuantizeSize32 : (void *)m_QuantizeSize; g_vt[k_lay[L].get_size] = s32 ? (void *)m_GetAllocationSize32 : (void *)m_GetAllocationSize;
     for (int s = 0; s < 6 && k_lay[L].nothing[s]; s++) g_vt[k_lay[L].nothing[s]] = (void *)m_Nothing;
     g_zone = malloc_create_zone(0, 0); malloc_set_zone_name(g_zone, "guest Unreal heap"); g_what = what;
+    g_ueh = dm_ueheap_init();
 }
 
 // Called once the modules are loaded and relocated, before any guest code runs

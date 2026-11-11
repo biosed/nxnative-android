@@ -7,11 +7,14 @@ void nvn_dirty_add_range(const void *mem, size_t size);           // Register a 
 void nvn_dirty_stat(int *live, int *peak, int *cap);                // number of registered memory pools, peak, tracking table capacity (for the memory readout line)
 void nvn_dirty_remove_range(const void *mem);                     // Pool destruction: restore protected pages to writable and mark invalid
 int nvn_dirty_tracked(const void *addr, size_t len);
-void nvn_dirty_protect(const void *addr, size_t len);              // Set the covered pages read-only
+int nvn_dirty_protect(const void *addr, size_t len);               // Set the covered pages read-only; 1 when every page is now protected and tracked (0: untracked, or an mprotect failed: those pages count as written from then on)
 uint64_t nvn_dirty_now(void);                                      // Current generation: take the content's stamp before nvn_dirty_protect and before reading it
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp); // Covered pages were written after the stamp -> 1
 const void *nvn_dirty_span(const void *addr, size_t len);          // The tracked range holding the span (a handle to keep; NULL = untracked)
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp);   // nvn_dirty_since through a kept handle (rechecked, scanned again only if it no longer holds the span)
 void nvn_dirty_stats(uint64_t *faults, uint64_t *preps);           // Cumulative: number of page faults triggered by game writes, number of pages unprotected before host writes
 void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns);   // Cumulative: this module's mprotect call count, pages covered, time spent
+uint64_t nvn_dirty_span_regid(const void *span);                  // The registration id of a span handle (nvn_dirty_span): changes when its slot is reused by another pool; 0 when not live
+uint64_t nvn_dirty_mp_failures(void);                              // mprotect calls of this module that failed (cumulative)
+int nvn_dirty_thread_faults(int *tid, uint64_t *n, int max);       // Cumulative page faults by thread (Android; up to max threads, in first-fault order): returns how many
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total); // Currently live slots, slot table high-water mark, total number of registrations
