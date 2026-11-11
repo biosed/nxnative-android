@@ -1819,6 +1819,7 @@ static void garbage_free(uint64_t done) {
     }
     pthread_mutex_unlock(&g_gbmu);
 }
+static VkFormat g_tv_fmt;   // the format of the view tex_view returned last (recording thread)
 // A view of the image: type and format from the NVN view (or the texture), levels and layers, swizzle (the format's missing alpha, the texture's and the view's swizzles)
 static VkImageView tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_vw, int want_type, int rt) {
     int target = has_vw && vw->set_target ? vw->target : t->d.target;
@@ -1872,6 +1873,7 @@ static VkImageView tex_view(vtex *v, const tex_t *t, const view_t *vw, int has_v
     // ((stencil >> 4) & lighting channel bits, from .y) wrote no lighting channel anywhere, and what a channel-limited light should light stayed dark (FINAL FANTASY RESONANCE's battle
     // sprites as dark silhouettes). The second component now reads the first (an identity swizzle {R, R, B, A})
     if (asp == VK_IMAGE_ASPECT_STENCIL_BIT && !rt) for (int i = 0; i < 4; i++) if (swz[i] == 3) swz[i] = 2;
+    g_tv_fmt = f.f;   // the format this view is made in (set_rt_: the attachment's format for passes and pipelines)
     uint64_t key = (uint64_t)f.f | (uint64_t)vt << 16 | (uint64_t)bl << 20 | (uint64_t)nl << 25 | (uint64_t)b0 << 30 | (uint64_t)nly << 42 | (uint64_t)(swz[0] | swz[1] << 3 | swz[2] << 6 | swz[3] << 9) << 50 | (uint64_t)(rt == 2 || rt == 3) << 62 | (uint64_t)(rt == 1 || rt == 3) << 63;
     if (asp == VK_IMAGE_ASPECT_STENCIL_BIT) key = ~key;   // the stencil aspect's views apart from the depth ones
     for (int i = 0; i < v->nviews; i++) if (v->views[i].key == key) return v->views[i].v;
@@ -2774,20 +2776,12 @@ static void set_rt(const uint8_t *op, const p_set_rt *r, uint32_t size) {
     }
     set_rt_(r);
 }
-// The format a colour attachment is rendered in: its NVN view's format where it sets one (the sRGB twin of a UNORM texture: the hardware encodes on store), as tex_view
-// picks it, else the texture's (vk-t13). Passes and pipelines used the texture's format while the view was sRGB: Tomodachi Life renders its last pass into an sRGB view of
+// The format a colour attachment is rendered in: the one tex_view made its view in (g_tv_fmt: the NVN view's format where it sets one, the sRGB twin of a UNORM texture
+// encoding on store; else the texture's), so a pass's and a pipeline's colour formats are the view's by construction (vk-t13; ffr-perf's review). Passes and pipelines used the texture's format while the view was sRGB: Tomodachi Life renders its last pass into an sRGB view of
 // the RGBA8 window texture; Vulkan wants the pipeline's format to match the view, and the Adreno stored linear values (the whole picture dark and contrasty, the Metal
 // host's texture sRGB). DM_VK_RT_VIEW_FMT=0: the texture's format, as before
 static int rt_view_fmt_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RT_VIEW_FMT"); v = !(e && atoi(e) == 0); LOG("vk: DM_VK_RT_VIEW_FMT=%d: colour attachments in their %s format", v, v ? "view's" : "texture's"); } return v; }
 static uint64_t g_rt_fmt_differs;   // colour attachments set whose view format is not the texture's (the GPU line)
-static VkFormat rt_view_fmt(const vtex *v, const tex_t *t, const view_t *vw, int has_vw) {
-    if (!rt_view_fmt_on()) return v->f.f;
-    fmt_t f = fmt_of(has_vw && vw->set_format ? vw->format : t->d.format);
-    if (!f.f || f.dec || v->f.dec || f.depth || v->f.depth || fmt_block(f.f) != fmt_block(v->f.f)) return v->f.f;
-    if (v->nvfl && f.f != v->vfl[0] && (v->nvfl < 2 || f.f != v->vfl[1])) return v->f.f;   // outside the image's format list (DM_VK_UBWC): tex_view takes the image's own
-    if (f.f != v->f.f) g_rt_fmt_differs++;
-    return f.f;
-}
 static void set_rt_(const p_set_rt *r) {
     pass_end();
     memset(&P, 0, sizeof P);
@@ -2796,7 +2790,7 @@ static void set_rt_(const p_set_rt *r) {
         if (!r->color[i]) continue;
         vtex *v = tex_get(r->color[i], 1); if (!v) continue;
         P.ct[i] = v; P.cv[i] = tex_view(v, r->color[i], &r->cview[i], r->has_cview[i], -1, 1);
-        P.cf[i] = rt_view_fmt(v, r->color[i], &r->cview[i], r->has_cview[i]);
+        P.cf[i] = !P.cv[i] ? VK_FORMAT_UNDEFINED : rt_view_fmt_on() ? g_tv_fmt : v->f.f; if (P.cf[i] && P.cf[i] != v->f.f) g_rt_fmt_differs++;
         uint32_t lv = r->has_cview[i] && r->cview[i].set_levels ? r->cview[i].base_level : 0, w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1;
         P.clv[i] = lv; P.cly[i] = r->has_cview[i] && r->cview[i].set_layers ? r->cview[i].min_layer : 0; P.cwr[i] = 1;
         if (w < P.w) P.w = w; if (h < P.h) P.h = h;
