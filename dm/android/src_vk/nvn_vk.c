@@ -3211,7 +3211,7 @@ static uint32_t texu_handle(int stage, const sbind *b) {
 // Tomodachi Life's island composite (adfa17e8e8976a0f bindings 12-15, f11413f932b50da7 2-3: cbuf 0 + 40928..40952) reads 0 there on Android, while the Metal host found
 // textures (IDs 1883, 1884) and drew the beach. Each such word (up to 16) is logged once with what was written over it in this submission (inline updates / copies, wlog), and
 // read again at the next presents: "written later" means the game fills it after the submission is recorded (the GPU would read it at run time)
-static struct { uint64_t addr, fr; char key[20]; int bind, st, done; } g_tz[16]; static int g_ntz;
+static struct { uint64_t addr, fr, sub; char key[20]; int bind, st, done; } g_tz[16]; static int g_ntz;
 static void texu_zero_note(int stage, const char *key, const sbind *b) {
     if (stage < 0 || stage >= 6 || b->reg < 0 || b->reg >= 16) return;
     const p_bind_buf *u = &S.ubo[stage][b->reg]; if (!u->addr) return;
@@ -3220,9 +3220,13 @@ static void texu_zero_note(int stage, const char *key, const sbind *b) {
     if (g_ntz >= 16) return;
     int w = 0; for (uint32_t i = 0; i < g_nwlog && i < NWLOG; i++) if (g_wlo[i] < a + 8 && g_whi[i] > a) w++;
     uint32_t v[4] = {0}; if ((uint64_t)b->off + 16 <= u->size) memcpy(v, (const void *)(uintptr_t)a, 16);
-    g_tz[g_ntz].addr = a; g_tz[g_ntz].fr = atomic_load(&g_presents); snprintf(g_tz[g_ntz].key, sizeof g_tz[g_ntz].key, "%s", key); g_tz[g_ntz].bind = (int)b->binding; g_tz[g_ntz].st = stage; g_tz[g_ntz].done = 0; g_ntz++;
+    g_tz[g_ntz].addr = a; g_tz[g_ntz].fr = atomic_load(&g_presents); snprintf(g_tz[g_ntz].key, sizeof g_tz[g_ntz].key, "%s", key); g_tz[g_ntz].bind = (int)b->binding; g_tz[g_ntz].st = stage; g_tz[g_ntz].done = 0; g_tz[g_ntz].sub = g_fence + 1; g_ntz++;
     LOG("vk: handle diag: shader %s binding %u (stage %d) reads cbuf %d +%d = %#llx: words %08x %08x %08x %08x at recording; %d in-order writes over it in this submission; buffer %#llx +%llu",
         key, b->binding, stage, b->reg, b->off, (unsigned long long)a, v[0], v[1], v[2], v[3], w, (unsigned long long)u->addr, (unsigned long long)u->size);
+}
+static void texu_zero_commit(void) {   // mtl_sub_commit: the words noted in this submission, read again as it is submitted (an in-order write the walk missed lands in between)
+    for (int i = 0; i < g_ntz; i++) { if (g_tz[i].sub != g_fence + 1) continue; uint32_t v[2]; memcpy(v, (const void *)(uintptr_t)g_tz[i].addr, 8);
+        LOG("vk: handle diag: %s binding %d, %#llx, at the submission's commit: %08x %08x%s", g_tz[i].key, g_tz[i].bind, (unsigned long long)g_tz[i].addr, v[0], v[1], v[0] & 0xfffff ? " (a texture ID: written between the draw's recording and the commit)" : ""); }
 }
 static void texu_zero_recheck(void) {   // mtl_present: the words noted, read again 1 and 30 frames later
     uint64_t fr = atomic_load(&g_presents);
@@ -5050,6 +5054,7 @@ static void mtl_exec_(const uint8_t *p) {
 }
 static void occ_flush(void);
 uint64_t mtl_sub_commit(void) {
+    if (g_ntz) texu_zero_commit();   // (vk-t10 diagnostics)
     pass_end(); occ_flush();
     vkCmdWriteTimestamp(C->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, C->qp, 1);
     barrier_all(C->up);   // the uploads, clears and copies at the start are done and visible before the submission's own work (nothing orders two command buffers of one batch)
