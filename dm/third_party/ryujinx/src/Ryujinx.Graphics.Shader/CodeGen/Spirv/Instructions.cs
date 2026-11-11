@@ -1800,6 +1800,11 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateLoadOrStore(CodeGenContext context, AstOperation operation, bool isStore)
         {
+            if (!isStore && operation.StorageKind == StorageKind.GlobalMemoryVector)
+            {
+                return GenerateRawVectorLoad(context, operation);
+            }
+
             // nxnative (after azmasm/switch2mac, MIT): a Switch 2 mesh program's store into its per-vertex / per-primitive planes goes straight into the mesh outputs
             // (CodeGenContext.MeshPlaneStore, written by SpirvGenerator.GenerateMeshEntry), so the values are not held twice
             if (isStore && operation.StorageKind == StorageKind.SharedMemory && context.Properties.Mesh is { IsMesh: true } mesh && operation.SourcesCount == 3 &&
@@ -1838,6 +1843,48 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
                 return new OperationResult(varType, result);
             }
+        }
+
+        // Load an aligned 64- or 128-bit raw value through one physical
+        // pointer. Word zero is returned; the rest go to the private array
+        // consumed by the original follower loads.
+        private static OperationResult GenerateRawVectorLoad(CodeGenContext context, AstOperation operation)
+        {
+            if (operation.GetSource(2) is not AstOperand { Type: OperandType.Constant } countOperand ||
+                operation.GetSource(3) is not AstOperand { Type: OperandType.Constant } memoryOperand)
+            {
+                throw new InvalidOperationException(
+                    $"The word count and local memory of a {operation.StorageKind} load must be constants.");
+            }
+
+            int count = countOperand.Value;
+            SpvInstruction vectorType = context.TypeVector(context.TypeU32(), count);
+            SpvInstruction addressWords = context.CompositeConstruct(
+                context.TypeVector(context.TypeU32(), 2),
+                context.Get(AggregateType.U32, operation.GetSource(0)),
+                context.Get(AggregateType.U32, operation.GetSource(1)));
+            SpvInstruction pointer = context.ConvertUToPtr(
+                context.TypePointer(StorageClass.PhysicalStorageBuffer, vectorType),
+                context.Bitcast(context.TypeInt(64, 0), addressWords));
+
+            SpvInstruction value = context.Load(vectorType, pointer, MemoryAccessMask.Aligned);
+            value.AddOperand((SpvLiteralInteger)4);
+            SpvInstruction wordPointerType = context.TypePointer(StorageClass.Private, context.TypeU32());
+
+            for (int word = 1; word < count; word++)
+            {
+                SpvInstruction element = context.AccessChain(
+                    wordPointerType,
+                    context.LocalMemories[memoryOperand.Value],
+                    context.Constant(context.TypeS32(), word - 1));
+                context.Store(
+                    element,
+                    context.CompositeExtract(context.TypeU32(), value, (SpvLiteralInteger)word));
+            }
+
+            return new OperationResult(
+                AggregateType.U32,
+                context.CompositeExtract(context.TypeU32(), value, (SpvLiteralInteger)0));
         }
 
         private static SpvInstruction GetStoragePointer(CodeGenContext context, AstOperation operation, out AggregateType varType)

@@ -74,22 +74,28 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             private readonly List<Entry> _entries;
             private readonly Dictionary<LsKey, Dictionary<uint, SearchResult>> _sharedEntries;
             private readonly Dictionary<(Instruction, StorageKind), int> _rawLastBindings;
-            private readonly Dictionary<(Instruction, StorageKind), int> _rawSameBaseFunctions;
+            private readonly Dictionary<int, int> _rawVectorFunctions;
             private readonly HelperFunctionManager _hfm;
-            private BasicBlock _rawBlock;
-            private Instruction _rawInst;
-            private StorageKind _rawStorageKind;
-            private Operand _rawBaseLo;
-            private Operand _rawBaseHi;
-            private int _rawFirstOffset;
 
             public GtsContext(HelperFunctionManager hfm)
             {
                 _entries = [];
                 _sharedEntries = new Dictionary<LsKey, Dictionary<uint, SearchResult>>();
                 _rawLastBindings = new Dictionary<(Instruction, StorageKind), int>();
-                _rawSameBaseFunctions = new Dictionary<(Instruction, StorageKind), int>();
+                _rawVectorFunctions = [];
                 _hfm = hfm;
+            }
+
+            public bool TryGetRawVectorFunctionId(int count, out int functionId)
+            {
+                return _rawVectorFunctions.TryGetValue(count, out functionId);
+            }
+
+            public int AddRawVectorFunction(int count, Function function)
+            {
+                int functionId = _hfm.AddFunction(function);
+                _rawVectorFunctions.Add(count, functionId);
+                return functionId;
             }
 
             public int GetOrAddRawLastBinding(ResourceManager resourceManager, Operation operation)
@@ -103,45 +109,6 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 }
 
                 return binding;
-            }
-
-            public bool TryGetRawSameBaseFunctionId(Operation operation, out int functionId)
-            {
-                return _rawSameBaseFunctions.TryGetValue((operation.Inst, operation.StorageKind), out functionId);
-            }
-
-            public int AddRawSameBaseFunction(Operation operation, Function function)
-            {
-                int functionId = _hfm.AddFunction(function);
-                _rawSameBaseFunctions.Add((operation.Inst, operation.StorageKind), functionId);
-                return functionId;
-            }
-
-            public bool MatchesRawBase(BasicBlock block, Operation operation, Operand baseLo, Operand baseHi, int constOffset)
-            {
-                if ((operation.Inst != Instruction.Load &&
-                     (operation.Inst != Instruction.Store || IsSmallInt(operation.StorageKind))) ||
-                    block != _rawBlock ||
-                    operation.Inst != _rawInst ||
-                    operation.StorageKind != _rawStorageKind ||
-                    !SameAddressOperand(block, baseLo, _rawBaseLo) ||
-                    !SameAddressOperand(block, baseHi, _rawBaseHi))
-                {
-                    return false;
-                }
-
-                long delta = (long)constOffset - _rawFirstOffset;
-                return delta >= -4096 && delta < 4096;
-            }
-
-            public void SetRawBase(BasicBlock block, Operation operation, Operand baseLo, Operand baseHi, int constOffset)
-            {
-                _rawBlock = block;
-                _rawInst = operation.Inst;
-                _rawStorageKind = operation.StorageKind;
-                _rawBaseLo = baseLo;
-                _rawBaseHi = baseHi;
-                _rawFirstOffset = constOffset;
             }
 
             public int AddFunction(Operation baseOp, bool isMultiTarget, IReadOnlyList<uint> targetCbs, Function function)
@@ -443,13 +410,114 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                     targetLanguage,
                     block,
                     operation,
-                    out int functionId))
+                    out int functionId,
+                    out bool raw))
                 {
                     return null;
                 }
 
+                if (raw &&
+                    operation.Inst == Instruction.Load &&
+                    operation.StorageKind == StorageKind.GlobalMemory &&
+                    operation.GlobalVectorCount > 1 &&
+                    operation.GlobalVectorWord == 0 &&
+                    TryGetRawVectorFunction(
+                        gtsContext,
+                        resourceManager,
+                        gpuAccessor,
+                        operation,
+                        out int vectorFunctionId))
+                {
+                    return GenerateRawVectorLoad(resourceManager, node, operation, vectorFunctionId);
+                }
+
                 return GenerateCallStorageOp(node, operation, null, functionId);
             }
+        }
+
+        private static LinkedListNode<INode> GenerateRawVectorLoad(
+            ResourceManager resourceManager,
+            LinkedListNode<INode> node,
+            Operation operation,
+            int functionId)
+        {
+            int count = operation.GlobalVectorCount;
+            int vectorMemoryId = resourceManager.GetRawVectorMemory();
+
+            node = GenerateCallStorageOp(node, operation, null, functionId);
+            LinkedListNode<INode> insertAfter = node;
+
+            for (LinkedListNode<INode> next = node.Next; next != null; next = next.Next)
+            {
+                if (next.Value is not Operation follower)
+                {
+                    continue;
+                }
+
+                if (follower.Inst == Instruction.Load &&
+                    follower.StorageKind == StorageKind.GlobalMemory &&
+                    follower.GlobalVectorCount == count &&
+                    follower.GlobalVectorGroup == operation.GlobalVectorGroup &&
+                    follower.GlobalVectorWord > 0)
+                {
+                    Operand word = Local();
+                    Operation load = new(
+                        Instruction.Load,
+                        StorageKind.LocalMemory,
+                        word,
+                        Const(vectorMemoryId),
+                        Const(follower.GlobalVectorWord - 1));
+                    insertAfter = insertAfter.List.AddAfter(insertAfter, load);
+
+                    Operand dest = follower.Dest;
+                    follower.TurnIntoCopy(word);
+                    word.UseOps.Remove(follower);
+                    follower.Dest = null;
+                    next.Value = new Operation(Instruction.Copy, dest, word);
+
+                    if (follower.GlobalVectorWord == count - 1)
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (follower.GlobalVectorCount != 0 ||
+                    follower.StorageKind != StorageKind.None ||
+                    follower.Inst == Instruction.Call ||
+                    follower.Inst == Instruction.Barrier ||
+                    follower.Inst == Instruction.MemoryBarrier ||
+                    follower.Inst.IsAtomic())
+                {
+                    break;
+                }
+            }
+
+            return node;
+        }
+
+        private static bool TryGetRawVectorFunction(
+            GtsContext gtsContext,
+            ResourceManager resourceManager,
+            IGpuAccessor gpuAccessor,
+            Operation operation,
+            out int functionId)
+        {
+            int count = operation.GlobalVectorCount;
+
+            if (gtsContext.TryGetRawVectorFunctionId(count, out functionId))
+            {
+                return true;
+            }
+
+            return TryGenerateRawStorageOp(
+                gtsContext,
+                resourceManager,
+                gpuAccessor,
+                operation,
+                out functionId,
+                count);
         }
 
         private static bool CanUseInlineStorageOp(Operation operation, TargetLanguage targetLanguage)
@@ -651,11 +719,13 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             TargetLanguage targetLanguage,
             BasicBlock block,
             Operation operation,
-            out int functionId)
+            out int functionId,
+            out bool raw)
         {
             Queue<PhiNode> phis = new();
             HashSet<PhiNode> visited = [];
             List<uint> targetCbs = [];
+            raw = false;
 
             Operand globalAddress = operation.GetSource(0);
 
@@ -717,33 +787,8 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             if (targetCbs.Count == 0)
             {
+                raw = true;
                 gpuAccessor.Log($"Global memory operation \"{operation.Inst}\" traced to no storage buffer: it goes through the memory pool table.");
-
-                DecomposeRawAddress(block, operation.GetSource(0), operation.GetSource(1), out Operand baseLo, out Operand baseHi, out int constOffset);
-
-                if (gtsContext.MatchesRawBase(block, operation, baseLo, baseHi, constOffset))
-                {
-                    if (gtsContext.TryGetRawSameBaseFunctionId(operation, out functionId))
-                    {
-                        return true;
-                    }
-
-                    if (!gtsContext.TryGetFunctionId(operation, isMultiTarget: true, [], out int fallbackFunctionId))
-                    {
-                        return false;
-                    }
-
-                    int lastBinding = gtsContext.GetOrAddRawLastBinding(resourceManager, operation);
-                    return TryGenerateRawSameBaseStorageOp(
-                        gtsContext,
-                        resourceManager,
-                        operation,
-                        lastBinding,
-                        fallbackFunctionId,
-                        out functionId);
-                }
-
-                gtsContext.SetRawBase(block, operation, baseLo, baseHi, constOffset);
             }
 
             if (gtsContext.TryGetFunctionId(operation, isMultiTarget: true, targetCbs, out functionId))
@@ -894,7 +939,8 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             ResourceManager resourceManager,
             IGpuAccessor gpuAccessor,
             Operation operation,
-            out int functionId)
+            out int functionId,
+            int vectorCount = 1)
         {
             functionId = 0;
 
@@ -1040,7 +1086,18 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             Operand resultValue = null;
 
-            if (operation.Inst == Instruction.Load)
+            if (operation.Inst == Instruction.Load && vectorCount > 1)
+            {
+                resultValue = context.Add(
+                    Instruction.Load,
+                    StorageKind.GlobalMemoryVector,
+                    Local(),
+                    hostLow,
+                    hostHigh,
+                    Const(vectorCount),
+                    Const(resourceManager.GetRawVectorMemory()));
+            }
+            else if (operation.Inst == Instruction.Load)
             {
                 resultValue = context.Load(StorageKind.GlobalMemory, hostLow, hostHigh);
 
@@ -1105,6 +1162,17 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             if (returnsValue)
             {
+                // A miss must preserve the scalar semantics: every word reads
+                // zero, including the followers stored in gmem_vec.
+                for (int word = 0; word < vectorCount - 1; word++)
+                {
+                    context.Store(
+                        StorageKind.LocalMemory,
+                        resourceManager.GetRawVectorMemory(),
+                        Const(word),
+                        Const(0));
+                }
+
                 context.Return(Const(0));
             }
             else
@@ -1114,306 +1182,15 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             Function function = new(
                 ControlFlowGraph.Create(context.GetOperations()).Blocks,
-                GetFunctionName(operation, isMultiTarget: true, []) + "Raw",
+                GetFunctionName(operation, isMultiTarget: true, []) +
+                    (vectorCount > 1 ? $"RawV{vectorCount}" : "Raw"),
                 returnsValue,
                 inArgumentsCount,
                 0);
 
-            functionId = gtsContext.AddFunction(operation, isMultiTarget: true, [], function);
-
-            return true;
-        }
-
-        private static bool TryGenerateRawSameBaseStorageOp(
-            GtsContext gtsContext,
-            ResourceManager resourceManager,
-            Operation operation,
-            int lastBinding,
-            int fallbackFunctionId,
-            out int functionId)
-        {
-            functionId = 0;
-
-            if (!resourceManager.TryGetStorageBufferBinding(GmemMapCbSlot, 0, write: false, out int mapBinding))
-            {
-                return false;
-            }
-
-            bool isSmall = IsSmallInt(operation.StorageKind);
-            int inArgumentsCount = operation.Inst == Instruction.Store ? 3 : 2;
-
-            EmitterContext context = new();
-
-            Operand addrLow = Argument(0);
-            Operand addrHigh = Argument(1);
-
-            Operand MapWord(Operand entry, int word)
-            {
-                return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
-            }
-
-            Operand last = context.Load(StorageKind.LocalMemory, lastBinding);
-            Operand found = context.IMultiply(last, Const(GmemMapEntryWords));
-            Operand startsAtOrBelow = context.BitwiseOr(
-                context.ICompareLessUnsigned(MapWord(found, 1), addrHigh),
-                context.BitwiseAnd(
-                    context.ICompareEqual(MapWord(found, 1), addrHigh),
-                    context.ICompareLessOrEqualUnsigned(MapWord(found, 0), addrLow)));
-            Operand endsAbove = context.BitwiseOr(
-                context.ICompareLessUnsigned(addrHigh, MapWord(found, 3)),
-                context.BitwiseAnd(
-                    context.ICompareEqual(addrHigh, MapWord(found, 3)),
-                    context.ICompareLessUnsigned(addrLow, MapWord(found, 2))));
-            Operand lblFallback = Label();
-            context.BranchIfFalse(lblFallback, context.BitwiseAnd(startsAtOrBelow, endsAbove));
-
-            Operand wordLow = isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
-            Operand hostLow = context.IAdd(wordLow, MapWord(found, 4));
-            Operand carry = context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, wordLow), Const(1), Const(0));
-            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, MapWord(found, 5)), carry);
-
-            Operand resultValue = null;
-
-            if (operation.Inst == Instruction.Load)
-            {
-                resultValue = context.Load(StorageKind.GlobalMemory, hostLow, hostHigh);
-
-                if (isSmall)
-                {
-                    Operand bitOffset = HelperFunctionManager.GetBitOffset(context, addrLow);
-
-                    resultValue = operation.StorageKind switch
-                    {
-                        StorageKind.GlobalMemoryS8 => context.BitfieldExtractS32(context.ShiftRightS32(resultValue, bitOffset), Const(0), Const(8)),
-                        StorageKind.GlobalMemoryS16 => context.BitfieldExtractS32(context.ShiftRightS32(resultValue, bitOffset), Const(0), Const(16)),
-                        StorageKind.GlobalMemoryU8 => context.BitwiseAnd(context.ShiftRightU32(resultValue, bitOffset), Const(byte.MaxValue)),
-                        _ => context.BitwiseAnd(context.ShiftRightU32(resultValue, bitOffset), Const(ushort.MaxValue)),
-                    };
-                }
-            }
-            else
-            {
-                context.Store(StorageKind.GlobalMemory, hostLow, hostHigh, Argument(2));
-            }
-
-            if (resultValue != null)
-            {
-                context.Return(resultValue);
-            }
-            else
-            {
-                context.Return();
-            }
-
-            context.MarkLabel(lblFallback);
-
-            bool returnsValue = operation.Dest != null;
-
-            if (returnsValue)
-            {
-                context.Return(context.Call(fallbackFunctionId, true, addrLow, addrHigh));
-            }
-            else
-            {
-                context.Call(fallbackFunctionId, false, addrLow, addrHigh, Argument(2));
-                context.Return();
-            }
-
-            Function function = new(
-                ControlFlowGraph.Create(context.GetOperations()).Blocks,
-                GetFunctionName(operation, isMultiTarget: true, []) + "RawSameBase",
-                returnsValue,
-                inArgumentsCount,
-                0);
-
-            functionId = gtsContext.AddRawSameBaseFunction(operation, function);
-
-            return true;
-        }
-
-        private static void DecomposeRawAddress(
-            BasicBlock block,
-            Operand addrLow,
-            Operand addrHigh,
-            out Operand baseLo,
-            out Operand baseHi,
-            out int constOffset)
-        {
-            addrLow = Utils.FindLastOperation(addrLow, block);
-            addrHigh = Utils.FindLastOperation(addrHigh, block);
-
-            if (addrLow.AsgOp is Operation addLo &&
-                addLo.Inst == Instruction.Add &&
-                addrHigh.AsgOp is Operation addHi &&
-                addHi.Inst == Instruction.Add)
-            {
-                Operand lo0 = addLo.GetSource(0);
-                Operand lo1 = addLo.GetSource(1);
-                Operand bLo = null;
-                Operand cOp = null;
-
-                if (lo0.Type == OperandType.LocalVariable && lo1.Type == OperandType.Constant)
-                {
-                    bLo = lo0;
-                    cOp = lo1;
-                }
-                else if (lo0.Type == OperandType.Constant && lo1.Type == OperandType.LocalVariable)
-                {
-                    bLo = lo1;
-                    cOp = lo0;
-                }
-
-                if (bLo != null)
-                {
-                    Operand hi0 = Utils.FindLastOperation(addHi.GetSource(0), block);
-                    Operand hi1 = Utils.FindLastOperation(addHi.GetSource(1), block);
-                    Operation hi0Op = hi0.AsgOp as Operation;
-                    Operation hi1Op = hi1.AsgOp as Operation;
-
-                    if (hi1Op?.Inst == Instruction.ConditionalSelect && hi0Op?.Inst != Instruction.ConditionalSelect)
-                    {
-                        baseLo = Utils.FindLastOperation(bLo, block);
-                        baseHi = hi0;
-                        constOffset = UnwrapScaledIndex(block, ref baseLo, ref baseHi) ? 0 : cOp.Value;
-                        return;
-                    }
-                    else if (hi0Op?.Inst == Instruction.ConditionalSelect && hi1Op?.Inst != Instruction.ConditionalSelect)
-                    {
-                        baseLo = Utils.FindLastOperation(bLo, block);
-                        baseHi = hi1;
-                        constOffset = UnwrapScaledIndex(block, ref baseLo, ref baseHi) ? 0 : cOp.Value;
-                        return;
-                    }
-                }
-            }
-
-            baseLo = addrLow;
-            baseHi = addrHigh;
-            constOffset = 0;
-            UnwrapScaledIndex(block, ref baseLo, ref baseHi);
-        }
-
-        private static bool UnwrapScaledIndex(BasicBlock block, ref Operand baseLo, ref Operand baseHi)
-        {
-            if (baseLo.AsgOp is not Operation addLo || addLo.Inst != Instruction.Add ||
-                baseHi.AsgOp is not Operation addHi || addHi.Inst != Instruction.Add)
-            {
-                return false;
-            }
-
-            Operand hi0 = Utils.FindLastOperation(addHi.GetSource(0), block);
-            Operand hi1 = Utils.FindLastOperation(addHi.GetSource(1), block);
-            Operation hi0Op = hi0.AsgOp as Operation;
-            Operation hi1Op = hi1.AsgOp as Operation;
-            Operation hiSumOp = null;
-
-            if (hi1Op?.Inst == Instruction.ConditionalSelect && hi0Op?.Inst == Instruction.Add)
-            {
-                hiSumOp = hi0Op;
-            }
-            else if (hi0Op?.Inst == Instruction.ConditionalSelect && hi1Op?.Inst == Instruction.Add)
-            {
-                hiSumOp = hi1Op;
-            }
-
-            if (hiSumOp == null)
-            {
-                return false;
-            }
-
-            Operand lo0 = Utils.FindLastOperation(addLo.GetSource(0), block);
-            Operand lo1 = Utils.FindLastOperation(addLo.GetSource(1), block);
-            Operand hs0 = Utils.FindLastOperation(hiSumOp.GetSource(0), block);
-            Operand hs1 = Utils.FindLastOperation(hiSumOp.GetSource(1), block);
-
-            static bool IsMulLo(Operand op) => (op.AsgOp as Operation)?.Inst is Instruction.Multiply or Instruction.ShiftLeft;
-            static bool IsMulHi(Operand op) => (op.AsgOp as Operation)?.Inst is Instruction.MultiplyHighU32 or Instruction.MultiplyHighS32 or Instruction.ShiftRightU32;
-
-            Operand arrLo = null;
-            Operand arrHi = null;
-
-            if (IsMulLo(lo0) && !IsMulLo(lo1))
-            {
-                arrLo = lo1;
-            }
-            else if (IsMulLo(lo1) && !IsMulLo(lo0))
-            {
-                arrLo = lo0;
-            }
-
-            if (IsMulHi(hs0) && !IsMulHi(hs1))
-            {
-                arrHi = hs1;
-            }
-            else if (IsMulHi(hs1) && !IsMulHi(hs0))
-            {
-                arrHi = hs0;
-            }
-
-            if (arrLo != null && arrHi != null)
-            {
-                baseLo = arrLo;
-                baseHi = arrHi;
-                return true;
-            }
-
-            return false;
-        }
-
-        private static bool SameAddressOperand(BasicBlock block, Operand a, Operand b, int depth = 0)
-        {
-            if (a == null || b == null)
-            {
-                return false;
-            }
-
-            a = Utils.FindLastOperation(a, block);
-            b = Utils.FindLastOperation(b, block);
-
-            if (a == b)
-            {
-                return true;
-            }
-
-            if (a.Type == OperandType.Constant && b.Type == OperandType.Constant)
-            {
-                return a.Value == b.Value;
-            }
-
-            if (depth >= 4 || a.AsgOp is not Operation opA || b.AsgOp is not Operation opB)
-            {
-                return false;
-            }
-
-            if (opA.Inst != opB.Inst || opA.StorageKind != opB.StorageKind || opA.SourcesCount != opB.SourcesCount)
-            {
-                return false;
-            }
-
-            switch (opA.Inst)
-            {
-                case Instruction.Add:
-                case Instruction.Multiply:
-                case Instruction.MultiplyHighS32:
-                case Instruction.MultiplyHighU32:
-                case Instruction.ShiftLeft:
-                case Instruction.ShiftRightU32:
-                case Instruction.ConditionalSelect:
-                case Instruction.CompareEqual:
-                case Instruction.CompareLessU32:
-                case Instruction.CompareGreaterU32:
-                    break;
-                default:
-                    return false;
-            }
-
-            for (int i = 0; i < opA.SourcesCount; i++)
-            {
-                if (!SameAddressOperand(block, opA.GetSource(i), opB.GetSource(i), depth + 1))
-                {
-                    return false;
-                }
-            }
+            functionId = vectorCount > 1
+                ? gtsContext.AddRawVectorFunction(vectorCount, function)
+                : gtsContext.AddFunction(operation, isMultiTarget: true, [], function);
 
             return true;
         }

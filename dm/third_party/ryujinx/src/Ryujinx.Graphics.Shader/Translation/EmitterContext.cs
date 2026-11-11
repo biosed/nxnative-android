@@ -22,6 +22,10 @@ namespace Ryujinx.Graphics.Shader.Translation
         public Block CurrBlock { get; set; }
         public InstOp CurrOp { get; set; }
 
+        // Zero means no vector access; each emitted LDG vector gets a distinct
+        // positive group so follower scans cannot consume another load's word.
+        public int GlobalVectorGroups { get; set; }
+
         public int OperationsCount => _operations.Count;
 
         private readonly struct BrxTarget

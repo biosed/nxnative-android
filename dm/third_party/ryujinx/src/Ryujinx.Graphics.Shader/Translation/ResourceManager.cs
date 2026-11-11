@@ -165,6 +165,21 @@ namespace Ryujinx.Graphics.Shader.Translation
             return Properties.AddLocalMemory(new MemoryDefinition($"gmem_last_{Properties.LocalMemories.Count}", AggregateType.U32, 1, zeroInit: true));
         }
 
+        // Words 1..3 returned by one raw vector load. Followers consume them
+        // immediately, before another memory access can overwrite the array.
+        private int _rawVectorMemoryId = -1;
+
+        public int GetRawVectorMemory()
+        {
+            if (_rawVectorMemoryId < 0)
+            {
+                _rawVectorMemoryId = Properties.AddLocalMemory(
+                    new MemoryDefinition("gmem_vec", AggregateType.Array | AggregateType.U32, 3));
+            }
+
+            return _rawVectorMemoryId;
+        }
+
         private int AddMemoryDefinition(string name, AggregateType type, int arrayLength = 1)
         {
             return Properties.AddLocalMemory(new MemoryDefinition(name, type, arrayLength));

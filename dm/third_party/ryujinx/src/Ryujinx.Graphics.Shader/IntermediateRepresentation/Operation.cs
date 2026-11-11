@@ -10,6 +10,12 @@ namespace Ryujinx.Graphics.Shader.IntermediateRepresentation
 
         public bool ForcePrecise { get; set; }
 
+        // Words emitted from one LDG.64/LDG.128. The group distinguishes
+        // adjacent vector loads with the same width.
+        public int GlobalVectorCount { get; set; }
+        public int GlobalVectorWord { get; set; }
+        public int GlobalVectorGroup { get; set; }
+
         private Operand[] _dests;
 
         public Operand Dest
