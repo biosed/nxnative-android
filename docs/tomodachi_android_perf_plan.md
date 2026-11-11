@@ -44,10 +44,14 @@ Each game submission becomes one `vkQueueSubmit` at `mtl_sub_commit`, so the GPU
 **What.** Cut a game submission into chunks: at a render-pass boundary inside the walk, once the chunk holds enough work, commit the chunk (`mtl_sub_commit`) and begin
 the next (`mtl_sub_begin`) without returning to the game. The GPU runs chunk k while chunk k+1 is recorded. The game still gets one fence for its submission (the last chunk's).
 
-**Trigger / chunk size.** At `pass_end_` of a pass with draws (never inside a pass, a held pass (`g_rt_hold`), or with deferred dispatches outstanding: those are flushed
-by pass_end first) when the chunk has recorded at least `DM_VK_CHUNK` draws (default 250 when on: the island records ~1,600 draws in ~20 ms, so ~6 chunks a frame,
-the first reaching the GPU after ~3 ms). Not in a submission's last 10% of commands (the tail is committed anyway). A time trigger (recorded ns) was considered: draws are
-cheaper to reason about and do not move with clocks.
+**Trigger / chunk size (revised after ffr-perf's grill).** Not inside `pass_end_`: it is called from paths that keep recording right after it (`mtl_sub_copy`, `fb_prepare`,
+the barrier handling, `gw_compose`, `copy_t2b`), which would find `C`, its command buffer, ring offsets or GW windows switched under them. The cut is made in `mtl_exec_`'s
+op loop, at the top of an op before it is dispatched, when nothing is mid-sequence: `!P.open && !g_rt_hold && !g_ndefer`, the chunk holds at least `DM_VK_CHUNK` draws
+(default 250 when on: the island records ~1,600 draws in ~20 ms, so ~6 chunks a frame, the first reaching the GPU after ~3 ms), and the walk is at OP_CALL depth 0-1
+(`g_nrs <= 1`; the walker's return stack survives a commit, deeper nests are left for later). If a pass is still open the cut waits for the next boundary. At most 8 chunks
+per game submission. No "last 10%" rule (the walk does not know the total: `mtl_sub_index` is empty on Vulkan); a short last chunk costs one more `vkQueueSubmit`.
+The cut is `mtl_sub_commit()` then `mtl_sub_begin()` with a flag that skips the per-game-submission work in begin (`tog_latch`, the recording-thread election) so the
+DM_CTL toggles and the counters stay per game submission.
 
 **Fences and contexts.** Each chunk is a full submission: its own context (`ctx_pick`), fence value (`++g_fence`), ring, upload command buffer, descriptor pools and
 completion. Guest `FenceSync` ops recorded in chunk k take chunk k's fence (as now: `g_fence + 1`), which covers everything before them. The value `mtl_sub_commit`
@@ -72,7 +76,19 @@ counters `REPORT_COUNTER`, `SIGNAL_EVENT`, `OP_FENCE_SYNC` order), the held-pass
 passlog of one island frame with chunks vs without (same draws, same bindings), screenshots, the counters line (chunks a frame, their draws, submit ns), FFR/FF12/HM
 regression runs with the key off (no code path change when off).
 
-**Predicted gain at the island's numbers.** Today ≈ game ~6 ms + recording ~20 ms + GPU wait ~32 ms ≈ 58-62 ms. With ~6 chunks, the GPU starts ~3 ms into recording and
-runs alongside it; the wait after the last chunk is the GPU work not yet done: ≈ max(0, GPU − overlap) ≈ 6-12 ms if the GPU keeps ~22-26 ms a frame (higher utilisation
-should also keep its clock up). Frame ≈ 6 + 21 (recording + chunk overhead) + 6-12 ≈ 33-40 ms, i.e. 58-62 → 33-40 ms (~16 → 25-30 fps). If the GPU's real time
+**Is the GPU busy 22 or 34 ms? (t10b).** The submissions' GPU spans (top of the upload command buffer to the bottom of the main one, per submission) sum to 22.6 ms a
+frame; the game waits 34.0 ms a frame, and at each wait 2.8 of the frame's 3 submissions have not ended. So at least ~11 ms of the wait is the GPU not running our work: idle
+between submissions (each waits for its recording) or submit latency, not GPU busy time. t12b logs this directly ("the GPU idle between game submissions ... ms a frame",
+from the same timestamps), so the decision can rest on it: a large idle share is what chunking removes; if the idle share is small and the spans grow when it is fed earlier
+(clocks), chunking only moves the wait.
+
+**Costs counted in the prediction.** Each chunk starts with `barrier_all` on its upload command buffer, so the GPU drains between chunks: ~6 bubbles a frame, est. 0.1-0.3 ms
+each on the Adreno (a full pipeline barrier with nothing in flight behind it), ~1-2 ms a frame; plus +0.5-1.5 ms of recording (per-chunk cache restarts, extra submits).
+The build logs, with chunks on and off: GPU idle between submissions, chunks per frame and their draws, submit time, the context high-water mark, the counters line.
+Occlusion counters: a ResetCounter in chunk k and a ReportCounter in chunk k+1 must sum through the segment chain as across game submissions (checked: the island's OCC line
+shows its reports; a unit case if any are seen across a cut).
+
+**Predicted gain at the island's numbers.** Today ≈ game ~6 ms + recording ~20 ms + GPU wait ~34 ms ≈ 58-62 ms. With ~6 chunks, the GPU starts ~3 ms into recording and
+runs alongside it; the wait after the last chunk is the GPU work not yet done: ≈ max(0, GPU + bubbles − overlap) ≈ 8-14 ms if the GPU keeps ~22-26 ms a frame plus ~1-2 ms
+of bubbles (higher utilisation should also keep its clock up). Frame ≈ 6 + 22 (recording + chunk overhead) + 8-14 ≈ 36-42 ms, i.e. 58-62 → 36-42 ms (~16 → 24-28 fps). If the GPU's real time
 is the ~34 ms it is waited for today, the frame becomes GPU-bound at ~36-40 ms. Not a gain if the GPU is busier than measured (then it moves the wait, not removes it).
