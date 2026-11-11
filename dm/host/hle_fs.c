@@ -644,36 +644,45 @@ int dm_fs_clone_committed(const char *dir, const char *to) {
 #else
 #define ST_MTIME_NS(s) ((int64_t)(s).st_mtim.tv_sec * 1000000000 + (s).st_mtim.tv_nsec)
 #endif
-static void changes_walk(const char *work, const char *commit, const char *rel, int depth, char *out, size_t n, size_t *used, int removed) {
-    char wd[1300]; snprintf(wd, sizeof wd, "%s%s%s", removed ? commit : work, *rel ? "/" : "", rel);
-    DIR *d = opendir(wd); if (!d) return;
+// The walk's buffers live in one context (commits are serialised by g_lock): each recursion frame holds a DIR pointer and a few integers, whatever stack the caller has
+// (every take-over here already runs on the big host stack, HLE_FORCE = HLE_FORCE_BIG above; this keeps the walk small anyway)
+typedef struct { const char *work, *commit; char rel[1024], wd[1300], a[1400], b[1400], g[256], item[400]; char *out; size_t n, used; int full; } chg_ctx;
+static void changes_walk(chg_ctx *c, int depth, int removed) {
+    size_t rl = strlen(c->rel);
+    snprintf(c->wd, sizeof c->wd, "%s%s%s", removed ? c->commit : c->work, rl ? "/" : "", c->rel);
+    DIR *d = opendir(c->wd); if (!d) return;
     struct dirent *e;
-    while ((e = readdir(d))) {
+    while (!c->full && (e = readdir(d))) {
         if (e->d_name[0] == '.' && strncmp(e->d_name, ".dm-case-", 9)) continue;
-        char r2[1300], a[1400], b[1400], g[256]; struct stat sa, sb;
-        snprintf(r2, sizeof r2, "%s%s%s", rel, *rel ? "/" : "", e->d_name);
-        snprintf(a, sizeof a, "%s/%s", work, r2); snprintf(b, sizeof b, "%s/%s", commit, r2);
-        if (!guest_name(wd, e->d_name, g, sizeof g)) strlcpy(g, e->d_name, sizeof g);
-        if (lstat(removed ? b : a, &sa)) continue;
-        int has_other = !lstat(removed ? a : b, &sb);
-        if (S_ISDIR(sa.st_mode)) { if (depth < 4) changes_walk(work, commit, r2, depth + 1, out, n, used, removed); continue; }
-        if (!S_ISREG(sa.st_mode)) continue;
-        char item[400]; item[0] = 0;
-        if (removed) { if (!has_other) snprintf(item, sizeof item, " -%s%s%s", rel, *rel ? "/" : "", g); }
-        else if (!has_other) snprintf(item, sizeof item, " +%s%s%s %.1f MB", rel, *rel ? "/" : "", g, sa.st_size / 1048576.0);
-        else if (sa.st_size != sb.st_size || ST_MTIME_NS(sa) != ST_MTIME_NS(sb)) snprintf(item, sizeof item, " ~%s%s%s %.1f MB", rel, *rel ? "/" : "", g, sa.st_size / 1048576.0);
-        if (!item[0]) continue;
-        size_t k = strlen(item);
-        if (*used + k + 4 >= n) { if (*used + 4 < n) { memcpy(out + *used, " ...", 5); *used += 4; } closedir(d); return; }
-        memcpy(out + *used, item, k + 1); *used += k;
+        snprintf(c->wd, sizeof c->wd, "%s%s%s", removed ? c->commit : c->work, rl ? "/" : "", c->rel);   // the recursion below reuses wd
+        if (!guest_name(c->wd, e->d_name, c->g, sizeof c->g)) strlcpy(c->g, e->d_name, sizeof c->g);
+        if (snprintf(c->rel + rl, sizeof c->rel - rl, "%s%s", rl ? "/" : "", e->d_name) >= (int)(sizeof c->rel - rl)) { c->rel[rl] = 0; continue; }
+        snprintf(c->a, sizeof c->a, "%s/%s", c->work, c->rel); snprintf(c->b, sizeof c->b, "%s/%s", c->commit, c->rel);
+        struct stat sa, sb;
+        int ok = !lstat(removed ? c->b : c->a, &sa), has_other = !lstat(removed ? c->a : c->b, &sb);
+        c->item[0] = 0;
+        if (ok && S_ISDIR(sa.st_mode)) { if (depth < 4) changes_walk(c, depth + 1, removed); }
+        else if (ok && S_ISREG(sa.st_mode)) {
+            c->rel[rl] = 0;   // the item shows the parent folder (physical) and the guest name of the file
+            if (removed) { if (!has_other) snprintf(c->item, sizeof c->item, " -%s%s%s", c->rel, rl ? "/" : "", c->g); }
+            else if (!has_other) snprintf(c->item, sizeof c->item, " +%s%s%s %.1f MB", c->rel, rl ? "/" : "", c->g, sa.st_size / 1048576.0);
+            else if (sa.st_size != sb.st_size || ST_MTIME_NS(sa) != ST_MTIME_NS(sb)) snprintf(c->item, sizeof c->item, " ~%s%s%s %.1f MB", c->rel, rl ? "/" : "", c->g, sa.st_size / 1048576.0);
+        }
+        c->rel[rl] = 0;
+        if (c->item[0]) {
+            size_t k = strlen(c->item);
+            if (c->used + k + 5 > c->n) { if (c->used + 5 <= c->n) { memcpy(c->out + c->used, " ...", 5); c->used += 4; } c->full = 1; }   // once: the walk stops
+            else { memcpy(c->out + c->used, c->item, k + 1); c->used += k; }
+        }
     }
     closedir(d);
 }
 static void save_changes(const char *work, const char *commit, char *out, size_t n) {
-    size_t used = 0; out[0] = 0;
-    changes_walk(work, commit, "", 0, out, n, &used, 0);
-    changes_walk(work, commit, "", 0, out, n, &used, 1);
-    if (!used) strlcpy(out, "none changed", n);
+    static chg_ctx c; memset(&c, 0, sizeof c);   // under g_lock
+    c.work = work; c.commit = commit; c.out = out; c.n = n; out[0] = 0;
+    changes_walk(&c, 0, 0);
+    if (!c.full) changes_walk(&c, 0, 1);
+    if (!c.used) strlcpy(out, "none changed", n);
     else memmove(out, out + 1, strlen(out + 1) + 1);   // the leading space
 }
 static Result commit_mount_locked(int i, int *notify_error) {
