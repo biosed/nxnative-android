@@ -216,6 +216,21 @@ static void pads_start(void) {
 
 // Mouse as a single-point touchscreen (front.h dm_touch_set): left button down / drag = finger 0, release = lifted. The content view takes the clicks,
 // not a window-wide event monitor, so clicks on the title bar, the window buttons and the resize edges still reach AppKit.
+// Leaving the game from the front end: the window's close button asks first (the game's own save is the only state kept), and every way out names itself in the log --
+// a closed window, Quit (⌘Q) and any other exit() through the atexit line -- after a user's "crash when leaving the house" ended with exit code 0 and nothing logged
+static const char *volatile g_exit_why;
+static void exit_log(void) { LOG("front end: process exiting (%s)", g_exit_why ? g_exit_why : "an exit() call the front end did not make: the game or a library"); }
+@interface DmGameWindowDelegate : NSObject <NSWindowDelegate> @end
+@implementation DmGameWindowDelegate
+- (BOOL)windowShouldClose:(NSWindow *)w {
+    (void)w; NSAlert *a = [NSAlert new];
+    a.messageText = @"Quit " DM_GAME_NAME @"?"; a.informativeText = @"Progress since the game's last save is lost.";
+    [a addButtonWithTitle:@"Quit"]; [a addButtonWithTitle:@"Keep Playing"];
+    int quit = [a runModal] == NSAlertFirstButtonReturn;
+    LOG("front end: the window's close button: %s", quit ? "quit" : "kept playing");
+    return quit;
+}
+@end
 @interface DmGameView : NSView @end
 @implementation DmGameView
 - (void)mouseDown:(NSEvent *)e { [self mouseDragged:e]; }
@@ -1170,8 +1185,12 @@ void front_run(void (*guest)(void)) {
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
             return nil;   // Swallow it to avoid the system beep
         }];
+        static DmGameWindowDelegate *wdel; wdel = [DmGameWindowDelegate new]; win.delegate = wdel;   // the close button asks first
+        atexit(exit_log);
         [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification object:win queue:nil
-                                                      usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
+                                                      usingBlock:^(NSNotification *n) { (void)n; g_exit_why = "the game window was closed"; exit(0); }];
+        [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationWillTerminateNotification object:nil queue:nil
+                                                      usingBlock:^(NSNotification *n) { (void)n; g_exit_why = "Quit (the menu or ⌘Q)"; }];
         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1).
         // Input is released when the window stops being key (and when it is minimized) and taken up again when it is key again
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
