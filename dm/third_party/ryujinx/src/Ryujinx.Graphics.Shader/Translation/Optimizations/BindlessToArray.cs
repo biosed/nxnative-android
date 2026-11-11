@@ -203,7 +203,16 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                     handleIndex = 0;
                 }
 
-                int length = Math.Max(MinimumArrayLength, gpuAccessor.QueryTextureArrayLengthFromBuffer(src0CbufSlot));
+                // nxnative: a length of 0 or less leaves the handle as it is: BindlessElimination then indexes the texture and sampler pools by its IDs, as the GPU reads it (dmsh_xlate
+                // QueryTextureArrayLengthFromBuffer, the game profile's ubo_handle_array pool)
+                int wanted = gpuAccessor.QueryTextureArrayLengthFromBuffer(src0CbufSlot);
+
+                if (wanted <= 0)
+                {
+                    continue;
+                }
+
+                int length = Math.Max(MinimumArrayLength, wanted);
 
                 TurnIntoArray(resourceManager, texOp, cbufSlot, handleIndex, length);
 

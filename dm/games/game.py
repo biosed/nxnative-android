@@ -128,6 +128,8 @@ def header(g):
     if tfu not in ('on', 'off'): sys.exit(f'{g.id}: tex_flush_upload must be on or off: {tfu}')
     tdu = g.get('tex_dirty_upload', 'off')   # with tex_flush_upload: a registered texture the CPU writes after init without any flush is uploaded too (dirty pages, hle_nvn.c nvn_ft_written): on / off
     if tdu not in ('on', 'off') or (tdu == 'on' and tfu != 'on'): sys.exit(f'{g.id}: tex_dirty_upload must be on or off, and needs tex_flush_upload on: {tdu}')
+    uha = g.get('ubo_handle_array', '32')   # the shader translator's length for a texture array of handles in a game's own uniform buffer (dmsh_build.py → dmsh_xlate); 32 = the default
+    if uha != 'pool' and (not uha.isdigit() or not 32 <= int(uha) <= 8193): sys.exit(f'{g.id}: ubo_handle_array must be pool or a number from 32 to 8193: {uha}')
     spb = g.get('spare_block', 'off')   # Android: an empty 64 MB image block kept ready, made off the recording thread (nvn_vk.c DM_VK_SPARE_BLOCK overrides): on / off
     if spb not in ('on', 'off'): sys.exit(f'{g.id}: spare_block must be on or off: {spb}')
     tds = g.get('tex_dyn_slots', 'off')   # shaders whose texture handle the translator could not trace to one slot: slot indices in c2, the bound slots in the fallback arrays (nvn_mtl.m): on / off

@@ -301,7 +301,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             Operand bindlessHandle = texOp.GetSource(0);
 
-            if (!IsBindlessHandleAllowed(bindlessHandle))
+            if (!IsBindlessHandleAllowed(bindlessHandle, resourceManager, gpuAccessor))
             {
                 return false;
             }
@@ -364,7 +364,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             return true;
         }
 
-        private static bool IsBindlessHandleAllowed(Operand bindlessHandle)
+        private static bool IsBindlessHandleAllowed(Operand bindlessHandle, ResourceManager resourceManager = null, IGpuAccessor gpuAccessor = null)
         {
             if (bindlessHandle.AsgOp is PhiNode phi)
             {
@@ -372,7 +372,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 {
                     Operand phiSource = phi.GetSource(srcIndex);
 
-                    if (phiSource.AsgOp is not PhiNode && !IsBindlessAccessAllowed(phiSource))
+                    if (phiSource.AsgOp is not PhiNode && !IsBindlessAccessAllowed(phiSource, resourceManager, gpuAccessor))
                     {
                         return false;
                     }
@@ -381,15 +381,25 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 return true;
             }
 
-            return IsBindlessAccessAllowed(bindlessHandle);
+            return IsBindlessAccessAllowed(bindlessHandle, resourceManager, gpuAccessor);
         }
 
-        private static bool IsBindlessAccessAllowed(Operand bindlessHandle)
+        private static bool IsBindlessAccessAllowed(Operand bindlessHandle, ResourceManager resourceManager = null, IGpuAccessor gpuAccessor = null)
         {
             if (bindlessHandle.Type == OperandType.ConstantBuffer)
             {
                 // Bindless access with handles from constant buffer is allowed.
 
+                return true;
+            }
+
+            // nxnative: a handle loaded from a game uniform buffer at a run-time offset, in a buffer whose arrays the host asked not to make (QueryTextureArrayLengthFromBuffer <= 0,
+            // the game profile's ubo_handle_array pool): read the pools by its IDs, as the GPU does (BindlessToArray left it). Other buffers keep the limitation below
+            if (resourceManager != null && gpuAccessor != null &&
+                bindlessHandle.AsgOp is Operation cbOp && cbOp.Inst == Instruction.Load && cbOp.StorageKind == StorageKind.ConstantBuffer && cbOp.SourcesCount == 4 &&
+                cbOp.GetSource(0).Type == OperandType.Constant && resourceManager.TryGetConstantBufferSlot(cbOp.GetSource(0).Value, out int cbSlot) && cbSlot != 2 &&
+                gpuAccessor.QueryTextureArrayLengthFromBuffer(cbSlot) <= 0)
+            {
                 return true;
             }
 

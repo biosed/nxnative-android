@@ -58,8 +58,11 @@ static class SwshXlate
         // arrays into pointers to the pools the replay keeps (pool_arrays), with a run-time bound, so the lengths are the whole ID ranges
         public int QuerySamplerArrayLengthFromPool() => 1 << 12;
         // c[2]: every handle word (C2HandleWords). EA SPORTS FC 27's lights index separate texture i as element 45 + i (c2 byte 0x168 + 8 i), which 32 elements clamped to element 31.
-        // Other buffers (the game's own uniform buffers, read through the handles' byte offsets as well) keep 32
-        public int QueryTextureArrayLengthFromBuffer(int slot) => slot == 2 ? C2HandleWords : 32;
+        // Other buffers (the game's own uniform buffers, read through the handles' byte offsets as well) keep 32, unless the game profile's ubo_handle_array names another length
+        // (dmsh_build.py passes it in the job), or 0 (ubo_handle_array pool): no array, the handle read where the shader computes it and the pools indexed by its IDs, as the GPU does
+        // (BindlessToArray then leaves it to BindlessElimination). Tomodachi Life: Living the Dream's ground and sea read their handles at 256 * layer + 224..296 of uniform slot 0,
+        // element 28 to over 5,000, which 32 elements clamped to element 31 for every layer (the island floor one texture: dashed lot borders, then grey)
+        public int QueryTextureArrayLengthFromBuffer(int slot) => slot == 2 ? C2HandleWords : _job["ubo_handle_array"] is JsonNode n ? (int)n : 32;
         public int QueryTextureArrayLengthFromPool() => 1 << 20;
 
         string Get(string table, int slot) => _job[table] is JsonObject t && t[slot.ToString()] is JsonNode n ? (n is JsonObject o ? (string)o["type"] : (string)n) : null;
