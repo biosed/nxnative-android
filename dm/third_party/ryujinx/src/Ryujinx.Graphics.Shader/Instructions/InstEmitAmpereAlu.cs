@@ -627,12 +627,29 @@ namespace Ryujinx.Graphics.Shader.Instructions
             }
         }
 
+        // Special register 0x84 holds the variable-rate-shading fragment size in
+        // bytes 1 and 2. The host path shades every pixel, hence a 1 x 1 fragment.
+        private const int SRegFragmentSize = 0x84;
+        private const int FragmentSizeOneByOne = 0x00010100;
+
         // S2R Rd, SR / S2UR URd, SR (72..80)
         public static void AS2r(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
+            int sr = x.Bits(72, 80);
 
-            ASet(context, x, EmitSReg(context, (SReg)x.Bits(72, 80)), AUniform(context));
+            if (sr == SRegFragmentSize)
+            {
+                ASet(context, x, Const(FragmentSizeOneByOne), AUniform(context));
+                return;
+            }
+
+            if (!Enum.IsDefined(typeof(SReg), sr))
+            {
+                context.TranslatorContext.GpuAccessor.Log($"S2R of special register 0x{sr:x2}, which the translator does not know: read as 0");
+            }
+
+            ASet(context, x, EmitSReg(context, (SReg)sr), AUniform(context));
         }
 
         // ULDC URd, c[bank][offset] (0xab9) or c[bank][URa + offset] (0xabb, URa at 24..30): a byte, short, word or word pair (size 73..76)
