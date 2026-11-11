@@ -28,9 +28,9 @@ def program(*insts): return bytes(0x80) + b''.join(insts) + inst(*EXIT)   # a ze
 # SPIR-V numbers the checks read
 OP_ENTRY_POINT, OP_EXECUTION_MODE, OP_DECORATE, OP_VARIABLE, OP_EMIT_MESH_TASKS, OP_SET_MESH_OUTPUTS = 15, 16, 71, 59, 5294, 5295
 MODEL_TASK, MODEL_MESH = 5364, 5365
-MODE_LOCAL_SIZE, MODE_OUTPUT_VERTICES, MODE_OUTPUT_PRIMITIVES, MODE_OUTPUT_TRIANGLES = 17, 26, 5270, 5298
+MODE_LOCAL_SIZE, MODE_OUTPUT_POINTS, MODE_OUTPUT_VERTICES, MODE_OUTPUT_PRIMITIVES, MODE_OUTPUT_LINES, MODE_OUTPUT_TRIANGLES = 17, 27, 26, 5270, 5269, 5298
 DEC_SPEC_ID, DEC_BUILTIN, DEC_LOCATION, DEC_PER_PRIMITIVE = 1, 11, 30, 5271
-BUILTIN_PRIMITIVE_TRIANGLE_INDICES = 5296
+BUILTIN_POINT_SIZE, BUILTIN_PRIMITIVE_POINT_INDICES, BUILTIN_PRIMITIVE_LINE_INDICES, BUILTIN_PRIMITIVE_TRIANGLE_INDICES = 1, 5294, 5295, 5296
 SC_TASK_PAYLOAD = 5402
 
 
@@ -86,6 +86,17 @@ class Mesh(unittest.TestCase):
         self.assertEqual(ops[OP_EMIT_MESH_TASKS][0][3], payload[0][1])   # the payload goes with the launch
         self.assertEqual(res['stage'], 'ts')
 
+    def test_task_reads_its_own_payload(self):
+        # 0x927 / 0xb8 writes a record, then 0x923 / 0xb8 reads the same word in another thread. The loaded value becomes the mesh-workgroup count, so it survives optimization.
+        code = program(stage(STAGE_LOAD, HEADER, rd=0), stage(STAGE_STORE, TASK_WRITE, rb=0, imm=0x10),
+                       stage(STAGE_LOAD, TASK_WRITE, rd=1, imm=0x10), stage(STAGE_STORE, TASK_WRITE, rb=1, imm=4))
+        (_, ops), _ = self.translate(code, stage='ts', local=[32, 1, 1], mesh=[0, 0, 64])
+        self.assertEqual([e[0] for e in ops[OP_ENTRY_POINT]], [MODEL_TASK])
+        self.assertEqual(len(ops[OP_EMIT_MESH_TASKS]), 1)
+
+    def test_task_refuses_mesh_topology(self):
+        self.refused(self.TASK, 'task program with mesh output', stage='ts', local=[32, 1, 1], mesh=[0, 0, 64, -5, 1])
+
     # A mesh program: its index (task memory word 0), a payload word by it, the four position planes and the generic planes of vertex 0, one per-primitive value of
     # primitive 0, triangle 0's indices (bytes 4..6) and the primitive count (byte 3)
     MESH = program(stage(STAGE_LOAD, TASK_READ, rd=1), stage(STAGE_LOAD, TASK_READ, rd=2, ra=1, imm=0x10),
@@ -120,6 +131,27 @@ class Mesh(unittest.TestCase):
         (_, ops), _ = self.translate(program(stage(STAGE_LOAD, HEADER, rd=1), stage(STAGE_STORE, PLANES, rb=1), stage(STAGE_STORE, COUNTS, rb=RZ, imm=3)),
                                      stage='ms', local=[32, 1, 1], mesh=[32, 16, 128, 0, 1, 2, 3])
         self.assertFalse([v for v in ops[OP_VARIABLE] if v[2] == SC_TASK_PAYLOAD])
+
+    def test_point_mesh_with_point_size(self):
+        code = program(*[stage(STAGE_STORE, PLANES, rb=1, imm=0x80 * p) for p in range(5)],
+                       stage(STAGE_STORE, INDICES, rb=RZ, imm=4), stage(STAGE_STORE, COUNTS, rb=1, imm=3))
+        (_, ops), _ = self.translate(code, stage='ms', local=[32, 1, 1], mesh=[32, 32, 64, -5, 1, -4, 0, 1, 2, 3])
+        ep = ops[OP_ENTRY_POINT][0]
+        modes = {m[1]: m[2:] for m in ops[OP_EXECUTION_MODE] if m[0] == ep[1]}
+        self.assertIn(MODE_OUTPUT_POINTS, modes)
+        decos = [d for d in ops[OP_DECORATE] if d[1] == DEC_BUILTIN]
+        self.assertTrue(any(d[2] == BUILTIN_PRIMITIVE_POINT_INDICES for d in decos))
+        self.assertTrue(any(d[2] == DEC_BUILTIN and d[3] == BUILTIN_POINT_SIZE for d in ops.get(72, [])))
+
+    def test_line_mesh(self):
+        code = program(*[stage(STAGE_STORE, PLANES, rb=1, imm=0x80 * p) for p in range(4)],
+                       stage(STAGE_STORE, INDICES, rb=RZ, imm=4), stage(STAGE_STORE, INDICES, rb=1, imm=5),
+                       stage(STAGE_STORE, COUNTS, rb=1, imm=3))
+        (_, ops), _ = self.translate(code, stage='ms', local=[32, 1, 1], mesh=[32, 32, 64, -5, 2, 0, 1, 2, 3])
+        ep = ops[OP_ENTRY_POINT][0]
+        modes = {m[1]: m[2:] for m in ops[OP_EXECUTION_MODE] if m[0] == ep[1]}
+        self.assertIn(MODE_OUTPUT_LINES, modes)
+        self.assertTrue(any(d[1] == DEC_BUILTIN and d[2] == BUILTIN_PRIMITIVE_LINE_INDICES for d in ops[OP_DECORATE]))
 
     def test_refused_mode(self):
         self.refused(program(stage(STAGE_STORE, 0x9800, rb=0)), 'stage memory mode 0x9800', stage='ms', local=[32, 1, 1], mesh=[32, 16, 128, 0, 1, 2, 3])

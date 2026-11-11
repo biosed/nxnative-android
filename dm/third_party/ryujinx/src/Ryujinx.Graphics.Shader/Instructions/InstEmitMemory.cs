@@ -371,6 +371,9 @@ namespace Ryujinx.Graphics.Shader.Instructions
             (_, Operand addrHigh) = Get40BitsAddress(context, new Register(ra, RegisterType.Gpr), extended, offset);
 
             Operand srcA = context.Copy(new Operand(new Register(ra, RegisterType.Gpr)));
+            bool vector = count > 1 && storageKind == StorageKind.GlobalMemory &&
+                          rd + count <= RegisterConsts.RegisterZeroIndex;
+            int group = vector ? ++context.GlobalVectorGroups : 0;
 
             for (int index = 0; index < count; index++)
             {
@@ -382,6 +385,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 }
 
                 Operand value = context.Load(storageKind, context.IAdd(srcA, Const(offset + index * 4)), addrHigh);
+
+                if (vector && value.AsgOp is Operation load)
+                {
+                    load.GlobalVectorCount = count;
+                    load.GlobalVectorWord = index;
+                    load.GlobalVectorGroup = group;
+                }
 
                 context.Copy(Register(dest), value);
             }

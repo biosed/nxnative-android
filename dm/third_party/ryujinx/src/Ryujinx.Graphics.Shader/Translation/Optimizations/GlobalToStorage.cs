@@ -73,13 +73,42 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             private readonly List<Entry> _entries;
             private readonly Dictionary<LsKey, Dictionary<uint, SearchResult>> _sharedEntries;
+            private readonly Dictionary<(Instruction, StorageKind), int> _rawLastBindings;
+            private readonly Dictionary<int, int> _rawVectorFunctions;
             private readonly HelperFunctionManager _hfm;
 
             public GtsContext(HelperFunctionManager hfm)
             {
                 _entries = [];
                 _sharedEntries = new Dictionary<LsKey, Dictionary<uint, SearchResult>>();
+                _rawLastBindings = new Dictionary<(Instruction, StorageKind), int>();
+                _rawVectorFunctions = [];
                 _hfm = hfm;
+            }
+
+            public bool TryGetRawVectorFunctionId(int count, out int functionId)
+            {
+                return _rawVectorFunctions.TryGetValue(count, out functionId);
+            }
+
+            public int AddRawVectorFunction(int count, Function function)
+            {
+                int functionId = _hfm.AddFunction(function);
+                _rawVectorFunctions.Add(count, functionId);
+                return functionId;
+            }
+
+            public int GetOrAddRawLastBinding(ResourceManager resourceManager, Operation operation)
+            {
+                var key = (operation.Inst, operation.StorageKind);
+
+                if (!_rawLastBindings.TryGetValue(key, out int binding))
+                {
+                    binding = resourceManager.AddRawLastEntryMemory();
+                    _rawLastBindings.Add(key, binding);
+                }
+
+                return binding;
             }
 
             public int AddFunction(Operation baseOp, bool isMultiTarget, IReadOnlyList<uint> targetCbs, Function function)
@@ -381,13 +410,114 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                     targetLanguage,
                     block,
                     operation,
-                    out int functionId))
+                    out int functionId,
+                    out bool raw))
                 {
                     return null;
                 }
 
+                if (raw &&
+                    operation.Inst == Instruction.Load &&
+                    operation.StorageKind == StorageKind.GlobalMemory &&
+                    operation.GlobalVectorCount > 1 &&
+                    operation.GlobalVectorWord == 0 &&
+                    TryGetRawVectorFunction(
+                        gtsContext,
+                        resourceManager,
+                        gpuAccessor,
+                        operation,
+                        out int vectorFunctionId))
+                {
+                    return GenerateRawVectorLoad(resourceManager, node, operation, vectorFunctionId);
+                }
+
                 return GenerateCallStorageOp(node, operation, null, functionId);
             }
+        }
+
+        private static LinkedListNode<INode> GenerateRawVectorLoad(
+            ResourceManager resourceManager,
+            LinkedListNode<INode> node,
+            Operation operation,
+            int functionId)
+        {
+            int count = operation.GlobalVectorCount;
+            int vectorMemoryId = resourceManager.GetRawVectorMemory();
+
+            node = GenerateCallStorageOp(node, operation, null, functionId);
+            LinkedListNode<INode> insertAfter = node;
+
+            for (LinkedListNode<INode> next = node.Next; next != null; next = next.Next)
+            {
+                if (next.Value is not Operation follower)
+                {
+                    continue;
+                }
+
+                if (follower.Inst == Instruction.Load &&
+                    follower.StorageKind == StorageKind.GlobalMemory &&
+                    follower.GlobalVectorCount == count &&
+                    follower.GlobalVectorGroup == operation.GlobalVectorGroup &&
+                    follower.GlobalVectorWord > 0)
+                {
+                    Operand word = Local();
+                    Operation load = new(
+                        Instruction.Load,
+                        StorageKind.LocalMemory,
+                        word,
+                        Const(vectorMemoryId),
+                        Const(follower.GlobalVectorWord - 1));
+                    insertAfter = insertAfter.List.AddAfter(insertAfter, load);
+
+                    Operand dest = follower.Dest;
+                    follower.TurnIntoCopy(word);
+                    word.UseOps.Remove(follower);
+                    follower.Dest = null;
+                    next.Value = new Operation(Instruction.Copy, dest, word);
+
+                    if (follower.GlobalVectorWord == count - 1)
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (follower.GlobalVectorCount != 0 ||
+                    follower.StorageKind != StorageKind.None ||
+                    follower.Inst == Instruction.Call ||
+                    follower.Inst == Instruction.Barrier ||
+                    follower.Inst == Instruction.MemoryBarrier ||
+                    follower.Inst.IsAtomic())
+                {
+                    break;
+                }
+            }
+
+            return node;
+        }
+
+        private static bool TryGetRawVectorFunction(
+            GtsContext gtsContext,
+            ResourceManager resourceManager,
+            IGpuAccessor gpuAccessor,
+            Operation operation,
+            out int functionId)
+        {
+            int count = operation.GlobalVectorCount;
+
+            if (gtsContext.TryGetRawVectorFunctionId(count, out functionId))
+            {
+                return true;
+            }
+
+            return TryGenerateRawStorageOp(
+                gtsContext,
+                resourceManager,
+                gpuAccessor,
+                operation,
+                out functionId,
+                count);
         }
 
         private static bool CanUseInlineStorageOp(Operation operation, TargetLanguage targetLanguage)
@@ -589,11 +719,13 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             TargetLanguage targetLanguage,
             BasicBlock block,
             Operation operation,
-            out int functionId)
+            out int functionId,
+            out bool raw)
         {
             Queue<PhiNode> phis = new();
             HashSet<PhiNode> visited = [];
             List<uint> targetCbs = [];
+            raw = false;
 
             Operand globalAddress = operation.GetSource(0);
 
@@ -655,6 +787,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             if (targetCbs.Count == 0)
             {
+                raw = true;
                 gpuAccessor.Log($"Global memory operation \"{operation.Inst}\" traced to no storage buffer: it goes through the memory pool table.");
             }
 
@@ -783,8 +916,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
         // slot, which no constant buffer of the game has (dmsh_build.py turns it into DMSH_KIND_GMEM_MAP). 1 << GmemMapLog2 entries of GmemMapEntryWords words each,
         // {start lo, start hi, end lo, end hi, delta lo, delta hi, 0, 0}, sorted by start; entry 0 is empty (start 0, end 0) and unused entries start at ~0
         public const int GmemMapCbSlot = 0xff;
-        private const int GmemMapLog2 = 12;
+        private const int GmemMapLog2 = 13;
         private const int GmemMapEntryWords = 8;
+        private const int GmemHintShift = 21;
 
         // nxnative: the write log (dmsh_abi.h DMSH_GMEM_LOG_*), reserved under the same sentinel slot at offset 1: the set of guest pages (address >> 12) the stores and atomics wrote,
         // as an open-addressing hash set of 1 << GmemLogLog2 words from word 1 (0 = empty), word 0 set when a page found no free slot in GmemLogProbes tries. The host cannot know where
@@ -805,7 +939,8 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             ResourceManager resourceManager,
             IGpuAccessor gpuAccessor,
             Operation operation,
-            out int functionId)
+            out int functionId,
+            int vectorCount = 1)
         {
             functionId = 0;
 
@@ -853,33 +988,96 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
             }
 
-            // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one)
-            Operand index = Const(0);
-
-            for (int step = 1 << (GmemMapLog2 - 1); step != 0; step >>= 1)
+            Operand AtOrBelow(Operand high, Operand low)
             {
-                Operand candidate = context.IAdd(index, Const(step));
-                Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
-                Operand startLow = MapWord(entry, 0);
-                Operand startHigh = MapWord(entry, 1);
-
-                Operand atOrBelow = context.BitwiseOr(
-                    context.ICompareLessUnsigned(startHigh, addrHigh),
-                    context.BitwiseAnd(context.ICompareEqual(startHigh, addrHigh), context.ICompareLessOrEqualUnsigned(startLow, addrLow)));
-
-                index = context.ConditionalSelect(atOrBelow, candidate, index);
+                return context.BitwiseOr(
+                    context.ICompareLessUnsigned(high, addrHigh),
+                    context.BitwiseAnd(context.ICompareEqual(high, addrHigh), context.ICompareLessOrEqualUnsigned(low, addrLow)));
             }
 
-            Operand found = context.IMultiply(index, Const(GmemMapEntryWords));
-            Operand endLow = MapWord(found, 2);
-            Operand endHigh = MapWord(found, 3);
+            Operand Below(Operand high, Operand low)
+            {
+                return context.BitwiseOr(
+                    context.ICompareLessUnsigned(addrHigh, high),
+                    context.BitwiseAnd(context.ICompareEqual(addrHigh, high), context.ICompareLessUnsigned(addrLow, low)));
+            }
 
-            Operand inPool = context.BitwiseOr(
-                context.ICompareLessUnsigned(addrHigh, endHigh),
-                context.BitwiseAnd(context.ICompareEqual(addrHigh, endHigh), context.ICompareLessUnsigned(addrLow, endLow)));
+            Operand selected = Local();
+            Operand lblFound = Label();
+            Operand lblChosen = Label();
 
+            // Try the entry this helper chose last in this invocation before
+            // searching the table. Entry zero is empty, so the first lookup
+            // still searches. The host binds one disjoint table for the draw.
+            int lastBinding = gtsContext.GetOrAddRawLastBinding(resourceManager, operation);
+            Operand last = context.Load(StorageKind.LocalMemory, lastBinding);
+            Operand lastEntry = context.IMultiply(last, Const(GmemMapEntryWords));
+            Operand lastHolds = context.BitwiseAnd(
+                AtOrBelow(MapWord(lastEntry, 1), MapWord(lastEntry, 0)),
+                Below(MapWord(lastEntry, 3), MapWord(lastEntry, 2)));
+            context.Copy(selected, last);
+            context.BranchIfTrue(lblChosen, lastHolds);
+
+            // A tagged 2 MiB-chunk hint names an entry which holds the whole
+            // chunk. Collisions and ranges which cover only part of a chunk
+            // take the search below.
+            Operand chunk = context.BitwiseOr(
+                context.ShiftLeft(addrHigh, Const(32 - GmemHintShift)),
+                context.ShiftRightU32(addrLow, Const(GmemHintShift)));
+            Operand indexMask = Const((1 << GmemMapLog2) - 1);
+            Operand hint = MapWord(
+                context.IMultiply(context.BitwiseAnd(chunk, indexMask), Const(GmemMapEntryWords)), 6);
+            Operand hintIndex = context.BitwiseAnd(hint, indexMask);
+            Operand hintFits = context.BitwiseAnd(
+                context.BitwiseAnd(
+                    context.ICompareNotEqual(hintIndex, Const(0)),
+                    context.ICompareEqual(context.ShiftRightU32(hint, Const(GmemMapLog2)), chunk)),
+                context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemHintShift - GmemMapLog2))));
+            context.Copy(selected, hintIndex);
+            context.BranchIfTrue(lblFound, hintFits);
+
+            // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one)
+            Operand index = Local();
+            Operand step = Local();
+            Operand lblSearch = Label();
+            context.Copy(index, Const(0));
+            context.Copy(step, Const(1 << (GmemMapLog2 - 1)));
+            context.MarkLabel(lblSearch);
+            Operand candidate = context.IAdd(index, step);
+            Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
+            context.Copy(index, context.ConditionalSelect(AtOrBelow(MapWord(entry, 1), MapWord(entry, 0)), candidate, index));
+            context.Copy(step, context.ShiftRightU32(step, Const(1)));
+            context.BranchIfTrue(lblSearch, context.ICompareNotEqual(step, Const(0)));
+
+            context.Copy(selected, index);
+            context.MarkLabel(lblFound);
+            context.Store(StorageKind.LocalMemory, lastBinding, selected);
+            Operand found = context.IMultiply(selected, Const(GmemMapEntryWords));
             Operand lblSkip = Label();
+            Operand inPool = Below(MapWord(found, 3), MapWord(found, 2));
+
+            if (vectorCount > 1)
+            {
+                // The resolver chose the entry from word zero. Require the
+                // vector's last byte to remain below its end as well, rather
+                // than relying on host pool alignment.
+                Operand lastLow = context.IAdd(addrLow, Const(vectorCount * 4 - 1));
+                Operand endCarry = context.ConditionalSelect(
+                    context.ICompareLessUnsigned(lastLow, addrLow), Const(1), Const(0));
+                Operand lastHigh = context.IAdd(addrHigh, endCarry);
+                Operand endLow = MapWord(found, 2);
+                Operand endHigh = MapWord(found, 3);
+                inPool = context.BitwiseOr(
+                    context.ICompareLessUnsigned(lastHigh, endHigh),
+                    context.BitwiseAnd(
+                        context.ICompareEqual(lastHigh, endHigh),
+                        context.ICompareLessUnsigned(lastLow, endLow)));
+            }
+
             context.BranchIfFalse(lblSkip, inPool);
+
+            context.MarkLabel(lblChosen);
+            found = context.IMultiply(selected, Const(GmemMapEntryWords));
 
             if (writes)
             {
@@ -908,7 +1106,18 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             Operand resultValue = null;
 
-            if (operation.Inst == Instruction.Load)
+            if (operation.Inst == Instruction.Load && vectorCount > 1)
+            {
+                resultValue = context.Add(
+                    Instruction.Load,
+                    StorageKind.GlobalMemoryVector,
+                    Local(),
+                    hostLow,
+                    hostHigh,
+                    Const(vectorCount),
+                    Const(resourceManager.GetRawVectorMemory()));
+            }
+            else if (operation.Inst == Instruction.Load)
             {
                 resultValue = context.Load(StorageKind.GlobalMemory, hostLow, hostHigh);
 
@@ -967,11 +1176,23 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             }
 
             context.MarkLabel(lblSkip);
+            context.Store(StorageKind.LocalMemory, lastBinding, Const(0));
 
             bool returnsValue = operation.Dest != null;
 
             if (returnsValue)
             {
+                // A miss must preserve the scalar semantics: every word reads
+                // zero, including the followers stored in gmem_vec.
+                for (int word = 0; word < vectorCount - 1; word++)
+                {
+                    context.Store(
+                        StorageKind.LocalMemory,
+                        resourceManager.GetRawVectorMemory(),
+                        Const(word),
+                        Const(0));
+                }
+
                 context.Return(Const(0));
             }
             else
@@ -981,12 +1202,15 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             Function function = new(
                 ControlFlowGraph.Create(context.GetOperations()).Blocks,
-                GetFunctionName(operation, isMultiTarget: true, []) + "Raw",
+                GetFunctionName(operation, isMultiTarget: true, []) +
+                    (vectorCount > 1 ? $"RawV{vectorCount}" : "Raw"),
                 returnsValue,
                 inArgumentsCount,
                 0);
 
-            functionId = gtsContext.AddFunction(operation, isMultiTarget: true, [], function);
+            functionId = vectorCount > 1
+                ? gtsContext.AddRawVectorFunction(vectorCount, function)
+                : gtsContext.AddFunction(operation, isMultiTarget: true, [], function);
 
             return true;
         }
