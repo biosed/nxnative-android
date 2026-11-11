@@ -2512,7 +2512,7 @@ static struct {
 } S;
 static int g_depth_zero = 1, g_origin_ll;
 static struct {   // the current render targets and the open dynamic rendering; clears that come before the pass's first draw become its load actions (a tiler then never reads the old contents)
-    int n; vtex *ct[8]; VkImageView cv[8]; vtex *dt; VkImageView dv; uint32_t w, h; int open;
+    int n; vtex *ct[8]; VkImageView cv[8]; VkFormat cf[8]; vtex *dt; VkImageView dv; uint32_t w, h; int open;   // cf: each colour attachment's view format (rt_view_fmt)
     int merged;   // the open pass went on across a SetRenderTargets (rt_hold_scan, or the same targets again): a draw sampling one of its attachments ends it first (draw_reads_rt)
     uint8_t pw_c[8], pw_d; rp_desc rpd;   // DM_VK_STORE_NONE: what this open pass wrote (draws, clears, its CLEAR loads), and its description (begun at its end)
     uint32_t clv[8], cly[8]; uint8_t cwr[8], cdrawn[8];   // each colour attachment's level and layer, and whether a draw wrote it since its last same-pass snapshot (fb_prepare)
@@ -2646,7 +2646,7 @@ static int pass_begin(void) {
     }
     P.layered = P.want_layered && P.lok && P.nlayers > 1;
     if (P.layered) d.layers = P.nlayers;
-    for (int i = 0; i < P.n; i++) { d.cv[i] = P.layered && P.lcv[i] ? P.lcv[i] : P.cv[i]; d.cf[i] = P.ct[i] ? P.ct[i]->f.f : VK_FORMAT_UNDEFINED; d.cl[i] = P.clr_c[i] ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD; d.cc[i] = P.cc[i]; if (P.clr_c[i]) P.cdrawn[i] = 1; }
+    for (int i = 0; i < P.n; i++) { d.cv[i] = P.layered && P.lcv[i] ? P.lcv[i] : P.cv[i]; d.cf[i] = P.ct[i] ? (P.cf[i] ? P.cf[i] : P.ct[i]->f.f) : VK_FORMAT_UNDEFINED; d.cl[i] = P.clr_c[i] ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD; d.cc[i] = P.cc[i]; if (P.clr_c[i]) P.cdrawn[i] = 1; }
     if (P.dt) { d.dv = P.layered && P.ldv ? P.ldv : P.dv; d.df = P.dt->f.f; d.stencil = P.dt->f.stencil; d.dl = P.clr_d ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
                 d.sl = P.clr_s ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD; d.dc = (VkClearDepthStencilValue){P.cd, P.cs}; if (P.clr_d || P.clr_s) P.ddrawn = 1; }
     memset(P.clr_c, 0, sizeof P.clr_c); P.clr_d = P.clr_s = 0;
@@ -2774,6 +2774,20 @@ static void set_rt(const uint8_t *op, const p_set_rt *r, uint32_t size) {
     }
     set_rt_(r);
 }
+// The format a colour attachment is rendered in: its NVN view's format where it sets one (the sRGB twin of a UNORM texture: the hardware encodes on store), as tex_view
+// picks it, else the texture's (vk-t13). Passes and pipelines used the texture's format while the view was sRGB: Tomodachi Life renders its last pass into an sRGB view of
+// the RGBA8 window texture; Vulkan wants the pipeline's format to match the view, and the Adreno stored linear values (the whole picture dark and contrasty, the Metal
+// host's texture sRGB). DM_VK_RT_VIEW_FMT=0: the texture's format, as before
+static int rt_view_fmt_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RT_VIEW_FMT"); v = !(e && atoi(e) == 0); LOG("vk: DM_VK_RT_VIEW_FMT=%d: colour attachments in their %s format", v, v ? "view's" : "texture's"); } return v; }
+static uint64_t g_rt_fmt_differs;   // colour attachments set whose view format is not the texture's (the GPU line)
+static VkFormat rt_view_fmt(const vtex *v, const tex_t *t, const view_t *vw, int has_vw) {
+    if (!rt_view_fmt_on()) return v->f.f;
+    fmt_t f = fmt_of(has_vw && vw->set_format ? vw->format : t->d.format);
+    if (!f.f || f.dec || v->f.dec || f.depth || v->f.depth || fmt_block(f.f) != fmt_block(v->f.f)) return v->f.f;
+    if (v->nvfl && f.f != v->vfl[0] && (v->nvfl < 2 || f.f != v->vfl[1])) return v->f.f;   // outside the image's format list (DM_VK_UBWC): tex_view takes the image's own
+    if (f.f != v->f.f) g_rt_fmt_differs++;
+    return f.f;
+}
 static void set_rt_(const p_set_rt *r) {
     pass_end();
     memset(&P, 0, sizeof P);
@@ -2782,6 +2796,7 @@ static void set_rt_(const p_set_rt *r) {
         if (!r->color[i]) continue;
         vtex *v = tex_get(r->color[i], 1); if (!v) continue;
         P.ct[i] = v; P.cv[i] = tex_view(v, r->color[i], &r->cview[i], r->has_cview[i], -1, 1);
+        P.cf[i] = rt_view_fmt(v, r->color[i], &r->cview[i], r->has_cview[i]);
         uint32_t lv = r->has_cview[i] && r->cview[i].set_levels ? r->cview[i].base_level : 0, w = v->w >> lv ? v->w >> lv : 1, h = v->h >> lv ? v->h >> lv : 1;
         P.clv[i] = lv; P.cly[i] = r->has_cview[i] && r->cview[i].set_layers ? r->cview[i].min_layer : 0; P.cwr[i] = 1;
         if (w < P.w) P.w = w; if (h < P.h) P.h = h;
@@ -4249,7 +4264,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (prim == NVN_DRAW_PRIMITIVE_LINE_LOOP || prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP || prim == NVN_DRAW_PRIMITIVE_PATCHES) { RED_ONCE(31, "primitive %d not implemented yet", prim); SKIP(4); }
     pso_key k; memset(&k, 0, sizeof k);
     k.vs = vs; k.fs = fs; k.gs = gs; k.prim = prim; k.nattr = S.nattr; memcpy(k.attr, S.attr, sizeof k.attr); k.nstream = S.nstream; memcpy(k.stream, S.stream, sizeof k.stream);
-    k.nc = P.n; for (int i = 0; i < P.n; i++) { k.cf[i] = P.ct[i] && P.cv[i] ? P.ct[i]->f.f : VK_FORMAT_UNDEFINED; k.blend[i] = S.blend[i]; }
+    k.nc = P.n; for (int i = 0; i < P.n; i++) { k.cf[i] = P.ct[i] && P.cv[i] ? (P.cf[i] ? P.cf[i] : P.ct[i]->f.f) : VK_FORMAT_UNDEFINED; k.blend[i] = S.blend[i]; }
     k.color = S.color; k.chmask = S.chmask; k.poly = S.poly; k.samples = P.ct[0] ? 1 : 1;
     if (S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS) RED_ONCE(48, "the alpha test (ColorStateSetAlphaTest %d) is not implemented: fragments are not discarded by it", (int)S.color.alpha_func);
     // Lines wider than one pixel (SetLineWidth): FINAL FANTASY XII THE ZODIAC AGE draws its battle target lines 3 pixels wide. The Metal host draws them as quads (it has only
@@ -6137,8 +6152,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     if (n % 600 == 0) LOG("vk: texel buffer slots read as zeros so far: nothing bound %llu, not a buffer texture %llu, format not usable %llu", (unsigned long long)g_tbuf_miss[0],
                           (unsigned long long)g_tbuf_miss[1], (unsigned long long)g_tbuf_miss[2]);
     if (n % 600 == 0) { uint64_t gp = atomic_exchange(&g_gpu_kind_ns[0], 0), gd = atomic_exchange(&g_gpu_kind_ns[1], 0), gc = atomic_exchange(&g_gpu_kind_ns[2], 0);
-                        LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms, the upload command buffers %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame (%.1f of them clears only), SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame (left open %.1f: the attachment it samples was not written in the pass)",
-                            gp / 600e6, gd / 600e6, gc / 600e6, atomic_exchange(&g_up_gpu_ns, 0) / 600e6, g_npass / 600.0, g_npass_clr / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0, g_nsplit_skip / 600.0); g_npass = 0; g_npass_clr = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; g_nsplit_skip = 0; }
+                        LOG("vk: GPU per frame over the last 600: render passes %.2f ms, dispatches %.2f ms, copies %.2f ms, the upload command buffers %.2f ms (the rest of the submissions' span is time between them); %.1f render passes a frame (%.1f of them clears only; colour targets set in another view format %.1f), SetRenderTargets detours held %.1f and same targets kept %.1f a frame, held passes ended for a draw that samples an attachment %.1f a frame (left open %.1f: the attachment it samples was not written in the pass)",
+                            gp / 600e6, gd / 600e6, gc / 600e6, atomic_exchange(&g_up_gpu_ns, 0) / 600e6, g_npass / 600.0, g_npass_clr / 600.0, g_rt_fmt_differs / 600.0, g_nheld / 600.0, g_nsame / 600.0, g_nsplit / 600.0, g_nsplit_skip / 600.0); g_npass = 0; g_npass_clr = 0; g_rt_fmt_differs = 0; g_nheld = 0; g_nsame = 0; g_nsplit = 0; g_nsplit_skip = 0; }
     if (n % 600 == 0) gsig_report(600);
     if (n % 600 == 0) {   // the host heap (malloc) and what the backend keeps in it, to attribute the process's native heap (dumpsys meminfo)
         struct mallinfo mi = mallinfo(); int nt = 0, nv = 0, live = 0; uint64_t snap = 0, xc = 0;
