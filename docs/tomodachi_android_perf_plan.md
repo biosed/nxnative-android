@@ -33,3 +33,46 @@ The `Presentation Thread` spends half its time in `block_wait` (a guest lock / c
 2. A (`DM_VK_FB_EPOCH`), reviewed by ffr-perf, as t6, A/B on the tablet.
 3. `DM_VK_NO_DYNREND=1` and `DM_CORE_SERIAL=0` A/Bs (env only).
 4. C only if 1-3 leave the pass count well above the Mac's 182.
+
+## 6. Chunked submission: the GPU starts while the frame is still being recorded (plan, not built)
+
+**Why.** On the t9c/t10b island the game waits for the GPU twice a frame, ~31-34 ms, and the wait counters say it waits for (nearly) the newest submission with the whole frame
+it just submitted still queued (0.2 submissions after the waited one, 2.8 still running). So the frame is a serial chain: the game's own work, then our recording of its
+submissions (~20 ms on the recording thread at 0.8-2.0 GHz), then the GPU (~22 ms busy by timestamps, ~34 ms waited: it also idles, and likely clocks down, while we record).
+Each game submission becomes one `vkQueueSubmit` at `mtl_sub_commit`, so the GPU sees none of a submission until all of it is recorded.
+
+**What.** Cut a game submission into chunks: at a render-pass boundary inside the walk, once the chunk holds enough work, commit the chunk (`mtl_sub_commit`) and begin
+the next (`mtl_sub_begin`) without returning to the game. The GPU runs chunk k while chunk k+1 is recorded. The game still gets one fence for its submission (the last chunk's).
+
+**Trigger / chunk size.** At `pass_end_` of a pass with draws (never inside a pass, a held pass (`g_rt_hold`), or with deferred dispatches outstanding: those are flushed
+by pass_end first) when the chunk has recorded at least `DM_VK_CHUNK` draws (default 250 when on: the island records ~1,600 draws in ~20 ms, so ~6 chunks a frame,
+the first reaching the GPU after ~3 ms). Not in a submission's last 10% of commands (the tail is committed anyway). A time trigger (recorded ns) was considered: draws are
+cheaper to reason about and do not move with clocks.
+
+**Fences and contexts.** Each chunk is a full submission: its own context (`ctx_pick`), fence value (`++g_fence`), ring, upload command buffer, descriptor pools and
+completion. Guest `FenceSync` ops recorded in chunk k take chunk k's fence (as now: `g_fence + 1`), which covers everything before them. The value `mtl_sub_commit`
+returns to the game is the last chunk's. With `DM_VK_REC_THREAD` (fence values handed out before recording, `g_fence_q`) chunking is off: the numbering would no longer match.
+
+**Ring and write-backs.** Unchanged rules, more instances: each chunk copies into its own ring (`g_wgen++` per begin, so `copy_in` reuse restarts per chunk: more copies,
+counted), its write-backs (post) run at its completion, in fence order (one completion thread). GPU-written ranges from chunk k read by chunk k+1 go through `gw_find` /
+`hold` exactly as between two game submissions today. Each submission starts with `barrier_all`, so chunk k+1's GPU work (copies, uploads, passes) starts after chunk k's.
+
+**Feedback snapshots and other per-submission state.** The snapshot images (`g_fbs`) are reused across submissions already; the start barrier orders a later chunk's copy
+into them after an earlier chunk's reads. Per-submission caches restart per chunk: `g_bvgen` (HTAB, stage reuse, texel views), `DIRTY_ONCE`, the CPU-written linear texture
+hash (16 MB a frame today: the dirty-page gating, the next small build, must land first or the hash runs once per chunk), occlusion query pools (per context; counter segments
+are completed in fence order as across game submissions). Expected recording cost: +0.5-1.5 ms a frame (more descriptor-set misses and copies, more `vkQueueSubmit`s).
+
+**EARLY_DONE / CTX_PICK.** More contexts in flight (3 → ~8 a frame): ctx_pick takes free ones, grows to the cap (32) if needed; each context costs a ring (4 MB minimum,
+following use). EARLY_DONE is unchanged per chunk (fence first, pool reset after). dm-complete's pool resets scale with passes, not submissions (the per-pass driver memory),
+so their total stays ~11 ms a frame on the completion thread, now spread over more, smaller resets.
+
+**Switch and risk.** `DM_VK_CHUNK=<draws>` (0 = off) and a profile key `submit_chunk <draws>` (default off): on for Tomodachi only until measured elsewhere. FFR / FF12 / HM
+keep today's path (FFR submits ~9 times a frame already; HM is not GPU-serial). Main risks: state that assumes one submission per game submission (the game-visible
+counters `REPORT_COUNTER`, `SIGNAL_EVENT`, `OP_FENCE_SYNC` order), the held-pass / feedback-snapshot logic at chunk edges, and memory (more rings in flight). Checks:
+passlog of one island frame with chunks vs without (same draws, same bindings), screenshots, the counters line (chunks a frame, their draws, submit ns), FFR/FF12/HM
+regression runs with the key off (no code path change when off).
+
+**Predicted gain at the island's numbers.** Today ≈ game ~6 ms + recording ~20 ms + GPU wait ~32 ms ≈ 58-62 ms. With ~6 chunks, the GPU starts ~3 ms into recording and
+runs alongside it; the wait after the last chunk is the GPU work not yet done: ≈ max(0, GPU − overlap) ≈ 6-12 ms if the GPU keeps ~22-26 ms a frame (higher utilisation
+should also keep its clock up). Frame ≈ 6 + 21 (recording + chunk overhead) + 6-12 ≈ 33-40 ms, i.e. 58-62 → 33-40 ms (~16 → 25-30 fps). If the GPU's real time
+is the ~34 ms it is waited for today, the frame becomes GPU-bound at ~36-40 ms. Not a gain if the GPU is busier than measured (then it moves the wait, not removes it).
