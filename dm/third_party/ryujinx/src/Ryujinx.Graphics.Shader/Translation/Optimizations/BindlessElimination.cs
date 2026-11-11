@@ -65,6 +65,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                         : texOp.Type.GlslTextureTypeName;
 
                     gpuAccessor.Log($"Failed to find handle source for bindless access of type \"{typeName}\".");
+                    if (Environment.GetEnvironmentVariable("DMSH_BINDLESS_DIAG") == "1") gpuAccessor.Log($"bindless diag: handle {Describe(texOp.GetSource(0), 3)}");
 
                     for (int destIndex = 0; destIndex < texOp.DestsCount; destIndex++)
                     {
@@ -366,6 +367,11 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
         private static bool IsBindlessHandleAllowed(Operand bindlessHandle, ResourceManager resourceManager = null, IGpuAccessor gpuAccessor = null)
         {
+            if (bindlessHandle.AsgOp is PhiNode && resourceManager != null && gpuAccessor != null && IsPoolSlotLoad(bindlessHandle, resourceManager, gpuAccessor, 3))
+            {
+                return true;
+            }
+
             if (bindlessHandle.AsgOp is PhiNode phi)
             {
                 for (int srcIndex = 0; srcIndex < phi.SourcesCount; srcIndex++)
@@ -384,6 +390,62 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             return IsBindlessAccessAllowed(bindlessHandle, resourceManager, gpuAccessor);
         }
 
+        // nxnative: a handle word loaded from a game uniform buffer the host asked not to make arrays of (QueryTextureArrayLengthFromBuffer <= 0), or an OR of such a word with
+        // another (a texture word and a separate sampler word, as BindlessToArray's secondary handle), or with a constant
+        private static string Describe(Operand o, int depth)   // diagnostics (DMSH_BINDLESS_DIAG=1): the handle's defining operations
+        {
+            if (o.Type == OperandType.Constant) return $"const {o.Value:x}";
+            if (o.Type == OperandType.ConstantBuffer) return "cbuf";
+            if (depth == 0) return "…";
+            if (o.AsgOp is PhiNode phi) { var parts = new System.Collections.Generic.List<string>(); for (int i = 0; i < phi.SourcesCount; i++) parts.Add(Describe(phi.GetSource(i), depth - 1)); return "phi(" + string.Join(", ", parts) + ")"; }
+            if (o.AsgOp is Operation op) { var parts = new System.Collections.Generic.List<string>(); for (int i = 0; i < op.SourcesCount; i++) parts.Add(Describe(op.GetSource(i), depth - 1)); return $"{op.Inst}/{op.StorageKind}(" + string.Join(", ", parts) + ")"; }
+            return "undef";
+        }
+
+        private static bool IsPoolSlotLoad(Operand handle, ResourceManager resourceManager, IGpuAccessor gpuAccessor, int orDepth)
+        {
+            if (handle.Type == OperandType.Constant)
+            {
+                return true;
+            }
+
+            // A word chosen on several paths (the register the handle lives in holds other values on paths that do not sample, e.g. a comparison): taken when one path loads it
+            // from such a buffer. Whatever the others hold is what the GPU would index the pools with too, so the pools are indexed by the value as it is
+            if (handle.AsgOp is PhiNode phi && orDepth > 0)
+            {
+                for (int i = 0; i < phi.SourcesCount; i++)
+                {
+                    if (IsPoolSlotLoad(phi.GetSource(i), resourceManager, gpuAccessor, orDepth - 1))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            if (handle.AsgOp is not Operation op)
+            {
+                return false;
+            }
+
+            if (op.Inst == Instruction.Copy && op.SourcesCount == 1)
+            {
+                return IsPoolSlotLoad(op.GetSource(0), resourceManager, gpuAccessor, orDepth);
+            }
+
+            if (op.Inst == Instruction.BitwiseOr && orDepth > 0 && op.SourcesCount == 2)
+            {
+                return IsPoolSlotLoad(op.GetSource(0), resourceManager, gpuAccessor, orDepth - 1) &&
+                       IsPoolSlotLoad(op.GetSource(1), resourceManager, gpuAccessor, orDepth - 1) &&
+                       (op.GetSource(0).Type != OperandType.Constant || op.GetSource(1).Type != OperandType.Constant);
+            }
+
+            return op.Inst == Instruction.Load && op.StorageKind == StorageKind.ConstantBuffer && op.SourcesCount == 4 &&
+                   op.GetSource(0).Type == OperandType.Constant && resourceManager.TryGetConstantBufferSlot(op.GetSource(0).Value, out int cbSlot) && cbSlot != 2 &&
+                   gpuAccessor.QueryTextureArrayLengthFromBuffer(cbSlot) <= 0;
+        }
+
         private static bool IsBindlessAccessAllowed(Operand bindlessHandle, ResourceManager resourceManager = null, IGpuAccessor gpuAccessor = null)
         {
             if (bindlessHandle.Type == OperandType.ConstantBuffer)
@@ -395,10 +457,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             // nxnative: a handle loaded from a game uniform buffer at a run-time offset, in a buffer whose arrays the host asked not to make (QueryTextureArrayLengthFromBuffer <= 0,
             // the game profile's ubo_handle_array pool): read the pools by its IDs, as the GPU does (BindlessToArray left it). Other buffers keep the limitation below
-            if (resourceManager != null && gpuAccessor != null &&
-                bindlessHandle.AsgOp is Operation cbOp && cbOp.Inst == Instruction.Load && cbOp.StorageKind == StorageKind.ConstantBuffer && cbOp.SourcesCount == 4 &&
-                cbOp.GetSource(0).Type == OperandType.Constant && resourceManager.TryGetConstantBufferSlot(cbOp.GetSource(0).Value, out int cbSlot) && cbSlot != 2 &&
-                gpuAccessor.QueryTextureArrayLengthFromBuffer(cbSlot) <= 0)
+            if (resourceManager != null && gpuAccessor != null && IsPoolSlotLoad(bindlessHandle, resourceManager, gpuAccessor, 3))
             {
                 return true;
             }
