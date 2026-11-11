@@ -180,7 +180,11 @@ int clonefile(const char *src, const char *dst, uint32_t flags) {
     (void)flags;
     struct stat st; if (lstat(src, &st)) return -1;
     if (S_ISLNK(st.st_mode)) { char t[4096]; ssize_t k = readlink(src, t, sizeof t - 1); if (k < 0) return -1; t[k] = 0; return symlink(t, dst); }
-    if (!S_ISDIR(st.st_mode)) return copy_file(src, dst, st.st_mode) || copy_xattrs(src, dst) ? -1 : 0;
+    if (!S_ISDIR(st.st_mode)) {   // the copy keeps the source's times, as APFS's clone does: the save commit log tells written files by their time (hle_fs.c save_changes)
+        if (copy_file(src, dst, st.st_mode) || copy_xattrs(src, dst)) return -1;
+        struct timespec t[2] = {st.st_atim, st.st_mtim}; utimensat(AT_FDCWD, dst, t, AT_SYMLINK_NOFOLLOW);
+        return 0;
+    }
     if (mkdir(dst, st.st_mode & 0777) || copy_xattrs(src, dst)) return -1;
     DIR *d = opendir(src); if (!d) return -1;
     struct dirent *e; int r = 0;

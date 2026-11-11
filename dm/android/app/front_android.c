@@ -479,7 +479,13 @@ static char *g_argv[4];
 static void boot_env(const char *files, const char *ext) {
     char p[1024];
     snprintf(p, sizeof p, "%s/log.txt", ext);
-    char prev[1024]; snprintf(prev, sizeof prev, "%s/log.prev.txt", ext); rename(p, prev);
+    // the last runs' logs: log.prev.txt (the run before), log.prev2.txt, log.prev3.txt -- a long play session is not pushed out by a couple of short test starts after it
+    char prev[1024], older[1024];
+    for (int k = 3; k > 1; k--) {   // log.prev2 -> log.prev3, log.prev -> log.prev2
+        if (k == 2) snprintf(prev, sizeof prev, "%s/log.prev.txt", ext); else snprintf(prev, sizeof prev, "%s/log.prev%d.txt", ext, k - 1);
+        snprintf(older, sizeof older, "%s/log.prev%d.txt", ext, k); rename(prev, older);
+    }
+    snprintf(prev, sizeof prev, "%s/log.prev.txt", ext); rename(p, prev);
     if (freopen(p, "w", stderr)) setvbuf(stderr, NULL, _IOLBF, 0);
     snprintf(p, sizeof p, "%s/settings.env", files);   // KEY=VALUE lines from MenuActivity
     FILE *f = fopen(p, "r");

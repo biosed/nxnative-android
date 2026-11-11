@@ -635,6 +635,47 @@ int dm_fs_clone_committed(const char *dir, const char *to) {
 }
 // Both Commit overloads share this transaction engine. Caller holds the path
 // and mount locks; front-end failure notification is delivered after unlocking.
+// What a commit changes, for the log: the files of the working tree that are new or were written since the committed version ("+name 9.0 MB", "~name 1.0 MB") and the
+// committed files the working tree no longer has ("-name"). "Written" = a different size or modification time: the clone at mount keeps the times (APFS clonefile; Android's
+// copy in compat.c sets them), and any write moves them. Stats only, no reads: the commit stays ~1 ms. Names are the guest's (guest_name). The list is cut with "..." at the
+// buffer's end. Read-only, before the swap: it changes nothing whatever it finds.
+#ifdef __APPLE__
+#define ST_MTIME_NS(s) ((int64_t)(s).st_mtimespec.tv_sec * 1000000000 + (s).st_mtimespec.tv_nsec)
+#else
+#define ST_MTIME_NS(s) ((int64_t)(s).st_mtim.tv_sec * 1000000000 + (s).st_mtim.tv_nsec)
+#endif
+static void changes_walk(const char *work, const char *commit, const char *rel, int depth, char *out, size_t n, size_t *used, int removed) {
+    char wd[1300]; snprintf(wd, sizeof wd, "%s%s%s", removed ? commit : work, *rel ? "/" : "", rel);
+    DIR *d = opendir(wd); if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.' && strncmp(e->d_name, ".dm-case-", 9)) continue;
+        char r2[1300], a[1400], b[1400], g[256]; struct stat sa, sb;
+        snprintf(r2, sizeof r2, "%s%s%s", rel, *rel ? "/" : "", e->d_name);
+        snprintf(a, sizeof a, "%s/%s", work, r2); snprintf(b, sizeof b, "%s/%s", commit, r2);
+        if (!guest_name(wd, e->d_name, g, sizeof g)) strlcpy(g, e->d_name, sizeof g);
+        if (lstat(removed ? b : a, &sa)) continue;
+        int has_other = !lstat(removed ? a : b, &sb);
+        if (S_ISDIR(sa.st_mode)) { if (depth < 4) changes_walk(work, commit, r2, depth + 1, out, n, used, removed); continue; }
+        if (!S_ISREG(sa.st_mode)) continue;
+        char item[400]; item[0] = 0;
+        if (removed) { if (!has_other) snprintf(item, sizeof item, " -%s%s%s", rel, *rel ? "/" : "", g); }
+        else if (!has_other) snprintf(item, sizeof item, " +%s%s%s %.1f MB", rel, *rel ? "/" : "", g, sa.st_size / 1048576.0);
+        else if (sa.st_size != sb.st_size || ST_MTIME_NS(sa) != ST_MTIME_NS(sb)) snprintf(item, sizeof item, " ~%s%s%s %.1f MB", rel, *rel ? "/" : "", g, sa.st_size / 1048576.0);
+        if (!item[0]) continue;
+        size_t k = strlen(item);
+        if (*used + k + 4 >= n) { if (*used + 4 < n) { memcpy(out + *used, " ...", 5); *used += 4; } closedir(d); return; }
+        memcpy(out + *used, item, k + 1); *used += k;
+    }
+    closedir(d);
+}
+static void save_changes(const char *work, const char *commit, char *out, size_t n) {
+    size_t used = 0; out[0] = 0;
+    changes_walk(work, commit, "", 0, out, n, &used, 0);
+    changes_walk(work, commit, "", 0, out, n, &used, 1);
+    if (!used) strlcpy(out, "none changed", n);
+    else memmove(out, out + 1, strlen(out + 1) + 1);   // the leading space
+}
 static Result commit_mount_locked(int i, int *notify_error) {
     int txn = g_mnt[i].txn_root;
     if (txn < 0 || txn >= g_nmnt) return RES_FAIL;
@@ -669,6 +710,7 @@ static Result commit_mount_locked(int i, int *notify_error) {
         return RES_FAIL;
     }
     char neu[1100]; snprintf(neu, sizeof neu, "%s.new", g_mnt[i].commit);
+    char chg[700]; save_changes(g_mnt[i].dir, g_mnt[i].commit, chg, sizeof chg);   // which files this commit adds, changes or removes (before the swap: the committed tree is still the old one)
     Result r = RES_OK;
     if (!access(neu, F_OK)) rm_tree(neu);
     if (clonefile(g_mnt[i].dir, neu, 0)) { LOG("[RED] save commit: clonefile %s failed errno=%d (committed version unchanged)", neu, errno); r = RES_FAIL; }
@@ -676,8 +718,8 @@ static Result commit_mount_locked(int i, int *notify_error) {
     else rm_tree(neu);                                                  // the old version that was swapped out
     // Timing readouts (integer microseconds, no floating point): how long the clone + atomic swap took; how long in total from this transaction's first save write to the end of the commit (the game writing files + the commit; 0 = no save write in this transaction)
     static int n; if (r == RES_OK) { uint64_t tc2 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-        LOG("save commit #%d: %s swapped atomically into %s (%d save writes so far) (clone + swap %llu us, since this transaction's first write %llu us)", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
-            (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0)); atomic_fetch_add(&g_save_commits, 1);
+        LOG("save commit #%d: %s swapped atomically into %s (%d save writes so far) (clone + swap %llu us, since this transaction's first write %llu us); files: %s", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
+            (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0), chg); atomic_fetch_add(&g_save_commits, 1);
         save_sync_committed();   // wakes the cloud sender, which clones the committed save through dm_fs_clone_committed above (save_sync.h)
     }
     return r;
