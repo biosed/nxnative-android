@@ -86,6 +86,14 @@ class Mesh(unittest.TestCase):
         self.assertEqual(ops[OP_EMIT_MESH_TASKS][0][3], payload[0][1])   # the payload goes with the launch
         self.assertEqual(res['stage'], 'ts')
 
+    def test_task_reads_its_own_payload(self):
+        # 0x927 / 0xb8 writes a record, then 0x923 / 0xb8 reads the same word in another thread. The loaded value becomes the mesh-workgroup count, so it survives optimization.
+        code = program(stage(STAGE_LOAD, HEADER, rd=0), stage(STAGE_STORE, TASK_WRITE, rb=0, imm=0x10),
+                       stage(STAGE_LOAD, TASK_WRITE, rd=1, imm=0x10), stage(STAGE_STORE, TASK_WRITE, rb=1, imm=4))
+        (_, ops), _ = self.translate(code, stage='ts', local=[32, 1, 1], mesh=[0, 0, 64])
+        self.assertEqual([e[0] for e in ops[OP_ENTRY_POINT]], [MODEL_TASK])
+        self.assertEqual(len(ops[OP_EMIT_MESH_TASKS]), 1)
+
     # A mesh program: its index (task memory word 0), a payload word by it, the four position planes and the generic planes of vertex 0, one per-primitive value of
     # primitive 0, triangle 0's indices (bytes 4..6) and the primitive count (byte 3)
     MESH = program(stage(STAGE_LOAD, TASK_READ, rd=1), stage(STAGE_LOAD, TASK_READ, rd=2, ra=1, imm=0x10),

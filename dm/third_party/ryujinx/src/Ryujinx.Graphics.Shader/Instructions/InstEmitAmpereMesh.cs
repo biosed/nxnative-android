@@ -45,6 +45,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             None,
             Header,
             TaskMemoryRead,
+            TaskMemoryOwnRead,
             TaskMemoryWrite,
             VertexPlanes,
             PrimitiveIndices,
@@ -82,7 +83,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             int offset = x.Bits(40, 64);
 
             AStageWindow window = load
-                ? mode switch { 0x7800 => AStageWindow.Header, 0x3800 => AStageWindow.TaskMemoryRead, _ => AStageWindow.None }
+                ? mode switch { 0x7800 => AStageWindow.Header, 0x3800 => AStageWindow.TaskMemoryRead, 0xb800 => AStageWindow.TaskMemoryOwnRead, _ => AStageWindow.None }
                 : mode switch { 0xb800 => AStageWindow.TaskMemoryWrite, 0xf800 => AStageWindow.VertexPlanes, 0x8000 => AStageWindow.PrimitiveIndices, 0x8800 => AStageWindow.PrimitiveHeader, _ => AStageWindow.None };
 
             if (window == AStageWindow.None)
@@ -95,7 +96,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 throw AFail(context, "stage memory form");
             }
 
-            bool taskWindow = window is AStageWindow.TaskMemoryWrite;
+            bool taskWindow = window is AStageWindow.TaskMemoryOwnRead or AStageWindow.TaskMemoryWrite;
             bool meshWindow = window is AStageWindow.TaskMemoryRead or AStageWindow.VertexPlanes or AStageWindow.PrimitiveIndices or AStageWindow.PrimitiveHeader;
 
             if ((taskWindow && !mesh.IsTask) || (meshWindow && !mesh.IsMesh))
@@ -140,6 +141,17 @@ namespace Ryujinx.Graphics.Shader.Instructions
                         Operand word = context.ShiftRightU32(context.BitwiseAnd(address, Const(mesh.PayloadWords * 4 - 1)), Const(2));
                         Operand loaded = context.Load(StorageKind.SharedMemory, mesh.PayloadMemoryId, word);
                         ASet(context, x, x.Ra == RegisterConsts.RegisterZeroIndex ? loaded : context.ConditionalSelect(context.ICompareEqual(word, Const(0)), index, loaded));
+                    }
+
+                    return;
+
+                case AStageWindow.TaskMemoryOwnRead:
+                    // A task may read back the payload it wrote through 0x927 / 0xb800. Ocarina of Time's 5d3a096025e375a1 writes records in one thread and
+                    // consumes them in another; this is the same task payload memory, not the mesh workgroup's TaskMemoryRead view.
+                    if (x.Rd != RegisterConsts.RegisterZeroIndex)
+                    {
+                        Operand word = context.ShiftRightU32(context.BitwiseAnd(address, Const(mesh.PayloadWords * 4 - 1)), Const(2));
+                        ASet(context, x, context.Load(StorageKind.SharedMemory, mesh.PayloadMemoryId, word));
                     }
 
                     return;
