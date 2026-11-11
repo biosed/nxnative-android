@@ -1566,7 +1566,7 @@ static int reup_hold(const vtex *v, uint64_t fr) {
 static uint64_t g_dirty_scans, g_dirty_skips;
 static int dirty_once(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_DIRTY_ONCE"); v = !e || atoi(e) != 0; } return v; }
 static int reup_this_frame(const vtex *v) {   // uploaded already this frame: a re-upload would be held (reup_hold), so the scan is left out
-    if (!dirty_once() || v->late || !v->reup_frame || v->reup_frame != atomic_load(&g_presents)) return 0;
+    if (!dirty_once() || v->late || v->lcpu || !v->reup_frame || v->reup_frame != atomic_load(&g_presents)) return 0;   // (a CPU-written linear texture is never held: DM_VK_LCPU_DIRTY)
     g_dirty_skips++; return 1;
 }
 static int tex_clean_now(vtex *v, const tex_t *t) {
@@ -1585,7 +1585,8 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
     // Not while evicted (tex_evict, the low-memory trim): its image is gone, and the remake below uploads it from its storage anyway. Tomodachi Life crashed in the driver's
     // vkCmdCopyBufferToImage2 two frames after a trim evicted 58 textures: this upload went into VK_NULL_HANDLE (FINAL FANTASY RESONANCE's CPU-written atlases are used every frame)
     // DM_VK_LCPU_DIRTY (vk-t12, default 1): a CPU-written linear texture in dirty-tracked storage (v->span, set when tex_upload_ stamped and protected it) is not hashed:
-    // a write to its pages makes it dirty and the re-upload below takes it, as for packaged textures. Tomodachi Life hashed one 16 MB texture a frame that never changed
+    // a write to its pages makes it dirty and the re-upload below takes it, as for packaged textures but never held (reup_hold, reup_this_frame and the HTAB / stage-reuse
+    // fast paths exempt it), so a write is uploaded at the next submission that uses it, as the hash did (Unreal's Slate atlas gains glyphs mid-frame; ffr-perf's review). Tomodachi Life hashed one 16 MB texture a frame that never changed
     // (0.58 G cycles in 20 s, ~2 ms of recording); untracked storage is still hashed. DM_VK_LCPU_DIRTY=0: hashed always, as before
     if (v && v->lcpu && v->span && lcpu_dirty_on()) g_lcpu_gated++;
     else if (v && v->lcpu && !v->gpu && !v->evicted && !for_rt && v->lhash_gen != g_bvgen) {   // a CPU-written linear texture (Unreal's Slate font atlas, a glyph cache): the GPU reads it in place on the Switch
@@ -1599,7 +1600,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
         if (for_rt) v->gpu = 1;
         else if (!v->gpu && t->mem && (v->dirty || (v->span && v->clean_gen != g_bvgen && !reup_this_frame(v) && !tex_clean_now(v, t)))) {
             uint64_t fr = atomic_load(&g_presents);
-            if (!v->dirty && !v->late && reup_hold(v, fr)) g_reup_held++;   // its stamp still says written: the next use tries again
+            if (!v->dirty && !v->late && !v->lcpu && reup_hold(v, fr)) g_reup_held++;   // its stamp still says written: the next use tries again (never a CPU-written linear texture: DM_VK_LCPU_DIRTY keeps the hash's per-submission freshness)
             else { uint64_t since = v->dirty ? 0 : v->stamp; v->dirty = 0; v->reup_frame = fr; tex_reupload(v, t, since); g_pkg_reup++;
                    if (v->late) { v->late = 0; v->packaged = 1; g_late_fill++; } } }   // a texture whose data came after its first use (late_fill): from its storage from now on   // never over what the GPU drew: a flush of the pool range around a render target is not new content
         return v;
@@ -3288,7 +3289,7 @@ static VkImageView tex_slot(int stage, uint64_t h, VkSampler *sm, int *ok, vtex 
     if (e->tid == tid && e->gen == g_bvgen && e->reg == reg) {
         vtex *v = e->v; uint64_t pres = atomic_load(&g_presents);
         if (!v) { *ok = e->ok; if (vo) *vo = NULL; g_ht_hit++; return e->view; }
-        if (!(v->evicted || v->dirty || v->dead || v->late || (v->lcpu && !(v->span && lcpu_dirty_on()) && v->lhash_gen != g_bvgen) || (!v->gpu && v->span && v->clean_gen != g_bvgen && !(v->reup_frame && v->reup_frame == pres)))) {
+        if (!(v->evicted || v->dirty || v->dead || v->late || (v->lcpu && !(v->span && lcpu_dirty_on()) && v->lhash_gen != g_bvgen) || (!v->gpu && v->span && v->clean_gen != g_bvgen && !(v->reup_frame && v->reup_frame == pres && !v->lcpu)))) {
             v->last_frame = pres; v->last_fence = g_fence + 1; *ok = e->ok; if (vo) *vo = v; g_ht_hit++; return e->view; }
         g_ht_slow++;
     } else g_ht_miss++;
@@ -3794,7 +3795,7 @@ static VkDescriptorSet wsc_try(shader_t *s, int stage) {
     if (!c->ok || c->s != s || c->bgen != g_bgen[stage] || c->bvgen != g_bvgen || c->reg != atomic_load_explicit(&g_reg_gen, memory_order_relaxed) || c->tb != S.tex_base || c->sb != S.samp_base) return VK_NULL_HANDLE;
     uint64_t pres = atomic_load(&g_presents);
     for (int k = 0; k < c->nv; k++) { vtex *v = c->v[k];
-        if (v->evicted || v->dirty || v->dead || (!v->gpu && v->span && v->clean_gen != g_bvgen && !(v->reup_frame && v->reup_frame == pres && !v->late))) return VK_NULL_HANDLE; }
+        if (v->evicted || v->dirty || v->dead || (!v->gpu && v->span && v->clean_gen != g_bvgen && !(v->reup_frame && v->reup_frame == pres && !v->late && !v->lcpu))) return VK_NULL_HANDLE; }
     uint32_t dy[16];
     for (int k = 0; k < c->nd; k++) { VkBuffer b; VkDeviceSize o, r; if (!dyn_resolve(s, stage, c->di[k], &b, &o, &r) || b != c->db[k] || r != c->dr[k]) return VK_NULL_HANDLE; dy[k] = (uint32_t)o; }
     for (int k = 0; k < c->nck; k++) { const wck_t *q = &c->ck[k]; const sbind *b = &s->b[q->i];
