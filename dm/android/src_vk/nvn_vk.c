@@ -1523,7 +1523,9 @@ static int late_fill(const tex_t *t, const fmt_t *f) {
 // The content hash of a CPU-written linear texture (tex_get: once a submission for each one bound). Four independent lanes of the old step, folded at the end: the one chain
 // waited on each multiply before the next (about 2 bytes a cycle), and Tomodachi Life's island spent 1.8 G cycles of a 20 s profile in it, 18% of the recording thread
 // (vk-t8). Any change still changes the result: each step is a bijection of its lane, and so is the fold of each lane. g_lcpu_*: the per-600 line
-static uint64_t g_lcpu_hashes, g_lcpu_bytes, g_lcpu_changed, g_lcpu_tracked;   // g_lcpu_tracked: hashes of storage the dirty pages cover (nvn_dirty_tracked; whether a page check could stand in, vk-t10)
+static uint64_t g_lcpu_hashes, g_lcpu_bytes, g_lcpu_changed, g_lcpu_tracked;
+static uint64_t g_lcpu_gated;   // lookups of a CPU-written linear texture left to the dirty pages instead of a hash (DM_VK_LCPU_DIRTY)
+static int lcpu_dirty_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_LCPU_DIRTY"); v = !(e && atoi(e) == 0); LOG("vk: DM_VK_LCPU_DIRTY=%d: CPU-written linear textures in tracked storage %s", v, v ? "follow their dirty pages (no hash)" : "hashed once a submission"); } return v; }   // g_lcpu_tracked: hashes of storage the dirty pages cover (nvn_dirty_tracked; whether a page check could stand in, vk-t10)
 static uint64_t mem_hash(const uint8_t *p, uint64_t n) {
     const uint64_t P = 0x100000001b3ull; uint64_t h0 = 0x9e3779b97f4a7c15ull, h1 = h0 ^ 1, h2 = h0 ^ 2, h3 = h0 ^ 3, x0, x1, x2, x3, i = 0;
     g_lcpu_hashes++; g_lcpu_bytes += n;
@@ -1582,7 +1584,11 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
     lk_(&g_rmu, LW_RMU); vtex *v = tex_find(t->serial); pthread_mutex_unlock(&g_rmu);
     // Not while evicted (tex_evict, the low-memory trim): its image is gone, and the remake below uploads it from its storage anyway. Tomodachi Life crashed in the driver's
     // vkCmdCopyBufferToImage2 two frames after a trim evicted 58 textures: this upload went into VK_NULL_HANDLE (FINAL FANTASY RESONANCE's CPU-written atlases are used every frame)
-    if (v && v->lcpu && !v->gpu && !v->evicted && !for_rt && v->lhash_gen != g_bvgen) {   // a CPU-written linear texture (Unreal's Slate font atlas, a glyph cache): the GPU reads it in place on the Switch
+    // DM_VK_LCPU_DIRTY (vk-t12, default 1): a CPU-written linear texture in dirty-tracked storage (v->span, set when tex_upload_ stamped and protected it) is not hashed:
+    // a write to its pages makes it dirty and the re-upload below takes it, as for packaged textures. Tomodachi Life hashed one 16 MB texture a frame that never changed
+    // (0.58 G cycles in 20 s, ~2 ms of recording); untracked storage is still hashed. DM_VK_LCPU_DIRTY=0: hashed always, as before
+    if (v && v->lcpu && v->span && lcpu_dirty_on()) g_lcpu_gated++;
+    else if (v && v->lcpu && !v->gpu && !v->evicted && !for_rt && v->lhash_gen != g_bvgen) {   // a CPU-written linear texture (Unreal's Slate font atlas, a glyph cache): the GPU reads it in place on the Switch
         v->lhash_gen = g_bvgen; if (nvn_dirty_tracked(t->mem, t->L.size)) g_lcpu_tracked++; uint64_t h = mem_hash(t->mem, t->L.size);
         if (h != v->lhash) { v->lhash = h; tex_upload(v, t); g_lcpu_changed++; }
     }
@@ -3282,7 +3288,7 @@ static VkImageView tex_slot(int stage, uint64_t h, VkSampler *sm, int *ok, vtex 
     if (e->tid == tid && e->gen == g_bvgen && e->reg == reg) {
         vtex *v = e->v; uint64_t pres = atomic_load(&g_presents);
         if (!v) { *ok = e->ok; if (vo) *vo = NULL; g_ht_hit++; return e->view; }
-        if (!(v->evicted || v->dirty || v->dead || v->late || (v->lcpu && v->lhash_gen != g_bvgen) || (!v->gpu && v->span && v->clean_gen != g_bvgen && !(v->reup_frame && v->reup_frame == pres)))) {
+        if (!(v->evicted || v->dirty || v->dead || v->late || (v->lcpu && !(v->span && lcpu_dirty_on()) && v->lhash_gen != g_bvgen) || (!v->gpu && v->span && v->clean_gen != g_bvgen && !(v->reup_frame && v->reup_frame == pres)))) {
             v->last_frame = pres; v->last_fence = g_fence + 1; *ok = e->ok; if (vo) *vo = v; g_ht_hit++; return e->view; }
         g_ht_slow++;
     } else g_ht_miss++;
@@ -5970,8 +5976,8 @@ static void meas_lines(void) {
     LOG("vk: index ranges per frame over the last 600: %.1f reused, %.1f scanned (%.0f indices); scans of the same range again %.1f, over another live range %.1f, into a free or old slot %.1f;"
         " %llu distinct ranges in the 600 frames%s; texel buffer views made %.1f a frame; tex_get %.1f a draw", g_ic_hit / 600.0, g_ic_scan / 600.0, g_ic_idx / 600.0, g_ic_same / 600.0, g_ic_coll / 600.0, g_ic_new / 600.0,
         (unsigned long long)g_ic_keys, g_ic_keys_over ? " (the set was full: more)" : "", atomic_exchange(&g_bv_made, 0) / 600.0, g_texget_n / (double)draws); g_texget_n = 0;
-    LOG("vk: CPU-written linear textures per frame over the last 600: %.1f content hashes (%.2f MB hashed), %.2f found changed and uploaded, %.1f of them in dirty-tracked storage", g_lcpu_hashes / 600.0, g_lcpu_bytes / 600.0 / 1048576.0, g_lcpu_changed / 600.0, g_lcpu_tracked / 600.0);
-    g_lcpu_hashes = g_lcpu_bytes = g_lcpu_changed = g_lcpu_tracked = 0;
+    LOG("vk: CPU-written linear textures per frame over the last 600: %.1f content hashes (%.2f MB hashed), %.2f found changed and uploaded, %.1f of them in dirty-tracked storage; %.1f lookups left to the dirty pages (DM_VK_LCPU_DIRTY %d)", g_lcpu_hashes / 600.0, g_lcpu_bytes / 600.0 / 1048576.0, g_lcpu_changed / 600.0, g_lcpu_tracked / 600.0, g_lcpu_gated / 600.0, lcpu_dirty_on());
+    g_lcpu_hashes = g_lcpu_bytes = g_lcpu_changed = g_lcpu_tracked = g_lcpu_gated = 0;
     LOG("vk: draws with a vertex attribute of format 0 read as zeros (DM_VK_ZERO_ATTR %d) per frame over the last 600: %.1f", zero_attr_on(), g_zattr_draws / 600.0); g_zattr_draws = 0;
     if (g_fbf_draws) { LOG("vk: DM_VK_FB_FAST per frame over the last 600: %.1f draws looked at, %.1f answered from the shader cache, %.1f by texture serials alone, %.1f with the full way for a matching serial%s",
                            g_fbf_draws / 600.0, g_fbf_cached / 600.0, g_fbf_serial / 600.0, g_fbf_full / 600.0, "");
