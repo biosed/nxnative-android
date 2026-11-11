@@ -390,7 +390,8 @@ static int gw_pg_any(uint64_t addr, uint64_t size) {
 static uint64_t g_gwa[NGW], g_gwe[NGW], g_gws[NGW];   // [i]: g_gw[i].addr, g_gw[i].addr + g_gw[i].size, g_gw[i].seq
 static int gw_index_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_INDEX"); v = e && atoi(e) != 0; if (v) LOG("vk: DM_VK_GW_INDEX=1: GPU-written entries walked by their compact ranges"); } return v; }
 #define GW_MISS(i, lo, n) (gw_index_on() ? ((lo) >= g_gwe[i] || (lo) + (n) <= g_gwa[i]) : ((lo) >= g_gw[i].addr + g_gw[i].size || (lo) + (n) <= g_gw[i].addr))   // entry i does not overlap [lo, lo + n)
-static void gw_del(int i) { gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] = g_gw[--g_ngw]; g_gwa[i] = g_gwa[g_ngw]; g_gwe[i] = g_gwe[g_ngw]; g_gws[i] = g_gws[g_ngw]; }   // caller holds g_gwmu
+static uint64_t g_gw_gen;   // bumped by every gw_add / gw_del (the entry set and its order changed: DM_VK_GW_LCACHE's answers are void); caller holds g_gwmu
+static void gw_del(int i) { g_gw_gen++; gw_pg_mark(g_gw[i].addr, g_gw[i].size, -1); g_gw[i] = g_gw[--g_ngw]; g_gwa[i] = g_gwa[g_ngw]; g_gwe[i] = g_gwe[g_ngw]; g_gws[i] = g_gws[g_ngw]; }   // caller holds g_gwmu
 static int g_gw_add_dfr;   // gw_add: the entry is a deferred dispatch's (see defer_on)
 static int g_gw_add_pad;   // gw_add: the entry is a padded window (DM_VK_GW_PAD)
 static int g_defer_haz;   // a draw's resources include what a deferred dispatch writes: the pass ends and the dispatches are recorded before the draw (DRAWQ)
@@ -405,7 +406,7 @@ static void gw_add(uint64_t addr, uint64_t size, VkBuffer buf, VkDeviceSize off,
         gw_del(i); break; }
     if (g_ngw == NGW) { int o = 0; for (int i = 1; i < g_ngw; i++) if (g_gws[i] < g_gws[o]) o = i;
         RED_ONCE(62, "more than %d GPU-written buffer ranges in flight: the oldest is forgotten", NGW); g_gw_dropped++; gw_del(o); }
-    g_gwa[g_ngw] = addr; g_gwe[g_ngw] = addr + size;
+    g_gwa[g_ngw] = addr; g_gwe[g_ngw] = addr + size; g_gw_gen++;
     g_gw[g_ngw++] = (gw_t){addr, size, buf, off, p, fence, ci, snap, exact, 0, 0, (uint8_t)g_gw_add_dfr}; g_gw[g_ngw - 1].pad = (uint8_t)g_gw_add_pad; g_gw[g_ngw - 1].seq = seq; g_gws[g_ngw - 1] = seq; gw_pg_mark(addr, size, 1);
     pthread_mutex_unlock(&g_gwmu);
 }
@@ -435,7 +436,7 @@ static int stale_patch_on(void) { return stale_patch_mode() != 0; }
 // the CPU's rewrites (gw_cpu_dirty / gw_patch). Each write-back also puts the words it wrote into the snapshots of the later live entries over the same bytes, so a snapshot keeps
 // meaning "guest memory without the CPU's writes since": an earlier submission's write-back is not taken for a CPU rewrite. =2: as 1, plus counts at each chained write-back of
 // the CPU's words kept (which the whole write-back overwrote before) and of words both the CPU and the GPU wrote (the GPU's kept, as before). Per-600 line 'vk: chained GPU-written ranges'
-static int chain_snap_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_CHAIN_SNAP"); v = e ? atoi(e) : 0; if (v < 0 || v > 2) v = 1;
+static int chain_snap_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_CHAIN_SNAP"); v = e ? atoi(e) : 0; if (v < 0 || v > 3) v = 1;
     if (v) LOG("vk: DM_VK_GW_CHAIN_SNAP=%d: a dispatch's range bound from a running submission's GPU-written range gets a snapshot and goes back by changed words%s", v, v == 2 ? " (with counts of the CPU's words kept)" : ""); } return v; }
 static uint64_t g_cs_n, g_cs_b, g_cs_b2b;   // chained ranges given a snapshot (recording thread); GPU-written buffer copies whose CPU-side bytes went into live snapshots
 static _Atomic uint64_t g_cs_prop_b, g_cs_prop_n, g_cs_kept_w, g_cs_both_w, g_cs_wb_n;   // completion: bytes put into later snapshots (writes), CPU words kept, words both wrote, chained write-backs
@@ -698,12 +699,24 @@ static VkDeviceSize gw_compose(uint64_t addr, uint64_t size, VkDeviceSize align)
 // completion, which puts the bytes back in guest memory and ends it) is unchanged. Hold ages and forwarded MB are counted for the per-600 line
 static uint64_t g_fwd_n, g_fwd_bytes, g_hold_n, g_hold_age_sum, g_hold_age_max;
 static int gw_forward_k(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_FORWARD"); v = e ? atoi(e) : 0; if (v < 0) v = 0; if (v) LOG("DM_VK_GW_FORWARD=%d: GPU-written ranges read %d or more submissions after their write are copied forward", v, v); } return v; }
+static uint64_t g_gw_lc_hit;   // DM_VK_GW_LCACHE answers (recording thread, under g_gwmu)
+static int gw_lcache_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_GW_LCACHE"); v = e && atoi(e) > 0; if (v) LOG("vk: DM_VK_GW_LCACHE=1: GPU-written lookups remembered until the entry set changes"); } return v; }
 static int gw_find_(uint64_t addr, uint64_t size, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off, uint8_t **p, int may_hold) {
     int hit = 0; uint64_t wait = 0; int why = 0;
     if (!__atomic_load_n(&g_ngw, __ATOMIC_RELAXED)) return 0;
     g_gw_calls++; if (!gw_pg_any(addr, size)) { g_gw_quick++; return 0; }
-    lk_(&g_gwmu, LW_GWMU); H0_GWH_T0(); g_gw_walked += (uint64_t)g_ngw; g_h0_look++; g_h0_walk += (uint64_t)g_ngw;
-    int bi = -1; for (int i = 0; i < g_ngw; i++) if (!GW_MISS(i, addr, size) && (bi < 0 || g_gws[i] > g_gws[bi])) bi = i;   // the newest write over the range decides
+    lk_(&g_gwmu, LW_GWMU); H0_GWH_T0(); g_h0_look++;
+    int bi = -1;
+    // DM_VK_GW_LCACHE (hm-fix-all): the newest entry over (addr, size) remembered until the entry set changes (g_gw_gen: any gw_add / gw_del). Outdoors in Harvest Moon
+    // ~1900 lookups a frame got past the page check and each walked ~490 entries (930k a frame, gw_find_ ~10% of all CPU, 11-11 profile); between two writes the same
+    // ranges are looked up again and again. Only the index is kept: what is done with the entry (hold, copy, compose) is decided afresh at every call, as before
+    static struct { uint64_t addr, size, gen; int bi; } lc[1024]; uint32_t lk = (uint32_t)((addr >> 4) * 0x9E3779B97F4A7C15ull >> 54) ^ (uint32_t)(size & 1023);
+    if (gw_lcache_on() && lc[lk & 1023].gen == g_gw_gen + 1 && lc[lk & 1023].addr == addr && lc[lk & 1023].size == size) { bi = lc[lk & 1023].bi; g_gw_lc_hit++; }
+    else {
+        g_gw_walked += (uint64_t)g_ngw; g_h0_walk += (uint64_t)g_ngw;
+        for (int i = 0; i < g_ngw; i++) if (!GW_MISS(i, addr, size) && (bi < 0 || g_gws[i] > g_gws[bi])) bi = i;   // the newest write over the range decides
+        if (gw_lcache_on()) { lc[lk & 1023].addr = addr; lc[lk & 1023].size = size; lc[lk & 1023].gen = g_gw_gen + 1; lc[lk & 1023].bi = bi; }
+    }
     for (int i = bi; i >= 0; i = -1) {   // once (a loop for the breaks below)
         gw_t *e = &g_gw[i];
         if (e->dfr) g_defer_haz = 1;   // what a deferred dispatch writes: it is recorded first (DRAWQ / pass_end)
@@ -4051,7 +4064,13 @@ static int ipk_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDevic
         c->fence = g_fence + 1; g_ipk[i].cur = best; g_ipk[i].cur_fence = g_fence + 1; fresh = 1;
         if (hwl_since(c->hseq, ibuf, ibuf + n)) { g_ipk_fb_hwl++; return 0; }   // a write-back while it synced (hm-fix-b)
     }
-    if (idxpool_keep_mode() == 2 && memcmp(c->p + (ibuf - base), (const void *)(uintptr_t)ibuf, n)) {
+    // =2 (hm-fix-all): the whole pool compared once, right after a sync (about 3.5 pools of ~8 MB a frame outdoors); later draws of the submission rely on the dirty and
+    // write-back checks above. =3: every draw's window compared (the old =2: ~60% of the recording thread outdoors, 11-11 profile)
+    uint64_t vo = ibuf - base, vn = n;
+    if (idxpool_keep_mode() == 2) { vo = 0; vn = fresh ? psize : 0; }
+    if (idxpool_keep_mode() >= 2 && vn && memcmp(c->p + vo, (const void *)(uintptr_t)(base + vo), vn)) {
+        c->valid = 0; g_ipk[i].cur_fence = 0;   // copied whole at its next sync; this submission's later draws take another copy
+        ibuf = base + vo; n = vn;   // the line below reports the compared window
         g_ipk_bad++; static int nl; if (nl++ < 16) { const uint8_t *a = c->p + (ibuf - base), *g = (const uint8_t *)(uintptr_t)ibuf; uint64_t f = 0; while (f < n && a[f] == g[f]) f++;
             uint64_t pg = ibuf + f, gen = 0; int st = -1; nvn_dirty_page_info((const void *)(uintptr_t)pg, &gen, &st); uint64_t l = f; while (l < n && a[l] != g[l]) l++;
             LOG("[RED] vk: DM_VK_IDXPOOL_KEEP=2: the kept copy differs from the guest's indices at %#llx +%llu, first at +%llu for %llu bytes (pool %#llx +%#llx); that page: generation %llu (copy's stamp %llu, now %llu), state %d, a write-back since the sync %d; copy %d of %d, full syncs %llu, synced for this draw %d",
@@ -6124,6 +6143,8 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
             (unsigned long long)atomic_exchange(&g_gw_b2t, 0), (unsigned long long)atomic_exchange(&g_gw_b2b, 0), g_wb_words * 4 / 1024.0, g_wb_bytes / 1024.0,
             (unsigned long long)atomic_exchange(&g_gw_gpu_reads, 0), (unsigned long long)atomic_exchange(&g_gw_cpu_fix, 0), (unsigned long long)atomic_exchange(&g_gw_b2t_guest, 0),
             g_t_stale / 600e6, g_stale_bytes / 600.0 / 1048576.0, g_t_patch / 600e6, g_npatch / 600.0, g_patch_regions / 600.0, g_t_split / 600e6, g_vid_push / 600.0, g_vid_nz / 600.0, g_gw_calls / 600.0, g_gw_quick / 600.0, g_gw_walked / 600.0);
+        if (gw_lcache_on()) LOG("vk: DM_VK_GW_LCACHE per frame over the last 600: %.0f GPU-written lookups answered from the cache", g_gw_lc_hit / 600.0);
+        g_gw_lc_hit = 0;
         g_wb_words = g_wb_bytes = 0; g_t_stale = g_stale_bytes = 0; g_t_patch = g_patch_regions = g_npatch = 0; g_vid_push = g_vid_nz = 0; g_t_split = 0; g_gw_calls = g_gw_quick = g_gw_walked = 0;
         { double miss_us = g_dsc_nmiss_t ? g_dsc_miss_ns / 1e3 / g_dsc_nmiss_t : 0;
           LOG("vk: descriptor sets per frame over the last 600 (DM_VK_DSET_CACHE2 %d): %.1f reused, %.1f made (%.1f us each to allocate and write), %.2f rejected on the full compare; ring blocks kept by content %.1f, put anew %.1f; the reuse saved about %.2f ms a frame; texture storage scans %.1f a frame, %.1f left out as uploaded this frame (DM_VK_DIRTY_ONCE %d); driver segments taken as built %.1f, built %.1f (DM_VK_SEG_CACHE %d); stale patches by dispatch %.2f (%.0f runs); held reads %.1f, their writer %.1f submissions back on average, %llu at most; forwarded %.2f (%.2f MB) (DM_VK_GW_FORWARD %d); entries ended at their write-back %.1f",

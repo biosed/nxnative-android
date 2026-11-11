@@ -493,6 +493,14 @@ static void boot_env(const char *files, const char *ext) {
     else fprintf(stderr, "boot: no settings.env, the defaults apply\n");
     snprintf(p, sizeof p, "%s/env.txt", ext);   // diagnostics: switches in <external>/env.txt (one KEY=VALUE per line) win
     if ((f = fopen(p, "r"))) { char ln[1024]; while (fgets(ln, sizeof ln, f)) { ln[strcspn(ln, "\r\n")] = 0; char *eq = strchr(ln, '='); if (!eq || ln[0] == '#') continue; *eq = 0; setenv(ln, eq + 1, 1); fprintf(stderr, "boot: env %s=%s\n", ln, eq + 1); } fclose(f); }
+#ifdef DM_GAME_HOST_ENV
+    {   // the game profile's host switch defaults (host_env): set only where neither settings.env nor env.txt set the variable; each one logged with its source
+        char he[1024]; snprintf(he, sizeof he, "%s", DM_GAME_HOST_ENV);
+        for (char *sv = NULL, *t = strtok_r(he, " ", &sv); t; t = strtok_r(NULL, " ", &sv)) { char *eq = strchr(t, '='); if (!eq) continue; *eq = 0;
+            if (getenv(t)) fprintf(stderr, "boot: profile host_env %s=%s not used (set to %s by settings or env.txt)\n", t, eq + 1, getenv(t));
+            else { setenv(t, eq + 1, 0); fprintf(stderr, "boot: profile host_env %s=%s\n", t, eq + 1); } }
+    }
+#endif
     const char *sub[][2] = {{"DM_ROMFS", "romfs"}, {"DM_VK_DIR", "vk"}, {"DM_FONT_DIR", "font"}};
     for (int i = 0; i < 3; i++) { snprintf(p, sizeof p, "%s/%s", ext, sub[i][1]); setenv(sub[i][0], p, 0); }
     snprintf(p, sizeof p, "%s/save", files); mkdir(p, 0755); setenv("DM_SAVE", p, 0);

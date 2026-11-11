@@ -43,3 +43,9 @@ depth_mode	zero
 # ---- Shader build ----
 # Packed-half results clamped to the half range on the Mac (dmsh_build.py half_clamp): the toon eye pass 937e832a1b3b3068 overflowed to inf in Metal and drew the eyes white
 shader_half_clamp	on
+
+# ---- Android host switches ----
+# Defaults for this game only (front_android.c; env.txt overrides each). Outdoors in Bloomfield (11-11, hm_next3, KEEP=0): 3.5-4.3 fps, recording 216-256 ms a frame, ~400 MB a frame of
+# index-pool copies for GPU-indirect indexed draws, ~6100 GPU-written lookups walking ~930k entries. RING_REUSE keeps the extra rings (the forest's 500 MB a frame of fresh rings went to
+# ~16 MB); IDXPOOL_KEEP keeps the index pools across frames (hm-fix-b: host write-backs seen); GW_PAD pads small GPU-written copies; GW_LCACHE caches the GPU-written lookups per submission.
+host_env	DM_VK_RING_REUSE=1 DM_VK_IDXPOOL_KEEP=1 DM_VK_GW_PAD=1 DM_VK_GW_LCACHE=1
