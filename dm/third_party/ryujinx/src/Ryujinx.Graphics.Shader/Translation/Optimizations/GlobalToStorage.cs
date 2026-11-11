@@ -1054,7 +1054,27 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             context.Store(StorageKind.LocalMemory, lastBinding, selected);
             Operand found = context.IMultiply(selected, Const(GmemMapEntryWords));
             Operand lblSkip = Label();
-            context.BranchIfFalse(lblSkip, Below(MapWord(found, 3), MapWord(found, 2)));
+            Operand inPool = Below(MapWord(found, 3), MapWord(found, 2));
+
+            if (vectorCount > 1)
+            {
+                // The resolver chose the entry from word zero. Require the
+                // vector's last byte to remain below its end as well, rather
+                // than relying on host pool alignment.
+                Operand lastLow = context.IAdd(addrLow, Const(vectorCount * 4 - 1));
+                Operand endCarry = context.ConditionalSelect(
+                    context.ICompareLessUnsigned(lastLow, addrLow), Const(1), Const(0));
+                Operand lastHigh = context.IAdd(addrHigh, endCarry);
+                Operand endLow = MapWord(found, 2);
+                Operand endHigh = MapWord(found, 3);
+                inPool = context.BitwiseOr(
+                    context.ICompareLessUnsigned(lastHigh, endHigh),
+                    context.BitwiseAnd(
+                        context.ICompareEqual(lastHigh, endHigh),
+                        context.ICompareLessUnsigned(lastLow, endLow)));
+            }
+
+            context.BranchIfFalse(lblSkip, inPool);
 
             context.MarkLabel(lblChosen);
             found = context.IMultiply(selected, Const(GmemMapEntryWords));

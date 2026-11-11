@@ -111,6 +111,8 @@ class RawReuse(Translated):
         functions = self.functions(disassembly)
         helper = functions[calls[0]]
         self.assertIn('OpLoopMerge', helper)
+        self.assertIn('%int_15', helper,
+                      'the resolver must check the 128-bit load\'s last byte')
         self.assertRegex(helper, r'OpLoad %v4uint \S+ Aligned 4')
         self.assertGreaterEqual(
             len(re.findall(r'OpStore \S+ %uint_0', helper)), 4,
