@@ -195,9 +195,11 @@ static int img_mem_(VkMemoryRequirements r, VkDeviceMemory *m, VkDeviceSize *off
     for (int pass = 0; pass < 2; pass++)   // blocks in use first, the empty spare only when none has room (so it stays empty while it can)
         for (int i = 0; i < g_nblk; i++) { mblock *b = &g_blk[i]; if (b->m && b->type == type && blk_empty(b) == pass && fr_take(b, r.size, r.alignment, off)) {
             b->live++; *m = b->m;   // counted before the spare checks below: an emptied spare taken now is no longer one
-            if (pass) { g_blk_spare_used++; if (spare_block_on()) blk_spare_want(type); }
-            else if (spare_block_on()) { VkDeviceSize room = 0; for (int k = 0; k < g_nblk; k++) if (g_blk[k].m && g_blk[k].type == type) for (int j = 0; j < g_blk[k].nfr; j++) room += g_blk[k].fr[j].size;
-                                         if (room < (16u << 20)) blk_spare_want(type); }
+            if (pass) g_blk_spare_used++;
+            // a new spare only when the blocks' free room runs low -- also after the spare was taken: asking for one at every use made a block, and the image freed soon after
+            // left two empty and one was freed: Tomodachi Life's island made and freed ~230 64 MB blocks in a minute (dm-blkspare 3% of the CPU), its textures coming and going
+            if (spare_block_on()) { VkDeviceSize room = 0; for (int k = 0; k < g_nblk; k++) if (g_blk[k].m && g_blk[k].type == type) for (int j = 0; j < g_blk[k].nfr; j++) room += g_blk[k].fr[j].size;
+                                    if (room < (16u << 20)) blk_spare_want(type); }
             return i; } }
     int i = 0; while (i < g_nblk && g_blk[i].m) i++;
     if (i == NBLK) die("Vulkan: image memory blocks exhausted");
@@ -885,7 +887,7 @@ static int gpu_ts_on(void) { static int v = -1; if (v < 0) { const char *e = get
 // wait on the GPU (SyncWait twice a frame) saw the end of its submission that much later, and later submissions' ends queued behind it. A context being reset is not taken
 // (c->resetting); DM_VK_EARLY_DONE=0: the reset first, as before. g_cl_*: the time from the fence to g_done, and the game's waits (mtl_wait), the command-pool line
 static int early_done_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_EARLY_DONE"); v = !(e && atoi(e) == 0); LOG("vk: DM_VK_EARLY_DONE=%d: %s", v, v ? "fences signalled before the pool resets" : "pools reset before the fence is signalled"); } return v; }
-static _Atomic uint64_t g_cl_ns, g_cl_n, g_gw8_ns, g_gw8_n;   // fence observed -> g_done; the game's waits on the GPU (mtl_wait): time, count
+static _Atomic uint64_t g_cl_ns, g_cl_n, g_gw8_ns, g_gw8_n, g_gw8_lag, g_gw8_pend;   // ... and per wait: submissions made after the one waited for, submissions still to end up to it   // fence observed -> g_done; the game's waits on the GPU (mtl_wait): time, count
 static void ctx_reset(ctx_t *c);
 static void ctx_complete(ctx_t *c) {
     if (c->nh0ip) {   // H0: the GPU-written indirect arguments this submission drew with (vertex or index count, instances)
@@ -1521,7 +1523,7 @@ static int late_fill(const tex_t *t, const fmt_t *f) {
 // The content hash of a CPU-written linear texture (tex_get: once a submission for each one bound). Four independent lanes of the old step, folded at the end: the one chain
 // waited on each multiply before the next (about 2 bytes a cycle), and Tomodachi Life's island spent 1.8 G cycles of a 20 s profile in it, 18% of the recording thread
 // (vk-t8). Any change still changes the result: each step is a bijection of its lane, and so is the fold of each lane. g_lcpu_*: the per-600 line
-static uint64_t g_lcpu_hashes, g_lcpu_bytes, g_lcpu_changed;
+static uint64_t g_lcpu_hashes, g_lcpu_bytes, g_lcpu_changed, g_lcpu_tracked;   // g_lcpu_tracked: hashes of storage the dirty pages cover (nvn_dirty_tracked; whether a page check could stand in, vk-t10)
 static uint64_t mem_hash(const uint8_t *p, uint64_t n) {
     const uint64_t P = 0x100000001b3ull; uint64_t h0 = 0x9e3779b97f4a7c15ull, h1 = h0 ^ 1, h2 = h0 ^ 2, h3 = h0 ^ 3, x0, x1, x2, x3, i = 0;
     g_lcpu_hashes++; g_lcpu_bytes += n;
@@ -1581,7 +1583,7 @@ static vtex *tex_get(const tex_t *t, int for_rt) {
     // Not while evicted (tex_evict, the low-memory trim): its image is gone, and the remake below uploads it from its storage anyway. Tomodachi Life crashed in the driver's
     // vkCmdCopyBufferToImage2 two frames after a trim evicted 58 textures: this upload went into VK_NULL_HANDLE (FINAL FANTASY RESONANCE's CPU-written atlases are used every frame)
     if (v && v->lcpu && !v->gpu && !v->evicted && !for_rt && v->lhash_gen != g_bvgen) {   // a CPU-written linear texture (Unreal's Slate font atlas, a glyph cache): the GPU reads it in place on the Switch
-        v->lhash_gen = g_bvgen; uint64_t h = mem_hash(t->mem, t->L.size);
+        v->lhash_gen = g_bvgen; if (nvn_dirty_tracked(t->mem, t->L.size)) g_lcpu_tracked++; uint64_t h = mem_hash(t->mem, t->L.size);
         if (h != v->lhash) { v->lhash = h; tex_upload(v, t); g_lcpu_changed++; }
     }
     if (v) {
@@ -3205,6 +3207,30 @@ static uint32_t texu_handle(int stage, const sbind *b) {
     if (b->skind == S_SAMP_UBO && b->soff >= 0 && (b->sreg != b->reg || b->soff != b->off)) h |= ubo_word(stage, b->sreg, b->soff);
     return h;
 }
+// Diagnostics (vk-t10, always on, a few lines): a single handle a shader reads from a uniform buffer that holds no texture ID when the draw is recorded (the stand-in is bound).
+// Tomodachi Life's island composite (adfa17e8e8976a0f bindings 12-15, f11413f932b50da7 2-3: cbuf 0 + 40928..40952) reads 0 there on Android, while the Metal host found
+// textures (IDs 1883, 1884) and drew the beach. Each such word (up to 16) is logged once with what was written over it in this submission (inline updates / copies, wlog), and
+// read again at the next presents: "written later" means the game fills it after the submission is recorded (the GPU would read it at run time)
+static struct { uint64_t addr, fr; char key[20]; int bind, st, done; } g_tz[16]; static int g_ntz;
+static void texu_zero_note(int stage, const char *key, const sbind *b) {
+    if (stage < 0 || stage >= 6 || b->reg < 0 || b->reg >= 16) return;
+    const p_bind_buf *u = &S.ubo[stage][b->reg]; if (!u->addr) return;
+    uint64_t a = u->addr + (uint64_t)b->off;
+    for (int i = 0; i < g_ntz; i++) if (g_tz[i].addr == a) return;
+    if (g_ntz >= 16) return;
+    int w = 0; for (uint32_t i = 0; i < g_nwlog && i < NWLOG; i++) if (g_wlo[i] < a + 8 && g_whi[i] > a) w++;
+    uint32_t v[4] = {0}; if ((uint64_t)b->off + 16 <= u->size) memcpy(v, (const void *)(uintptr_t)a, 16);
+    g_tz[g_ntz].addr = a; g_tz[g_ntz].fr = atomic_load(&g_presents); snprintf(g_tz[g_ntz].key, sizeof g_tz[g_ntz].key, "%s", key); g_tz[g_ntz].bind = (int)b->binding; g_tz[g_ntz].st = stage; g_tz[g_ntz].done = 0; g_ntz++;
+    LOG("vk: handle diag: shader %s binding %u (stage %d) reads cbuf %d +%d = %#llx: words %08x %08x %08x %08x at recording; %d in-order writes over it in this submission; buffer %#llx +%llu",
+        key, b->binding, stage, b->reg, b->off, (unsigned long long)a, v[0], v[1], v[2], v[3], w, (unsigned long long)u->addr, (unsigned long long)u->size);
+}
+static void texu_zero_recheck(void) {   // mtl_present: the words noted, read again 1 and 30 frames later
+    uint64_t fr = atomic_load(&g_presents);
+    for (int i = 0; i < g_ntz; i++) { if (g_tz[i].done >= 2) continue; uint64_t age = fr - g_tz[i].fr; if (age < 1 || (g_tz[i].done == 1 && age < 30)) continue;
+        uint32_t v[2]; memcpy(v, (const void *)(uintptr_t)g_tz[i].addr, 8);
+        LOG("vk: handle diag: %s binding %d, %#llx, %llu frames later: %08x %08x%s", g_tz[i].key, g_tz[i].bind, (unsigned long long)g_tz[i].addr, (unsigned long long)age, v[0], v[1], v[0] & 0xfffff ? " (a texture ID now: written after the draw was recorded)" : "");
+        g_tz[i].done++; }
+}
 static uint64_t texu_slot(int stage, const sbind *b) {   // as a bound slot's handle: texture ID | sampler ID << 20, both in the host table
     uint32_t h = texu_handle(stage, b), t = h & 0xfffff, sm = h >> 20;
     return (uint64_t)(t ? t + (uint32_t)S.tex_base : 0) | (uint64_t)(sm ? sm + (uint32_t)S.samp_base : 0) << 20;
@@ -3873,6 +3899,7 @@ static VkDescriptorSet write_set_(shader_t *s, int stage) {
                 uint64_t tel = b->type != BT_SAMP && !simg && b->kind == K_TEXU && cnt > 1 ? texu_elem(stage, b, (int)e) : 0;   // an element of a handle array: 0 = no texture there (the stand-in)
                 if (b->type != BT_SAMP && !simg && (dyn || (b->kind == K_TEX && b->reg >= 0 && b->reg + (int)e < NTEX) || (b->kind == K_TEXU && (cnt == 1 || tel)))) {
                     th = dyn ? dyn_slot(stage, (int)e) : b->kind == K_TEXU ? (cnt > 1 ? tel : texu_slot(stage, b)) : S.tex[stage][b->reg + e]; have = !dyn;
+                    if (b->kind == K_TEXU && cnt == 1 && !(th & 0xfffff)) texu_zero_note(stage, s->key, b);   // (vk-t10 diagnostics)
                     int ok; vtex *tv; view = tex_slot(stage, th, &sm, &ok, &tv);
                     if (fit) { if (b->kind == K_TEXU) { fit = 0; g_wsc_nf[WSC_NF_TEXU]++; } else if (tv) { if (nc.nv < 64) nc.v[nc.nv++] = tv; else { fit = 0; g_wsc_nf[WSC_NF_MANY]++; } } }
                     if (stage == 0 && tv && tv->vhaz && tv->vhaz_epoch == g_vbar_epoch) g_vs_haz = 1;   // written by a pass whose end barrier left vertex shaders out (DM_VK_PASS_BARRIER)
@@ -5057,7 +5084,7 @@ uint64_t mtl_present_count(void) { return atomic_load(&g_presents); }
 void mtl_wait_committed(uint64_t fence) { lk_(&g_mu, LW_MU); while (g_fence < fence) pthread_cond_wait(&g_cv, &g_mu); pthread_mutex_unlock(&g_mu); }   // until the record thread has submitted it (mtl_sub_commit broadcasts g_cv)
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     uint64_t w0 = now_ns(); int waited = 0;
-    lk_(&g_mu, LW_MU); waited = g_done < fence;
+    lk_(&g_mu, LW_MU); waited = g_done < fence; if (waited) { atomic_fetch_add(&g_gw8_lag, g_fence - fence); atomic_fetch_add(&g_gw8_pend, fence - g_done); }
     if (timeout_ns == UINT64_MAX || timeout_ns > 60ull * 1000000000ull) { while (g_done < fence) pthread_cond_wait(&g_cv, &g_mu); }
     else {
         struct timespec t; clock_gettime(CLOCK_REALTIME, &t); uint64_t ns = (uint64_t)t.tv_nsec + timeout_ns; t.tv_sec += (time_t)(ns / 1000000000ull); t.tv_nsec = (long)(ns % 1000000000ull);
@@ -5920,9 +5947,10 @@ static void meas_lines(void) {
     { uint64_t n = atomic_exchange(&g_cpr_n, 0), ns = atomic_exchange(&g_cpr_ns, 0), nb = atomic_exchange(&g_cpr_bufs, 0), nr = atomic_exchange(&g_cpr_rec, 0);
       LOG("vk: command pools per frame over the last 600 (DM_VK_POOL_RESET %d): %.1f reset by dm-complete (%.3f ms, %.1f of them buffer by buffer), %.2f left to the recording thread; %d submission contexts",
           pool_reset_mode(), n / 600.0, ns / 600e6, nb / 600.0, nr / 600.0, NCTX); }
-    { uint64_t cn = atomic_exchange(&g_cl_n, 0), cns = atomic_exchange(&g_cl_ns, 0), wn = atomic_exchange(&g_gw8_n, 0), wns = atomic_exchange(&g_gw8_ns, 0);
-      LOG("vk: completion per frame over the last 600 (DM_VK_EARLY_DONE %d): a fence reached the game %.3f ms after the GPU ended it on average (%.1f submissions); the game waited for the GPU %.1f times, %.2f ms",
-          early_done_on(), cn ? cns / (double)cn / 1e6 : 0.0, cn / 600.0, wn / 600.0, wns / 600e6); }
+    { uint64_t cn = atomic_exchange(&g_cl_n, 0), cns = atomic_exchange(&g_cl_ns, 0), wn = atomic_exchange(&g_gw8_n, 0), wns = atomic_exchange(&g_gw8_ns, 0), lag = atomic_exchange(&g_gw8_lag, 0), pend = atomic_exchange(&g_gw8_pend, 0);
+      LOG("vk: completion per frame over the last 600 (DM_VK_EARLY_DONE %d): a fence reached the game %.3f ms after the GPU ended it on average (%.1f submissions); the game waited for the GPU %.1f times, %.2f ms"
+          " (per wait: %.2f submissions made after the one waited for, %.2f still running up to it)",
+          early_done_on(), cn ? cns / (double)cn / 1e6 : 0.0, cn / 600.0, wn / 600.0, wns / 600e6, wn ? lag / (double)wn : 0.0, wn ? pend / (double)wn : 0.0); }
     uint64_t hit = 0, miss = 0, mb = 0; for (int i = 0; i < CI_N; i++) { hit += g_ci_hit[i]; miss += g_ci_miss[i]; mb += g_ci_mbytes[i]; }
     static const char *cn[CI_N] = {"vertex", "index", "index pool", "uniform", "storage", "texel", "image copy"};
     char cb[600]; size_t o = 0; cb[0] = 0;
@@ -5935,8 +5963,8 @@ static void meas_lines(void) {
     LOG("vk: index ranges per frame over the last 600: %.1f reused, %.1f scanned (%.0f indices); scans of the same range again %.1f, over another live range %.1f, into a free or old slot %.1f;"
         " %llu distinct ranges in the 600 frames%s; texel buffer views made %.1f a frame; tex_get %.1f a draw", g_ic_hit / 600.0, g_ic_scan / 600.0, g_ic_idx / 600.0, g_ic_same / 600.0, g_ic_coll / 600.0, g_ic_new / 600.0,
         (unsigned long long)g_ic_keys, g_ic_keys_over ? " (the set was full: more)" : "", atomic_exchange(&g_bv_made, 0) / 600.0, g_texget_n / (double)draws); g_texget_n = 0;
-    LOG("vk: CPU-written linear textures per frame over the last 600: %.1f content hashes (%.2f MB hashed), %.2f found changed and uploaded", g_lcpu_hashes / 600.0, g_lcpu_bytes / 600.0 / 1048576.0, g_lcpu_changed / 600.0);
-    g_lcpu_hashes = g_lcpu_bytes = g_lcpu_changed = 0;
+    LOG("vk: CPU-written linear textures per frame over the last 600: %.1f content hashes (%.2f MB hashed), %.2f found changed and uploaded, %.1f of them in dirty-tracked storage", g_lcpu_hashes / 600.0, g_lcpu_bytes / 600.0 / 1048576.0, g_lcpu_changed / 600.0, g_lcpu_tracked / 600.0);
+    g_lcpu_hashes = g_lcpu_bytes = g_lcpu_changed = g_lcpu_tracked = 0;
     LOG("vk: draws with a vertex attribute of format 0 read as zeros (DM_VK_ZERO_ATTR %d) per frame over the last 600: %.1f", zero_attr_on(), g_zattr_draws / 600.0); g_zattr_draws = 0;
     if (g_fbf_draws) { LOG("vk: DM_VK_FB_FAST per frame over the last 600: %.1f draws looked at, %.1f answered from the shader cache, %.1f by texture serials alone, %.1f with the full way for a matching serial%s",
                            g_fbf_draws / 600.0, g_fbf_cached / 600.0, g_fbf_serial / 600.0, g_fbf_full / 600.0, "");
@@ -5988,6 +6016,7 @@ static void meas_lines(void) {
     memset(g_shw_n, 0, sizeof g_shw_n); memset(g_shw_b, 0, sizeof g_shw_b); memset(g_shw_all, 0, sizeof g_shw_all); g_shw_ns = 0;
 }
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
+    if (g_ntz) texu_zero_recheck();
     (void)period_s;
     uint64_t n = atomic_fetch_add(&g_presents, 1) + 1;
     g_frame_draw = 0; vk_ctl(n);
