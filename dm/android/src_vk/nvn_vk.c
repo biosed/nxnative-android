@@ -887,6 +887,7 @@ static int gpu_ts_on(void) { static int v = -1; if (v < 0) { const char *e = get
 // wait on the GPU (SyncWait twice a frame) saw the end of its submission that much later, and later submissions' ends queued behind it. A context being reset is not taken
 // (c->resetting); DM_VK_EARLY_DONE=0: the reset first, as before. g_cl_*: the time from the fence to g_done, and the game's waits (mtl_wait), the command-pool line
 static int early_done_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_EARLY_DONE"); v = !(e && atoi(e) == 0); LOG("vk: DM_VK_EARLY_DONE=%d: %s", v, v ? "fences signalled before the pool resets" : "pools reset before the fence is signalled"); } return v; }
+static _Atomic uint64_t g_gpu_gap_ns, g_gpu_gap_n;   // GPU time between one game submission's end and the next one's start (timestamps; presents in between count as idle): the completion line
 static _Atomic uint64_t g_cl_ns, g_cl_n, g_gw8_ns, g_gw8_n, g_gw8_lag, g_gw8_pend;   // ... and per wait: submissions made after the one waited for, submissions still to end up to it   // fence observed -> g_done; the game's waits on the GPU (mtl_wait): time, count
 static void ctx_reset(ctx_t *c);
 static void ctx_complete(ctx_t *c) {
@@ -921,6 +922,9 @@ static void ctx_complete(ctx_t *c) {
     if (vkGetQueryPoolResults(g_dev, c->qp, 0, 3, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[2] >= ts[0]) atomic_fetch_add(&g_up_gpu_ns, (uint64_t)((double)(ts[2] - ts[0]) * g_props.limits.timestampPeriod));
     if (vkGetQueryPoolResults(g_dev, c->qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0])
         { uint64_t gns = (uint64_t)((double)(ts[1] - ts[0]) * g_props.limits.timestampPeriod); atomic_fetch_add(&g_gpu_ns, gns); atomic_fetch_add(&g_gpu_cum, gns);
+          { static uint64_t prev_end; if (prev_end && ts[0] > prev_end) { uint64_t gap = (uint64_t)((double)(ts[0] - prev_end) * g_props.limits.timestampPeriod);   // the GPU's idle time before this submission
+                if (gap < 1000000000ull) { atomic_fetch_add(&g_gpu_gap_ns, gap); atomic_fetch_add(&g_gpu_gap_n, 1); } }
+            prev_end = ts[1]; }
           uint64_t dt = gns * 12 / 625; if (gpu_ts_on() && dt < t_end) t_top = t_end - dt; }   // the GPU's 19.2 MHz ticks
     if (c->ntq >= 2) { static uint64_t t[NTQ]; uint32_t n = c->ntq & ~1u;
         if (vkGetQueryPoolResults(g_dev, c->tq, 0, n, n * 8, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
@@ -5963,8 +5967,9 @@ static void meas_lines(void) {
           pool_reset_mode(), n / 600.0, ns / 600e6, nb / 600.0, nr / 600.0, NCTX); }
     { uint64_t cn = atomic_exchange(&g_cl_n, 0), cns = atomic_exchange(&g_cl_ns, 0), wn = atomic_exchange(&g_gw8_n, 0), wns = atomic_exchange(&g_gw8_ns, 0), lag = atomic_exchange(&g_gw8_lag, 0), pend = atomic_exchange(&g_gw8_pend, 0);
       LOG("vk: completion per frame over the last 600 (DM_VK_EARLY_DONE %d): a fence reached the game %.3f ms after the GPU ended it on average (%.1f submissions); the game waited for the GPU %.1f times, %.2f ms"
-          " (per wait: %.2f submissions made after the one waited for, %.2f still running up to it)",
-          early_done_on(), cn ? cns / (double)cn / 1e6 : 0.0, cn / 600.0, wn / 600.0, wns / 600e6, wn ? lag / (double)wn : 0.0, wn ? pend / (double)wn : 0.0); }
+          " (per wait: %.2f submissions made after the one waited for, %.2f still running up to it); the GPU idle between game submissions %.2f ms a frame (%.1f gaps)",
+          early_done_on(), cn ? cns / (double)cn / 1e6 : 0.0, cn / 600.0, wn / 600.0, wns / 600e6, wn ? lag / (double)wn : 0.0, wn ? pend / (double)wn : 0.0,
+          atomic_exchange(&g_gpu_gap_ns, 0) / 600e6, atomic_exchange(&g_gpu_gap_n, 0) / 600.0); }
     uint64_t hit = 0, miss = 0, mb = 0; for (int i = 0; i < CI_N; i++) { hit += g_ci_hit[i]; miss += g_ci_miss[i]; mb += g_ci_mbytes[i]; }
     static const char *cn[CI_N] = {"vertex", "index", "index pool", "uniform", "storage", "texel", "image copy"};
     char cb[600]; size_t o = 0; cb[0] = 0;
