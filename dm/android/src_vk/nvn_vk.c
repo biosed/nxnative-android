@@ -2806,15 +2806,27 @@ static VkCompareOp cop(int f) { return f >= 1 && f <= 8 ? (VkCompareOp)(f - 1) :
 static int bf_src1(int f) { return f >= 0x10 && f <= 0x13; }   // NVN_BLEND_FUNC_SRC1_COLOR … ONE_MINUS_SRC1_ALPHA
 // The second source without the GPU feature (Mali), or without the pixel shader's output 1: read as one (ONE_MINUS_*: zero), as before
 static int bf_no_src1(int f) { if (!bf_src1(f)) return f; RED_ONCE(10, "dual-source blending: not available here, the second source reads as one"); return f == 0x11 || f == 0x13 ? 1 : 2; }
+// DM_VK_ZERO_ATTR (vk-t9b, default 1): a vertex attribute the vertex shader reads but the game set to format 0 (off) reads zeros from binding ZB (16, a stride-0 binding of
+// g_zero_buf), as the Metal host does (nvn_mtl.m ZERO_ATTR). It used to be left out of the pipeline, its input undefined ("[RED] vertex attribute 2 format 0 has no Vulkan
+// format", Tomodachi Life's island). Needs 17 vertex bindings (the Adreno has 32); DM_VK_ZERO_ATTR=0: left out as before. g_zattr_draws: the per-600 vertex line
+enum { ZB = 16 };
+static uint64_t g_zattr_draws;
+static int zero_attr_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_ZERO_ATTR"); v = !(e && atoi(e) == 0) && g_props.limits.maxVertexInputBindings > ZB;
+    LOG("vk: DM_VK_ZERO_ATTR=%d: vertex attributes of format 0 %s", v, v ? "read zeros (binding 16)" : "left out"); } return v; }
 static VkPipeline pso_create(const pso_key *k, VkPipelineLayout pl) {
     VkShaderModule vsm = k->gs ? k->vs->mod : vs_pad_mod(k->vs, k->fs);   // padded where the pixel shader reads what the vertex shader does not write (with a geometry stage between, as it was)
     VkPipelineShaderStageCreateInfo st[3] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vsm, "main", NULL}}; uint32_t nst = 1;
     if (k->gs) st[nst++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_GEOMETRY_BIT, k->gs->mod, "main", NULL};
     if (k->fs) st[nst++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, k->dual ? k->fs->mod_dual : k->fs->mod, "main", NULL};
-    VkVertexInputBindingDescription vb[16]; VkVertexInputAttributeDescription va[16]; uint32_t nvb = 0, nva = 0; uint32_t used = 0;
-    for (int i = 0; i < k->nattr && i < 16; i++) {
+    VkVertexInputBindingDescription vb[17]; VkVertexInputAttributeDescription va[16]; uint32_t nvb = 0, nva = 0; uint32_t used = 0; int zused = 0;
+    for (int i = 0; i < 16; i++) {
         if (!(k->vs->vin_mask >> i & 1)) continue;
-        VkFormat f = vfmt(k->attr[i].fmt);
+        uint32_t afmt = i < k->nattr ? k->attr[i].fmt : 0;   // an input past the attributes the game set: off, as format 0
+        if (!afmt && i >= k->nattr && !zero_attr_on()) continue;
+        VkFormat f = afmt ? vfmt(afmt) : VK_FORMAT_UNDEFINED;
+        if (!f && zero_attr_on() && !afmt) {   // format 0: the game left the attribute off; it reads zeros, as nvn_mtl.m's ZERO_ATTR (the zero buffer at binding ZB)
+            static const VkFormat zf[3] = {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT};
+            va[nva++] = (VkVertexInputAttributeDescription){(uint32_t)i, ZB, zf[k->vs->vin[i] < 3 ? k->vs->vin[i] : 0], 0}; zused = 1; continue; }
         if (!f) { static int n; if (n++ < 8) LOG("[RED] vk: vertex attribute %d format %#x has no Vulkan format", i, k->attr[i].fmt); continue; }
         va[nva++] = (VkVertexInputAttributeDescription){(uint32_t)i, k->attr[i].stream, f, k->attr[i].offset};
         used |= 1u << k->attr[i].stream;
@@ -2824,6 +2836,7 @@ static VkPipeline pso_create(const pso_key *k, VkPipelineLayout pl) {
         if (div > 1) RED_ONCE(11, "instance divisor %u: drawn as 1", div);
         vb[nvb++] = (VkVertexInputBindingDescription){(uint32_t)s, stride, div ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
     }
+    if (zused) vb[nvb++] = (VkVertexInputBindingDescription){ZB, 0, VK_VERTEX_INPUT_RATE_VERTEX};   // stride 0: every vertex reads the same 16 zero bytes
     VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, NULL, 0, nvb, vb, nva, va};
     static const VkPrimitiveTopology TOPO[] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,
         VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
@@ -4342,6 +4355,8 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         vbs[s] = b; vos[s] = o;
         if (h0slot >= 0 && !per_inst && stride && to > from) { uint64_t vc = (to - from) / stride; if (vc < C->h0vmax[h0slot]) C->h0vmax[h0slot] = (uint32_t)(vc > UINT32_MAX ? UINT32_MAX : vc); }   // H0: vertices copied
     }
+    if (zero_attr_on()) { int z = 0; for (int i = 0; i < 16 && !z; i++) z = (vs->vin_mask >> i & 1) && (i >= S.nattr || !S.attr[i].fmt);
+        if (z) { VkDeviceSize zo = 0; vkCmdBindVertexBuffers(cb, ZB, 1, &g_zero_buf, &zo); g_zattr_draws++; } }   // the zero binding of format-0 attributes (pso_create)
     // one call for each run of consecutive slots that changed (DM_VK_STATE_SKIP): was a call per stream for every draw
     for (int s = 0; s < 16;) {
         if (!(used >> s & 1) || (sk && (g_ds_last.vb_ok >> s & 1) && g_ds_last.vb[s] == vbs[s] && g_ds_last.vo[s] == vos[s])) { if (used >> s & 1) g_bind_skips++; s++; continue; }
@@ -5917,6 +5932,7 @@ static void meas_lines(void) {
         (unsigned long long)g_ic_keys, g_ic_keys_over ? " (the set was full: more)" : "", atomic_exchange(&g_bv_made, 0) / 600.0, g_texget_n / (double)draws); g_texget_n = 0;
     LOG("vk: CPU-written linear textures per frame over the last 600: %.1f content hashes (%.2f MB hashed), %.2f found changed and uploaded", g_lcpu_hashes / 600.0, g_lcpu_bytes / 600.0 / 1048576.0, g_lcpu_changed / 600.0);
     g_lcpu_hashes = g_lcpu_bytes = g_lcpu_changed = 0;
+    LOG("vk: draws with a vertex attribute of format 0 read as zeros (DM_VK_ZERO_ATTR %d) per frame over the last 600: %.1f", zero_attr_on(), g_zattr_draws / 600.0); g_zattr_draws = 0;
     if (g_fbf_draws) { LOG("vk: DM_VK_FB_FAST per frame over the last 600: %.1f draws looked at, %.1f answered from the shader cache, %.1f by texture serials alone, %.1f with the full way for a matching serial%s",
                            g_fbf_draws / 600.0, g_fbf_cached / 600.0, g_fbf_serial / 600.0, g_fbf_full / 600.0, "");
                        if (g_fbf_chk) LOG("vk: DM_VK_FB_FAST=2 over the last 600 frames: %llu draws checked against the full way, %llu differed", (unsigned long long)g_fbf_chk, (unsigned long long)g_fbf_bad);
