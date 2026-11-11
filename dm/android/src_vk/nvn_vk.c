@@ -3978,7 +3978,7 @@ static void ipk_free_copies(int i) {   // a refused pool's copies (the slot stay
     for (int k = 0; k < IPK_NCMAX; k++) if (g_ipk[i].c[k].b) { vkDestroyBuffer(g_dev, g_ipk[i].c[k].b, NULL); vkFreeMemory(g_dev, g_ipk[i].c[k].m, NULL); g_ipk_bytes_live -= g_ipk[i].size; }
     memset(g_ipk[i].c, 0, sizeof g_ipk[i].c); g_ipk[i].cur = 0; g_ipk[i].cur_fence = 0;
 }
-static int ipk_sync(int i, ipk_copy *c) {   // brings copy c of pool slot i up to date with guest memory; 0: refused (untracked or protection failed)
+static int ipk_sync(int i, ipk_copy *c) {   // brings copy c of pool slot i up to date with guest memory; 0: refused (untracked or protection failed); -1: not this time (hm-fix-b)
     uint64_t base = g_ipk[i].base, size = g_ipk[i].size; const void *span = g_ipk[i].span;
     uint64_t now = nvn_dirty_now(), hs = hwl_now();   // before protecting and reading: a write (or a host write-back) after them shows at the next sync
     if (c->valid && hs - c->hseq > NHWL) c->valid = 0;   // the write-back log went round since the last sync: copied whole
@@ -3986,16 +3986,20 @@ static int ipk_sync(int i, ipk_copy *c) {   // brings copy c of pool slot i up t
         if (!nvn_dirty_protect((const void *)(uintptr_t)base, (size_t)size)) return 0;
         memcpy(c->p, (const void *)(uintptr_t)base, size); c->stamp = now; c->hseq = hs; c->valid = 1; g_ipk_full++; g_ipk_syncs++; return 1;
     }
-    {   // host write-backs into the pool since the last sync (hm-fix-b: the KEEP=2 differences outdoors, 11-11): their pages copied whatever their stamp says
+    {   // host write-backs into the pool since the last sync (hm-fix-b: the KEEP=2 differences outdoors, 11-11): their pages are protected again and copied whatever their
+        // stamp says, as the dirty pages below (a page a host write left writable with an old generation would otherwise never fault again: review). The ranges are taken
+        // under g_hwl_mu and copied after it (the completion thread's hwl_add is not held up by the copies)
+        static uint64_t rlo[NHWL], rhi[NHWL]; int nr = 0;   // the recording thread only
         pthread_mutex_lock(&g_hwl_mu); uint64_t end = g_hwl_seq;
         for (uint64_t k = c->hseq; k < end; k++) {
             uint64_t lo = g_hwl[k % NHWL].lo, hi = g_hwl[k % NHWL].hi;
             if (hi <= base || lo >= base + size) continue;
-            lo = (lo < base ? base : lo) & ~4095ull; hi = hi > base + size ? base + size : hi;
-            for (uint64_t pg = lo; pg < hi; pg += 4096) { uint64_t pl = base + size - pg < 4096 ? base + size - pg : 4096;
-                memcpy(c->p + (pg - base), (const void *)(uintptr_t)pg, pl); g_ipk_hwl_pages++; }
+            rlo[nr] = (lo < base ? base : lo) & ~4095ull; rhi[nr] = hi > base + size ? base + size : hi; nr++;
         }
         pthread_mutex_unlock(&g_hwl_mu);
+        for (int k = 0; k < nr; k++) for (uint64_t pg = rlo[k]; pg < rhi[k]; pg += 4096) { uint64_t pl = base + size - pg < 4096 ? base + size - pg : 4096;
+            if (!nvn_dirty_protect((const void *)(uintptr_t)pg, (size_t)pl)) { c->valid = 0; return -1; }   // not protected (a host write in the middle of it): this sync falls back, the next copies whole
+            memcpy(c->p + (pg - base), (const void *)(uintptr_t)pg, pl); g_ipk_hwl_pages++; }
     }
     uint64_t np = 0;
     for (uint64_t ch = 0; ch < size; ch += 65536) {
@@ -4041,7 +4045,9 @@ static int ipk_get(uint64_t ibuf, uint64_t n, uint32_t isz, VkBuffer *b, VkDevic
         if (best < 0) { g_ipk_fb_flight++; return 0; }
         c = &g_ipk[i].c[best];
         if (!c->b) { c->b = buf_new(psize, ALL_BUF_USAGE, &c->m, (void **)&c->p); if (!c->b || !c->p) { g_ipk_fb_other++; return 0; } g_ipk_bytes_live += psize; c->valid = 0; }
-        if (!ipk_sync(i, c)) { g_ipk[i].refused = 2; g_ipk_fb_other++; static int nl; if (nl++ < 4) LOG("vk: DM_VK_IDXPOOL_KEEP: pool %#llx +%llu cannot be protected: copied as before", (unsigned long long)base, (unsigned long long)psize); return 0; }
+        int sr = ipk_sync(i, c);
+        if (sr < 0) { g_ipk_fb_hwl++; return 0; }   // a write-back page could not be protected again: this draw copies as before
+        if (!sr) { g_ipk[i].refused = 2; g_ipk_fb_other++; static int nl; if (nl++ < 4) LOG("vk: DM_VK_IDXPOOL_KEEP: pool %#llx +%llu cannot be protected: copied as before", (unsigned long long)base, (unsigned long long)psize); return 0; }
         c->fence = g_fence + 1; g_ipk[i].cur = best; g_ipk[i].cur_fence = g_fence + 1; fresh = 1;
         if (hwl_since(c->hseq, ibuf, ibuf + n)) { g_ipk_fb_hwl++; return 0; }   // a write-back while it synced (hm-fix-b)
     }
