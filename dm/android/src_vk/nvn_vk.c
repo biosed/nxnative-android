@@ -1945,7 +1945,9 @@ enum { BT_UBO, BT_SSBO, BT_CIS, BT_TBUF, BT_UTB, BT_STB, BT_SIMG, BT_TEX, BT_SAM
 enum { K_UNK, K_CBUF, K_C1, K_SUPPORT, K_DRVCB, K_TEX, K_IMG, K_SBUF, K_TBUF, K_UBOP, K_TEXU };   // K_UBOP: a compute uniform buffer read through its address (dmsh_build.py ubo_ptr), bound as storage;
                                                                                                 // K_TEXU: a bindless texture handle in uniform slot reg at byte off (tex_ubo)
 enum { S_NONE, S_SAMP, S_SAMP_TEX, S_SAMP_ID, S_SAMP_UBO };   // S_SAMP_UBO: the sampler's handle in uniform slot sreg at byte soff (samp_ubo)
-typedef struct { uint32_t binding, count; uint8_t type, kind, skind; int16_t reg, sreg, off, soff; } sbind;
+// off / soff: byte offsets in a uniform buffer, up to its 64 KB -- 32-bit (vk-t11): as int16_t, Tomodachi Life's island composite read its handles at cbuf 0 + 40928..40952 as
+// -24608..-24584, before the buffer (zero, the stand-in bound: the beach and inlets black)
+typedef struct { uint32_t binding, count; uint8_t type, kind, skind; int16_t reg, sreg; int32_t off, soff; } sbind;
 typedef struct {
     char key[17]; int stage;   // 0 vertex, 1 fragment, 5 compute (NVN stage numbers)
     VkShaderModule mod, mod_dual; VkDescriptorSetLayout dsl;   // mod_dual: a fragment shader's output 1 as the second source of dual-source blending (spv_dual)
@@ -2368,7 +2370,7 @@ static shader_t *shader_get_(const uint8_t md[8]) {
         else if (!strncmp(ln, "c1 ", 3)) { size_t n = strlen(ln + 3) / 2; s->c1 = malloc(n + 16); s->c1_len = (uint32_t)n; for (size_t i = 0; i < n; i++) sscanf(ln + 3 + 2 * i, "%2hhx", &s->c1[i]); }
         else if (sscanf(ln, "vin %d %d", &l, &t) == 2 && l >= 0 && l < 32) { s->vin[l] = (uint8_t)t; s->vin_mask |= 1u << l; }
         else if (sscanf(ln, "b %d %7s %d %15s %d %d %15s %d %d", &b, ty, &cnt, kind, &reg, &off, sk, &sreg, &soff) >= 8 && s->nb < 64) {   // the 9th field, the sampler's byte offset, is newer
-            sbind *e = &s->b[s->nb++]; e->binding = (uint32_t)b; e->count = cnt > 0 ? (uint32_t)cnt : 1; e->reg = (int16_t)reg; e->off = (int16_t)off; e->sreg = (int16_t)sreg; e->soff = (int16_t)soff;
+            sbind *e = &s->b[s->nb++]; e->binding = (uint32_t)b; e->count = cnt > 0 ? (uint32_t)cnt : 1; e->reg = (int16_t)reg; e->off = (int32_t)off; e->sreg = (int16_t)sreg; e->soff = (int32_t)soff;
             e->type = !strcmp(ty, "ubo") ? BT_UBO : !strcmp(ty, "ssbo") ? BT_SSBO : !strcmp(ty, "cis") ? BT_CIS : !strcmp(ty, "tbuf") ? BT_TBUF : !strcmp(ty, "utb") ? BT_UTB :
                       !strcmp(ty, "stb") ? BT_STB : !strcmp(ty, "simg") ? BT_SIMG : !strcmp(ty, "tex") ? BT_TEX : BT_SAMP;
             e->kind = !strcmp(kind, "cbuf") ? K_CBUF : !strcmp(kind, "c1") ? K_C1 : !strcmp(kind, "support") ? K_SUPPORT : !strcmp(kind, "drvcb") ? K_DRVCB : !strcmp(kind, "tex") ? K_TEX :
