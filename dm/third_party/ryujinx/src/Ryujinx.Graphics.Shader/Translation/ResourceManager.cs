@@ -160,6 +160,13 @@ namespace Ryujinx.Graphics.Shader.Translation
         }
 
         // nxnative: the pool table entry a raw global memory helper chose last in this invocation (GlobalToStorage.TryGenerateRawStorageOp), one word for each helper, zero at the start
+        // The table entry a raw access helper resolved last in this invocation: its start, end and delta words (map words 0..5), so a hit compares
+        // against registers instead of loading the entry again. Zero-initialized: end 0 holds no address
+        public int AddRawEntryCacheMemory()
+        {
+            return Properties.AddLocalMemory(new MemoryDefinition($"gmem_entry_{Properties.LocalMemories.Count}", AggregateType.Array | AggregateType.U32, 6, zeroInit: true));
+        }
+
         public int AddRawLastEntryMemory()
         {
             return Properties.AddLocalMemory(new MemoryDefinition($"gmem_last_{Properties.LocalMemories.Count}", AggregateType.U32, 1, zeroInit: true));
