@@ -75,6 +75,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             private readonly Dictionary<LsKey, Dictionary<uint, SearchResult>> _sharedEntries;
             private readonly Dictionary<int, int> _rawVectorFunctions;
             private readonly HelperFunctionManager _hfm;
+            private int _rawEntryCacheBinding = -1;
 
             public GtsContext(HelperFunctionManager hfm)
             {
@@ -95,8 +96,6 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 _rawVectorFunctions.Add(count, functionId);
                 return functionId;
             }
-
-            private int _rawEntryCacheBinding = -1;
 
             // One cache for the shader: every raw helper resolves through the same immutable table, so a store after a load to the same pool hits
             // too, and only one zero-initialised array stays live
