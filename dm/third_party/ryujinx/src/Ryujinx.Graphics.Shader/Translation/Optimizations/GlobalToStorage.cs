@@ -73,7 +73,6 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             private readonly List<Entry> _entries;
             private readonly Dictionary<LsKey, Dictionary<uint, SearchResult>> _sharedEntries;
-            private readonly Dictionary<(Instruction, StorageKind), int> _rawLastBindings;
             private readonly Dictionary<int, int> _rawVectorFunctions;
             private readonly HelperFunctionManager _hfm;
 
@@ -81,7 +80,6 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             {
                 _entries = [];
                 _sharedEntries = new Dictionary<LsKey, Dictionary<uint, SearchResult>>();
-                _rawLastBindings = new Dictionary<(Instruction, StorageKind), int>();
                 _rawVectorFunctions = [];
                 _hfm = hfm;
             }
@@ -98,33 +96,20 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 return functionId;
             }
 
-            private readonly Dictionary<(Instruction, StorageKind), int> _rawEntryCacheBindings = new();
+            private int _rawEntryCacheBinding = -1;
 
-            public int GetOrAddRawEntryCacheBinding(ResourceManager resourceManager, Operation operation)
+            // One cache for the shader: every raw helper resolves through the same immutable table, so a store after a load to the same pool hits
+            // too, and only one zero-initialised array stays live
+            public int GetOrAddRawEntryCacheBinding(ResourceManager resourceManager)
             {
-                var key = (operation.Inst, operation.StorageKind);
-
-                if (!_rawEntryCacheBindings.TryGetValue(key, out int binding))
+                if (_rawEntryCacheBinding < 0)
                 {
-                    binding = resourceManager.AddRawEntryCacheMemory();
-                    _rawEntryCacheBindings.Add(key, binding);
+                    _rawEntryCacheBinding = resourceManager.AddRawEntryCacheMemory();
                 }
 
-                return binding;
+                return _rawEntryCacheBinding;
             }
 
-            public int GetOrAddRawLastBinding(ResourceManager resourceManager, Operation operation)
-            {
-                var key = (operation.Inst, operation.StorageKind);
-
-                if (!_rawLastBindings.TryGetValue(key, out int binding))
-                {
-                    binding = resourceManager.AddRawLastEntryMemory();
-                    _rawLastBindings.Add(key, binding);
-                }
-
-                return binding;
-            }
 
             public int AddFunction(Operation baseOp, bool isMultiTarget, IReadOnlyList<uint> targetCbs, Function function)
             {
@@ -1024,7 +1009,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             // The entry this helper resolved last in this invocation, kept as its start, end and delta words (ResourceManager.AddRawEntryCacheMemory):
             // an address inside it, and for a vector its last byte too, takes it without loading the table at all. The cache starts zero (end 0), so the
             // first lookup searches. The host binds one disjoint table for the draw.
-            int cacheBinding = gtsContext.GetOrAddRawEntryCacheBinding(resourceManager, operation);
+            int cacheBinding = gtsContext.GetOrAddRawEntryCacheBinding(resourceManager);
 
             Operand CacheWord(int word)
             {
