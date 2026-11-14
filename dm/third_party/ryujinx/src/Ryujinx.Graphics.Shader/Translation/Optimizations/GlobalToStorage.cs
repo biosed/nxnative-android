@@ -73,15 +73,14 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             private readonly List<Entry> _entries;
             private readonly Dictionary<LsKey, Dictionary<uint, SearchResult>> _sharedEntries;
-            private readonly Dictionary<(Instruction, StorageKind), int> _rawLastBindings;
             private readonly Dictionary<int, int> _rawVectorFunctions;
             private readonly HelperFunctionManager _hfm;
+            private int _rawEntryCacheBinding = -1;
 
             public GtsContext(HelperFunctionManager hfm)
             {
                 _entries = [];
                 _sharedEntries = new Dictionary<LsKey, Dictionary<uint, SearchResult>>();
-                _rawLastBindings = new Dictionary<(Instruction, StorageKind), int>();
                 _rawVectorFunctions = [];
                 _hfm = hfm;
             }
@@ -98,18 +97,18 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 return functionId;
             }
 
-            public int GetOrAddRawLastBinding(ResourceManager resourceManager, Operation operation)
+            // One cache for the shader: every raw helper resolves through the same immutable table, so a store after a load to the same pool hits
+            // too, and only one zero-initialised array stays live
+            public int GetOrAddRawEntryCacheBinding(ResourceManager resourceManager)
             {
-                var key = (operation.Inst, operation.StorageKind);
-
-                if (!_rawLastBindings.TryGetValue(key, out int binding))
+                if (_rawEntryCacheBinding < 0)
                 {
-                    binding = resourceManager.AddRawLastEntryMemory();
-                    _rawLastBindings.Add(key, binding);
+                    _rawEntryCacheBinding = resourceManager.AddRawEntryCacheMemory();
                 }
 
-                return binding;
+                return _rawEntryCacheBinding;
             }
+
 
             public int AddFunction(Operation baseOp, bool isMultiTarget, IReadOnlyList<uint> targetCbs, Function function)
             {
@@ -1006,17 +1005,36 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             Operand lblFound = Label();
             Operand lblChosen = Label();
 
-            // Try the entry this helper chose last in this invocation before
-            // searching the table. Entry zero is empty, so the first lookup
-            // still searches. The host binds one disjoint table for the draw.
-            int lastBinding = gtsContext.GetOrAddRawLastBinding(resourceManager, operation);
-            Operand last = context.Load(StorageKind.LocalMemory, lastBinding);
-            Operand lastEntry = context.IMultiply(last, Const(GmemMapEntryWords));
-            Operand lastHolds = context.BitwiseAnd(
-                AtOrBelow(MapWord(lastEntry, 1), MapWord(lastEntry, 0)),
-                Below(MapWord(lastEntry, 3), MapWord(lastEntry, 2)));
-            context.Copy(selected, last);
-            context.BranchIfTrue(lblChosen, lastHolds);
+            // The entry this helper resolved last in this invocation, kept as its start, end and delta words (ResourceManager.AddRawEntryCacheMemory):
+            // an address inside it, and for a vector its last byte too, takes it without loading the table at all. The cache starts zero (end 0), so the
+            // first lookup searches. The host binds one disjoint table for the draw.
+            int cacheBinding = gtsContext.GetOrAddRawEntryCacheBinding(resourceManager);
+
+            Operand CacheWord(int word)
+            {
+                return context.Load(StorageKind.LocalMemory, cacheBinding, Const(word));
+            }
+
+            Operand lastLow = addrLow;
+            Operand lastHigh = addrHigh;
+
+            if (vectorCount > 1)
+            {
+                lastLow = context.IAdd(addrLow, Const(vectorCount * 4 - 1));
+                lastHigh = context.IAdd(addrHigh, context.ConditionalSelect(context.ICompareLessUnsigned(lastLow, addrLow), Const(1), Const(0)));
+            }
+
+            Operand LastBelow(Operand high, Operand low)
+            {
+                return context.BitwiseOr(
+                    context.ICompareLessUnsigned(lastHigh, high),
+                    context.BitwiseAnd(context.ICompareEqual(lastHigh, high), context.ICompareLessUnsigned(lastLow, low)));
+            }
+
+            Operand cachedHolds = context.BitwiseAnd(
+                AtOrBelow(CacheWord(1), CacheWord(0)),
+                LastBelow(CacheWord(3), CacheWord(2)));
+            context.BranchIfTrue(lblChosen, cachedHolds);
 
             // A tagged 2 MiB-chunk hint names an entry which holds the whole
             // chunk. Collisions and ranges which cover only part of a chunk
@@ -1051,33 +1069,20 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             context.Copy(selected, index);
             context.MarkLabel(lblFound);
-            context.Store(StorageKind.LocalMemory, lastBinding, selected);
-            Operand found = context.IMultiply(selected, Const(GmemMapEntryWords));
-            Operand lblSkip = Label();
-            Operand inPool = Below(MapWord(found, 3), MapWord(found, 2));
 
-            if (vectorCount > 1)
+            // The chosen entry (its start is at or below the address) replaces the cache; an address past its end is refused below, and a later access
+            // inside it hits the cache
+            Operand found = context.IMultiply(selected, Const(GmemMapEntryWords));
+
+            for (int word = 0; word < 6; word++)
             {
-                // The resolver chose the entry from word zero. Require the
-                // vector's last byte to remain below its end as well, rather
-                // than relying on host pool alignment.
-                Operand lastLow = context.IAdd(addrLow, Const(vectorCount * 4 - 1));
-                Operand endCarry = context.ConditionalSelect(
-                    context.ICompareLessUnsigned(lastLow, addrLow), Const(1), Const(0));
-                Operand lastHigh = context.IAdd(addrHigh, endCarry);
-                Operand endLow = MapWord(found, 2);
-                Operand endHigh = MapWord(found, 3);
-                inPool = context.BitwiseOr(
-                    context.ICompareLessUnsigned(lastHigh, endHigh),
-                    context.BitwiseAnd(
-                        context.ICompareEqual(lastHigh, endHigh),
-                        context.ICompareLessUnsigned(lastLow, endLow)));
+                context.Store(StorageKind.LocalMemory, cacheBinding, Const(word), MapWord(found, word));
             }
 
-            context.BranchIfFalse(lblSkip, inPool);
+            Operand lblSkip = Label();
+            context.BranchIfFalse(lblSkip, LastBelow(CacheWord(3), CacheWord(2)));
 
             context.MarkLabel(lblChosen);
-            found = context.IMultiply(selected, Const(GmemMapEntryWords));
 
             if (writes)
             {
@@ -1100,9 +1105,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             // A small integer is read or written in its 32-bit word
             Operand wordLow = isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
-            Operand hostLow = context.IAdd(wordLow, MapWord(found, 4));
+            Operand hostLow = context.IAdd(wordLow, CacheWord(4));
             Operand carry = context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, wordLow), Const(1), Const(0));
-            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, MapWord(found, 5)), carry);
+            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, CacheWord(5)), carry);
 
             Operand resultValue = null;
 
@@ -1176,7 +1181,6 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             }
 
             context.MarkLabel(lblSkip);
-            context.Store(StorageKind.LocalMemory, lastBinding, Const(0));
 
             bool returnsValue = operation.Dest != null;
 

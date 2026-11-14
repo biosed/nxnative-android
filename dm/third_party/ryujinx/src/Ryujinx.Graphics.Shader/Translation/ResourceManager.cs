@@ -159,10 +159,12 @@ namespace Ryujinx.Graphics.Shader.Translation
             }
         }
 
-        // nxnative: the pool table entry a raw global memory helper chose last in this invocation (GlobalToStorage.TryGenerateRawStorageOp), one word for each helper, zero at the start
-        public int AddRawLastEntryMemory()
+        // nxnative: the pool table entry the shader's raw global memory helpers (GlobalToStorage.TryGenerateRawStorageOp) resolved last in this
+        // invocation: its start, end and delta words (map words 0..5), so a hit compares against registers instead of loading the entry again. One
+        // array per shader, zero-initialized: end 0 holds no address. A vector hit also requires its last byte below the cached end
+        public int AddRawEntryCacheMemory()
         {
-            return Properties.AddLocalMemory(new MemoryDefinition($"gmem_last_{Properties.LocalMemories.Count}", AggregateType.U32, 1, zeroInit: true));
+            return Properties.AddLocalMemory(new MemoryDefinition($"gmem_entry_{Properties.LocalMemories.Count}", AggregateType.Array | AggregateType.U32, 6, zeroInit: true));
         }
 
         // Words 1..3 returned by one raw vector load. Followers consume them
